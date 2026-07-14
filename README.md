@@ -1,4 +1,4 @@
-# codependent-
+# codependent
 
 Local-first, agentic developer environment with:
 
