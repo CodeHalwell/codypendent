@@ -1,4 +1,4 @@
-# codependent
+# Codypendent
 
 Local-first, agentic developer environment with:
 
@@ -8,6 +8,27 @@ Local-first, agentic developer environment with:
 - GitHub automation
 - multimodal input (text/voice/image)
 - governed plugin ecosystem
+
+Pronounced: `code-ee-pendent`
+
+Positioning: `The agentic developer environment with attachment issues.`
+
+## Naming Baseline
+
+Use `Codypendent` as the product name and avoid shortening executables to `cody` to reduce naming overlap.
+
+- `codypendent` - CLI and TUI entrypoint
+- `codypendent daemon` - daemon command
+- `codypendentd` - daemon executable
+- `.codypendent/` - user and repository configuration
+- `Codypendent Protocol` - client/daemon protocol
+- `Codypendent Skills` - skill packages
+- `Codypendent Fabric` - knowledge system
+
+See scaffold and delivery plan:
+
+- [`docs/PROJECT_SCAFFOLD.md`](docs/PROJECT_SCAFFOLD.md)
+- [`docs/TIMELINE.md`](docs/TIMELINE.md)
 
 ## Product Boundary
 
