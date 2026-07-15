@@ -85,6 +85,10 @@ CREATE TABLE approvals (
     expires_at TEXT
 );
 
+-- Artifact ROWS are per-occurrence metadata (id, classification, provenance);
+-- only the underlying BLOB (the file, keyed by sha256) is deduplicated. Two
+-- occurrences of identical bytes with different sources/classifications are
+-- two rows sharing one blob — never one row (see STEP 1.4).
 CREATE TABLE artifacts (
     id TEXT PRIMARY KEY,
     sha256 TEXT NOT NULL,
@@ -94,7 +98,7 @@ CREATE TABLE artifacts (
     created_at TEXT NOT NULL,
     provenance_json TEXT NOT NULL
 );
-CREATE UNIQUE INDEX idx_artifacts_hash ON artifacts(sha256, media_type);
+CREATE INDEX idx_artifacts_hash ON artifacts(sha256);
 
 CREATE TABLE workspace_leases (
     id TEXT PRIMARY KEY,
@@ -134,11 +138,11 @@ Extend `codypendent-protocol` (additive only — Phase 0 payloads keep working; 
 
 **RULES**
 
-1. Unknown enum variants must not crash a client: give every protocol enum `#[non_exhaustive]` and handle `_` arms in consumers.
+1. Unknown enum variants must not crash a peer, and `#[non_exhaustive]` alone does **not** achieve that — it only affects compile-time matching, after a value has already deserialized. An internally tagged serde enum rejects an unknown `type` during deserialization, before any `_` arm can run. Therefore every protocol enum that crosses the wire (`Payload` — already done in Phase 0 — plus `CommandBody`, `EventBody`, `Subscription`, and every later addition) MUST carry a `#[serde(other)] Unknown` unit-variant fallback, and receivers MUST handle `Unknown` gracefully: the daemon rejects it structurally (`protocol.unsupported-payload` / command rejection), clients render an "unsupported item" placeholder and continue. (`#[serde(other)]` requires a unit variant on a tagged enum — which is exactly what these are; keep `#[non_exhaustive]` as well for compile-time hygiene.)
 2. Events are only ever produced by the daemon **after** persistence (see STEP 1.3).
 3. Clients send **semantic** input (whole text submissions, approval decisions) — never keystrokes.
 
-**TESTS** — round-trip serde tests for every new payload; a fixture-corpus test that deserializes `crates/test-support/fixtures/events-basic.jsonl` (Phase 0 bytes) still passes — old events must parse forever.
+**TESTS** — round-trip serde tests for every new payload; unknown-tag tests for each wire enum (a made-up `type` deserializes to `Unknown`, is rejected structurally, and the connection survives — mirror the Phase 0 `Payload` tests); a fixture-corpus test that deserializes `crates/test-support/fixtures/events-basic.jsonl` (Phase 0 bytes) still passes — old events must parse forever.
 
 **COMMIT** `"phase1: protocol v1.1 payloads, subscriptions, catchup, artifact refs"`
 
@@ -195,11 +199,12 @@ impl ArtifactStore {
 
 **RULES**
 
-1. Same content + same media type ⇒ same stored file (dedup via the unique index); a second `put` returns the existing ref.
-2. Rename-into-place makes writes atomic; a crash leaves only `tmp/` garbage, which startup sweeps.
+1. **Dedup blobs, never metadata.** Identical bytes ⇒ one stored file (the CAS path is keyed by sha256 alone), but every `put` creates its **own** `artifacts` row with its own `ArtifactId`, classification, and provenance — the Chapter 14 contract keeps `id` and `hash` separate for exactly this reason. If the same bytes arrive first from an `Internal` source and later from a `Secret` source, that is two rows (one `Internal`, one `Secret`) sharing one blob; the second occurrence must never inherit the first row's lower classification, and classification checks (model routing, export, display) always read the row of the specific `ArtifactRef` in hand, never a row looked up by hash.
+2. Rename-into-place makes writes atomic; a crash leaves only `tmp/` garbage, which startup sweeps. A `put` whose blob already exists skips the write but still inserts its metadata row.
 3. Nothing above 64 KiB is ever embedded in an event; store it and reference it.
+4. Blob garbage collection (when it eventually exists) may delete a blob only when **no** artifact row references its hash.
 
-**TESTS** — put/open round-trip; hash verification; dedup; tmp-sweep on startup.
+**TESTS** — put/open round-trip; hash verification; blob dedup with per-occurrence rows (same bytes as `Internal` then `Secret` ⇒ one blob file, two rows, and the `Secret` ref resolves to `Secret` classification); tmp-sweep on startup.
 
 ## STEP 1.5 — Policy engine and capabilities (MVP)
 
