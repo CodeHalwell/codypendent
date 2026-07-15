@@ -1,6 +1,10 @@
 # Summary
 
 - [Codypendent Manual](00-index.md)
+- [The Codypendent Story](21-the-codypendent-story.md)
+
+# Manual
+
 - [Vision and Architectural Invariants](01-vision-and-invariants.md)
 - [System Architecture](02-system-architecture.md)
 - [Daemon and Client Protocol](03-daemon-client-protocol.md)
@@ -21,3 +25,16 @@
 - [Glossary](18-glossary.md)
 - [Competitive Design Synthesis](19-competitive-design-synthesis.md)
 - [Interaction and Autonomy Model](20-interaction-and-autonomy-model.md)
+
+# End-to-End Build Guide
+
+- [How to Use This Guide](build/00-how-to-use-this-guide.md)
+- [Phase 0 — Workspace Bootstrap](build/10-phase-0-workspace-bootstrap.md)
+- [Phase 1 — Persistent Agent Slice](build/11-phase-1-persistent-agent-slice.md)
+- [Phase 2 — Skills and Knowledge](build/12-phase-2-skills-and-knowledge.md)
+- [Phase 3 — GitHub and IDE](build/13-phase-3-github-and-ide.md)
+- [Phase 4 — Docs Studio and Code Intelligence](build/14-phase-4-docs-studio-and-code-intelligence.md)
+- [Phase 5 — Workflows and Multi-Agent](build/15-phase-5-workflows-and-multi-agent.md)
+- [Phase 6 — Plugins and Multimodal](build/16-phase-6-plugins-and-multimodal.md)
+- [Phase 7 — Routing and Learning](build/17-phase-7-routing-and-learning.md)
+- [Master Acceptance Checklist](build/99-master-acceptance-checklist.md)

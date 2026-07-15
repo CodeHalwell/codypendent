@@ -4,6 +4,11 @@ Codypendent is a local-first agentic developer environment built around a persis
 
 This manual is arranged in the order an implementer should understand the system.
 
+Two consolidated companions to this manual:
+
+- [The Codypendent Story](21-the-codypendent-story.md) — the entire design as one coherent narrative. Read it first if you are new.
+- [End-to-End Build Guide](build/00-how-to-use-this-guide.md) — step-by-step implementation plans (Phase 0–7) written for an implementation agent with no prior context, with verified code for Phase 0 and explicit specifications, tests, and exit checklists for every later phase.
+
 ## Reading path
 
 1. [Vision and architectural invariants](01-vision-and-invariants.md)

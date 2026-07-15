@@ -1,7 +1,7 @@
 {
   "name": "Codypendent Documentation Suite",
-  "version": "0.2",
-  "date": "2026-07-14",
+  "version": "0.3",
+  "date": "2026-07-15",
   "files": [
     "CONTRIBUTING.md",
     "README.md",
@@ -28,7 +28,18 @@
     "docs/18-glossary.md",
     "docs/19-competitive-design-synthesis.md",
     "docs/20-interaction-and-autonomy-model.md",
+    "docs/21-the-codypendent-story.md",
     "docs/SUMMARY.md",
+    "docs/build/00-how-to-use-this-guide.md",
+    "docs/build/10-phase-0-workspace-bootstrap.md",
+    "docs/build/11-phase-1-persistent-agent-slice.md",
+    "docs/build/12-phase-2-skills-and-knowledge.md",
+    "docs/build/13-phase-3-github-and-ide.md",
+    "docs/build/14-phase-4-docs-studio-and-code-intelligence.md",
+    "docs/build/15-phase-5-workflows-and-multi-agent.md",
+    "docs/build/16-phase-6-plugins-and-multimodal.md",
+    "docs/build/17-phase-7-routing-and-learning.md",
+    "docs/build/99-master-acceptance-checklist.md",
     "specs/agent.toml",
     "specs/changeset.yaml",
     "specs/command.toml",
@@ -39,5 +50,5 @@
     "specs/skill.toml",
     "specs/workflow.yaml"
   ],
-  "description": "Architecture suite with competitive design synthesis and interaction/autonomy model."
+  "description": "Architecture suite with competitive design synthesis, interaction/autonomy model, the consolidated Codypendent Story, and the end-to-end build guide (phases 0-7) for implementation agents."
 }

@@ -30,6 +30,11 @@ See scaffold and delivery plan:
 - [`docs/PROJECT_SCAFFOLD.md`](docs/PROJECT_SCAFFOLD.md)
 - [`docs/TIMELINE.md`](docs/TIMELINE.md)
 
+Consolidated documentation:
+
+- [The Codypendent Story](docs/docs/21-the-codypendent-story.md) — all design docs unified into one coherent narrative.
+- [End-to-End Build Guide](docs/docs/build/00-how-to-use-this-guide.md) — phase-by-phase implementation plans, written for an implementation agent, from empty directory to full product.
+
 ## Product Boundary
 
 ```text
