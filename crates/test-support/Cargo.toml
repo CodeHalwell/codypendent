@@ -1,0 +1,14 @@
+[package]
+name = "codypendent-test-support"
+description = "Shared fixtures and helpers for Codypendent tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

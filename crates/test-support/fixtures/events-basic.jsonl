@@ -1,0 +1,4 @@
+{"sequence":1,"occurred_at":"2026-07-14T09:00:00Z","actor":{"type":"System"},"body":{"type":"SessionCreated","title":"fixture session"}}
+{"sequence":2,"occurred_at":"2026-07-14T09:00:05Z","actor":{"type":"Human","user_id":"dana"},"body":{"type":"NoteAppended","text":"first note"}}
+{"sequence":3,"occurred_at":"2026-07-14T09:00:10Z","actor":{"type":"Human","user_id":"dana"},"body":{"type":"NoteAppended","text":"second note"}}
+{"sequence":4,"occurred_at":"2026-07-14T09:00:15Z","actor":{"type":"System"},"body":{"type":"SessionClosed"}}
