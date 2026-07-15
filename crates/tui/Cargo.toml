@@ -1,0 +1,18 @@
+[package]
+name = "codypendent-tui"
+description = "codypendent-tui: Ratatui rendering, input, layout, components, and themes. Speaks only protocol types — no database or network code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

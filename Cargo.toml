@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/daemon",
     "crates/cli",
+    "crates/tui",
     "crates/test-support",
 ]
 
@@ -17,11 +18,27 @@ repository = "https://github.com/CodeHalwell/codypendent"
 # Internal crates
 codypendent-protocol = { path = "crates/protocol" }
 codypendent-daemon = { path = "crates/daemon" }
+codypendent-tui = { path = "crates/tui" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
-# consumed by the runtime layer in Phase 1.
+# consumed by the runtime layer in Phase 1. The runtime crate selects providers
+# behind features (ADR-009: selected crates, never the umbrella `full`).
 agent-framework-core = "0.1.1"
+agent-framework-openai = "0.1.1"
+agent-framework-anthropic = "0.1.1"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Hashing (content-addressed artifact store)
+sha2 = "0.10"
+hex = "0.4"
+
+# Async traits and config parsing
+async-trait = "0.1"
+toml = "0.8"
 
 # Async runtime and serialization
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "process", "fs", "sync"] }
