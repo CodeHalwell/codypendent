@@ -1,0 +1,25 @@
+schema_version = 1
+id = "rust.verify-after-patch"
+name = "Verify Rust Patch"
+scope = "repository"
+event = "patch.proposed"
+kind = "validate"
+priority = 100
+
+[runtime]
+type = "command"
+program = "cargo"
+args = ["test", "--workspace"]
+working_directory = "$WORKTREE"
+timeout_seconds = 900
+
+[policy]
+failure = "block"
+requires_approval = false
+network = "deny"
+
+[output]
+capture_stdout = true
+capture_stderr = true
+create_artifact = true
+attach_to = "changeset"

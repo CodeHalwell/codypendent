@@ -1,0 +1,18 @@
+[book]
+title = "Codypendent Manual"
+authors = ["Codypendent contributors"]
+description = "Architecture and implementation manual for the Codypendent local-first agentic developer environment."
+src = "docs"
+language = "en"
+multilingual = false
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/CodeHalwell/codypendent"
+edit-url-template = "https://github.com/CodeHalwell/codypendent/edit/main/{path}"
+site-url = "/codypendent/"
+default-theme = "navy"
+preferred-dark-theme = "navy"

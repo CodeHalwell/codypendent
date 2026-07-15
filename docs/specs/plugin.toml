@@ -1,0 +1,35 @@
+schema_version = 1
+id = "github"
+name = "GitHub Integration"
+version = "0.1.0"
+kind = "native-process"
+publisher = "codypendent-project"
+
+scopes = ["user", "organization", "repository"]
+
+[runtime]
+command = "codypendent-plugin-github"
+protocol = "mcp-stdio"
+working_directory = "isolated"
+
+[capabilities]
+filesystem_read = []
+filesystem_write = []
+network = ["api.github.com:443", "uploads.github.com:443"]
+secrets = ["github-token"]
+subprocess = false
+
+[resources]
+memory_mb = 256
+cpu_seconds = 60
+wall_seconds = 120
+maximum_output_mb = 20
+
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+sandbox_profile = "network-client"
+
+[update]
+channel = "stable"
+permission_change_requires_approval = true

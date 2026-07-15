@@ -1,0 +1,23 @@
+schema_version = 1
+id = "local-sandbox"
+name = "Local Sandboxed Runner"
+kind = "local"
+platforms = ["linux", "macos", "windows"]
+
+[capabilities]
+worktrees = true
+containers = true
+browser = false
+desktop = false
+gpu = false
+
+[isolation]
+filesystem = "capability-scoped"
+network = "deny-by-default"
+process = "restricted"
+secrets = "brokered"
+
+[limits]
+maximum_concurrent_runs = 4
+memory_mb_per_run = 4096
+maximum_duration_seconds = 7200

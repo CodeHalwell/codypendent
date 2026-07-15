@@ -1,0 +1,39 @@
+schema_version = 1
+
+[scope]
+kind = "repository"
+
+[data]
+classification = "confidential"
+remote_models_allowed = ["approved-openai", "approved-anthropic"]
+local_models_allowed = true
+
+[filesystem]
+read = ["$REPOSITORY"]
+write = ["$WORKTREE"]
+deny = ["$REPOSITORY/.git", "$HOME/.ssh", "$HOME/.config"]
+
+[shell]
+allowed_programs = ["cargo", "git", "rg", "rustfmt"]
+shell_interpreter_requires_approval = true
+maximum_seconds = 900
+
+[network]
+allow = ["api.github.com:443", "crates.io:443", "index.crates.io:443"]
+default = "deny"
+
+[git]
+commit = "approval"
+push = "always-approval"
+force_push = "deny"
+delete_branch = "always-approval"
+
+[plugins]
+unsigned = "deny"
+native_process = "approval"
+permission_expansion = "always-approval"
+
+[memory]
+cross_repository = false
+retain_days = 365
+secrets = "deny"

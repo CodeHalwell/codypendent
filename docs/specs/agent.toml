@@ -1,0 +1,25 @@
+schema_version = 1
+id = "code.implementer"
+name = "Implementation Agent"
+description = "Implements an approved plan inside an isolated worktree."
+scope = "repository"
+mode = "build"
+autonomy = "supervised"
+model_policy = "coding-balanced"
+skills = ["repository.conventions", "code.implement", "testing.targeted"]
+tools = ["workspace.read_file", "workspace.search", "workspace.apply_patch", "shell.run", "git.diff"]
+
+[permissions]
+filesystem_read = ["$REPOSITORY"]
+filesystem_write = ["$WORKTREE"]
+commands = ["cargo", "git", "rg", "rustfmt"]
+network = []
+delegate_agents = false
+
+[budget]
+maximum_cost_usd = 3.00
+maximum_duration_seconds = 1800
+maximum_tool_calls = 80
+
+[completion]
+requires = ["changeset-created", "targeted-tests-pass", "chronicle-updated"]

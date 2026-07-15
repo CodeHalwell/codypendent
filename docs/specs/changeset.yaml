@@ -1,0 +1,29 @@
+schema_version: 1
+id: example-change-set
+base_revision: 79acbf1
+worktree: run-implementation-01
+status: proposed
+
+plan_nodes:
+  - implement-parser-fix
+  - add-regression-test
+
+patches:
+  - id: patch-001
+    file: src/parser.rs
+    operation: update
+    plan_node: implement-parser-fix
+  - id: patch-002
+    file: tests/parser_escape.rs
+    operation: create
+    plan_node: add-regression-test
+
+verification:
+  - kind: command
+    command: cargo test --test parser_escape
+    outcome: passed
+    artifact: artifact://verification/targeted-test
+
+publication:
+  strategy: selective-apply
+  commit_message: "Fix escaped delimiter parsing"

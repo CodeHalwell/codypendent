@@ -1,0 +1,19 @@
+schema_version = 1
+id = "fix-ci"
+name = "Fix CI"
+description = "Investigate a failed GitHub check and prepare a verified change set."
+scope = "repository"
+invocation = "/fix-ci"
+
+[entrypoint]
+type = "workflow"
+workflow = "repair-github-check"
+
+[arguments.pull_request]
+type = "github_pull_request"
+required = true
+
+[defaults]
+mode = "spec"
+autonomy = "supervised"
+open_chronicle = true
