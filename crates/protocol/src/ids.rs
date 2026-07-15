@@ -48,6 +48,7 @@ uuid_id!(RunId);
 uuid_id!(TaskId);
 uuid_id!(AgentId);
 uuid_id!(ArtifactId);
+uuid_id!(ChangeSetId);
 uuid_id!(WorkflowId);
 uuid_id!(ToolId);
 uuid_id!(SkillId);

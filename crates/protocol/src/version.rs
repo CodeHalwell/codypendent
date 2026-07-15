@@ -10,7 +10,11 @@ pub struct ProtocolVersion {
 
 /// The current protocol version. Additive changes bump `minor`; breaking
 /// changes bump `major` and require negotiation.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+///
+/// Phase 1 adds handshake, command, catch-up, artifact-reference, and run/tool/
+/// approval event payloads — all additive over Phase 0, so `major` stays `1`
+/// and `minor` advances to `1`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.
