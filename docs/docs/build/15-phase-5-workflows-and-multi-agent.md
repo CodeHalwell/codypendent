@@ -19,7 +19,7 @@
 
 ## STEP 5.2 — Durable execution: node records and checkpoints
 
-Migration 0005: `workflow_runs` (id, workflow id+version, run_id, inputs_json, state), `workflow_nodes` (workflow_run_id, node_id, state, agent_run_id, attempt, cost_json, started/ended), `checkpoints` (id, workflow_run_id, graph_signature, state artifact id, created_at).
+Migration 0005 (all four tables in this one migration — migrations are append-only, and STEP 5.3 needs the last one): `workflow_runs` (id, workflow id+version, run_id, inputs_json, state), `workflow_nodes` (workflow_run_id, node_id, state, agent_run_id, attempt, cost_json, started/ended), `checkpoints` (id, workflow_run_id, graph_signature, state artifact id, created_at), and `blackboard_items` (id, workflow_run_id, kind, payload_json, author_json, confidence, evidence_json, revision, superseded_by, created_at — consumed in STEP 5.3).
 
 1. Implement `SqliteCheckpointStorage` for the framework checkpoint interface ([Chapter 12](../12-agent-framework-rs-integration.md)): checkpoint = graph signature + node states + shared state + active approvals + artifact refs + worktree revision + model policy version + context/compaction version ([Chapter 04](../04-agent-runtime-and-workflows.md)). Database writes and daemon workflow state share a transaction (or the outbox pattern) — no torn checkpoints.
 2. Checkpoint at: node completion, approval waits, and pause. **Resume rejects a changed graph signature** unless a migration is registered ([Chapter 04](../04-agent-runtime-and-workflows.md)).
@@ -33,7 +33,7 @@ Migration 0005: `workflow_runs` (id, workflow id+version, run_id, inputs_json, s
 
 ## STEP 5.3 — The blackboard
 
-`runtime/blackboard.rs` per [Chapter 04](../04-agent-runtime-and-workflows.md): typed artifacts only — `Finding`, `Hypothesis`, `Decision`, `CodeLocation`, `ProposedPatch(ArtifactRef)`, `TestResult`, `DocumentDraft`, `OpenQuestion` — each carrying author (agent/run/task), confidence, evidence refs, scope, revision, and supersession status. Stored in migration 0005's `blackboard_items` table, scoped to a workflow run; agents read/write it through two registry tools (`blackboard.post`, `blackboard.query`) so every access is traced.
+`runtime/blackboard.rs` per [Chapter 04](../04-agent-runtime-and-workflows.md): typed artifacts only — `Finding`, `Hypothesis`, `Decision`, `CodeLocation`, `ProposedPatch(ArtifactRef)`, `TestResult`, `DocumentDraft`, `OpenQuestion` — each carrying author (agent/run/task), confidence, evidence refs, scope, revision, and supersession status. Stored in the `blackboard_items` table created by migration 0005 in STEP 5.2, scoped to a workflow run; agents read/write it through two registry tools (`blackboard.post`, `blackboard.query`) so every access is traced.
 
 **RULE:** agents in a multi-agent workflow communicate **only** via blackboard artifacts and declared node outputs — never by exchanging raw transcripts ([Chapter 04](../04-agent-runtime-and-workflows.md) task model).
 

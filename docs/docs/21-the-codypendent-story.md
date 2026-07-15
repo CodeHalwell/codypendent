@@ -1,6 +1,6 @@
 # The Codypendent Story
 
-> **One coherent narrative of the entire design.** This chapter consolidates every document in this repository — the manual chapters 01–20, the project scaffold, the timeline, the security policy, the contribution rules, the product notes, and the example manifests under `specs/` — into a single story. Nothing here overrides the detailed chapters; where you need precision, follow the reference links. Where this chapter reconciles two documents that grew apart, it says so explicitly.
+> **One coherent narrative of the entire design.** This chapter consolidates every document in this repository — the manual chapters 01–20, the project scaffold, the timeline, the security policy, the contribution rules, the product notes, and the example manifests under `docs/specs/` — into a single story. Nothing here overrides the detailed chapters; where you need precision, follow the reference links. Where this chapter reconciles two documents that grew apart, it says so explicitly.
 
 ---
 
@@ -214,7 +214,7 @@ This repository grew in layers. Where documents disagree, this is the resolution
 
 1. **Crate layout.** [`PROJECT_SCAFFOLD.md`](../PROJECT_SCAFFOLD.md) sketches five crates (`codypendent-{cli,daemon,protocol,skills,fabric}`); the manual's [suggested shape](../README.md) lists nine directories (`protocol, daemon, runtime, knowledge, integrations, sandbox, tui, cli, test-support`). **Resolution:** the manual's target shape is authoritative as the *destination*, but crates are created only when a phase needs them (per [CONTRIBUTING](../CONTRIBUTING.md): "do not add a crate merely to mirror an architecture diagram"). Phase 0 creates `protocol`, `daemon`, `cli`, `test-support`; `runtime` and `tui` arrive in Phase 1; `knowledge` in Phase 2; `integrations` in Phase 3; `sandbox` in Phase 6. Package names follow the scaffold convention `codypendent-*`; binaries are `codypendent` and `codypendentd`.
 2. **Timeline vs roadmap.** [`TIMELINE.md`](../TIMELINE.md) (weeks 0–12, phases 0–5) is the *calendar and go-to-market overlay* — naming, trademark, launch checklist — for the early engineering phases. [Chapter 15](15-roadmap.md) (phases 0–7) is the authoritative *engineering sequence*. The build guide follows Chapter 15 and folds the timeline's identity/launch tasks into its Phase 0 notes.
-3. **Stub outlines.** `docs/architecture/*` and `docs/workflows/*` are early outlines superseded by manual chapters 03/11 and the `specs/` manifests; they remain as pointers.
+3. **Stub outlines.** `docs/architecture/*` and `docs/workflows/*` are early outlines superseded by manual chapters 03/11 and the `docs/specs/` manifests; they remain as pointers.
 4. **Normative language.** MUST/SHOULD/MAY per the [manual index](00-index.md). Candidate technologies (Loro, Qdrant, Wasmtime) are validated by explicit gates, not asserted.
 
 ## 9. How we get there — and how we know it works

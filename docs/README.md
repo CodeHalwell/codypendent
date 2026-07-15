@@ -91,6 +91,6 @@ The initial workspace deliberately avoids turning every subsystem into its own c
 
 ## Newly incorporated design patterns
 
-Version 0.2 adds explicit modes, durable specifications, session branching and steering, cumulative change sets, first-class hooks and commands, chronicles, JSONL operation, mid-session model switching, remote-attach/runner architecture, browser verification and repository-map strategies.
+Version 0.2 added explicit modes, durable specifications, session branching and steering, cumulative change sets, first-class hooks and commands, chronicles, JSONL operation, mid-session model switching, remote-attach/runner architecture, browser verification and repository-map strategies. Version 0.3 consolidates the suite into [The Codypendent Story](docs/21-the-codypendent-story.md) and adds the [End-to-End Build Guide](docs/build/00-how-to-use-this-guide.md).
 
 See [Competitive Design Synthesis](docs/19-competitive-design-synthesis.md) and [Interaction and Autonomy Model](docs/20-interaction-and-autonomy-model.md).

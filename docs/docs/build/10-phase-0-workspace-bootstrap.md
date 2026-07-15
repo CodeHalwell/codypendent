@@ -178,7 +178,8 @@ CREATE TABLE events (
 
 - IDs are UUIDv7 newtypes (sortable, `#[serde(transparent)]`); `ModelId` and `UserId` are strings by design.
 - The envelope carries `protocol_version`; the server rejects incompatible **major** versions with a structured `Error` payload, never by closing the connection silently.
-- Framing is `u32` **big-endian** length prefix + JSON, 16 MiB cap; `read_envelope` returns `Ok(None)` on clean EOF so connection loops terminate without error noise.
+- `Payload` has a `#[serde(other)] Unknown` fallback: a payload tag from a newer 1.x peer deserializes to `Unknown` and is rejected structurally (`protocol.unsupported-payload`) with the connection kept alive — an additive minor-version extension must never kill the stream.
+- Framing is `u32` **big-endian** length prefix + JSON, 16 MiB cap. `read_envelope` returns `Ok(None)` **only** on a clean end-of-stream before the first length byte; the first byte is read separately because `read_exact` alone would conflate a clean close with a connection dropped mid-prefix, which must surface as an error.
 - Discovery resolves the socket as: `CODYPENDENT_SOCKET` override → under `CODYPENDENT_DATA_DIR` if set → `$XDG_RUNTIME_DIR/codypendent/` → `<data>/run/`; and validates the ~104-byte Unix limit up front.
 
 **CREATE FILE `crates/protocol/Cargo.toml`**
@@ -431,6 +432,26 @@ pub enum Payload {
     /// Structured protocol-level error (never parse human text to decide
     /// behaviour).
     Error(ProtocolError),
+    /// Forward-compatibility fallback: a payload tag this build does not know
+    /// deserializes to `Unknown` instead of failing the whole frame, so the
+    /// receiver can reject it structurally and keep the connection alive
+    /// (additive 1.x payloads must never break an older peer).
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_payload_tag_deserializes_to_unknown() {
+        let request = Envelope::request(ClientId::new(), Payload::Ping);
+        let mut value = serde_json::to_value(&request).expect("serialize");
+        value["payload"] = serde_json::json!({ "type": "FromTheFuture", "detail": 42 });
+        let parsed: Envelope = serde_json::from_value(value).expect("future payloads must parse");
+        assert!(matches!(parsed.payload, Payload::Unknown));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,17 +582,21 @@ pub async fn write_envelope<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Read one envelope. Returns `Ok(None)` on a clean end-of-stream before the
-/// first length byte.
+/// Read one envelope. Returns `Ok(None)` only on a clean end-of-stream before
+/// the first length byte. A stream that ends mid-prefix or mid-payload is an
+/// error — the first byte is read separately because `read_exact` alone would
+/// conflate a clean close (0 bytes) with a connection dropped after a partial
+/// prefix (1–3 bytes).
 pub async fn read_envelope<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Envelope>, FrameError> {
     let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
+    match reader.read(&mut len_buf[..1]).await {
+        Ok(0) => return Ok(None),
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
+    reader.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(len as usize));
@@ -579,6 +604,55 @@ pub async fn read_envelope<R: AsyncRead + Unpin>(
     let mut buf = vec![0u8; len as usize];
     reader.read_exact(&mut buf).await?;
     Ok(Some(serde_json::from_slice(&buf)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{Envelope, Payload};
+    use crate::ids::ClientId;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn round_trip() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let sent = Envelope::request(ClientId::new(), Payload::Ping);
+        write_envelope(&mut writer, &sent).await.expect("write");
+        let received = read_envelope(&mut reader)
+            .await
+            .expect("read")
+            .expect("one envelope");
+        assert_eq!(received.message_id, sent.message_id);
+        assert!(matches!(received.payload, Payload::Ping));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_returns_none() {
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        drop(writer);
+        let result = read_envelope(&mut reader).await.expect("clean eof is ok");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_length_prefix_is_an_error() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&[0x00, 0x00]).await.expect("two bytes");
+        drop(writer);
+        assert!(
+            read_envelope(&mut reader).await.is_err(),
+            "a stream dropped mid-prefix must not look like a clean close"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_payload_is_an_error() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&8u32.to_be_bytes()).await.expect("prefix");
+        writer.write_all(&[1, 2, 3]).await.expect("partial payload");
+        drop(writer);
+        assert!(read_envelope(&mut reader).await.is_err());
+    }
 }
 ```
 
@@ -1781,6 +1855,23 @@ async fn ping_status_shutdown_over_socket() {
         other => panic!("expected version error, got {other:?}"),
     }
 
+    // An unknown (future, additive) payload must be rejected structurally,
+    // and the connection must remain usable afterwards.
+    let mut future_value =
+        serde_json::to_value(Envelope::request(client_id, Payload::Ping)).expect("serialize");
+    future_value["payload"] = serde_json::json!({ "type": "PayloadFromTheFuture" });
+    let future: Envelope = serde_json::from_value(future_value).expect("parse");
+    let reply = roundtrip(&mut stream, &future).await;
+    match reply.payload {
+        Payload::Error(error) => assert_eq!(error.code, "protocol.unsupported-payload"),
+        other => panic!("expected unsupported-payload error, got {other:?}"),
+    }
+    let reply = roundtrip(&mut stream, &Envelope::request(client_id, Payload::Ping)).await;
+    assert!(
+        matches!(reply.payload, Payload::Pong),
+        "connection must survive an unknown payload"
+    );
+
     let reply = roundtrip(
         &mut stream,
         &Envelope::request(client_id, Payload::Shutdown),
@@ -1849,6 +1940,11 @@ instance_identity_survives_restart ... ok
 duplicate_sequence_is_rejected ... ok
 fixture_replay_produces_expected_projection ... ok
 ping_status_shutdown_over_socket ... ok
+envelope::tests::unknown_payload_tag_deserializes_to_unknown ... ok
+framing::tests::round_trip ... ok
+framing::tests::clean_eof_returns_none ... ok
+framing::tests::truncated_length_prefix_is_an_error ... ok
+framing::tests::truncated_payload_is_an_error ... ok
 ```
 
 **COMMIT** `"phase0: cli, test support, fixtures, integration tests, ci"`
@@ -1906,7 +2002,7 @@ rm -rf /tmp/cody-e2e
 
 ## Deferred item registry (revisit in later phases)
 
-- Windows named-pipe transport (protocol `discovery`/server) — Phase 3+, before any Windows release gate.
+- **Windows support** — Phase 3+, before any Windows release gate. Phase 0 code is deliberately Unix-only in more places than the transport alone; the full inventory to revisit is: `UnixListener`/`UnixStream` (server, CLI client, socket test — becomes a named-pipe transport), `tokio::signal::unix` SIGTERM handling in the server's `select!` loop (needs a cross-platform arm), `PermissionsExt` 0o700 directory permissions in `discovery` (needs Windows ACL equivalent), and `CommandExt::process_group` in the CLI's daemon spawn (needs Windows detached-process flags). Piecemeal `cfg` fixes to any one of these do not make Windows work and must not be applied individually — do the transport and the inventory together.
 - `expected_revision` optimistic concurrency on commands — Phase 1 command handling.
 - Multi-writer sequence allocation (`next_sequence` currently assumes the daemon's single-writer discipline) — revisit if a second writer ever appears.
 

@@ -18,6 +18,7 @@ Unlike Phase 0, this chapter specifies **modules, schemas, behaviours, and tests
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-tui = { path = "crates/tui" }
 agent-framework-openai = "0.1.1"
+agent-framework-anthropic = "0.1.1"
 ratatui = "0.29"
 crossterm = "0.28"
 sha2 = "0.10"
@@ -26,7 +27,7 @@ async-trait = "0.1"
 toml = "0.8"
 ```
 
-- `codypendent-runtime` — agent runs, tools, approvals bridge, model integration, context, compaction. This crate (and only this crate) depends on `agent-framework-core`/`agent-framework-openai`, behind features `provider-openai` (default on). Define feature `provider-anthropic = ["dep:agent-framework-anthropic"]` now, leave it off (ADR-009: never the umbrella `full`).
+- `codypendent-runtime` — agent runs, tools, approvals bridge, model integration, context, compaction. This crate (and only this crate) depends on the framework crates, behind features: in the runtime crate's manifest declare `agent-framework-openai = { workspace = true, optional = true }` and `agent-framework-anthropic = { workspace = true, optional = true }`, with features `provider-openai = ["dep:agent-framework-openai"]` (in `default`) and `provider-anthropic = ["dep:agent-framework-anthropic"]` (off). Every `dep:` feature target must be a declared optional dependency — that is why both crates appear in the workspace list above even though only OpenAI is enabled (ADR-009: selected crates, never the umbrella `full`).
 - `codypendent-tui` — rendering, input, layout, components, themes. Depended on by `codypendent-cli`; contains **no** direct database or network code — it speaks only protocol types.
 
 ## STEP 1.1 — Schema: migration 0002

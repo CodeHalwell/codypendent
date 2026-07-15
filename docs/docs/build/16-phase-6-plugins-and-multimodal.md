@@ -69,7 +69,7 @@ Finish the [Chapter 10](../10-ide-github-and-inputs.md) theme system: semantic t
 
 ## STEP 6.7 — Agentic setup assistant
 
-`codypendent setup` — an agent run under a dedicated restricted profile ([README](../../README.md) constraints are the specification):
+`codypendent setup` — an agent run under a dedicated restricted profile (the root [README's "Agentic Setup & Personalization" section](../../../README.md) is the specification for its constraints):
 
 1. Discovers: installed toolchains, repo layout, existing `AGENTS.md`/`CLAUDE.md`/Cursor rules/MCP configs (compatibility importers — normalize into the registry with source provenance, per [Chapter 19](../19-competitive-design-synthesis.md)), available local models (probe Ollama), terminal capabilities.
 2. **Proposes** a configuration change-set (config diffs rendered like code diffs) — policy, models.toml, imported items, theme. The user accepts per item.
