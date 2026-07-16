@@ -28,18 +28,43 @@ impl TerminalGuard {
     /// bracketed paste. Returns a ready-to-draw terminal.
     ///
     /// # Errors
-    /// Propagates any terminal I/O error from crossterm / ratatui.
+    /// Propagates any terminal I/O error from crossterm / ratatui. If a failure
+    /// happens *after* raw mode was enabled, raw mode (and any alt-screen / mouse
+    /// state) is torn down best-effort before the error is returned — otherwise
+    /// the terminal would be left in raw mode with no guard to restore it.
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
+        if let Err(e) = execute!(
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
             event::EnableBracketedPaste
-        )?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        ) {
+            Self::cleanup_after_failed_enter();
+            return Err(e);
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(e) => {
+                Self::cleanup_after_failed_enter();
+                Err(e)
+            }
+        }
+    }
+
+    /// Best-effort teardown for a failed [`enter`](Self::enter): raw mode is on
+    /// but no guard was constructed, so restore the terminal here. Every step is
+    /// best-effort (errors ignored) and harmless if that piece was never enabled.
+    fn cleanup_after_failed_enter() {
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            event::DisableBracketedPaste
+        );
+        let _ = disable_raw_mode();
     }
 
     /// Mutable access to the underlying `ratatui` terminal (to call `draw`).

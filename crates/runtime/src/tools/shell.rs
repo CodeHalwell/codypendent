@@ -134,6 +134,7 @@ impl Shell {
         // Resolve the program to an absolute path using the daemon's PATH *now*,
         // so the child can run with an emptied environment and still be found.
         let resolved = resolve_program(&request.program, &request.cwd)
+            .await
             .ok_or_else(|| ToolError::ProgramNotFound(program_str.clone()))?;
 
         let mut command = Command::new(&resolved);
@@ -250,10 +251,17 @@ async fn drain(
             let take = (max - buf.len()).min(n);
             buf.extend_from_slice(&chunk[..take]);
             if take < n {
+                // This chunk pushed us past the cap: keep the prefix, then drain
+                // the rest of the pipe to the void so the child never blocks.
                 overflowed = true;
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+                break;
             }
         } else {
+            // Already at the cap: drain everything still coming in one shot.
             overflowed = true;
+            tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+            break;
         }
     }
     Ok((buf, overflowed))
@@ -297,33 +305,42 @@ async fn kill_group(pid: Option<u32>, child: &mut Child) {
 }
 
 /// Resolve `program` to an absolute path, searching the daemon PATH for a bare
-/// name. Returns `None` when nothing matches.
-fn resolve_program(program: &Path, cwd: &Path) -> Option<PathBuf> {
+/// name. Returns `None` when nothing matches. Async so the executable-bit checks
+/// never block the runtime thread.
+async fn resolve_program(program: &Path, cwd: &Path) -> Option<PathBuf> {
     if program.is_absolute() {
-        return is_executable(program).then(|| program.to_path_buf());
+        return is_executable(program).await.then(|| program.to_path_buf());
     }
     if program.components().count() > 1 {
         let joined = cwd.join(program);
-        return is_executable(&joined).then_some(joined);
+        return is_executable(&joined).await.then_some(joined);
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if is_executable(&candidate).await {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Whether `path` is a regular file with an execute bit set. Checking the bit
 /// (not merely existence) skips non-executable shims that shadow a real binary
-/// earlier on PATH.
+/// earlier on PATH. Uses async `tokio::fs` so it does not block the runtime.
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+async fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
+    tokio::fs::metadata(path)
+        .await
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
+async fn is_executable(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
 }

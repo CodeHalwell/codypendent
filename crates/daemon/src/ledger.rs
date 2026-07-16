@@ -85,6 +85,36 @@ pub async fn load_events(
     Ok(events)
 }
 
+/// Load only the single most recent event for a session (the highest sequence),
+/// or `None` if it has none. Cheaper than [`load_events`] when the caller needs
+/// just the latest event rather than the whole history.
+pub async fn load_last_event(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> anyhow::Result<Option<SessionEvent>> {
+    let row: Option<EventRow> = sqlx::query_as(
+        "SELECT sequence, occurred_at, actor, body, causation_id, correlation_id \
+         FROM events WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(session_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some((sequence, occurred_at, actor, body, causation_id, correlation_id)) => {
+            Ok(Some(SessionEvent {
+                sequence: u64::try_from(sequence)?,
+                occurred_at: DateTime::parse_from_rfc3339(&occurred_at)?.with_timezone(&Utc),
+                causation_id: causation_id.map(|id| id.parse()).transpose()?,
+                correlation_id: correlation_id.map(|id| id.parse()).transpose()?,
+                actor: serde_json::from_str(&actor)?,
+                body: serde_json::from_str(&body)?,
+            }))
+        }
+    }
+}
+
 /// The next sequence number for a session (1-based).
 pub async fn next_sequence(pool: &SqlitePool, session_id: SessionId) -> anyhow::Result<u64> {
     let (max,): (i64,) =

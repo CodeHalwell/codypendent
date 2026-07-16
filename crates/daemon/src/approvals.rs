@@ -30,15 +30,17 @@
 //! auditability — instead of parking. The matching key is `run_id` + the hex
 //! SHA-256 of the action's canonical JSON serialization.
 //!
-//! Waiters live behind a [`tokio::sync::Mutex`]-guarded map keyed by
+//! Waiters live behind a [`std::sync::Mutex`]-guarded map keyed by
 //! [`ApprovalId`], each a [`tokio::sync::watch`] channel carrying the eventual
-//! [`ApprovalDecision`]. `watch` retains the last value, so a decision delivered
-//! before the run subscribes is never lost, and multiple observers (a resuming
-//! run, an attached client) can subscribe independently.
+//! [`ApprovalDecision`]. The map is only ever locked for synchronous map
+//! operations (never across an `.await`), so a std mutex is the right primitive.
+//! `watch` retains the last value, so a decision delivered before the run
+//! subscribes is never lost, and multiple observers (a resuming run, an attached
+//! client) can subscribe independently.
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{
@@ -48,7 +50,7 @@ use codypendent_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
 use crate::policy::Capability;
 
@@ -266,7 +268,7 @@ impl ApprovalBroker {
         approval_id: ApprovalId,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut rx = {
-            let guard = self.waiters.lock().await;
+            let guard = self.waiters.lock().expect("waiters mutex poisoned");
             match guard.get(&approval_id) {
                 Some(sender) => sender.subscribe(),
                 None => return Err(ApprovalError::NotFound { approval_id }),
@@ -275,15 +277,21 @@ impl ApprovalBroker {
 
         loop {
             // Copy the retained value out and drop the borrow guard *before* any
-            // await (the guard is not `Send`). Checking before parking means a
-            // decision that landed before subscription is never missed.
+            // await. Checking before parking means a decision that landed before
+            // subscription is never missed.
             let current = *rx.borrow_and_update();
             if let Some(decision) = current {
-                self.waiters.lock().await.remove(&approval_id);
+                self.waiters
+                    .lock()
+                    .expect("waiters mutex poisoned")
+                    .remove(&approval_id);
                 return Ok(decision);
             }
             if rx.changed().await.is_err() {
-                self.waiters.lock().await.remove(&approval_id);
+                self.waiters
+                    .lock()
+                    .expect("waiters mutex poisoned")
+                    .remove(&approval_id);
                 return Err(ApprovalError::WaiterGone { approval_id });
             }
         }
@@ -454,7 +462,7 @@ impl ApprovalBroker {
             let approval = pending_from_row(row)?;
             // Re-register only if a waiter is not already live (idempotent
             // reload).
-            let mut guard = self.waiters.lock().await;
+            let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
             guard
                 .entry(approval.approval_id)
                 .or_insert_with(|| watch::channel(None).0);
@@ -468,14 +476,17 @@ impl ApprovalBroker {
     /// a decision (auto-approval).
     async fn register_waiter(&self, approval_id: ApprovalId, initial: Option<ApprovalDecision>) {
         let (sender, _rx) = watch::channel(initial);
-        self.waiters.lock().await.insert(approval_id, sender);
+        self.waiters
+            .lock()
+            .expect("waiters mutex poisoned")
+            .insert(approval_id, sender);
     }
 
     /// Deliver `decision` to a parked waiter, if any. `send_replace` never fails
     /// even when nobody is subscribed yet — the value is retained for a later
     /// subscriber.
     async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
-        let guard = self.waiters.lock().await;
+        let guard = self.waiters.lock().expect("waiters mutex poisoned");
         if let Some(sender) = guard.get(&approval_id) {
             sender.send_replace(Some(decision));
         }

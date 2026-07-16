@@ -580,17 +580,20 @@ impl CommandProcessor {
             .await
             .map_err(map_approval_error)?;
 
-        // Re-publish the broker's persisted ApprovalResolved and capture the
-        // last sequence for the outcome.
-        let events = crate::ledger::load_events(pool, session_id)
+        // Re-publish the broker's persisted ApprovalResolved and capture the last
+        // sequence for the outcome. The broker appends the `ApprovalResolved` as
+        // the session's final event, so loading only that latest event (rather
+        // than the whole history) is enough.
+        let last_event = crate::ledger::load_last_event(pool, session_id)
             .await
             .map_err(internal_error)?;
-        if let Some(event) = events.iter().rev().find(|e| {
-            matches!(&e.body, EventBody::ApprovalResolved { approval_id: a, .. } if *a == approval_id)
-        }) {
-            self.subscriptions.publish(session_id, event.clone());
+        if let Some(event) = &last_event {
+            if matches!(&event.body, EventBody::ApprovalResolved { approval_id: a, .. } if *a == approval_id)
+            {
+                self.subscriptions.publish(session_id, event.clone());
+            }
         }
-        let last_sequence = events.last().map(|e| e.sequence);
+        let last_sequence = last_event.map(|e| e.sequence);
 
         let outcome = CommandOutcome {
             command_id: command.command_id,

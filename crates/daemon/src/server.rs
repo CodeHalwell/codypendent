@@ -194,60 +194,104 @@ impl ConnState {
     }
 }
 
-/// Serve one connection: a read loop multiplexed with the heartbeat timer.
+/// Serve one connection: a frame-read loop plus a separate heartbeat task.
 /// Lifecycle payloads are served without a handshake; session interaction is
 /// gated on a prior `ClientHello`. Event forwarders spawned by `AttachSession`
 /// write to the same (shared) socket and are aborted when the connection ends.
+///
+/// The heartbeat runs in its own task (not a `select!` arm of the read loop) so a
+/// heartbeat tick can never cancel a `read_envelope` future mid-frame — which
+/// would drop the consumed bytes and desynchronize the stream. The read loop only
+/// races reads against an idle-shutdown signal the heartbeat task raises, and it
+/// stamps a shared last-activity instant the heartbeat task consults to decide
+/// when a silent client should be dropped.
 async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyhow::Result<()> {
     let (mut read_half, write_half) = stream.into_split();
     let writer: SharedWriter = Arc::new(Mutex::new(write_half));
     let mut conn = ConnState::new();
     let mut forwarders: Vec<JoinHandle<()>> = Vec::new();
 
-    // Delay the first tick a full interval so an idle-but-fresh connection is
-    // not immediately probed.
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
-        HEARTBEAT_INTERVAL,
-    );
-    let mut silent_intervals: u32 = 0;
+    // The read loop stamps this on every frame; the heartbeat task reads it to
+    // decide when the client has gone silent. Locked only for the instant swap,
+    // never across an `.await`, so a std mutex is the right tool.
+    let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    // The heartbeat task raises this to end an idle (or dead-peer) connection.
+    let (idle_tx, mut idle_rx) = watch::channel(false);
+
+    let heartbeat = tokio::spawn(heartbeat_loop(
+        Arc::clone(&writer),
+        Arc::clone(&last_activity),
+        idle_tx,
+    ));
 
     let result = loop {
         tokio::select! {
-            // `read_envelope` parks on the first length byte while idle, so a
-            // heartbeat tick that cancels it there consumes nothing (the happy
-            // path never cancels mid-frame — frames are tiny and atomic).
+            // Frame reads are never raced against a timer, so a frame is never
+            // cancelled mid-parse. The only competing arm is the idle signal,
+            // which the heartbeat task raises only once the client has already
+            // gone silent — so nothing in flight is lost.
             read = read_envelope(&mut read_half) => {
                 let request = match read {
                     Ok(Some(request)) => request,
                     Ok(None) => break Ok(()), // clean end-of-stream
                     Err(e) => break Err(e.into()),
                 };
-                silent_intervals = 0;
+                *last_activity
+                    .lock()
+                    .expect("last-activity mutex poisoned") = tokio::time::Instant::now();
                 match handle_request(&state, &writer, &mut conn, &mut forwarders, request).await {
                     Ok(true) => break Ok(()), // shutdown handled
                     Ok(false) => {}
                     Err(e) => break Err(e),
                 }
             }
-            _ = heartbeat.tick() => {
-                silent_intervals += 1;
-                if silent_intervals >= HEARTBEAT_MISS_LIMIT {
-                    break Ok(()); // silent for 3 intervals — drop the client
-                }
-                let ping = Envelope::request(conn.client_id_or(ClientId::new()), Payload::Ping);
-                if send(&writer, &ping).await.is_err() {
-                    break Ok(()); // peer gone
-                }
-            }
+            // The heartbeat task asked us to end (silent 3 intervals, or the peer
+            // vanished mid-ping). A `changed()` error (sender dropped) ends it too.
+            _ = idle_rx.changed() => break Ok(()),
         }
     };
 
+    heartbeat.abort();
     // A slow or vanished client must never wedge a forwarder; drop them all.
     for forwarder in forwarders {
         forwarder.abort();
     }
     result
+}
+
+/// The per-connection heartbeat, run as its own task beside the read loop. It
+/// pings the client every [`HEARTBEAT_INTERVAL`] via the shared writer and, when
+/// the client has been silent for [`HEARTBEAT_MISS_LIMIT`] intervals (or a ping
+/// write fails), signals `idle_tx` so the read loop ends the connection. Keeping
+/// it off the read path is what guarantees a tick never cancels a frame read.
+async fn heartbeat_loop(
+    writer: SharedWriter,
+    last_activity: Arc<std::sync::Mutex<tokio::time::Instant>>,
+    idle_tx: watch::Sender<bool>,
+) {
+    // Delay the first tick a full interval so an idle-but-fresh connection is
+    // not immediately probed.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    let idle_limit = HEARTBEAT_INTERVAL * HEARTBEAT_MISS_LIMIT;
+    loop {
+        ticker.tick().await;
+        let idle = last_activity
+            .lock()
+            .expect("last-activity mutex poisoned")
+            .elapsed();
+        if idle >= idle_limit {
+            let _ = idle_tx.send(true); // silent for 3 intervals — drop the client
+            return;
+        }
+        let ping = Envelope::request(ClientId::new(), Payload::Ping);
+        if send(&writer, &ping).await.is_err() {
+            let _ = idle_tx.send(true); // peer gone
+            return;
+        }
+    }
 }
 
 /// Handle one request. Returns `Ok(true)` when a Shutdown was served (the caller
@@ -587,12 +631,22 @@ fn load_or_create_secret(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, &secret)?;
+    // Create the file with mode 0600 atomically, so the secret is never briefly
+    // world-readable in the TOCTOU window a create-then-chmod would leave open.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(&secret)?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, &secret)?;
     Ok(secret)
 }
 

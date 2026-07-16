@@ -97,7 +97,12 @@ pub async fn stop(paths: &RuntimePaths) -> anyhow::Result<()> {
 }
 
 /// `codypendent daemon status [--json]`.
-pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
+///
+/// Prints the status (human text or JSON) and RETURNS whether the daemon is
+/// running (`true`) or not (`false`). The library never calls
+/// `std::process::exit`; the `status` subcommand's exit-1-when-not-running
+/// decision lives in `main.rs`.
+pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<bool> {
     match client::daemon_status(&paths.socket_path).await {
         Ok(status) => {
             if json {
@@ -117,7 +122,7 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
                 println!("  socket       {}", status.socket_path);
                 println!("  sessions     {}", status.session_count);
             }
-            Ok(())
+            Ok(true)
         }
         Err(_) => {
             if json {
@@ -125,7 +130,7 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
             } else {
                 println!("daemon is not running");
             }
-            std::process::exit(1);
+            Ok(false)
         }
     }
 }

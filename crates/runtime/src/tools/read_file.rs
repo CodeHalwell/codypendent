@@ -59,42 +59,67 @@ impl ReadFile {
 
     /// Read an excerpt of `input.path`, refusing any path outside `scope`.
     ///
-    /// The path is canonicalized and classified against the granted scope before
-    /// the file is opened — a traversal or planted symlink cannot smuggle a read
-    /// out of scope. At most [`DEFAULT_MAX_LINES`] lines are returned unless an
-    /// explicit range is given.
+    /// The path is canonicalized *once*, the scope check runs on that resolved
+    /// path, and the very same resolved path is then opened and streamed — so a
+    /// traversal or a symlink swapped in between the check and the open cannot
+    /// redirect the read out of scope (no TOCTOU gap). The file is read line by
+    /// line through a [`tokio::io::BufReader`], retaining only the excerpt window
+    /// in memory, so an enormous file is never buffered whole. At most
+    /// [`DEFAULT_MAX_LINES`] lines are returned unless an explicit range is given.
     pub async fn execute(
         input: &ReadFileInput,
         scope: &PathScope,
     ) -> Result<FileExcerpt, ToolError> {
-        Self::guard_scope(&input.path, scope)?;
+        use tokio::io::AsyncBufReadExt;
 
-        let bytes = tokio::fs::read(&input.path).await?;
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
+        // Resolve the path ONCE, then check and read that same canonical path.
+        let canonical = tokio::fs::canonicalize(&input.path).await?;
+        Self::guard_scope(&canonical, scope)?;
 
-        let (start, end) = match input.range {
-            Some((start, end)) => {
-                if start == 0 {
-                    return Err(ToolError::InvalidRange {
-                        start,
-                        end,
-                        reason: "line numbers are 1-based".to_string(),
-                    });
-                }
-                if end < start {
-                    return Err(ToolError::InvalidRange {
-                        start,
-                        end,
-                        reason: "end precedes start".to_string(),
-                    });
-                }
-                (start, end.min(total.max(1)))
+        // Validate an explicit range before touching the file (unchanged errors).
+        if let Some((start, end)) = input.range {
+            if start == 0 {
+                return Err(ToolError::InvalidRange {
+                    start,
+                    end,
+                    reason: "line numbers are 1-based".to_string(),
+                });
             }
-            None => (1, total.clamp(1, DEFAULT_MAX_LINES)),
+            if end < start {
+                return Err(ToolError::InvalidRange {
+                    start,
+                    end,
+                    reason: "end precedes start".to_string(),
+                });
+            }
+        }
+
+        // The inclusive window we retain: the requested span, or the first
+        // DEFAULT_MAX_LINES lines by default. Only these lines are held in memory.
+        let (want_start, want_end) = match input.range {
+            Some((start, end)) => (start, end),
+            None => (1, DEFAULT_MAX_LINES),
         };
 
+        // Stream line by line, keeping only the window and counting the total, so
+        // the excerpt semantics (total_lines, truncation) stay exact without the
+        // whole file ever residing in memory.
+        let file = tokio::fs::File::open(&canonical).await?;
+        let mut lines = tokio::io::BufReader::new(file).lines();
+        let mut total = 0usize;
+        let mut window: Vec<String> = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            total += 1;
+            if total >= want_start && total <= want_end {
+                window.push(line);
+            }
+            // Past the window we only keep counting (nothing is retained).
+        }
+
+        let (start, end) = match input.range {
+            Some((start, end)) => (start, end.min(total.max(1))),
+            None => (1, total.clamp(1, DEFAULT_MAX_LINES)),
+        };
         // Clamp to the file; an empty file yields an empty excerpt.
         let (start, end) = if total == 0 {
             (0, 0)
@@ -102,10 +127,12 @@ impl ReadFile {
             (start.min(total), end.min(total))
         };
 
+        // Emit the retained lines whose absolute number falls in [start, end].
+        // The window's first entry is line `want_start`.
         let mut content = String::new();
-        if total > 0 {
-            for (offset, line) in lines[start - 1..end].iter().enumerate() {
-                let number = start + offset;
+        for (offset, line) in window.iter().enumerate() {
+            let number = want_start + offset;
+            if number >= start && number <= end {
                 content.push_str(&format!("{number:>6}\t{line}\n"));
             }
         }

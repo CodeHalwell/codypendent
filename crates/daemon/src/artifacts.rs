@@ -137,29 +137,27 @@ impl ArtifactStore {
         provenance: Provenance,
         bytes: &[u8],
     ) -> anyhow::Result<ArtifactRef> {
-        let tmp_dir = self.tmp_dir();
-        tokio::fs::create_dir_all(&tmp_dir).await?;
-        let tmp_path = tmp_dir.join(Uuid::now_v7().to_string());
-
-        // Stream to the temp file while hashing the same chunks.
+        // `bytes` is already fully in memory, so hash it directly — no disk write
+        // is needed to learn the content address. A dedup hit therefore touches
+        // no temp file at all.
         let mut hasher = Sha256::new();
-        {
-            let mut file = tokio::fs::File::create(&tmp_path).await?;
-            for chunk in bytes.chunks(64 * 1024) {
-                file.write_all(chunk).await?;
-                hasher.update(chunk);
-            }
-            file.flush().await?;
-            // Durability of the blob's bytes before we publish it by rename.
-            file.sync_all().await?;
-        }
+        hasher.update(bytes);
         let sha256 = hex::encode(hasher.finalize());
 
         let blob_path = self.blob_path(&sha256);
-        if tokio::fs::try_exists(&blob_path).await? {
-            // Dedup: identical bytes are already stored; drop the temp copy.
-            tokio::fs::remove_file(&tmp_path).await?;
-        } else {
+        if !tokio::fs::try_exists(&blob_path).await? {
+            // New blob: stage it in tmp/ with a single write + fsync, then
+            // atomically rename into place. A crash leaves only tmp/ garbage.
+            let tmp_dir = self.tmp_dir();
+            tokio::fs::create_dir_all(&tmp_dir).await?;
+            let tmp_path = tmp_dir.join(Uuid::now_v7().to_string());
+            {
+                let mut file = tokio::fs::File::create(&tmp_path).await?;
+                file.write_all(bytes).await?;
+                file.flush().await?;
+                // Durability of the blob's bytes before we publish it by rename.
+                file.sync_all().await?;
+            }
             if let Some(parent) = blob_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }

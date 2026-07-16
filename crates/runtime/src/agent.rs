@@ -185,6 +185,24 @@ impl CancellationToken {
         *self.rx.borrow()
     }
 
+    /// Resolve once cancellation has been requested — immediately if it already
+    /// has. Cancellation-safe, so it can race another future inside a
+    /// `tokio::select!`. If the controlling handle is dropped without ever
+    /// cancelling, this parks forever (letting the other `select!` arm win).
+    pub async fn cancelled(&self) {
+        let mut rx = self.rx.clone();
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+        // The sender was dropped without a cancel: never fires.
+        std::future::pending::<()>().await
+    }
+
     /// A token that is never cancelled (its source is dropped, so the retained
     /// value stays `false`). Convenient for runs that opt out of cancellation.
     pub fn never() -> Self {
@@ -534,16 +552,24 @@ impl FrameworkAgentRuntime {
                 }
                 ModelStep::Finish { summary } => break Terminal::Completed(summary),
                 ModelStep::CallTool { tool, args } => {
-                    let observation = self
-                        .run_tool(&run, &run_actor, &tool, args, &mut actions)
-                        .await?;
-                    transcript.push(TurnItem::ToolResult {
-                        tool,
-                        output: observation,
-                    });
-                    // Safe point: a completed tool call is a steering boundary.
-                    self.drain_steering(&mut run, &run_actor, &mut transcript)
-                        .await?;
+                    match self
+                        .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
+                        .await?
+                    {
+                        ToolFlow::Observation(observation) => {
+                            transcript.push(TurnItem::ToolResult {
+                                tool,
+                                output: observation,
+                            });
+                            // Safe point: a completed tool call is a steering
+                            // boundary.
+                            self.drain_steering(&mut run, &run_actor, &mut transcript)
+                                .await?;
+                        }
+                        // Cancellation fired while parked on an approval: stop
+                        // without executing the tool.
+                        ToolFlow::Cancelled => break Terminal::Cancelled,
+                    }
                 }
             }
         };
@@ -668,7 +694,8 @@ impl FrameworkAgentRuntime {
     /// Run one model-proposed tool through the middleware: map to a
     /// [`ProposedAction`], evaluate policy, request+await approval when required,
     /// execute under the granted scope, and emit `ToolStarted`/`ToolCompleted`.
-    /// Returns the compacted observation to feed back to the model.
+    /// Returns the compacted observation to feed back to the model, or
+    /// [`ToolFlow::Cancelled`] if the run was cancelled while parked on approval.
     async fn run_tool(
         &self,
         run: &RunContext,
@@ -676,7 +703,8 @@ impl FrameworkAgentRuntime {
         tool: &str,
         args: Value,
         actions: &mut Vec<Value>,
-    ) -> anyhow::Result<String> {
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<ToolFlow> {
         // (a) map the call to a typed tool + proposed action.
         let prepared = match self.prepare(tool, &args, run).await {
             Ok(prepared) => prepared,
@@ -695,7 +723,7 @@ impl FrameworkAgentRuntime {
                 )
                 .await?;
                 actions.push(action_digest(tool, "failed", None));
-                return Ok(format!("tool error: {message}"));
+                return Ok(ToolFlow::Observation(format!("tool error: {message}")));
             }
         };
 
@@ -723,7 +751,7 @@ impl FrameworkAgentRuntime {
                 )
                 .await?;
                 actions.push(action_digest(tool, "denied", None));
-                return Ok(format!("policy denied: {reason}"));
+                return Ok(ToolFlow::Observation(format!("policy denied: {reason}")));
             }
             Decision::RequireApproval => {
                 // (c) park the run in WaitingForApproval until an approver
@@ -761,7 +789,14 @@ impl FrameworkAgentRuntime {
                 )
                 .await?;
 
-                let decision = self.approvals.await_decision(approval_id).await?;
+                // Park on the decision, but never block a cancelled run: race the
+                // approval against cancellation. If cancellation wins, stop here
+                // (do not run the tool) and let the loop drive the run to
+                // Cancelled.
+                let decision = tokio::select! {
+                    decision = self.approvals.await_decision(approval_id) => decision?,
+                    _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
+                };
                 self.transition(run.session_id, run.run_id, RunState::Running)
                     .await?;
                 if decision != ApprovalDecision::Approve {
@@ -779,7 +814,7 @@ impl FrameworkAgentRuntime {
                     )
                     .await?;
                     actions.push(action_digest(tool, "rejected", None));
-                    return Ok("approval rejected".to_string());
+                    return Ok(ToolFlow::Observation("approval rejected".to_string()));
                 }
             }
             Decision::Allow => {}
@@ -814,7 +849,7 @@ impl FrameworkAgentRuntime {
             outcome_label(&outcome),
             artifact.as_ref().map(|a| a.id),
         ));
-        Ok(observation)
+        Ok(ToolFlow::Observation(observation))
     }
 
     /// Map a tool call to its typed input and [`ProposedAction`]. Applying a
@@ -1049,6 +1084,15 @@ impl FrameworkAgentRuntime {
     fn write_scope(&self, run: &RunContext) -> PathScope {
         self.policy.file_write_scope(&self.eval_ctx(run))
     }
+}
+
+/// The outcome of driving one tool call through the middleware.
+enum ToolFlow {
+    /// The compacted observation to feed back to the model.
+    Observation(String),
+    /// The run was cancelled while parked on an approval; the loop must stop
+    /// without executing the tool.
+    Cancelled,
 }
 
 /// A tool call resolved to its typed input plus the action policy evaluates.

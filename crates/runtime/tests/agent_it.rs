@@ -671,3 +671,100 @@ async fn cancellation_reaches_cancelled_without_running_tools() {
         }
     )));
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation while parked on an approval: the run stops promptly, does not
+// execute the tool, and reaches Cancelled even though the approval is never
+// resolved.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cancellation_while_parked_on_approval_reaches_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    repo_with_committed_file(&repo, "a.txt", "hello\n").await;
+
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "cancel-parked")
+        .await
+        .unwrap();
+    projections::insert_run(
+        &pool,
+        run,
+        session,
+        "diagnose",
+        AgentMode::Build,
+        "hosted",
+        "{}",
+    )
+    .await
+    .unwrap();
+
+    let runtime = build_runtime!(pool, store, broker, hub);
+    let mut rx = hub.subscribe(session);
+
+    // A Build-mode shell.run parks on approval — which we deliberately never
+    // resolve, so only cancellation can free the parked run.
+    let driver = ScriptedDriver::new(vec![
+        ModelStep::CallTool {
+            tool: "shell.run".to_string(),
+            args: json!({"program": "git", "args": ["--version"]}),
+        },
+        ModelStep::Finish {
+            summary: "unreached".to_string(),
+        },
+    ]);
+    let ctx = RunContext::new(
+        session,
+        run,
+        "diagnose",
+        AgentMode::Build,
+        repo.clone(),
+        repo.clone(),
+    );
+
+    let (handle, token) = cancellation();
+    let run_task = tokio::spawn(async move { runtime.execute_run(&driver, ctx, token).await });
+
+    // Wait until the run is parked (ToolProposed published), then cancel.
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event arrives within 5s")
+            .expect("event");
+        if matches!(event.body, EventBody::ToolProposed { .. }) {
+            break;
+        }
+    }
+    handle.cancel();
+
+    let disposition = tokio::time::timeout(std::time::Duration::from_secs(5), run_task)
+        .await
+        .expect("the run terminates promptly after cancellation")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(disposition, RunDisposition::Cancelled { .. }));
+    assert_eq!(
+        projections::load_run_state(&pool, run).await.unwrap(),
+        Some(RunState::Cancelled)
+    );
+
+    // The tool never executed — cancellation won the approval race.
+    let events = ledger::load_events(&pool, session).await.unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.body, EventBody::ToolStarted { .. })));
+    assert!(events.iter().any(|e| matches!(
+        &e.body,
+        EventBody::RunCompleted {
+            disposition: RunDisposition::Cancelled { .. },
+            ..
+        }
+    )));
+}

@@ -124,7 +124,16 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Daemon { command } => match command {
             DaemonCommand::Start => commands::start(&paths).await,
             DaemonCommand::Stop => commands::stop(&paths).await,
-            DaemonCommand::Status { json } => commands::status(&paths, json).await,
+            DaemonCommand::Status { json } => {
+                // `status` returns the running-state; the exit-1-when-not-running
+                // decision lives here (the only place `std::process::exit` runs).
+                let running = commands::status(&paths, json).await?;
+                if running {
+                    Ok(())
+                } else {
+                    std::process::exit(1);
+                }
+            }
         },
         TopCommand::Run {
             objective,

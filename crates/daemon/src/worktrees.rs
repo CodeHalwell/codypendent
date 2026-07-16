@@ -408,16 +408,21 @@ impl WorktreeManager {
             let Ok(listing) = run_git(&repo, &["worktree", "list", "--porcelain"]).await else {
                 continue;
             };
+            // Our per-run worktrees are the ones that live under the managed base
+            // directory for this repository — identify them by *path*, not branch
+            // name, so a detached-HEAD worktree (branch == None) is adopted too
+            // instead of being silently skipped.
+            let managed_base = self
+                .managed_base_for(&repo)
+                .map(|b| canonicalize_lenient(&b));
             for record in parse_worktree_list(&listing) {
-                // Only our per-run worktrees, never the main working tree.
-                let is_ours = record
-                    .branch
-                    .as_deref()
-                    .is_some_and(|b| b.contains("codypendent/run-"));
+                let canon = canonicalize_lenient(&record.path);
+                let is_ours = managed_base
+                    .as_ref()
+                    .is_some_and(|base| canon.starts_with(base));
                 if !is_ours {
                     continue;
                 }
-                let canon = canonicalize_lenient(&record.path);
                 if !known.contains(&canon) {
                     report.adopted_orphans.push(record.path);
                 }
@@ -425,6 +430,19 @@ impl WorktreeManager {
         }
 
         Ok(report)
+    }
+
+    /// The base directory this manager places `repo`'s worktrees under, matching
+    /// [`worktree_path_for`](Self::worktree_path_for)'s layout: the override base
+    /// if set, else `<repo>/../codypendent-worktrees/<repo-name>`. `None` when the
+    /// repository path has no parent or final component.
+    fn managed_base_for(&self, repo: &Path) -> Option<PathBuf> {
+        if let Some(base) = &self.base_override {
+            return Some(base.clone());
+        }
+        let parent = repo.parent()?;
+        let repo_name = repo.file_name()?;
+        Some(parent.join("codypendent-worktrees").join(repo_name))
     }
 
     /// Compute the worktree path for a run. Default layout is
@@ -458,6 +476,11 @@ impl WorktreeManager {
         // `git diff <base>` in the worktree spans base -> working tree, capturing
         // both merged-into-branch commits and uncommitted edits in one patch.
         let diff = if lease.worktree_path.exists() {
+            // `git diff` omits *untracked* files, but a force-release that is
+            // about to delete the worktree would then lose them silently. Mark
+            // them intent-to-add first so they appear in the diff as additions
+            // (the worktree is being torn down, so mutating its index is fine).
+            let _ = run_git(&lease.worktree_path, &["add", "-A", "--intent-to-add"]).await;
             run_git(&lease.worktree_path, &["diff", &lease.base_commit])
                 .await
                 .unwrap_or_default()
@@ -481,9 +504,13 @@ impl WorktreeManager {
     }
 }
 
-/// The first 8 hex characters of a run id (its UUID's `time_low` field).
+/// A collision-resistant short id for a run: the **last** 12 hex characters of
+/// the run id's UUIDv7. The high bits of a v7 UUID are a shared millisecond
+/// clock — runs minted within ~65s share their leading hex digits — so the tail
+/// (the random component) is used instead. The `codypendent/run-` prefix stays.
 fn short_run_id(run_id: RunId) -> String {
-    run_id.0.as_simple().to_string()[..8].to_string()
+    let simple = run_id.0.as_simple().to_string();
+    simple[simple.len() - 12..].to_string()
 }
 
 /// Reject a worktree path that resolves inside the repository working tree.
@@ -936,6 +963,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_release_preserves_untracked_file_in_patch() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let run_id = seed_run(&pool).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = lease.worktree_path.clone();
+
+        // The ONLY local change is a brand-new *untracked* file. `git diff <base>`
+        // alone would omit it, so a force-release must intent-to-add it first.
+        std::fs::write(wt.join("untracked.txt"), "precious untracked work\n").unwrap();
+
+        let outcome = mgr.release(&pool, &store, lease.id, true).await.unwrap();
+
+        assert!(outcome.dirty, "an untracked file makes the worktree dirty");
+        assert!(outcome.worktree_removed, "force removes the worktree");
+        let patch = outcome
+            .patch
+            .expect("force-discarding real work exports a safety patch");
+        assert!(store.verify(&pool, patch.id).await.unwrap());
+
+        // The exported patch actually contains the untracked file and its content.
+        let mut file = store.open(&pool, patch.id).await.unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.unwrap();
+        let patch_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            patch_text.contains("untracked.txt"),
+            "patch must name the untracked file, got:\n{patch_text}"
+        );
+        assert!(
+            patch_text.contains("precious untracked work"),
+            "patch must carry the untracked content, got:\n{patch_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_record_is_reconciled_to_orphaned() {
         let dir = tempdir().unwrap();
         let pool = test_pool(dir.path()).await;
@@ -973,11 +1042,10 @@ mod tests {
         let pool = test_pool(dir.path()).await;
         let repo = init_repo(dir.path());
 
-        // Two genuinely distinct runs. Their short ids are the first 8 hex chars
-        // of the run id (STEP 1.8), so the runs must differ in that prefix; note
-        // that two `RunId::new()` (UUIDv7) values minted in the same ~65s window
-        // share those bits (they are the high bits of the millisecond clock), and
-        // the manager then correctly refuses the collision as a `LeaseConflict`.
+        // Two genuinely distinct runs. The short id is the last 12 hex chars of
+        // the run id — the v7 random tail — so distinct runs get distinct
+        // worktrees even when their high (millisecond-clock) bits coincide. These
+        // two share nothing relevant and differ in that tail (…0001 vs …0002).
         let run_a = RunId(Uuid::from_u128(0xaaaa_aaaa_0000_7000_8000_0000_0000_0001));
         let run_b = RunId(Uuid::from_u128(0xbbbb_bbbb_0000_7000_8000_0000_0000_0002));
         insert_run(&pool, run_a).await;

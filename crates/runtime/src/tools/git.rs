@@ -70,11 +70,18 @@ impl GitDiff {
         &[CapabilityKind::FileWrite, CapabilityKind::CommandExecute]
     }
 
-    /// The [`ProposedAction`] the middleware evaluates before granting.
+    /// The [`ProposedAction`] the middleware evaluates before granting. It mirrors
+    /// the actual invocation `git -C <cwd> --no-pager diff` so policy, approval,
+    /// and audit see the real command (the `cwd` is `-C <dir>`, not a pathspec).
     pub fn proposed_action(input: &GitDiffInput) -> ProposedAction {
         ProposedAction::ExecuteCommand {
             program: GIT.to_string(),
-            args: vec!["diff".to_string(), input.cwd.to_string_lossy().into_owned()],
+            args: vec![
+                "-C".to_string(),
+                input.cwd.to_string_lossy().into_owned(),
+                "--no-pager".to_string(),
+                "diff".to_string(),
+            ],
         }
     }
 
@@ -169,13 +176,16 @@ impl ApplyPatch {
         &[CapabilityKind::FileWrite, CapabilityKind::CommandExecute]
     }
 
-    /// The [`ProposedAction`] the middleware evaluates before granting.
+    /// The [`ProposedAction`] the middleware evaluates before granting. It mirrors
+    /// the actual invocation `git -C <cwd> apply` (the patch text arrives on
+    /// stdin) so policy, approval, and audit see the real command.
     pub fn proposed_action(input: &ApplyPatchInput) -> ProposedAction {
         ProposedAction::ExecuteCommand {
             program: GIT.to_string(),
             args: vec![
-                "apply".to_string(),
+                "-C".to_string(),
                 input.cwd.to_string_lossy().into_owned(),
+                "apply".to_string(),
             ],
         }
     }
