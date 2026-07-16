@@ -369,18 +369,35 @@ async fn handle_request(
                         client_id: conn.client_id_or(request.client_id),
                         role: conn.role,
                     };
-                    let reply = match state
+                    let reply_envelope = match state
                         .commands
                         .apply(&state.pool, ctx, command.clone())
                         .await
                     {
-                        Ok(outcome) => Payload::CommandAccepted {
-                            command_id: outcome.command_id,
-                            sequence: outcome.last_sequence,
-                        },
-                        Err(error) => Payload::CommandRejected(error),
+                        Ok(outcome) => {
+                            let mut env = Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: outcome.command_id,
+                                    sequence: outcome.last_sequence,
+                                },
+                            );
+                            // Surface the created session id so a fresh client
+                            // (`codypendent run`) can learn the session it just
+                            // created. The `CommandAccepted` payload is
+                            // intentionally minimal; the envelope's `session_id`
+                            // field carries this connection-level metadata
+                            // (Chapter 03).
+                            if let Some(created) = outcome.created_session {
+                                env.session_id = Some(created);
+                            }
+                            env
+                        }
+                        Err(error) => {
+                            Envelope::reply_to(&request, Payload::CommandRejected(error))
+                        }
                     };
-                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                    send(writer, &reply_envelope).await?;
                 }
             }
         }
