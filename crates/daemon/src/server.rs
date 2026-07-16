@@ -166,8 +166,13 @@ struct ConnState {
     /// The client's identity — from `ClientHello` (its envelope, or a valid
     /// resume token). `None` until the connection handshakes.
     client_id: Option<ClientId>,
-    /// The role applied to commands on this connection, from the most recent
-    /// `AttachSession`. Read-only [`ClientRole::Observer`] until then.
+    /// The role applied to commands on this connection. A handshaken local
+    /// client defaults to [`ClientRole::Controller`]: the Phase 1 socket is
+    /// user-private (0700 dirs, OS peer identity), so the single connecting user
+    /// is trusted to create sessions and control their own runs without a prior
+    /// attach. An explicit `AttachSession` may narrow (or re-assert) the role —
+    /// e.g. an observer-only view. Remote transports (later phases) will default
+    /// to `Observer` and require authenticated elevation.
     role: ClientRole,
     /// Whether a `ClientHello` has been seen (session interaction requires it).
     handshaken: bool,
@@ -177,7 +182,7 @@ impl ConnState {
     fn new() -> Self {
         Self {
             client_id: None,
-            role: ClientRole::Observer,
+            role: ClientRole::Controller,
             handshaken: false,
         }
     }
