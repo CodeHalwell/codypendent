@@ -78,6 +78,17 @@ enum TopCommand {
         #[arg(long, value_enum, default_value = "jsonl")]
         events: EventsFormat,
     },
+    /// Maintain the knowledge fabric's derived indexes (Phase 2).
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Delete the derived indexes and rebuild them from the authoritative rows.
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -165,5 +176,8 @@ async fn main() -> anyhow::Result<()> {
             from_sequence,
             events: EventsFormat::Jsonl,
         } => commands::attach(&paths, session_id, from_sequence).await,
+        TopCommand::Index {
+            command: IndexCommand::Rebuild,
+        } => commands::index_rebuild(&paths).await,
     }
 }

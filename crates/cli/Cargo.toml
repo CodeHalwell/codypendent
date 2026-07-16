@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 codypendent-protocol = { workspace = true }
 codypendent-tui = { workspace = true }
+codypendent-knowledge = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

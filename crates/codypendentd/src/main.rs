@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use codypendent_daemon::{db, instance, recovery, server};
 use codypendent_protocol::discovery::RuntimePaths;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::executor::RuntimeExecutor;
@@ -53,6 +53,16 @@ async fn main() -> anyhow::Result<()> {
         resurfaced_approvals = report.resurfaced_approvals.len(),
         "startup recovery complete"
     );
+
+    // Register the built-in tools into the governed registry (STEP 2.2 — Phase-1
+    // tools "now registered with metadata"). Idempotent: `register_builtins`
+    // upserts by identity and reuses ids, so this is safe on every boot and is
+    // what gives retrieval and the Skill Studio a populated registry from the
+    // first start. A failure here is logged but never blocks the daemon.
+    match codypendent_knowledge::register_builtins(&pool).await {
+        Ok(()) => info!("built-in tools registered in the knowledge registry"),
+        Err(error) => warn!(%error, "failed to register built-in tools"),
+    }
 
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run

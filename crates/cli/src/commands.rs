@@ -1,11 +1,15 @@
-//! Daemon lifecycle commands (Phase 0) and the headless JSONL client (STEP
-//! 1.13: `run` and `attach`).
+//! Daemon lifecycle commands (Phase 0), the headless JSONL client (STEP 1.13:
+//! `run` and `attach`), and the Phase-2 `index rebuild` maintenance command.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use codypendent_knowledge::{
+    db as knowledge_db, register_builtins, retrieve, HashingEmbedder, Registry, RetrievalConfig,
+    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ClientRole, CommandBody, Payload, SessionId, Subscription, WorkspaceId,
@@ -335,4 +339,52 @@ pub(crate) fn expect_catchup(
         }
         other => anyhow::bail!("unexpected reply to AttachSession: {other:?}"),
     }
+}
+
+/// `codypendent index rebuild`: delete the derived indexes and rebuild them from
+/// the authoritative rows (STEP 2.1 rule 2 / the Phase-2 "stale indexes rebuild
+/// from authority" exit criterion).
+///
+/// The derived indexes (Tantivy, the vector index) live under `<data_dir>/index/`
+/// and are a *pure function* of the authoritative registry/memory/code rows, so
+/// they can be deleted at any time and replaying authority restores identical
+/// results. This command is self-contained (it does not require the daemon): it
+/// opens the database directly, ensures the built-in tools are registered,
+/// removes the derived-index directory, rebuilds the retrieval indexes from the
+/// registry, and runs a canary query to prove the fresh index serves retrieval.
+pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    // Idempotent baseline: a rebuild on a never-started daemon still has the
+    // built-in tools to index.
+    register_builtins(&pool).await?;
+
+    // Derived indexes are deletable at any time.
+    let index_dir = paths.data_dir.join("index");
+    if index_dir.exists() {
+        std::fs::remove_dir_all(&index_dir)
+            .with_context(|| format!("removing derived index dir {}", index_dir.display()))?;
+    }
+
+    // Replay authority into fresh indexes.
+    let items = Registry::new().list(&pool).await?;
+    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
+
+    // Canary: the freshly rebuilt index still serves retrieval (System-scoped
+    // built-ins are visible; a Medium ceiling admits every first-party tool).
+    let query = RetrievalQuery::new("run the tests", vec![Scope::System], RiskClass::Medium);
+    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
+
+    println!(
+        "index rebuild complete: {} registry item(s) re-indexed from authority; \
+         canary \"run the tests\" -> {} tool card(s), {} skill card(s)",
+        items.len(),
+        result.tools.len(),
+        result.skills.len(),
+    );
+    Ok(())
 }
