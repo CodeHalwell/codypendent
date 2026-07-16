@@ -32,12 +32,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+use codypendent_knowledge::{
+    db as knowledge_db, CapabilityRequest, EvidenceRef, MemoryClass, MemoryRecord, MemoryStore,
+    Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope, TrustTier,
+};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Catchup, ClientId, ClientRole, Command, CommandBody, CommandId,
     Envelope, Payload, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
-use codypendent_tui::{map_event, reduce, render, Action, AppState, Intent, TerminalGuard, Theme};
+use codypendent_tui::{
+    map_event, reduce, render, Action, AppState, Intent, MemoryCard, SkillCard, TerminalGuard,
+    Theme,
+};
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -76,7 +83,8 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     conn.handshake("codypendent-tui", env!("CARGO_PKG_VERSION"))
         .await?;
 
-    let (session_id, catchup) = resolve_or_create_session(&mut conn, paths, &repo).await?;
+    let (session_id, workspace_id, catchup) =
+        resolve_or_create_session(&mut conn, paths, &repo).await?;
 
     // Seed the state from catch-up, then from any live event that outraced the
     // attach reply and was buffered during setup — both before the loop reads a
@@ -89,6 +97,17 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
             reduce(&mut state, Action::DaemonEvent(Box::new(event)));
         }
     }
+
+    // STEP 2.6: seed the Skill Studio + memory browser projections. This reads the
+    // knowledge fabric's authoritative rows directly from SQLite (WAL allows
+    // concurrent reads alongside the daemon) and maps them into the TUI's plain
+    // projection structs — the one place the two worlds meet, done here (not in
+    // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
+    // failure logs and continues with empty lists; it never fails the TUI. Done
+    // before entering the terminal so any diagnostic reaches a cooked screen.
+    let (skills, memories) = load_knowledge(paths, workspace_id).await;
+    state.skills = skills;
+    state.memories = memories;
 
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
@@ -343,7 +362,7 @@ async fn resolve_or_create_session(
     conn: &mut Connection,
     paths: &RuntimePaths,
     repo: &Path,
-) -> anyhow::Result<(SessionId, Catchup)> {
+) -> anyhow::Result<(SessionId, WorkspaceId, Catchup)> {
     let mut store = SessionStore::load(paths);
     let key = repo.to_string_lossy().into_owned();
 
@@ -358,7 +377,7 @@ async fn resolve_or_create_session(
             })
             .await?;
         if let Payload::Catchup { catchup } = reply.payload {
-            return Ok((stored.session_id, catchup));
+            return Ok((stored.session_id, stored.workspace_id, catchup));
         }
         // Rejected: the daemon no longer has that session (fresh data dir, or it
         // was closed). Fall through and create a new one, keeping the workspace.
@@ -408,7 +427,193 @@ async fn resolve_or_create_session(
     );
     store.save(paths); // best-effort: a persistence miss only costs the next
                        // launch a fresh session, never correctness.
-    Ok((session_id, catchup))
+    Ok((session_id, workspace, catchup))
+}
+
+/// Read the knowledge fabric's registry + memories directly from SQLite and map
+/// them into the TUI's plain projection structs (STEP 2.6). This is the CLI's
+/// job precisely because the TUI crate performs no I/O and never depends on
+/// `codypendent-knowledge`; the mapping from the knowledge domain types to the
+/// projection structs happens here and nowhere else.
+///
+/// The database is opened via the same helper the `index rebuild` path uses; WAL
+/// mode lets this read concurrently with the running daemon. Every failure path
+/// (open, list, query) is swallowed into an empty list with a stderr note, so a
+/// missing or busy database only means empty Skills / Memory browsers — never a
+/// TUI that refuses to start.
+async fn load_knowledge(
+    paths: &RuntimePaths,
+    workspace_id: WorkspaceId,
+) -> (Vec<SkillCard>, Vec<MemoryCard>) {
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = match knowledge_db::open(&database_path).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!(
+                "codypendent: Skill Studio / memory views unavailable \
+                 (opening {}: {error})",
+                database_path.display()
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let skills = match Registry::new().list(&pool).await {
+        Ok(items) => items.iter().map(skill_card).collect(),
+        Err(error) => {
+            eprintln!("codypendent: could not list registry items: {error}");
+            Vec::new()
+        }
+    };
+
+    // Visible memory scopes: the System tier plus this session's workspace. The
+    // store enforces cross-repository isolation in SQL; an empty result is fine.
+    let scopes = vec![Scope::System, Scope::Workspace(workspace_id)];
+    let memories = match MemoryStore::new().query(&pool, &scopes, None).await {
+        Ok(records) => records.iter().map(memory_card).collect(),
+        Err(error) => {
+            eprintln!("codypendent: could not query memories: {error}");
+            Vec::new()
+        }
+    };
+
+    pool.close().await;
+    (skills, memories)
+}
+
+/// Map a governed [`RegistryItem`] into the TUI's [`SkillCard`] projection,
+/// rendering each requested capability **verbatim** (STEP 2.6 "skill permissions
+/// are visible").
+fn skill_card(item: &RegistryItem) -> SkillCard {
+    SkillCard {
+        name: item.name.clone(),
+        kind: registry_kind_label(item.kind).to_owned(),
+        scope: scope_label(&item.scope),
+        trust: trust_label(item.trust.tier).to_owned(),
+        status: status_label(item.status).to_owned(),
+        risk: risk_label(item.risk).to_owned(),
+        description: item.description.clone(),
+        permissions: item.permissions.iter().map(capability_verbatim).collect(),
+    }
+}
+
+/// Map a [`MemoryRecord`] into the TUI's [`MemoryCard`] projection. `source` is a
+/// human rendering of the record's evidence refs (joined when there are several),
+/// which the memory browser's "open source" affordance surfaces in full.
+fn memory_card(record: &MemoryRecord) -> MemoryCard {
+    let source = if record.provenance.is_empty() {
+        "(no evidence)".to_owned()
+    } else {
+        record
+            .provenance
+            .iter()
+            .map(evidence_source)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    MemoryCard {
+        statement: record.statement.clone(),
+        class: memory_class_label(record.class).to_owned(),
+        scope: scope_label(&record.scope),
+        revision: record.valid_from.0.clone(),
+        observed: record.observed_at.date_naive().to_string(),
+        confidence: record.confidence,
+        source,
+    }
+}
+
+/// Render one requested capability exactly as declared, e.g.
+/// `"filesystem_read: $REPOSITORY"` or `"command: cargo"` — the verbatim form the
+/// Skill Studio shows.
+fn capability_verbatim(capability: &CapabilityRequest) -> String {
+    match capability {
+        CapabilityRequest::FilesystemRead(value) => format!("filesystem_read: {value}"),
+        CapabilityRequest::FilesystemWrite(value) => format!("filesystem_write: {value}"),
+        CapabilityRequest::Command(value) => format!("command: {value}"),
+        CapabilityRequest::Network(value) => format!("network: {value}"),
+        CapabilityRequest::Secret(value) => format!("secret: {value}"),
+    }
+}
+
+/// A human rendering of a memory's evidence ref (what "open source" reveals).
+fn evidence_source(evidence: &EvidenceRef) -> String {
+    match evidence {
+        EvidenceRef::EventRange {
+            session_id,
+            from_sequence,
+            to_sequence,
+        } => format!("events {from_sequence}..{to_sequence} of session {session_id}"),
+        EvidenceRef::Artifact {
+            artifact,
+            source_path,
+        } => match source_path {
+            Some(path) => format!("artifact {} ({path})", artifact.id),
+            None => format!("artifact {}", artifact.id),
+        },
+    }
+}
+
+/// A compact human label for a memory/registry [`Scope`]: the tier, plus a short
+/// prefix of its key for the id-bearing tiers (the full UUID is noise in a card).
+fn scope_label(scope: &Scope) -> String {
+    match scope.key() {
+        Some(key) => format!(
+            "{} {}",
+            scope.tier(),
+            key.chars().take(8).collect::<String>()
+        ),
+        None => scope.tier().to_owned(),
+    }
+}
+
+fn registry_kind_label(kind: RegistryItemKind) -> &'static str {
+    match kind {
+        RegistryItemKind::Tool => "tool",
+        RegistryItemKind::Skill => "skill",
+        RegistryItemKind::Plugin => "plugin",
+        RegistryItemKind::Hook => "hook",
+        RegistryItemKind::Command => "command",
+    }
+}
+
+fn trust_label(tier: TrustTier) -> &'static str {
+    match tier {
+        TrustTier::Untrusted => "untrusted",
+        TrustTier::Community => "community",
+        TrustTier::Verified => "verified",
+        TrustTier::FirstParty => "first-party",
+    }
+}
+
+fn status_label(status: RegistryStatus) -> &'static str {
+    match status {
+        RegistryStatus::Draft => "draft",
+        RegistryStatus::Active => "active",
+        RegistryStatus::Modified => "modified",
+        RegistryStatus::Deprecated => "deprecated",
+    }
+}
+
+fn risk_label(risk: RiskClass) -> &'static str {
+    match risk {
+        RiskClass::Safe => "safe",
+        RiskClass::Low => "low",
+        RiskClass::Medium => "medium",
+        RiskClass::High => "high",
+    }
+}
+
+fn memory_class_label(class: MemoryClass) -> &'static str {
+    match class {
+        MemoryClass::Working => "working",
+        MemoryClass::Episodic => "episodic",
+        MemoryClass::Semantic => "semantic",
+        MemoryClass::Procedural => "procedural",
+        MemoryClass::Preference => "preference",
+        MemoryClass::Failure => "failure",
+        MemoryClass::Artifact => "artifact",
+        MemoryClass::Code => "code",
+    }
 }
 
 /// The persisted repo → session mapping, so reopening the TUI in a repository

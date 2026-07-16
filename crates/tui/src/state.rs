@@ -61,6 +61,16 @@ pub enum Overlay {
     Steering(String),
     /// A "cancel this run?" confirmation.
     ConfirmCancel,
+    /// The Skill Studio browser (STEP 2.6): the [`AppState::skills`] list plus a
+    /// detail panel that shows the selected skill's description, risk, and its
+    /// requested permissions **verbatim** ("skill permissions are visible").
+    Skills,
+    /// The memory browser (STEP 2.6): the [`AppState::memories`] list plus a
+    /// provenance card. `source_open` is whether the focused memory's source has
+    /// been revealed by the "open source" affordance — the TUI does no I/O, so
+    /// opening surfaces the full source string in place; a real file-open is the
+    /// CLI's job later ("every retrieved memory opens its source").
+    Memory { source_open: bool },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -187,6 +197,63 @@ impl RunView {
     }
 }
 
+/// A Skill Studio card (STEP 2.6): one registry item projected for the Skills
+/// browser. Self-contained — the TUI never depends on `codypendent-knowledge`;
+/// the CLI harness maps each `RegistryItem` into this shape (the one place the
+/// two worlds meet). Every field is a pre-rendered human string so the renderer
+/// stays a pure projection.
+///
+/// `permissions` are the requested capabilities rendered **verbatim** (e.g.
+/// `"filesystem_read: $REPOSITORY"`, `"command: cargo"`) — the exact strings the
+/// package declared, never a paraphrase — so the "skill permissions are visible"
+/// exit criterion holds at a glance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCard {
+    /// The item's name (its registry identity within a scope).
+    pub name: String,
+    /// The kind label (`tool` / `skill` / `plugin` / `hook` / `command`).
+    pub kind: String,
+    /// The scope the item is installed at (e.g. `system`, `workspace …`).
+    pub scope: String,
+    /// The provenance trust tier (`untrusted` … `first-party`).
+    pub trust: String,
+    /// The lifecycle status (`draft` / `active` / `modified` / `deprecated`).
+    pub status: String,
+    /// The coarse risk class (`safe` / `low` / `medium` / `high`).
+    pub risk: String,
+    /// The item's description (untrusted content; shown, never trusted).
+    pub description: String,
+    /// The requested capabilities, one verbatim string per capability.
+    pub permissions: Vec<String>,
+}
+
+/// A memory provenance card (STEP 2.6): one curated memory projected for the
+/// Memory browser. Also self-contained — the CLI maps a `MemoryRecord` (via its
+/// `ProvenanceCard`) into it. The renderer draws the Chapter 06 provenance card
+/// (statement, source, revision, scope, confidence) from these fields alone.
+///
+/// `source` is a human rendering of the memory's evidence ref (e.g. `"events
+/// 3..7 of session <id>"` or `"artifact <ref> (path)"`); the "open source"
+/// affordance surfaces it in full so every retrieved memory opens its source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCard {
+    /// The remembered fact.
+    pub statement: String,
+    /// The memory class (`semantic` / `procedural` / `preference` / …).
+    pub class: String,
+    /// The scope the memory lives in (cross-repository isolation is enforced in
+    /// the store, never here).
+    pub scope: String,
+    /// The revision the memory is valid from.
+    pub revision: String,
+    /// When the memory was observed (a date string).
+    pub observed: String,
+    /// The curator's confidence in the fact, in `[0, 1]`.
+    pub confidence: f32,
+    /// The human-readable evidence source (what "open source" reveals).
+    pub source: String,
+}
+
 /// The status-line projection (STEP 1.12 RULE 4, [Chapter 20] projections):
 /// mode, run state, model, context %, cost, worktree, pending-approval count.
 ///
@@ -217,6 +284,18 @@ pub struct AppState {
     pub pending_approvals: Vec<PendingApproval>,
     /// Index into `pending_approvals` of the focused approval.
     pub selected_approval: usize,
+    /// The Skill Studio projection (STEP 2.6): every registered item, mapped to a
+    /// self-contained [`SkillCard`] by the CLI. Populated once at attach; the
+    /// [`Overlay::Skills`] browser reads it.
+    pub skills: Vec<SkillCard>,
+    /// Index into `skills` of the focused skill.
+    pub selected_skill: usize,
+    /// The memory projection (STEP 2.6): the visible-scope memories, mapped to
+    /// self-contained [`MemoryCard`]s by the CLI. May be empty. The
+    /// [`Overlay::Memory`] browser reads it.
+    pub memories: Vec<MemoryCard>,
+    /// Index into `memories` of the focused memory.
+    pub selected_memory: usize,
     /// The focused pane.
     pub focus: Pane,
     /// The top-most overlay / modal.
@@ -250,6 +329,10 @@ impl AppState {
             selected_run: 0,
             pending_approvals: Vec::new(),
             selected_approval: 0,
+            skills: Vec::new(),
+            selected_skill: 0,
+            memories: Vec::new(),
+            selected_memory: 0,
             focus: Pane::Sessions,
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
@@ -265,7 +348,12 @@ impl AppState {
         match self.overlay {
             Overlay::NewRun(_) | Overlay::Steering(_) => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
-            Overlay::None | Overlay::Help => InputMode::Normal,
+            // The Skills / Memory browsers are navigable with the normal key
+            // table (arrows, `S`/`M` to toggle, `o` to open a source, Esc to
+            // dismiss), so they stay in `Normal` mode.
+            Overlay::None | Overlay::Help | Overlay::Skills | Overlay::Memory { .. } => {
+                InputMode::Normal
+            }
         }
     }
 
@@ -286,6 +374,18 @@ impl AppState {
     #[must_use]
     pub fn focused_approval(&self) -> Option<&PendingApproval> {
         self.pending_approvals.get(self.selected_approval)
+    }
+
+    /// The focused Skill Studio card, if any.
+    #[must_use]
+    pub fn focused_skill(&self) -> Option<&SkillCard> {
+        self.skills.get(self.selected_skill)
+    }
+
+    /// The focused memory card, if any.
+    #[must_use]
+    pub fn focused_memory(&self) -> Option<&MemoryCard> {
+        self.memories.get(self.selected_memory)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.

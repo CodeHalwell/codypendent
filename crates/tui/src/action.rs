@@ -70,6 +70,16 @@ pub enum Action {
     /// Abandon the open prompt (`Esc`).
     InputCancel,
 
+    // --- knowledge browsers (STEP 2.6) ---
+    /// Toggle the Skill Studio browser (`S`).
+    OpenSkills,
+    /// Toggle the memory browser (`M`).
+    OpenMemory,
+    /// Reveal the focused memory's source in full (`o`, or `Enter` in the memory
+    /// browser). The TUI does no I/O, so this surfaces the source string rather
+    /// than opening a file.
+    OpenSource,
+
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).
     Help,

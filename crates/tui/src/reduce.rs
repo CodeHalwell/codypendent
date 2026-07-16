@@ -50,6 +50,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => state.overlay = Overlay::None,
 
+        Action::OpenSkills => {
+            state.overlay = match state.overlay {
+                Overlay::Skills => Overlay::None,
+                _ => Overlay::Skills,
+            }
+        }
+        Action::OpenMemory => {
+            state.overlay = match state.overlay {
+                Overlay::Memory { .. } => Overlay::None,
+                _ => Overlay::Memory { source_open: false },
+            }
+        }
+        Action::OpenSource => open_source(state),
+
         Action::Help => {
             state.overlay = match state.overlay {
                 Overlay::Help => Overlay::None,
@@ -318,8 +332,22 @@ fn terminal_state(disposition: &RunDisposition) -> RunState {
     }
 }
 
-/// Move the selection / scroll within the focused pane by `delta` (-1 or +1).
+/// Move the selection / scroll by `delta` (-1 or +1). When a knowledge browser
+/// is open it drives that browser's list; otherwise it drives the focused pane.
 fn nav(state: &mut AppState, delta: i32) {
+    match state.overlay {
+        Overlay::Skills => {
+            step(&mut state.selected_skill, state.skills.len(), delta);
+            return;
+        }
+        Overlay::Memory { .. } => {
+            step(&mut state.selected_memory, state.memories.len(), delta);
+            // Moving to a different memory collapses any revealed source.
+            state.overlay = Overlay::Memory { source_open: false };
+            return;
+        }
+        _ => {}
+    }
     match state.focus {
         Pane::Sessions => step(&mut state.selected_run, state.runs.len(), delta),
         Pane::Approvals => step(
@@ -350,6 +378,11 @@ fn scroll_page(state: &mut AppState, up: bool) {
 }
 
 fn expand_selected(state: &mut AppState) {
+    // In the memory browser, `Enter` opens the focused memory's source.
+    if matches!(state.overlay, Overlay::Memory { .. }) {
+        open_source(state);
+        return;
+    }
     if state.focus != Pane::Transcript {
         return;
     }
@@ -362,6 +395,16 @@ fn expand_selected(state: &mut AppState) {
                 _ => {}
             }
         }
+    }
+}
+
+/// Reveal the focused memory's source in the memory browser. A no-op unless the
+/// memory browser is open with at least one memory to open. The TUI does no I/O,
+/// so "open" flips the overlay's `source_open` flag; the renderer then surfaces
+/// the full source string (a real file-open is the CLI's job later).
+fn open_source(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::Memory { .. }) && !state.memories.is_empty() {
+        state.overlay = Overlay::Memory { source_open: true };
     }
 }
 
@@ -894,6 +937,115 @@ mod tests {
             .transcript
             .iter()
             .any(|e| matches!(e, TranscriptEntry::Unsupported { .. })));
+    }
+
+    fn skill(name: &str, permissions: &[&str]) -> crate::state::SkillCard {
+        crate::state::SkillCard {
+            name: name.to_owned(),
+            kind: "skill".to_owned(),
+            scope: "repository".to_owned(),
+            trust: "first-party".to_owned(),
+            status: "active".to_owned(),
+            risk: "medium".to_owned(),
+            description: "a test skill".to_owned(),
+            permissions: permissions.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    fn memory(statement: &str, source: &str) -> crate::state::MemoryCard {
+        crate::state::MemoryCard {
+            statement: statement.to_owned(),
+            class: "semantic".to_owned(),
+            scope: "repository".to_owned(),
+            revision: "79acbf1".to_owned(),
+            observed: "2026-07-14".to_owned(),
+            confidence: 1.0,
+            source: source.to_owned(),
+        }
+    }
+
+    #[test]
+    fn open_skills_toggles_the_studio_overlay() {
+        let mut s = AppState::new();
+        s.skills = vec![skill("rust.fix-ci", &["command: cargo"])];
+        reduce(&mut s, Action::OpenSkills);
+        assert_eq!(s.overlay, Overlay::Skills);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+        // Toggling closes it again.
+        reduce(&mut s, Action::OpenSkills);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn open_memory_toggles_the_memory_overlay() {
+        let mut s = AppState::new();
+        s.memories = vec![memory(
+            "tests use cargo nextest",
+            "events 3..7 of session x",
+        )];
+        reduce(&mut s, Action::OpenMemory);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: false });
+        reduce(&mut s, Action::OpenMemory);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn skill_navigation_moves_selection_within_the_studio() {
+        let mut s = AppState::new();
+        s.skills = vec![
+            skill("a", &["command: cargo"]),
+            skill("b", &["filesystem_read: $REPOSITORY"]),
+        ];
+        reduce(&mut s, Action::OpenSkills);
+        assert_eq!(s.selected_skill, 0);
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_skill, 1);
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_skill, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_skill, 0);
+    }
+
+    #[test]
+    fn memory_navigation_moves_selection_and_collapses_source() {
+        let mut s = AppState::new();
+        s.memories = vec![memory("m0", "src0"), memory("m1", "src1")];
+        reduce(&mut s, Action::OpenMemory);
+        // Open the first memory's source, then navigate: the source collapses.
+        reduce(&mut s, Action::OpenSource);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: true });
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_memory, 1);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: false });
+    }
+
+    #[test]
+    fn open_source_reveals_the_focused_memory_source() {
+        let mut s = AppState::new();
+        s.memories = vec![memory(
+            "tests use cargo nextest",
+            "artifact abc (rust-toolchain.toml)",
+        )];
+        reduce(&mut s, Action::OpenMemory);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: false });
+        // Both the explicit key and Enter open the source.
+        reduce(&mut s, Action::OpenSource);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: true });
+        // Re-open the browser and use Enter (Expand) this time.
+        reduce(&mut s, Action::OpenMemory); // close
+        reduce(&mut s, Action::OpenMemory); // reopen, source collapsed
+        assert_eq!(s.overlay, Overlay::Memory { source_open: false });
+        reduce(&mut s, Action::Expand);
+        assert_eq!(s.overlay, Overlay::Memory { source_open: true });
+    }
+
+    #[test]
+    fn open_source_is_inert_without_the_memory_overlay() {
+        let mut s = AppState::new();
+        s.memories = vec![memory("m", "src")];
+        // No overlay open: opening a source does nothing.
+        reduce(&mut s, Action::OpenSource);
+        assert_eq!(s.overlay, Overlay::None);
     }
 
     #[test]

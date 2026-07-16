@@ -88,6 +88,21 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "S",
+        description: "open the Skill Studio (permissions verbatim)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "M",
+        description: "open the memory browser (provenance cards)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "o",
+        description: "open the focused memory's source",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "q",
         description: "detach (the run keeps going)",
         mouse: None,
@@ -165,6 +180,9 @@ fn map_normal_char(c: char) -> Action {
         'a' => Action::Approve(ApprovalScope::Once),
         'A' => Action::Approve(ApprovalScope::Run),
         'r' => Action::Reject,
+        'S' => Action::OpenSkills,
+        'M' => Action::OpenMemory,
+        'o' => Action::OpenSource,
         _ => Action::NoOp,
     }
 }
@@ -264,6 +282,18 @@ mod tests {
             Action::Approve(ApprovalScope::Run)
         );
         assert_eq!(map_event(&ch('r'), InputMode::Normal, W), Action::Reject);
+        assert_eq!(
+            map_event(&ch('S'), InputMode::Normal, W),
+            Action::OpenSkills
+        );
+        assert_eq!(
+            map_event(&ch('M'), InputMode::Normal, W),
+            Action::OpenMemory
+        );
+        assert_eq!(
+            map_event(&ch('o'), InputMode::Normal, W),
+            Action::OpenSource
+        );
     }
 
     #[test]
