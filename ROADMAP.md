@@ -19,16 +19,18 @@ the release gate is the
 |------:|-------|:------:|
 | **0** | Workspace bootstrap — daemon lifecycle, protocol, ledger, CI | ✅ |
 | **1** | Persistent coding-agent slice — sessions/runs, tools, approvals, TUI, JSONL | ✅ |
-| **2** | Skills & knowledge — registry, retrieval, memory | ⬜ |
+| **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ⬜ |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | ⬜ |
 | **5** | Workflows & multi-agent orchestration | ⬜ |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
 | **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
 
-> **You are here:** Phase 1 is complete end-to-end — you can drive a run from the
-> TUI or headlessly, approvals park and resolve, disconnect/reconnect continues
-> the run, and kill-9 recovers it. Phase 2 is the next slice.
+> **You are here:** Phases 0–2 are complete. The system is now editable and
+> knowledgeable: a governed registry with hybrid retrieval (recall@8 = 1.0 on the
+> eval set, unsafe items filtered), an always-on memory fabric with provenance and
+> absolute cross-repository isolation, and a tree-sitter code graph + repository
+> map. Phase 3 (GitHub & IDE awareness) is the next slice.
 
 ---
 
@@ -85,14 +87,27 @@ increments `boot_count`; fixture log replays deterministically. ✅
       long session falls back to live-tail)
 - [ ] Surface `CommandRejected` in the TUI as a transient notice
 
-## Phase 2 — Skills & knowledge ⬜
+## Phase 2 — Skills & knowledge ✅
 
-- [ ] Skill registry + scope hierarchy; package loader; Skill Studio
-- [ ] Hybrid BM25/dense/exact retrieval; memory observer + curator; provenance UI
-- [ ] Basic code symbol graph; framework-compatible registry skill provider
+New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 
-**Exit:** top-k selection beats full-tool injection on an eval set; skill
-permissions visible; every retrieved memory opens its source; stale indexes rebuild.
+- [x] **2.1** Schema `0003` + crate foundation (registry/memory/code-graph/outbox tables, shared types)
+- [x] **2.2** Scoped registry + `skill.toml` package loader (strict keys, content-hash change detection) + built-in tools + `rust.fix-ci` reference skill
+- [x] **2.3** Hybrid retrieval (dense + BM25 + exact + history) with hard security filters, rerank, dependency closure, budget disclosure
+- [x] **2.4** Memory observer + curator pipeline + provenance + SQL-level scoped retrieval + supersession
+- [x] **2.5** Tree-sitter code graph (nodes/edges + evidence) + repository map v1
+- [x] **2.6** Skill Studio + memory browser in the TUI (permissions verbatim, provenance card)
+- [x] Daemon registers built-in tools on startup; `codypendent index rebuild`; run-lifecycle context manifest + memory-on-completion
+
+**Exit criteria**
+
+- [x] Retrieval eval: **recall@8 = 1.0** (≥ 0.8 gate), 100% unsafe-item exclusion, disclosed top-k (254 tok) fits a budget the full-injection baseline (4580 tok) blows through
+- [x] `rust.fix-ci` loads, is retrieved for "the CI test is failing", and its permissions render verbatim in the Studio
+- [x] Memory never leaks across repositories (SQL scope filter; leak test green)
+- [x] `codypendent index rebuild` after deleting `<data_dir>/index/` restores identical results
+- [x] Every retrieved memory opens its source (provenance card + open-source affordance)
+- [~] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories — *run-lifecycle wiring landing*
+- [x] `fmt` / `clippy` / `test` green; commits made; tree clean
 
 ## Phase 3 — GitHub & IDE awareness ⬜
 
