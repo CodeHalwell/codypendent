@@ -52,6 +52,14 @@ const SHELL_TOOL: &str = "shell.run";
 /// Markers that flag a note as an explicit memory proposal.
 const PROPOSE_MARKERS: [&str; 2] = ["memory.propose:", "memory:"];
 
+/// The canonical revision for a ledger sequence: `seq:` + a fixed-width,
+/// zero-padded number, so `valid_from`/`valid_until` sort lexicographically the
+/// same as numerically (the memory query compares them as strings in SQL —
+/// without padding, `seq:10` would sort before `seq:2`). 20 digits covers `u64`.
+fn seq_revision(sequence: u64) -> Revision {
+    Revision(format!("seq:{sequence:020}"))
+}
+
 /// Extract [`CandidateMemory`] proposals from a slice of session events under
 /// `scope`. Pure and side-effect-free; see the module docs for the extraction
 /// rules and how the evidence session id is sourced.
@@ -166,7 +174,7 @@ fn repeated_command_candidates(
             }],
             confidence: OBSERVED_CONFIDENCE,
             observed_at,
-            valid_from: Revision(format!("seq:{to}")),
+            valid_from: seq_revision(to),
             sensitivity: DataClassification::Internal,
             retention: None,
         });
@@ -224,7 +232,7 @@ fn run_outcome_candidates(events: &[SessionEvent], scope: &Scope) -> Vec<Candida
             }],
             confidence: OBSERVED_CONFIDENCE,
             observed_at: event.occurred_at,
-            valid_from: Revision(format!("seq:{}", event.sequence)),
+            valid_from: seq_revision(event.sequence),
             // Inherit the chronicle's classification so a sensitive run does not
             // become a less-restricted memory.
             sensitivity: chronicle.sensitivity,
@@ -270,7 +278,7 @@ fn explicit_proposal_candidates(
             }],
             confidence: OBSERVED_CONFIDENCE,
             observed_at: event.occurred_at,
-            valid_from: Revision(format!("seq:{}", event.sequence)),
+            valid_from: seq_revision(event.sequence),
             sensitivity: DataClassification::Internal,
             retention: None,
         });

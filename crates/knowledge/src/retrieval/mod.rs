@@ -213,6 +213,11 @@ pub fn retrieve(
         .filter_map(|id| by_id.get(id).copied())
         .filter(|item| passes_hard_filters(item, query))
         .collect();
+    // Collapse shadowed duplicates: several survivors can share `(kind, name)` at
+    // different scopes; the registry contract says the most specific scope wins
+    // SELECTION, so keep only the winner per identity before ranking + disclosure
+    // — otherwise the broader item could rank, or a duplicate card could show.
+    let survivors = collapse_shadowed(survivors);
 
     // Normalizers so each signal lands in ~[0, 1] before the weighted sum.
     let max_lexical = lexical_scores.values().copied().fold(0.0_f32, f32::max);
@@ -358,6 +363,26 @@ pub fn retrieve(
 struct Scored<'a> {
     item: &'a RegistryItem,
     score: f32,
+}
+
+/// Keep only the most-specific-scope survivor per `(kind, name)` identity — the
+/// registry shadowing contract. Order-preserving and deterministic: on equal
+/// specificity the earlier survivor wins, so ranking sees stable input.
+fn collapse_shadowed(survivors: Vec<&RegistryItem>) -> Vec<&RegistryItem> {
+    let mut winner: HashMap<(RegistryItemKind, String), usize> = HashMap::new();
+    let mut kept: Vec<&RegistryItem> = Vec::new();
+    for item in survivors {
+        let key = (item.kind, item.name.clone());
+        match winner.get(&key) {
+            Some(&idx) if kept[idx].scope.specificity() >= item.scope.specificity() => {}
+            Some(&idx) => kept[idx] = item,
+            None => {
+                winner.insert(key, kept.len());
+                kept.push(item);
+            }
+        }
+    }
+    kept
 }
 
 /// The four hard filters, in the Chapter 05 order. Any `false` drops the item

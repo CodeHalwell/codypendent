@@ -163,6 +163,9 @@ pub enum ManifestError {
     /// A declared entrypoint path does not exist under the package directory.
     #[error("declared entrypoint `{path}` does not exist under the package directory")]
     MissingEntrypoint { path: String },
+
+    #[error("declared entrypoint `{path}` escapes the package directory")]
+    EscapingEntrypoint { path: String },
     /// The manifest's `scope` string does not match the tier of the [`Scope`] the
     /// package is being registered under.
     #[error("manifest scope `{declared}` does not match the registration scope `{expected}`")]
@@ -190,10 +193,17 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     let raw = std::fs::read_to_string(dir.join("skill.toml"))?;
     let manifest: SkillManifest = toml::from_str(&raw)?;
 
-    // Every declared entrypoint must be present on disk.
+    // Every declared entrypoint must exist AND stay within the package. A `../`
+    // or absolute entrypoint could otherwise validate — and later silently
+    // change — a file outside `dir` that `hash_package` never hashes (so the
+    // change would go undetected as `Modified`).
+    let package_root = dir.canonicalize()?;
     for path in manifest.entrypoints.declared() {
-        if !dir.join(path).exists() {
+        let Ok(resolved) = dir.join(path).canonicalize() else {
             return Err(ManifestError::MissingEntrypoint { path: path.clone() });
+        };
+        if !resolved.starts_with(&package_root) {
+            return Err(ManifestError::EscapingEntrypoint { path: path.clone() });
         }
     }
 
