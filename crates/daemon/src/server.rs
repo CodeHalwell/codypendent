@@ -393,9 +393,7 @@ async fn handle_request(
                             }
                             env
                         }
-                        Err(error) => {
-                            Envelope::reply_to(&request, Payload::CommandRejected(error))
-                        }
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply_envelope).await?;
                 }

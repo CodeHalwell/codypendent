@@ -1,6 +1,6 @@
 //! `codypendentd` — the persistent Codypendent daemon.
 
-use codypendent_daemon::{db, instance, server};
+use codypendent_daemon::{db, instance, recovery, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -25,6 +25,18 @@ async fn main() -> anyhow::Result<()> {
         boot_count = boot.boot_count,
         database = %database_path.display(),
         "codypendentd starting"
+    );
+
+    // Reconcile state a previous process may have left mid-flight — before the
+    // socket opens, so no client observes a half-recovered run (STEP 1.14).
+    let report = recovery::recover_on_startup(&pool, &paths).await?;
+    info!(
+        swept_tmp = report.swept_tmp,
+        orphaned_leases = report.orphaned_leases.len(),
+        reconciled_effects = report.reconciled_effects,
+        failed_runs = report.failed_runs.len(),
+        resurfaced_approvals = report.resurfaced_approvals.len(),
+        "startup recovery complete"
     );
 
     server::run(pool, paths, boot).await
