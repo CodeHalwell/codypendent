@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+codypendent-daemon = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
@@ -20,6 +21,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
