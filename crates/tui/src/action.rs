@@ -7,7 +7,7 @@
 //! The reducer ([`crate::reduce::reduce`]) is the only place that reads an
 //! `Action`, and it performs no I/O.
 
-use codypendent_protocol::{ApprovalScope, SessionEvent};
+use codypendent_protocol::{ApprovalScope, RunId, SessionEvent};
 
 use crate::state::Pane;
 
@@ -20,6 +20,15 @@ pub enum Action {
     // --- from the connection task ---
     /// A durable daemon event to fold into state.
     DaemonEvent(Box<SessionEvent>),
+    /// A catch-up *snapshot* (the session was too far behind for an event
+    /// replay): seed the session title, closed flag, and its active runs as
+    /// stubs so a reopened long-running session is not blank until the next live
+    /// event fills a run in.
+    CatchupSnapshot {
+        title: String,
+        closed: bool,
+        runs: Vec<RunId>,
+    },
     /// A periodic timer tick (spinner animation, elapsed timers). No I/O.
     Tick,
 

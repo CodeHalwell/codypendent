@@ -23,6 +23,21 @@ use crate::state::{
 pub fn reduce(state: &mut AppState, action: Action) {
     match action {
         Action::DaemonEvent(event) => apply_event(state, *event),
+        Action::CatchupSnapshot {
+            title,
+            closed,
+            runs,
+        } => {
+            // Too far behind for an event replay: seed what the snapshot carries.
+            // Runs become stubs (their objective/mode fill in from the next live
+            // event) so the session is not blank on reopen.
+            state.session_title = Some(title);
+            state.session_closed = closed;
+            let mode = state.default_mode;
+            for run_id in runs {
+                state.ensure_run(run_id, String::new(), mode);
+            }
+        }
         Action::Tick => state.tick = state.tick.wrapping_add(1),
 
         Action::CyclePane => state.focus = state.focus.next(),
@@ -604,6 +619,26 @@ mod tests {
             }),
         );
         assert_eq!(s.runs[0].state, RunState::Running);
+    }
+
+    #[test]
+    fn catchup_snapshot_seeds_title_and_run_stubs() {
+        // A too-far-behind reopen folds the projection, not events: the title and
+        // a stub per active run so the session is not blank.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            Action::CatchupSnapshot {
+                title: "long session".to_owned(),
+                closed: false,
+                runs: vec![run_id],
+            },
+        );
+        assert_eq!(s.session_title.as_deref(), Some("long session"));
+        assert!(!s.session_closed);
+        assert_eq!(s.runs.len(), 1);
+        assert_eq!(s.runs[0].run_id, run_id);
     }
 
     #[test]

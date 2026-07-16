@@ -347,10 +347,25 @@ fn command_envelope(client_id: ClientId, body: CommandBody) -> Envelope {
 /// individual events, so the transcript simply begins from the next live event
 /// (Phase 1 keeps runs short enough that this is rare).
 fn fold_catchup(state: &mut AppState, catchup: Catchup) {
-    if let Catchup::Events { events, .. } = catchup {
-        for event in events {
-            reduce(state, Action::DaemonEvent(Box::new(event)));
+    match catchup {
+        Catchup::Events { events, .. } => {
+            for event in events {
+                reduce(state, Action::DaemonEvent(Box::new(event)));
+            }
         }
+        // Too far behind for an event replay — fold the projection so a reopened
+        // long-running session shows its title + active runs instead of blank.
+        Catchup::Snapshot { projection, .. } => {
+            reduce(
+                state,
+                Action::CatchupSnapshot {
+                    title: projection.title,
+                    closed: projection.closed,
+                    runs: projection.active_runs,
+                },
+            );
+        }
+        _ => {}
     }
 }
 

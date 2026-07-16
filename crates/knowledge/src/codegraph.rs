@@ -53,6 +53,36 @@ pub fn stable_repository_id(canonical_path: &Path) -> RepositoryId {
     RepositoryId(Uuid::from_bytes(bytes))
 }
 
+/// Retire a repository's entire code graph — every edge, then every node.
+///
+/// The Phase-2 pipeline rebuilds the graph with a full working-tree scan on each
+/// startup (there is no live per-file watcher yet), and a per-file
+/// [`upsert_file_graph`] cannot by itself drop a *removed* symbol — the schema
+/// keys nodes by `symbol_key`, not by file. Wiping the repository before a full
+/// re-scan is therefore how removed functions/types stop lingering in the graph
+/// (and in the repository map, which reads every node for the repository). Code
+/// nodes are a derived, regenerable projection — nothing durable references their
+/// ids — so discarding and rebuilding them is safe.
+pub async fn clear_repository(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<(), CodeGraphError> {
+    let repo = repository.to_string();
+    sqlx::query(
+        "DELETE FROM code_edges WHERE from_node IN (SELECT id FROM code_nodes WHERE repository = ?) \
+         OR to_node IN (SELECT id FROM code_nodes WHERE repository = ?)",
+    )
+    .bind(&repo)
+    .bind(&repo)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM code_nodes WHERE repository = ?")
+        .bind(&repo)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Errors from parsing or persisting the code graph.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeGraphError {

@@ -41,6 +41,13 @@ CREATE INDEX idx_registry_kind ON registry_items(kind);
 -- One live item per (name, scope) — a workspace skill and a user skill of the
 -- same name are distinct rows (both visible); shadowing is resolved in code.
 CREATE UNIQUE INDEX idx_registry_identity ON registry_items(kind, name, scope_tier, scope_key);
+-- SQLite treats NULLs as distinct, so the index above does NOT enforce identity
+-- for keyless (System) scopes where scope_key IS NULL — two concurrent
+-- registrations of the same built-in could both insert. A partial index over
+-- just (kind, name, scope_tier) for the NULL case closes that gap.
+CREATE UNIQUE INDEX idx_registry_identity_keyless
+    ON registry_items(kind, name, scope_tier)
+    WHERE scope_key IS NULL;
 
 -- The memory ledger (Chapter 06 MemoryRecord). A newer observation never
 -- deletes an older one — it supersedes it (supersedes_json + valid_from/until).

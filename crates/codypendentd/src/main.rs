@@ -106,6 +106,14 @@ async fn scan_repository(pool: &SqlitePool, repository: RepositoryId) {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let revision = head_revision(&root);
 
+    // Retire the repository's prior graph before a full re-scan so symbols
+    // removed since the last boot (with the now-stable repository id) do not
+    // linger in the graph or the repository map. The code graph is derived and
+    // regenerable, so wiping + rebuilding is safe.
+    if let Err(error) = codegraph::clear_repository(pool, repository).await {
+        warn!(%error, "could not clear the prior code graph before re-scan");
+    }
+
     let files = collect_rust_sources(&root, SCAN_FILE_CAP);
     let mut scanned = 0usize;
     let mut nodes = 0usize;

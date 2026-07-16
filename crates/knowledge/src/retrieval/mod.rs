@@ -298,13 +298,28 @@ pub fn retrieve(
     // honest measure of a k-card disclosure (closure never inflates the count).
     let mut disclosed_tool_ids: Vec<RegistryItemId> = Vec::new();
     let mut tool_set: HashSet<RegistryItemId> = HashSet::new();
-    // Required tools ordered by their own rank, not skill-declaration order.
-    for scored in ranked.iter().filter(|s| required_set.contains(&s.item.id)) {
+    // Required tools first, resolved from the FULL survivor set — not just the
+    // reranked pool. A tool a selected skill must call can survive the hard
+    // filters yet fall outside the top `rerank_pool`; pulling only from `ranked`
+    // would then disclose the skill card without its tool. Order the ranked ones
+    // by their rank, then any required survivors that ranked outside the pool.
+    let rank_of: HashMap<RegistryItemId, usize> = ranked
+        .iter()
+        .enumerate()
+        .map(|(index, scored)| (scored.item.id, index))
+        .collect();
+    let mut required_tools: Vec<&RegistryItem> = survivors
+        .iter()
+        .copied()
+        .filter(|item| required_set.contains(&item.id))
+        .collect();
+    required_tools.sort_by_key(|item| rank_of.get(&item.id).copied().unwrap_or(usize::MAX));
+    for item in required_tools {
         if disclosed_tool_ids.len() >= config.disclose_tools_max {
             break;
         }
-        if tool_set.insert(scored.item.id) {
-            disclosed_tool_ids.push(scored.item.id);
+        if tool_set.insert(item.id) {
+            disclosed_tool_ids.push(item.id);
         }
     }
     for item in ranked_tools {
