@@ -78,9 +78,9 @@ fn package_parse_round_trip() {
     // Writes/commands/network → Medium; no secrets → not High.
     assert_eq!(item.risk, RiskClass::Medium);
 
-    // required_tools (4) + optional_tools (2).
+    // required_tools (3) + optional_tools (3).
     assert_eq!(item.dependencies.len(), 6);
-    assert_eq!(item.dependencies.iter().filter(|d| !d.optional).count(), 4);
+    assert_eq!(item.dependencies.iter().filter(|d| !d.optional).count(), 3);
 
     // local-user publisher → first-party trust.
     assert_eq!(item.trust.publisher, "local-user");

@@ -12,13 +12,17 @@ languages = ["rust"]
 required_tools = [
   "workspace.read_file",
   "workspace.search",
-  "github.read_checks",
   "shell.run"
 ]
 
+# `github.read_checks` is aspirational: no such built-in exists in Phase 2, and a
+# skill must not declare a *required* tool the registry cannot resolve (the model
+# would see a card it can never fully satisfy). Kept as optional until a GitHub
+# check-reading tool is registered.
 optional_tools = [
   "git.apply_patch",
-  "github.comment"
+  "github.comment",
+  "github.read_checks"
 ]
 
 [permissions]

@@ -489,6 +489,19 @@ async fn handle_request(
                                     });
                                 }
                             }
+                            // A `CancelRun` must also reach the LIVE runtime loop:
+                            // recording `Cancelled` in the projection does not stop
+                            // the agent, so signal the executor's per-run
+                            // cancellation token. Idempotent and best-effort — a
+                            // no-op with no executor injected or an already-finished
+                            // run. (No `newly_applied` gate: cancellation is
+                            // idempotent, and a re-delivered cancel should still be
+                            // free to stop a run the first delivery raced.)
+                            if let (Some(executor), CommandBody::CancelRun { run_id }) =
+                                (state.executor.as_ref(), &command.body)
+                            {
+                                executor.cancel_run(*run_id);
+                            }
                             let mut env = Envelope::reply_to(
                                 &request,
                                 Payload::CommandAccepted {

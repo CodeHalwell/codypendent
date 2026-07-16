@@ -21,6 +21,9 @@
 //! builds those from plain closures rather than the macros the runtime's own
 //! integration tests use.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
@@ -30,10 +33,10 @@ use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{Actor, DataClassification, EventBody, RepositoryId, SessionId};
+use codypendent_protocol::{Actor, DataClassification, EventBody, RepositoryId, RunId, SessionId};
 use codypendent_runtime::agent::{
-    ApprovalRequest, CancellationToken, FrameworkAgentRuntime, FrameworkModelDriver, RunContext,
-    RunJournal,
+    cancellation, ApprovalRequest, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
+    FrameworkModelDriver, RunContext, RunJournal,
 };
 use codypendent_runtime::models::{load_models, resolve_model, ModelPolicy, ModelRegistry};
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
@@ -52,6 +55,14 @@ pub struct RuntimeExecutor {
     /// Minted once at startup (in `main`) and shared with the code-graph scan, so
     /// every run's context maps + memories share one stable repository identity.
     repository: RepositoryId,
+    /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
+    /// a run's handle before its loop starts and removes it once the loop is
+    /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
+    /// so an accepted `CancelRun` actually stops the runtime instead of only
+    /// marking the projection `Cancelled`. `Arc<Mutex<…>>` so every clone of this
+    /// (cheap-to-clone) executor shares one registry — the clone the server holds
+    /// must see the handle the worker task registered.
+    cancellations: Arc<Mutex<HashMap<RunId, CancellationHandle>>>,
 }
 
 impl RuntimeExecutor {
@@ -72,6 +83,7 @@ impl RuntimeExecutor {
             subscriptions,
             approvals,
             repository,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -205,7 +217,7 @@ impl RuntimeExecutor {
     /// disposition. `Ok(())` means the loop reached a terminal state itself;
     /// `Err(reason)` means the run could not run (e.g. no model configured) and
     /// the caller must fail it cleanly.
-    async fn execute(&self, launch: &RunLaunch) -> Result<(), String> {
+    async fn execute(&self, launch: &RunLaunch, token: CancellationToken) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
         let resolved = resolve_model(&registry, &policy, launch.mode)
             .await
@@ -235,7 +247,7 @@ impl RuntimeExecutor {
             launch.repository.clone(),
         );
         runtime
-            .execute_run(&driver, ctx, CancellationToken::never())
+            .execute_run(&driver, ctx, token)
             .await
             .map(|_| ())
             .map_err(|e| format!("run failed: {e}"))
@@ -340,6 +352,17 @@ impl RunExecutor for RuntimeExecutor {
             let run_id = launch.run_id;
             let objective = launch.objective.clone();
 
+            // Register a cancellation handle BEFORE the loop starts, so a
+            // `CancelRun` accepted at any point after this run was launched can
+            // stop it. The token drives `execute`; the handle stays in the shared
+            // registry for `cancel_run` to fire.
+            let (handle, token) = cancellation();
+            executor
+                .cancellations
+                .lock()
+                .expect("cancellations registry lock")
+                .insert(run_id, handle);
+
             // Open the run's trace with the knowledge-fabric context (repository
             // map + retrieved tool/skill cards + cited memories). Emitted here,
             // BEFORE the agent loop, so the note never races the loop's own
@@ -350,7 +373,7 @@ impl RunExecutor for RuntimeExecutor {
             // becomes a clean terminal failure (a `JoinError`) rather than a
             // wedged, forever-`Queued`/`Running` run.
             let worker = executor.clone();
-            let joined = tokio::spawn(async move { worker.execute(&launch).await }).await;
+            let joined = tokio::spawn(async move { worker.execute(&launch, token).await }).await;
 
             let failure = match joined {
                 Ok(Ok(())) => None,              // the loop reached a terminal state itself
@@ -375,12 +398,35 @@ impl RunExecutor for RuntimeExecutor {
                 }
             }
 
+            // The run has reached a terminal state; drop its cancellation handle
+            // so the registry does not grow without bound (and a late `cancel_run`
+            // for this run becomes a clean no-op).
+            executor
+                .cancellations
+                .lock()
+                .expect("cancellations registry lock")
+                .remove(&run_id);
+
             // The run has now reached a terminal state (either the loop finished
             // it, or `fail_run` above did). Harvest any curated memories from its
             // event trace and note each durable one — emitted AFTER the loop, so
             // these appends never race it either.
             executor.harvest_memories(session_id).await;
         });
+    }
+
+    fn cancel_run(&self, run_id: RunId) {
+        // Fire the run's cancellation token if it is still executing in this
+        // process; a finished or unknown run simply is not in the registry, so
+        // this is a clean no-op.
+        if let Some(handle) = self
+            .cancellations
+            .lock()
+            .expect("cancellations registry lock")
+            .get(&run_id)
+        {
+            handle.cancel();
+        }
     }
 
     fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker)> {

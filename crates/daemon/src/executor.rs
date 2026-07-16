@@ -51,6 +51,18 @@ pub trait RunExecutor: Send + Sync {
     /// immediately; the implementation owns the run to a terminal state.
     fn spawn_run(&self, launch: RunLaunch);
 
+    /// Request cancellation of an in-flight `run_id`. Fire-and-forget and
+    /// idempotent: a no-op if the run is not currently executing in this process
+    /// (already finished, never launched here, or owned by another process).
+    ///
+    /// Recording `RunState::Cancelled` on the ledger does not by itself stop the
+    /// agent loop — the runtime only relinquishes at a cancellation token — so the
+    /// server calls this when a `CancelRun` is accepted, so the live loop actually
+    /// stops instead of running on and overwriting the cancelled projection with a
+    /// later `Completed`/`Failed`. The default does nothing: the executor-less
+    /// server path (`server::run`, the daemon's own tests) drives no runtime loop.
+    fn cancel_run(&self, _run_id: RunId) {}
+
     /// The shared event fan-out and approval broker this executor publishes a
     /// run's events through and resolves approvals against.
     ///
