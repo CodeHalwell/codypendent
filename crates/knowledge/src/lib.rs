@@ -47,7 +47,7 @@ pub use retrieval::{
     RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
 };
 
-pub use codegraph::{CodeGraphError, GraphDelta};
+pub use codegraph::{stable_repository_id, CodeGraphError, GraphDelta};
 pub use repomap::{ApiSymbol, ModuleEntry, PackageEntry, RepositoryMap};
 
 pub use memory::{

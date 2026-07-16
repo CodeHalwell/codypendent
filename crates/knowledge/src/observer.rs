@@ -30,10 +30,10 @@
 //! Event-range candidates are only emitted when the session id is available;
 //! artifact-cited candidates (the `RunCompleted` chronicle) are always emitted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use codypendent_protocol::{
-    DataClassification, EventBody, RunDisposition, SessionEvent, SessionId, ToolOutcome,
+    DataClassification, EventBody, RunDisposition, RunId, SessionEvent, SessionId, ToolOutcome,
 };
 
 use crate::memory::CandidateMemory;
@@ -89,27 +89,39 @@ fn repeated_command_candidates(
         return Vec::new();
     };
 
-    // Pair each `shell.run` ToolStarted (which carries the args digest) with the
-    // next `shell.run` ToolCompleted that succeeds.
-    let mut pending: Vec<(String, u64)> = Vec::new();
+    // Pair each `shell.run` ToolStarted (which carries the args digest) with its
+    // own run's ToolCompleted, keyed by `RunId`. A plain stack mispairs when
+    // runs interleave and strands the start of any run whose tool *failed*
+    // (leaving stale entries); keying by run id — and removing the pending entry
+    // on ANY completion, recording a success only when the outcome succeeded —
+    // pairs correctly regardless of concurrency or failure.
+    let mut pending: HashMap<RunId, (String, u64)> = HashMap::new();
     let mut runs: Vec<SuccessfulRun> = Vec::new();
     for event in events {
         match &event.body {
             EventBody::ToolStarted {
-                tool, args_digest, ..
+                run_id,
+                tool,
+                args_digest,
+                ..
             } if tool == SHELL_TOOL => {
-                pending.push((args_digest.clone(), event.sequence));
+                pending.insert(*run_id, (args_digest.clone(), event.sequence));
             }
-            EventBody::ToolCompleted { tool, outcome, .. }
-                if tool == SHELL_TOOL && matches!(outcome, ToolOutcome::Succeeded) =>
-            {
-                if let Some((digest, start_sequence)) = pending.pop() {
-                    runs.push(SuccessfulRun {
-                        digest,
-                        start_sequence,
-                        complete_sequence: event.sequence,
-                        completed_at: event.occurred_at,
-                    });
+            EventBody::ToolCompleted {
+                run_id,
+                tool,
+                outcome,
+                ..
+            } if tool == SHELL_TOOL => {
+                if let Some((digest, start_sequence)) = pending.remove(run_id) {
+                    if matches!(outcome, ToolOutcome::Succeeded) {
+                        runs.push(SuccessfulRun {
+                            digest,
+                            start_sequence,
+                            complete_sequence: event.sequence,
+                            completed_at: event.occurred_at,
+                        });
+                    }
                 }
             }
             _ => {}

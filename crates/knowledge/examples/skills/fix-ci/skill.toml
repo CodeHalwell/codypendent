@@ -17,7 +17,7 @@ required_tools = [
 ]
 
 optional_tools = [
-  "workspace.apply_patch",
+  "git.apply_patch",
   "github.comment"
 ]
 

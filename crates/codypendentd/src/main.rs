@@ -73,12 +73,17 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => warn!(%error, "failed to register built-in tools"),
     }
 
-    // Mint the process's repository identity once, then warm the code graph so the
-    // repository map a run's context opens with is real. The SAME id is handed to
-    // the executor, so runs, their context maps, and their curated memories all
-    // share one stable repository. The scan is bounded and failure-tolerant — a
-    // parse error on one file must never abort startup.
-    let repository = RepositoryId::new();
+    // Derive the process's repository identity from the working directory's
+    // canonical path, so the SAME checkout maps to the SAME id across restarts —
+    // a random id per boot would orphan the previous run's code graph and
+    // repository-scoped memories and bloat the database. Then warm the code graph
+    // so the repository map a run's context opens with is real. The same id is
+    // handed to the executor, so runs, their context maps, and their curated
+    // memories all share one stable repository. The scan is bounded and
+    // failure-tolerant — a parse error on one file must never abort startup.
+    let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repository =
+        codypendent_knowledge::stable_repository_id(&workdir.canonicalize().unwrap_or(workdir));
     scan_repository(&pool, repository).await;
 
     // The executor owns the shared event fan-out + approval broker the server

@@ -345,13 +345,16 @@ pub(crate) fn expect_catchup(
 /// the authoritative rows (STEP 2.1 rule 2 / the Phase-2 "stale indexes rebuild
 /// from authority" exit criterion).
 ///
-/// The derived indexes (Tantivy, the vector index) live under `<data_dir>/index/`
-/// and are a *pure function* of the authoritative registry/memory/code rows, so
-/// they can be deleted at any time and replaying authority restores identical
-/// results. This command is self-contained (it does not require the daemon): it
+/// The derived indexes are a *pure function* of the authoritative
+/// registry/memory/code rows, so they can be discarded at any time and replaying
+/// authority restores identical results. In Phase 2 the retrieval indexes
+/// (Tantivy BM25 + the vector index) are held in memory and rebuilt from the
+/// registry on demand — persisting them under `<data_dir>/index/` is a later
+/// step. This command is self-contained (it does not require the daemon): it
 /// opens the database directly, ensures the built-in tools are registered,
-/// removes the derived-index directory, rebuilds the retrieval indexes from the
-/// registry, and runs a canary query to prove the fresh index serves retrieval.
+/// removes `<data_dir>/index/` if present (forward-compatible with persisted
+/// indexes, a no-op today), rebuilds the retrieval indexes from the registry,
+/// and runs a canary query to prove the fresh index serves retrieval.
 pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
     paths.ensure_directories()?;
     let database_path = paths.data_dir.join("codypendent.db");

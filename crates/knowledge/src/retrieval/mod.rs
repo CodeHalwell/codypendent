@@ -281,7 +281,6 @@ pub fn retrieve(
         .filter(|item| item.kind == RegistryItemKind::Tool)
         .map(|item| (item.name.as_str(), *item))
         .collect();
-    let mut required_ids: Vec<RegistryItemId> = Vec::new();
     let mut required_set: HashSet<RegistryItemId> = HashSet::new();
     for skill in &disclosed_skills {
         for dependency in &skill.dependencies {
@@ -289,9 +288,7 @@ pub fn retrieve(
                 continue;
             }
             if let Some(tool) = survivor_tool_by_name.get(dependency.target.as_str()) {
-                if required_set.insert(tool.id) {
-                    required_ids.push(tool.id);
-                }
+                required_set.insert(tool.id);
             }
         }
     }

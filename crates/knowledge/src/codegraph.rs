@@ -38,6 +38,21 @@ use crate::types::{
 /// The IANA media type recorded on a file's descriptive evidence artifact.
 const RUST_MEDIA_TYPE: &str = "text/x-rust";
 
+/// Derive a **stable** [`RepositoryId`] from a repository's canonical path.
+///
+/// The daemon must map the same checkout to the same id across restarts: a fresh
+/// random id per boot would orphan the previous run's `code_nodes`/`code_edges`
+/// and any repository-scoped memories or skills (they become unreachable) and
+/// grow the database without bound. Deterministic — the first 16 bytes of the
+/// SHA-256 of the canonical path, as a UUID — so no persisted mapping is needed.
+#[must_use]
+pub fn stable_repository_id(canonical_path: &Path) -> RepositoryId {
+    let digest = Sha256::digest(canonical_path.to_string_lossy().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    RepositoryId(Uuid::from_bytes(bytes))
+}
+
 /// Errors from parsing or persisting the code graph.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeGraphError {

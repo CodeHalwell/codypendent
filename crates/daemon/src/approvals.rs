@@ -288,29 +288,37 @@ impl ApprovalBroker {
         // invisible until re-attach. When no hub is bound (executor-less server,
         // tests) this is a no-op; the durable events above are unaffected.
         if let Some(hub) = &self.subscriptions {
-            hub.publish(
-                session_id,
-                SessionEvent {
-                    sequence: requested_seq as u64,
-                    occurred_at: now,
-                    causation_id: None,
-                    correlation_id: None,
-                    actor: Actor::System,
-                    body: requested,
-                },
-            );
-            if let Some((resolved_seq, body)) = resolved {
+            // The durable events are already committed; a (never-expected) negative
+            // sequence must not wrap into a bogus on-wire value, so publish only on
+            // a lossless conversion and otherwise skip (the client re-syncs on
+            // re-attach catch-up).
+            if let Ok(sequence) = u64::try_from(requested_seq) {
                 hub.publish(
                     session_id,
                     SessionEvent {
-                        sequence: resolved_seq as u64,
+                        sequence,
                         occurred_at: now,
                         causation_id: None,
                         correlation_id: None,
                         actor: Actor::System,
-                        body,
+                        body: requested,
                     },
                 );
+            }
+            if let Some((resolved_seq, body)) = resolved {
+                if let Ok(sequence) = u64::try_from(resolved_seq) {
+                    hub.publish(
+                        session_id,
+                        SessionEvent {
+                            sequence,
+                            occurred_at: now,
+                            causation_id: None,
+                            correlation_id: None,
+                            actor: Actor::System,
+                            body,
+                        },
+                    );
+                }
             }
         }
 

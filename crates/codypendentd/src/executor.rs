@@ -30,9 +30,7 @@ use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{
-    Actor, DataClassification, EventBody, RepositoryId, SessionEvent, SessionId,
-};
+use codypendent_protocol::{Actor, DataClassification, EventBody, RepositoryId, SessionId};
 use codypendent_runtime::agent::{
     ApprovalRequest, CancellationToken, FrameworkAgentRuntime, FrameworkModelDriver, RunContext,
     RunJournal,
@@ -115,19 +113,17 @@ impl RuntimeExecutor {
             move |session: SessionId, actor: Actor, body: EventBody| {
                 let pool = persist_pool.clone();
                 async move {
-                    if let EventBody::RunStateChanged { run_id, state } = &body {
+                    // Append first — with an atomic sequence claim, so a live run
+                    // and a concurrent client command can never collide on a
+                    // sequence — then advance the (derived, replay-rebuildable)
+                    // run projection, so an append failure never leaves the
+                    // projection ahead of the ledger.
+                    let event =
+                        ledger::append_next_event(&pool, session, &actor, &body, Utc::now())
+                            .await?;
+                    if let EventBody::RunStateChanged { run_id, state } = &event.body {
                         projections::set_run_state(&pool, *run_id, *state).await?;
                     }
-                    let sequence = ledger::next_sequence(&pool, session).await?;
-                    let event = SessionEvent {
-                        sequence,
-                        occurred_at: Utc::now(),
-                        causation_id: None,
-                        correlation_id: None,
-                        actor,
-                        body,
-                    };
-                    ledger::append_event(&pool, session, &event).await?;
                     Ok(event)
                 }
             },
@@ -213,16 +209,16 @@ impl RuntimeExecutor {
     /// so an attached client observes the note live. Used to surface the context
     /// manifest and the curated memories in a run's trace.
     async fn emit_note(&self, session_id: SessionId, text: String) -> anyhow::Result<()> {
-        let sequence = ledger::next_sequence(&self.pool, session_id).await?;
-        let event = SessionEvent {
-            sequence,
-            occurred_at: Utc::now(),
-            causation_id: None,
-            correlation_id: None,
-            actor: Actor::System,
-            body: EventBody::NoteAppended { text },
-        };
-        ledger::append_event(&self.pool, session_id, &event).await?;
+        // Atomic sequence claim — the note may race a concurrent client command
+        // on the same session.
+        let event = ledger::append_next_event(
+            &self.pool,
+            session_id,
+            &Actor::System,
+            &EventBody::NoteAppended { text },
+            Utc::now(),
+        )
+        .await?;
         // Persist-before-publish: only after the append does the note fan out.
         self.subscriptions.publish(session_id, event);
         Ok(())

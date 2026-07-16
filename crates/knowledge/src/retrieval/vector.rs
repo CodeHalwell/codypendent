@@ -74,8 +74,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
         norm_a += x * x;
         norm_b += y * y;
     }
-    if norm_a == 0.0 || norm_b == 0.0 {
+    // Guard the denominator itself, not just the norms: `norm_a.sqrt() *
+    // norm_b.sqrt()` can underflow to 0.0 for tiny-but-nonzero norms, which would
+    // yield an inf/NaN score.
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom <= 0.0 {
         return 0.0;
     }
-    dot / (norm_a.sqrt() * norm_b.sqrt())
+    dot / denom
 }
