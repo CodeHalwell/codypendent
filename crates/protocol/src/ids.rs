@@ -62,6 +62,14 @@ uuid_id!(CorrelationId);
 uuid_id!(ApprovalId);
 uuid_id!(DaemonInstanceId);
 
+// Phase 2 — knowledge fabric (registry, memory, code graph).
+uuid_id!(RegistryItemId);
+uuid_id!(MemoryId);
+uuid_id!(CodeNodeId);
+uuid_id!(RepositoryId);
+uuid_id!(BranchId);
+uuid_id!(OrganizationId);
+
 /// Model identifiers are provider strings such as `"claude-sonnet-5"` or
 /// `"qwen2.5-coder:32b"`, not UUIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

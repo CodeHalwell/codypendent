@@ -1,5 +1,7 @@
 //! `codypendentd` library: persistence, ledger, replay, and the client
-//! protocol server. The binary in `src/main.rs` wires these together.
+//! protocol server. The `codypendentd` binary — in the sibling
+//! `crates/codypendentd` assembly crate — wires these together and injects a
+//! [`RunExecutor`](crate::executor::RunExecutor) over the runtime agent loop.
 
 // Phase 0
 pub mod db;
@@ -12,6 +14,7 @@ pub mod server;
 pub mod approvals;
 pub mod artifacts;
 pub mod commands;
+pub mod executor;
 pub mod policy;
 pub mod projections;
 pub mod recovery;

@@ -33,6 +33,7 @@ use tracing::{error, info, warn};
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
 use crate::commands::{ApplyContext, CommandProcessor};
+use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
 use crate::projections;
@@ -67,14 +68,40 @@ pub struct ServerState {
     pub artifacts: ArtifactStore,
     /// The per-user secret (32 bytes) that signs resume tokens.
     pub secret: Vec<u8>,
+    /// Executes accepted runs. `None` in a lib-only / test embedding (the run
+    /// stays `Queued`); the assembly binary injects an implementation that wraps
+    /// the runtime agent loop (dependency inversion — see [`crate::executor`]).
+    pub executor: Option<Arc<dyn RunExecutor>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
 /// SIGINT. Removes the socket and pidfile on exit.
+///
+/// This is the executor-less entry point: an accepted `StartRun` is persisted
+/// and the run stays `Queued` (nothing executes it). It is what the daemon's own
+/// integration tests (`tests/socket.rs`, `tests/server_it.rs`) drive. The
+/// assembly binary calls [`run_with_executor`] with a real executor.
 pub async fn run(
     pool: SqlitePool,
     paths: RuntimePaths,
     instance: InstanceRecord,
+) -> anyhow::Result<()> {
+    run_with_executor(pool, paths, instance, None).await
+}
+
+/// Like [`run`], but with an injected [`RunExecutor`] that actually executes an
+/// accepted `StartRun` (the assembly binary wraps the runtime agent loop).
+///
+/// When an executor is present, the server binds its command fan-out and
+/// approval broker to the executor's ([`RunExecutor::collaborators`]), so a
+/// run's events reach attached clients and a client's `ResolveApproval` reaches
+/// the runtime awaiting it. With `executor = None` the server creates its own
+/// fresh instances and behaves exactly as the pre-executor server did.
+pub async fn run_with_executor(
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    instance: InstanceRecord,
+    executor: Option<Arc<dyn RunExecutor>>,
 ) -> anyhow::Result<()> {
     prepare_socket(&paths).await?;
     let listener = UnixListener::bind(&paths.socket_path)?;
@@ -84,9 +111,15 @@ pub async fn run(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // One shared fan-out drives both the command processor (publisher) and the
-    // server (subscriber); cloning a `SubscriptionHub` shares its channels.
-    let subscriptions = SubscriptionHub::new();
-    let commands = CommandProcessor::new(subscriptions.clone(), ApprovalBroker::new());
+    // server (subscriber); cloning a `SubscriptionHub` shares its channels. When
+    // an executor is injected, reuse ITS hub + broker so run events published by
+    // the agent loop reach this server's forwarders, and a client's
+    // `ResolveApproval` (routed through the command processor) wakes the runtime.
+    let (subscriptions, approvals) = executor
+        .as_ref()
+        .and_then(|e| e.collaborators())
+        .unwrap_or_else(|| (SubscriptionHub::new(), ApprovalBroker::new()));
+    let commands = CommandProcessor::new(subscriptions.clone(), approvals);
     let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
     let secret = load_or_create_secret(&paths.data_dir)?;
 
@@ -100,6 +133,7 @@ pub async fn run(
         subscriptions,
         artifacts,
         secret,
+        executor,
     });
 
     #[cfg(unix)]
@@ -419,6 +453,55 @@ async fn handle_request(
                         .await
                     {
                         Ok(outcome) => {
+                            // A freshly accepted `StartRun` is handed to the
+                            // executor so the run actually EXECUTES rather than
+                            // sitting `Queued` forever. Fire-and-forget: the
+                            // executor spawns its own task and we never await it.
+                            // With no executor injected (lib-only / tests) this
+                            // is a no-op — the run stays `Queued`, exactly as
+                            // before.
+                            // Gate on `newly_applied`: a duplicate `StartRun`
+                            // delivery replays the recorded outcome (with the same
+                            // `created_run`), and launching again would run two
+                            // agent loops for one run. A replayed outcome is never
+                            // `newly_applied`, so the executor fires exactly once.
+                            if let (true, Some(run_id), Some(executor)) = (
+                                outcome.newly_applied,
+                                outcome.created_run,
+                                state.executor.as_ref(),
+                            ) {
+                                if let CommandBody::StartRun {
+                                    session_id,
+                                    objective,
+                                    mode,
+                                } = &command.body
+                                {
+                                    executor.spawn_run(RunLaunch {
+                                        session_id: *session_id,
+                                        run_id,
+                                        objective: objective.clone(),
+                                        mode: *mode,
+                                        // Phase 1 carries no per-run repository
+                                        // path on the wire, so fall back to the
+                                        // daemon's working directory.
+                                        repository: std::env::current_dir()
+                                            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                                    });
+                                }
+                            }
+                            // A `CancelRun` must also reach the LIVE runtime loop:
+                            // recording `Cancelled` in the projection does not stop
+                            // the agent, so signal the executor's per-run
+                            // cancellation token. Idempotent and best-effort — a
+                            // no-op with no executor injected or an already-finished
+                            // run. (No `newly_applied` gate: cancellation is
+                            // idempotent, and a re-delivered cancel should still be
+                            // free to stop a run the first delivery raced.)
+                            if let (Some(executor), CommandBody::CancelRun { run_id }) =
+                                (state.executor.as_ref(), &command.body)
+                            {
+                                executor.cancel_run(*run_id);
+                            }
                             let mut env = Envelope::reply_to(
                                 &request,
                                 Payload::CommandAccepted {
@@ -476,8 +559,10 @@ async fn handle_attach(
     subscriptions: Vec<Subscription>,
 ) -> anyhow::Result<()> {
     // Subscribe *before* computing catch-up so an event published during the
-    // read cannot slip through the gap (a rare overlap re-delivers an event the
-    // client already has — harmless, it dedups by sequence).
+    // read cannot slip through the gap. An event committed between subscribing
+    // and `load_events` is then delivered twice — once in catch-up, once on the
+    // live receiver — so the forwarder drops anything at or below the catch-up
+    // watermark (`current_max`) to avoid a double-render on the attach race.
     let receiver = state.subscriptions.subscribe(session_id);
 
     // Current max sequence (0 for an empty/absent session).
@@ -487,10 +572,15 @@ async fn handle_attach(
     let gap = current_max.saturating_sub(last_seen);
 
     let catchup = if gap <= CATCHUP_EVENT_LIMIT {
+        // Cap replay at `current_max` — the live forwarder's drop watermark. An
+        // event committed between reading `current_max` and this `load_events`
+        // has sequence > current_max, so it is NOT dropped by the forwarder;
+        // excluding it here keeps it delivered exactly once (live), instead of
+        // both in catch-up and live.
         let events: Vec<SessionEvent> = ledger::load_events(&state.pool, session_id)
             .await?
             .into_iter()
-            .filter(|event| event.sequence > last_seen)
+            .filter(|event| event.sequence > last_seen && event.sequence <= current_max)
             .collect();
         Catchup::Events {
             from: last_seen + 1,
@@ -518,6 +608,7 @@ async fn handle_attach(
         subscriptions,
         client_id,
         session_id,
+        current_max,
     ));
     forwarders.push(handle);
     Ok(())
@@ -527,16 +618,26 @@ async fn handle_attach(
 /// subscription set. Never blocks the ledger: a lagging receiver skips the
 /// missed span (the client re-attaches to catch up) and a vanished client ends
 /// the task.
+///
+/// `catchup_through` is the last sequence the attach reply already delivered
+/// (its `through`); events at or below it are dropped here, because subscribing
+/// before catch-up can queue an event on the receiver that catch-up also
+/// included — forwarding it again would double-render it on the client.
 async fn forward_events(
     writer: SharedWriter,
     mut receiver: broadcast::Receiver<SessionEvent>,
     subscriptions: Vec<Subscription>,
     client_id: ClientId,
     session_id: SessionId,
+    catchup_through: u64,
 ) {
     loop {
         match receiver.recv().await {
             Ok(event) => {
+                // Already delivered in the catch-up reply — drop the overlap.
+                if event.sequence <= catchup_through {
+                    continue;
+                }
                 if !subscription_matches(&subscriptions, &event) {
                     continue;
                 }

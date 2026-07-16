@@ -1,0 +1,30 @@
+[package]
+name = "codypendent-codypendentd"
+description = "codypendentd assembly binary: wires the daemon server to the runtime agent loop via a RunExecutor (dependency inversion)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "codypendentd"
+path = "src/main.rs"
+
+[dependencies]
+codypendent-daemon = { workspace = true }
+codypendent-runtime = { workspace = true }
+codypendent-protocol = { workspace = true }
+codypendent-knowledge = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

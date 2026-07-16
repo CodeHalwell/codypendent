@@ -1,2 +1,5 @@
 /target
 /book
+
+# Claude Code local state (agent worktrees, local settings). Never committed.
+/.claude/

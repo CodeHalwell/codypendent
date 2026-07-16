@@ -6,9 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "codypendentd"
-path = "src/main.rs"
+# Lib-only: the `codypendentd` binary now lives in `crates/codypendentd` (the
+# assembly layer that depends on BOTH this crate and `codypendent-runtime` and
+# injects a `RunExecutor`). Keeping the daemon lib-only is what breaks the
+# would-be dependency cycle (runtime depends on daemon).
 
 [dependencies]
 codypendent-protocol = { workspace = true }

@@ -1,11 +1,15 @@
-//! Daemon lifecycle commands (Phase 0) and the headless JSONL client (STEP
-//! 1.13: `run` and `attach`).
+//! Daemon lifecycle commands (Phase 0), the headless JSONL client (STEP 1.13:
+//! `run` and `attach`), and the Phase-2 `index rebuild` maintenance command.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use codypendent_knowledge::{
+    db as knowledge_db, register_builtins, retrieve, HashingEmbedder, Registry, RetrievalConfig,
+    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ClientRole, CommandBody, Payload, SessionId, Subscription, WorkspaceId,
@@ -19,7 +23,7 @@ use crate::stream::{self, RunExit};
 /// this call spawned and waited for one. Shared by the human-facing
 /// `codypendent daemon start` and the silent variant `run --jsonl` uses (its
 /// stdout must carry nothing but JSONL envelopes).
-enum EnsureOutcome {
+pub(crate) enum EnsureOutcome {
     AlreadyRunning,
     Started { pid: u32 },
 }
@@ -27,7 +31,7 @@ enum EnsureOutcome {
 /// Spawn `codypendentd` detached if nothing answers Ping yet, then wait for
 /// the socket to come up (5 second budget). No I/O beyond the daemon's own
 /// log file — callers decide how (or whether) to report the outcome.
-async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
+pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
     if client::ping(&paths.socket_path).await {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -325,7 +329,7 @@ pub async fn attach_over_connection<W: Write>(
 }
 
 /// Common `AttachSession` reply handling shared by `run` and `attach`.
-fn expect_catchup(
+pub(crate) fn expect_catchup(
     reply: codypendent_protocol::Envelope,
 ) -> anyhow::Result<codypendent_protocol::Catchup> {
     match reply.payload {
@@ -335,4 +339,55 @@ fn expect_catchup(
         }
         other => anyhow::bail!("unexpected reply to AttachSession: {other:?}"),
     }
+}
+
+/// `codypendent index rebuild`: delete the derived indexes and rebuild them from
+/// the authoritative rows (STEP 2.1 rule 2 / the Phase-2 "stale indexes rebuild
+/// from authority" exit criterion).
+///
+/// The derived indexes are a *pure function* of the authoritative
+/// registry/memory/code rows, so they can be discarded at any time and replaying
+/// authority restores identical results. In Phase 2 the retrieval indexes
+/// (Tantivy BM25 + the vector index) are held in memory and rebuilt from the
+/// registry on demand — persisting them under `<data_dir>/index/` is a later
+/// step. This command is self-contained (it does not require the daemon): it
+/// opens the database directly, ensures the built-in tools are registered,
+/// removes `<data_dir>/index/` if present (forward-compatible with persisted
+/// indexes, a no-op today), rebuilds the retrieval indexes from the registry,
+/// and runs a canary query to prove the fresh index serves retrieval.
+pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    // Idempotent baseline: a rebuild on a never-started daemon still has the
+    // built-in tools to index.
+    register_builtins(&pool).await?;
+
+    // Derived indexes are deletable at any time.
+    let index_dir = paths.data_dir.join("index");
+    if index_dir.exists() {
+        std::fs::remove_dir_all(&index_dir)
+            .with_context(|| format!("removing derived index dir {}", index_dir.display()))?;
+    }
+
+    // Replay authority into fresh indexes.
+    let items = Registry::new().list(&pool).await?;
+    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
+
+    // Canary: the freshly rebuilt index still serves retrieval (System-scoped
+    // built-ins are visible; a Medium ceiling admits every first-party tool).
+    let query = RetrievalQuery::new("run the tests", vec![Scope::System], RiskClass::Medium);
+    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
+
+    println!(
+        "index rebuild complete: {} registry item(s) re-indexed from authority; \
+         canary \"run the tests\" -> {} tool card(s), {} skill card(s)",
+        items.len(),
+        result.tools.len(),
+        result.skills.len(),
+    );
+    Ok(())
 }

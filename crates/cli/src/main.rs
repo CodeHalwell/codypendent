@@ -14,11 +14,17 @@
 //! codypendent run --objective "..." [--mode build] [--repo PATH] --jsonl
 //! codypendent attach <SESSION_ID> [--from-sequence N] --events jsonl
 //! ```
+//!
+//! STEP 1.12 makes the bare invocation open the interactive TUI:
+//!
+//! ```text
+//! codypendent            # opens the TUI for the current repository's session
+//! ```
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codypendent_cli::commands;
+use codypendent_cli::{commands, tui};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{AgentMode, SessionId};
 
@@ -29,8 +35,10 @@ use codypendent_protocol::{AgentMode, SessionId};
     about = "Codypendent — the local-first agentic developer environment"
 )]
 struct Cli {
+    /// With no subcommand, `codypendent` opens the interactive TUI attached to
+    /// the current repository's session (STEP 1.12).
     #[command(subcommand)]
-    command: TopCommand,
+    command: Option<TopCommand>,
 }
 
 #[derive(Subcommand)]
@@ -70,6 +78,17 @@ enum TopCommand {
         #[arg(long, value_enum, default_value = "jsonl")]
         events: EventsFormat,
     },
+    /// Maintain the knowledge fabric's derived indexes (Phase 2).
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Delete the derived indexes and rebuild them from the authoritative rows.
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -120,7 +139,11 @@ enum EventsFormat {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = RuntimePaths::resolve()?;
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `codypendent`: open the TUI for the current directory's repo.
+        return tui::run(&paths, std::env::current_dir()?).await;
+    };
+    match command {
         TopCommand::Daemon { command } => match command {
             DaemonCommand::Start => commands::start(&paths).await,
             DaemonCommand::Stop => commands::stop(&paths).await,
@@ -153,5 +176,8 @@ async fn main() -> anyhow::Result<()> {
             from_sequence,
             events: EventsFormat::Jsonl,
         } => commands::attach(&paths, session_id, from_sequence).await,
+        TopCommand::Index {
+            command: IndexCommand::Rebuild,
+        } => commands::index_rebuild(&paths).await,
     }
 }

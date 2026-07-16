@@ -1,0 +1,30 @@
+{"query": "read the contents of src/main.rs", "expected_tool_ids": ["workspace.read_file"], "forbidden_ids": ["decoy.database_drop_table", "decoy.aws_s3_delete"]}
+{"query": "open the file crates/daemon/src/server.rs and show me lines 40 to 80", "expected_tool_ids": ["workspace.read_file"], "forbidden_ids": ["decoy.database_drop_table"]}
+{"query": "what does the Cargo.toml at the workspace root contain", "expected_tool_ids": ["workspace.read_file"], "forbidden_ids": []}
+{"query": "search the codebase for the function handle_request", "expected_tool_ids": ["workspace.search"], "forbidden_ids": ["decoy.aws_s3_delete"]}
+{"query": "find every place that calls append_event across the repo", "expected_tool_ids": ["workspace.search"], "forbidden_ids": []}
+{"query": "grep for the string TODO in all rust files", "expected_tool_ids": ["workspace.search"], "forbidden_ids": []}
+{"query": "which files mention SubscriptionHub", "expected_tool_ids": ["workspace.search"], "forbidden_ids": []}
+{"query": "run the full test suite", "expected_tool_ids": ["shell.run"], "forbidden_ids": ["decoy.database_drop_table", "decoy.k8s_delete_namespace"]}
+{"query": "execute cargo build and show me the output", "expected_tool_ids": ["shell.run"], "forbidden_ids": ["decoy.k8s_delete_namespace"]}
+{"query": "run cargo clippy to check for lints", "expected_tool_ids": ["shell.run"], "forbidden_ids": []}
+{"query": "show me the uncommitted changes in the working tree", "expected_tool_ids": ["git.diff"], "forbidden_ids": ["decoy.database_drop_table"]}
+{"query": "what has changed since the last commit", "expected_tool_ids": ["git.diff"], "forbidden_ids": []}
+{"query": "give me the diff of the current branch", "expected_tool_ids": ["git.diff"], "forbidden_ids": []}
+{"query": "apply this patch to the source tree", "expected_tool_ids": ["git.apply_patch"], "forbidden_ids": ["decoy.database_drop_table"]}
+{"query": "apply the following unified diff and stage it", "expected_tool_ids": ["git.apply_patch"], "forbidden_ids": []}
+{"query": "the CI test is failing, diagnose and fix it", "expected_tool_ids": ["rust.fix-ci", "workspace.read_file", "workspace.search", "shell.run"], "forbidden_ids": ["decoy.database_drop_table"]}
+{"query": "github actions is red on my rust project, help me repair the failing clippy job", "expected_tool_ids": ["rust.fix-ci", "shell.run"], "forbidden_ids": []}
+{"query": "reproduce the failing test and make a minimal fix", "expected_tool_ids": ["rust.fix-ci", "shell.run", "workspace.read_file"], "forbidden_ids": []}
+{"query": "locate the failing assertion then read the surrounding code", "expected_tool_ids": ["workspace.search", "workspace.read_file"], "forbidden_ids": []}
+{"query": "find the module that defines the policy engine and read it", "expected_tool_ids": ["workspace.search", "workspace.read_file"], "forbidden_ids": []}
+{"query": "run the tests, then show me what changed", "expected_tool_ids": ["shell.run", "git.diff"], "forbidden_ids": []}
+{"query": "make the edit by applying a patch and then run the tests to confirm", "expected_tool_ids": ["git.apply_patch", "shell.run"], "forbidden_ids": []}
+{"query": "inspect the file then search for other usages of the same symbol", "expected_tool_ids": ["workspace.read_file", "workspace.search"], "forbidden_ids": []}
+{"query": "diagnose why cargo test hangs and read the offending test file", "expected_tool_ids": ["shell.run", "workspace.read_file"], "forbidden_ids": []}
+{"query": "show me the diff and then apply a follow-up patch", "expected_tool_ids": ["git.diff", "git.apply_patch"], "forbidden_ids": []}
+{"query": "read the migration file and search for the tables it creates", "expected_tool_ids": ["workspace.read_file", "workspace.search"], "forbidden_ids": []}
+{"query": "find where RunExecutor is defined and read that file", "expected_tool_ids": ["workspace.search", "workspace.read_file"], "forbidden_ids": []}
+{"query": "run the knowledge crate tests only", "expected_tool_ids": ["shell.run"], "forbidden_ids": ["decoy.aws_s3_delete"]}
+{"query": "fix the broken rust build in CI end to end", "expected_tool_ids": ["rust.fix-ci", "shell.run", "workspace.read_file"], "forbidden_ids": ["decoy.k8s_delete_namespace"]}
+{"query": "search for the term idempotency_key and open the file with the most hits", "expected_tool_ids": ["workspace.search", "workspace.read_file"], "forbidden_ids": []}

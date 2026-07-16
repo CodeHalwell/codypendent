@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/daemon",
+    "crates/codypendentd",
     "crates/cli",
     "crates/tui",
     "crates/runtime",
+    "crates/knowledge",
     "crates/test-support",
 ]
 
@@ -21,6 +23,7 @@ codypendent-protocol = { path = "crates/protocol" }
 codypendent-daemon = { path = "crates/daemon" }
 codypendent-tui = { path = "crates/tui" }
 codypendent-runtime = { path = "crates/runtime" }
+codypendent-knowledge = { path = "crates/knowledge" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
@@ -59,6 +62,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+
+# Knowledge fabric (Phase 2): full-text (BM25), tree-sitter code graph, fs watch.
+# The vector layer stays abstracted behind a trait — Phase 2 ships a small
+# embedded cosine index; Qdrant is a Phase 4+ option behind the same trait.
+tantivy = "0.22"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+notify = "7"
 
 # CLI and paths
 clap = { version = "4", features = ["derive"] }

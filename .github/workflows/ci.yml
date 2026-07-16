@@ -7,23 +7,72 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never debugs these builds, so drop debug info and incremental state to
+  # shrink `target/` and lower link-time memory on the heavy tree (tantivy,
+  # tree-sitter, sqlx, both agent providers).
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
 
 jobs:
-  check:
+  # `lint` and `test` are SEPARATE jobs on purpose. In one combined job the
+  # runner kept a single `target/` holding both clippy's and test's artifacts
+  # for the heavy tree, and the second compile overran the disk ~45 min into the
+  # Test step. Splitting gives the test job a fresh runner with the full freed
+  # disk, and — because CI logs are not retrievable here — the two-step
+  # Build/Run split below makes the failing PHASE visible from step timing alone
+  # (a build-phase death is compile/disk; a run-phase timeout is a hung test).
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}"
+          sudo docker image prune -af || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ripgrep
-        # The workspace.search tool shells out to `rg` (Phase 1 STEP 1.7); its
-        # integration test needs ripgrep on PATH, which ubuntu-latest lacks.
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        with:
+          key: lint
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}"
+          sudo docker image prune -af || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: Install ripgrep
+        # The workspace.search tool shells out to `rg` (Phase 1 STEP 1.7); its
+        # integration test needs ripgrep on PATH, which ubuntu-latest lacks.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Build tests
+        # Compile every test binary WITHOUT running, so a compile/disk failure is
+        # isolated to this step (distinct from a test hang in the next one).
+        run: |
+          cargo test --workspace --all-features --no-run
+          df -h /
+      - name: Run tests
+        # Bounded so a test that hangs only under CI fails fast and legibly (as a
+        # timeout) instead of running to the 6 h job limit. The whole suite runs
+        # in well under a minute locally.
+        timeout-minutes: 15
+        run: cargo test --workspace --all-features

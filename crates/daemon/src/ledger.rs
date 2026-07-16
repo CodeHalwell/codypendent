@@ -6,7 +6,7 @@
 //! authority they build on.
 
 use chrono::{DateTime, Utc};
-use codypendent_protocol::{SessionEvent, SessionId};
+use codypendent_protocol::{Actor, EventBody, SessionEvent, SessionId};
 use sqlx::SqlitePool;
 
 /// Insert a session row in state `open`.
@@ -113,6 +113,47 @@ pub async fn load_last_event(
             }))
         }
     }
+}
+
+/// Atomically claim the next sequence for `session_id` and append an event,
+/// returning the persisted [`SessionEvent`].
+///
+/// The sequence is computed *inside* the INSERT (`COALESCE(MAX(sequence),0)+1`
+/// via `INSERT … SELECT … RETURNING`), so the read and the write happen under a
+/// single write lock — concurrent appenders on the same session (a live run and
+/// a client command such as steering, cancel, or approval resolution) can never
+/// claim the same number and trip the `(session_id, sequence)` uniqueness
+/// constraint. Prefer this over a separate [`next_sequence`] + [`append_event`],
+/// which race. Actor/body are `System`-friendly: no causation/correlation ids.
+pub async fn append_next_event(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    actor: &Actor,
+    body: &EventBody,
+    occurred_at: DateTime<Utc>,
+) -> anyhow::Result<SessionEvent> {
+    let (sequence,): (i64,) = sqlx::query_as(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
+         FROM events WHERE session_id = ? \
+         RETURNING sequence",
+    )
+    .bind(session_id.to_string())
+    .bind(occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(actor)?)
+    .bind(serde_json::to_string(body)?)
+    .bind(session_id.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(SessionEvent {
+        sequence: u64::try_from(sequence)?,
+        occurred_at,
+        causation_id: None,
+        correlation_id: None,
+        actor: actor.clone(),
+        body: body.clone(),
+    })
 }
 
 /// The next sequence number for a session (1-based).

@@ -501,11 +501,291 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             );
         }
         Overlay::ConfirmCancel => render_confirm(frame, area, theme),
+        Overlay::Skills => render_skills(frame, area, state, theme),
+        Overlay::Memory { source_open } => {
+            render_memory(frame, area, state, theme, *source_open);
+        }
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
             }
         }
+    }
+}
+
+/// The Skill Studio browser (STEP 2.6): a scrollable list of registered items on
+/// the left, and a detail panel on the right that renders the selected skill's
+/// metadata, description, risk, and — the exit-criterion payload — its requested
+/// **permissions verbatim**. Colors are Theme tokens only (RULE 7).
+fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Skill Studio ({}) ", state.skills.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(inner);
+
+    // Left: the item list (name + scope · trust · status).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.skills.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no skills registered",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, skill) in state.skills.iter().enumerate() {
+        let selected = idx == state.selected_skill;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&skill.name, 26),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!("    {} · {} · {}", skill.scope, skill.trust, skill.status),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail panel for the focused skill.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(skill) = state.focused_skill() {
+        lines.push(Line::styled(
+            format!("{} — {}", skill.name, skill.kind),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(field("scope", &skill.scope, theme.text.primary));
+        lines.push(field("trust", &skill.trust, theme.text.secondary));
+        lines.push(field("status", &skill.status, theme.text.secondary));
+        lines.push(field(
+            "risk",
+            &skill.risk,
+            skill_risk_color(&skill.risk, theme),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(section("Description", theme));
+        lines.push(Line::styled(
+            format!("  {}", skill.description),
+            Style::default().fg(theme.text.primary),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(section("Permissions", theme));
+        if skill.permissions.is_empty() {
+            lines.push(Line::styled(
+                "  (no permissions requested)",
+                Style::default().fg(theme.text.muted),
+            ));
+        } else {
+            // Verbatim: each requested capability exactly as the package declared
+            // it — never paraphrased ("skill permissions are visible").
+            for permission in &skill.permissions {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", Style::default().fg(theme.status.warning)),
+                    Span::styled(permission.clone(), Style::default().fg(theme.text.primary)),
+                ]));
+            }
+        }
+    } else {
+        lines.push(Line::styled(
+            "  no skill selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · M memory · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// The memory browser (STEP 2.6): the visible-scope memories on the left, and a
+/// Chapter 06 provenance card for the focused memory on the right (fact, source,
+/// revision, observed, scope, confidence), with an "open source" affordance.
+/// When `source_open`, the full source string is surfaced in place — the TUI
+/// does no I/O, so opening reveals rather than launches a file.
+fn render_memory(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    source_open: bool,
+) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Memory ({}) ", state.memories.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(inner);
+
+    // Left: the memory list (statement + class · scope).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.memories.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no memories in scope",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, memory) in state.memories.iter().enumerate() {
+        let selected = idx == state.selected_memory;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&memory.statement, 26),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!("    {} · {}", memory.class, memory.scope),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the provenance card for the focused memory.
+    let card_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(memory) = state.focused_memory() {
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(section("Provenance card", theme));
+        lines.push(field("Fact", &memory.statement, theme.text.primary));
+        lines.push(field("Source", &memory.source, theme.text.secondary));
+        lines.push(field("Revision", &memory.revision, theme.text.secondary));
+        lines.push(field("Observed", &memory.observed, theme.text.secondary));
+        lines.push(field("Scope", &memory.scope, theme.text.secondary));
+        lines.push(field(
+            "Confidence",
+            &format!("{:.2}", memory.confidence),
+            theme.status.info,
+        ));
+        lines.push(Line::raw(""));
+        if source_open {
+            // Opened: surface the full source string, marked as revealed.
+            lines.push(Line::styled(
+                "  ▼ source opened",
+                Style::default()
+                    .fg(theme.status.success)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                format!("    {}", memory.source),
+                Style::default().fg(theme.text.primary),
+            ));
+        } else {
+            lines.push(Line::styled(
+                "  [o] open source",
+                Style::default().fg(theme.status.info),
+            ));
+        }
+    } else {
+        lines.push(Line::styled(
+            "  no memory selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · S skills · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(card_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// Color for a skill's coarse risk label (`safe` / `low` / `medium` / `high`).
+fn skill_risk_color(risk: &str, theme: &Theme) -> Color {
+    match risk {
+        "safe" | "low" => theme.status.success,
+        "medium" => theme.status.warning,
+        "high" => theme.status.error,
+        _ => theme.text.muted,
     }
 }
 
@@ -908,6 +1188,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::reduce::reduce;
+    use crate::state::{MemoryCard, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
         Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
@@ -1138,5 +1419,98 @@ mod tests {
         let state = AppState::new();
         let text = render_to_string(&state, 80, 24);
         assert!(text.contains("no runs yet"));
+    }
+
+    #[test]
+    fn skill_studio_snapshot_shows_permissions_verbatim() {
+        let mut state = running_build_state();
+        state.skills = vec![SkillCard {
+            name: "rust.fix-ci".to_owned(),
+            kind: "skill".to_owned(),
+            scope: "repository".to_owned(),
+            trust: "first-party".to_owned(),
+            status: "active".to_owned(),
+            risk: "medium".to_owned(),
+            description: "diagnose and fix a failing CI run".to_owned(),
+            permissions: vec![
+                "filesystem_read: $REPOSITORY".to_owned(),
+                "command: cargo".to_owned(),
+            ],
+        }];
+        reduce(&mut state, Action::OpenSkills);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Skill Studio"), "title missing:\n{text}");
+        assert!(text.contains("rust.fix-ci"), "skill name missing:\n{text}");
+        assert!(text.contains("Permissions"), "section missing:\n{text}");
+        // The exit criterion: requested capabilities render verbatim.
+        assert!(
+            text.contains("filesystem_read: $REPOSITORY"),
+            "verbatim fs permission missing:\n{text}"
+        );
+        assert!(
+            text.contains("command: cargo"),
+            "verbatim command permission missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn memory_browser_snapshot_shows_the_provenance_card() {
+        let mut state = running_build_state();
+        state.memories = vec![MemoryCard {
+            statement: "This repository requires Rust nightly".to_owned(),
+            class: "semantic".to_owned(),
+            scope: "repository".to_owned(),
+            revision: "79acbf1".to_owned(),
+            observed: "2026-07-14".to_owned(),
+            confidence: 1.0,
+            source: "artifact 3f2a (rust-toolchain.toml)".to_owned(),
+        }];
+        reduce(&mut state, Action::OpenMemory);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(
+            text.contains("Provenance card"),
+            "card title missing:\n{text}"
+        );
+        assert!(
+            text.contains("This repository requires Rust nightly"),
+            "fact missing:\n{text}"
+        );
+        // Every retrieved memory opens its source: the source is on the card.
+        assert!(
+            text.contains("rust-toolchain.toml"),
+            "source missing:\n{text}"
+        );
+        assert!(text.contains("79acbf1"), "revision missing:\n{text}");
+        assert!(text.contains("Confidence"), "confidence missing:\n{text}");
+        // Before opening, the affordance is offered.
+        assert!(text.contains("open source"), "affordance missing:\n{text}");
+    }
+
+    #[test]
+    fn memory_browser_open_source_reveals_the_full_ref() {
+        let mut state = running_build_state();
+        state.memories = vec![MemoryCard {
+            statement: "tests use cargo nextest".to_owned(),
+            class: "procedural".to_owned(),
+            scope: "repository".to_owned(),
+            revision: "abc1234".to_owned(),
+            observed: "2026-07-15".to_owned(),
+            confidence: 0.9,
+            source: "events 3..7 of session 51ee".to_owned(),
+        }];
+        reduce(&mut state, Action::OpenMemory);
+        reduce(&mut state, Action::OpenSource);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(
+            text.contains("source opened"),
+            "opened marker missing:\n{text}"
+        );
+        assert!(
+            text.contains("events 3..7 of session 51ee"),
+            "revealed source missing:\n{text}"
+        );
     }
 }

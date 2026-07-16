@@ -25,8 +25,11 @@ Use `Codypendent` as the product name and avoid shortening executables to `cody`
 - `Codypendent Skills` - skill packages
 - `Codypendent Fabric` - knowledge system
 
+**📍 [ROADMAP.md](ROADMAP.md) — build progress & phase tracker (start here to see what's done).**
+
 See scaffold and delivery plan:
 
+- [`ROADMAP.md`](ROADMAP.md) — at-a-glance status of every phase, with checkboxes
 - [`docs/PROJECT_SCAFFOLD.md`](docs/PROJECT_SCAFFOLD.md)
 - [`docs/TIMELINE.md`](docs/TIMELINE.md)
 
