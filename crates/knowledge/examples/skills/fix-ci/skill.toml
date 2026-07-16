@@ -1,0 +1,44 @@
+schema_version = 1
+id = "rust.fix-ci"
+name = "Fix Rust CI"
+version = "0.1.0"
+scope = "repository"
+status = "draft"
+
+description = "Diagnose and repair Rust GitHub Actions failures."
+intents = ["ci failure", "rust tests", "github actions", "clippy"]
+languages = ["rust"]
+
+required_tools = [
+  "workspace.read_file",
+  "workspace.search",
+  "github.read_checks",
+  "shell.run"
+]
+
+optional_tools = [
+  "workspace.apply_patch",
+  "github.comment"
+]
+
+[permissions]
+filesystem_read = ["$REPOSITORY"]
+filesystem_write = ["$WORKTREE"]
+commands = ["cargo", "git"]
+network = ["api.github.com:443"]
+secrets = []
+
+[limits]
+maximum_iterations = 20
+maximum_duration_seconds = 1800
+maximum_cost_usd = 3.00
+
+[entrypoints]
+instructions = "SKILL.md"
+tests = "tests/"
+references = "references/"
+scripts = "scripts/"
+
+[trust]
+publisher = "local-user"
+signature_required = false

@@ -81,3 +81,29 @@ fn scope_flattens_to_a_filterable_tier_and_key() {
             > Scope::User(codypendent_protocol::UserId("u".into())).specificity()
     );
 }
+
+#[test]
+fn scope_round_trips_through_serde() {
+    // Adjacent tagging must round-trip both the keyless and id-bearing variants
+    // (internal tagging cannot serialize the latter) — memory records embed a
+    // Scope and are serialized as JSON.
+    for scope in [
+        Scope::System,
+        Scope::Repository(RepositoryId::new()),
+        Scope::User(codypendent_protocol::UserId("alice".into())),
+    ] {
+        let json = serde_json::to_string(&scope).expect("scope serializes");
+        let back: Scope = serde_json::from_str(&json).expect("scope deserializes");
+        assert_eq!(scope, back, "round-trip mismatch for {json}");
+    }
+    // The wire shape is exactly the flattened tier/key projection.
+    assert_eq!(
+        serde_json::to_value(Scope::System).unwrap(),
+        serde_json::json!({ "tier": "system" })
+    );
+    let repo = RepositoryId::new();
+    assert_eq!(
+        serde_json::to_value(Scope::Repository(repo)).unwrap(),
+        serde_json::json!({ "tier": "repository", "key": repo.to_string() })
+    );
+}

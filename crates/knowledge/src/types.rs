@@ -24,8 +24,13 @@ pub type JsonSchema = serde_json::Value;
 /// inference is forbidden: a `Repository` scope never matches another repo, and
 /// retrieval enforces this with a SQL filter on the flattened
 /// [`tier`](Scope::tier)/[`key`](Scope::key), never by heuristic.
+// Adjacently tagged (`tier` + `key`) so the id-bearing variants round-trip:
+// internal tagging (`tag` only) cannot serialize a newtype variant wrapping a
+// UUID (which serializes as a bare string), whereas adjacent tagging emits
+// `{"tier":"repository","key":"<uuid>"}` and `{"tier":"system"}` — exactly the
+// flattened shape stored in `scope_tier`/`scope_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "tier", rename_all = "snake_case")]
+#[serde(tag = "tier", content = "key", rename_all = "snake_case")]
 pub enum Scope {
     System,
     Organization(OrganizationId),

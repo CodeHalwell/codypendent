@@ -12,8 +12,11 @@
 //! (Tantivy, vectors) under `<data_dir>/index/`, which are deletable and
 //! rebuildable at any time (`codypendent index rebuild`).
 
+pub mod builtin;
 pub mod db;
+pub mod manifest;
 pub mod outbox;
+pub mod registry;
 pub mod types;
 
 pub use types::{
@@ -24,3 +27,10 @@ pub use types::{
 };
 
 pub use outbox::KnowledgeIndexEvent;
+
+pub use builtin::{builtin_tools, register_builtins};
+pub use manifest::{
+    load_package, ManifestError, SkillEntrypoints, SkillLimits, SkillManifest, SkillPermissions,
+    SkillTrust,
+};
+pub use registry::{resolve_shadowed, Registry, RegistryError};
