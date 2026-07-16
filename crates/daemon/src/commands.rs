@@ -404,6 +404,10 @@ impl CommandProcessor {
             events,
             ProjectionOp::None,
             (Some(session_id), None),
+            // The session is being created now, at revision 0. There is no prior
+            // session to guard, so `expected_revision` is ignored here (the
+            // sensible rule for `CreateSession`).
+            RevisionOp::Establish,
         )
         .await
     }
@@ -443,6 +447,9 @@ impl CommandProcessor {
                 mode,
             },
             (None, Some(run_id)),
+            RevisionOp::Bump {
+                expected: command.expected_revision,
+            },
         )
         .await
     }
@@ -473,6 +480,9 @@ impl CommandProcessor {
             events,
             ProjectionOp::None,
             (None, None),
+            RevisionOp::Bump {
+                expected: command.expected_revision,
+            },
         )
         .await
     }
@@ -504,6 +514,9 @@ impl CommandProcessor {
             events,
             ProjectionOp::None,
             (None, None),
+            RevisionOp::Bump {
+                expected: command.expected_revision,
+            },
         )
         .await
     }
@@ -536,6 +549,9 @@ impl CommandProcessor {
             events,
             ProjectionOp::SetRunState { run_id, state },
             (None, None),
+            RevisionOp::Bump {
+                expected: command.expected_revision,
+            },
         )
         .await
     }
@@ -565,11 +581,36 @@ impl CommandProcessor {
                 )
             })?;
 
-        insert_command_received(pool, ctx, command, Some(session_id))
-            .await
-            .map_err(internal_error)?;
+        // Record the `received` row and honor the optimistic-concurrency guard
+        // atomically (fix: `expected_revision`). A stale guard is rejected here,
+        // before the broker runs, so nothing is applied. A concurrent duplicate
+        // that lost the insert race replays the recorded outcome (fix:
+        // idempotency-key insert race), never `internal.command-apply-failed`.
+        if let Err(err) = insert_command_received(
+            pool,
+            ctx,
+            command,
+            Some(session_id),
+            command.expected_revision,
+        )
+        .await
+        {
+            if let Some(conflict) = err.downcast_ref::<RevisionConflict>() {
+                return Err(revision_conflict(conflict.expected, conflict.actual));
+            }
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
 
-        self.approvals
+        match self
+            .approvals
             .resolve(
                 pool,
                 approval_id,
@@ -578,7 +619,40 @@ impl CommandProcessor {
                 ctx.client_id.to_string(),
             )
             .await
-            .map_err(map_approval_error)?;
+        {
+            Ok(()) => {
+                // The broker appended `ApprovalResolved`; advance the session
+                // revision to reflect this applied session-state change so a
+                // later `expected_revision` sees it.
+                bump_session_revision(pool, session_id)
+                    .await
+                    .map_err(internal_error)?;
+            }
+            // FINALIZATION CHOICE (fix: reject-resolution consistency): treat
+            // "approval already resolved" as a *successful no-op* — the decision
+            // is already recorded on the ledger — and finalize the command
+            // `applied` (never leave it stranded `received`). This matches the
+            // `resume_received` replay path, which already folds
+            // `AlreadyResolved` into success, so the FIRST delivery and any
+            // same-key REPLAY return the SAME `applied` outcome (not "error then
+            // success"). No revision bump: this delivery appended no new event.
+            Err(ApprovalError::AlreadyResolved { .. }) => {
+                let last_sequence = max_sequence(pool, session_id)
+                    .await
+                    .map_err(internal_error)?;
+                let outcome = CommandOutcome {
+                    command_id: command.command_id,
+                    created_session: None,
+                    created_run: None,
+                    last_sequence,
+                };
+                finalize_applied(pool, command.command_id, &outcome)
+                    .await
+                    .map_err(internal_error)?;
+                return Ok(outcome);
+            }
+            Err(e) => return Err(map_approval_error(e)),
+        }
 
         // Re-publish the broker's persisted ApprovalResolved and capture the last
         // sequence for the outcome. The broker appends the `ApprovalResolved` as
@@ -625,8 +699,9 @@ impl CommandProcessor {
         events: Vec<(Actor, EventBody)>,
         projection: ProjectionOp,
         created: (Option<SessionId>, Option<RunId>),
+        revision: RevisionOp,
     ) -> Result<CommandOutcome, CodypendentError> {
-        let (outcome, persisted) = self
+        let committed = self
             .commit(
                 pool,
                 ctx,
@@ -637,9 +712,37 @@ impl CommandProcessor {
                 events,
                 projection,
                 created,
+                revision,
             )
-            .await
-            .map_err(internal_error)?;
+            .await;
+
+        let (outcome, persisted) = match committed {
+            Ok(value) => value,
+            Err(err) => {
+                // A failed `expected_revision` guard is a structured protocol
+                // conflict, not an infrastructure failure — the tx rolled back,
+                // so nothing was applied.
+                if let Some(conflict) = err.downcast_ref::<RevisionConflict>() {
+                    return Err(revision_conflict(conflict.expected, conflict.actual));
+                }
+                // A concurrent duplicate delivery won the race to insert the
+                // `commands` row (its `UNIQUE(idempotency_key)`/PK tripped). That
+                // is not `internal.command-apply-failed`: the winner already
+                // recorded the outcome, so replay it via the existing-command
+                // path (RULE: duplicate delivery = one effect, one result). We
+                // re-run the idempotency lookup and only replay when a row with
+                // this key exists, so an unrelated unique violation still errors.
+                if is_unique_violation(&err) {
+                    if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                        .await
+                        .map_err(internal_error)?
+                    {
+                        return self.handle_existing(pool, existing).await;
+                    }
+                }
+                return Err(internal_error(err));
+            }
+        };
 
         // Step 6: publish only after the commit (persist before publish).
         for event in persisted {
@@ -660,10 +763,39 @@ impl CommandProcessor {
         events: Vec<(Actor, EventBody)>,
         projection: ProjectionOp,
         created: (Option<SessionId>, Option<RunId>),
+        revision: RevisionOp,
     ) -> anyhow::Result<(CommandOutcome, Vec<SessionEvent>)> {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let mut tx = pool.begin().await?;
+
+        // Optimistic-concurrency guard + revision advance, atomic (inside this
+        // tx) with the append it protects. `Establish` (CreateSession) inserts a
+        // fresh session at revision 0 below and ignores `expected_revision`;
+        // `Bump` checks the guard against the *live* revision — read under the
+        // write lock so no concurrent command can slip between check and bump —
+        // and advances it. On a mismatch we abort the whole tx (nothing applied).
+        if let RevisionOp::Bump { expected } = revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(event_session.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+            let current = u64::try_from(current)?;
+            if let Some(expected) = expected {
+                if expected != current {
+                    return Err(RevisionConflict {
+                        expected,
+                        actual: current,
+                    }
+                    .into());
+                }
+            }
+            sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+                .bind(&now_str)
+                .bind(event_session.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
 
         // commands row (received).
         sqlx::query(
@@ -895,6 +1027,62 @@ fn run_not_found(run_id: RunId) -> CodypendentError {
     CodypendentError::new("protocol.run-not-found", format!("no run {run_id}"), false)
 }
 
+/// The structured `protocol.revision-conflict` returned when a command's
+/// `expected_revision` guard does not match the session's live revision. Not
+/// retryable (an identical retry would carry the same stale revision).
+fn revision_conflict(expected: u64, actual: u64) -> CodypendentError {
+    CodypendentError::new(
+        "protocol.revision-conflict",
+        format!("expected session revision {expected} but it is at {actual}"),
+        false,
+    )
+}
+
+/// Whether `err` wraps a SQLite UNIQUE / PRIMARY KEY constraint violation — the
+/// signal that a concurrent delivery of the same command won the race to insert
+/// the `commands` row. Detected via the typed `sqlx` database error (not string
+/// matching), so unrelated infrastructure failures are never mistaken for a
+/// duplicate.
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::Database(db)) if db.is_unique_violation()
+    )
+}
+
+/// A failed `expected_revision` guard, carried out of the write transaction as a
+/// downcastable error so the caller can surface it as `protocol.revision-conflict`
+/// (distinct from an infrastructure failure).
+#[derive(Debug)]
+struct RevisionConflict {
+    expected: u64,
+    actual: u64,
+}
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected session revision {} but it is at {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
+/// Advance a session's `revision` by one (and touch `updated_at`) on the pool.
+/// Used by the `ResolveApproval` path, whose session append lives in the broker's
+/// own transaction and so cannot bump the revision inside [`CommandProcessor::commit`].
+async fn bump_session_revision(pool: &SqlitePool, session_id: SessionId) -> anyhow::Result<()> {
+    sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Restated rejection for the `AttachSession`/`Unknown` arms of `apply` (already
 /// rejected in `validate`; this keeps the dispatch match total).
 fn rejected_for_body(body: &CommandBody) -> CodypendentError {
@@ -969,15 +1157,36 @@ async fn lookup_command(
     }
 }
 
-/// Insert a command row in `status = 'received'` on the pool (its own commit).
-/// Used by the two-commit `ResolveApproval` path, whose external effect (the
-/// broker's transaction) cannot share this one.
+/// Insert a command row in `status = 'received'` on the pool (its own commit),
+/// honoring the `expected_revision` guard atomically with the insert. Used by the
+/// two-commit `ResolveApproval` path, whose external effect (the broker's
+/// transaction) cannot share this one. Returns a downcastable [`RevisionConflict`]
+/// when the guard fails (nothing is inserted), and surfaces a
+/// `UNIQUE`/PK violation verbatim so the caller can replay a duplicate delivery.
 async fn insert_command_received(
     pool: &SqlitePool,
     ctx: &ApplyContext,
     command: &Command,
     session: Option<SessionId>,
+    expected_revision: Option<u64>,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    // Guard against a stale `expected_revision` before recording the command
+    // (only meaningful when the command targets an existing session).
+    if let (Some(session_id), Some(expected)) = (session, expected_revision) {
+        let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let current = u64::try_from(current)?;
+        if expected != current {
+            return Err(RevisionConflict {
+                expected,
+                actual: current,
+            }
+            .into());
+        }
+    }
     sqlx::query(
         "INSERT INTO commands \
          (id, idempotency_key, session_id, client_id, body, status, received_at) \
@@ -989,8 +1198,9 @@ async fn insert_command_received(
     .bind(ctx.client_id.to_string())
     .bind(serde_json::to_string(&command.body)?)
     .bind(Utc::now().to_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1097,6 +1307,17 @@ enum PreInsert<'a> {
         session_id: SessionId,
         title: &'a str,
     },
+}
+
+/// How a command's write transaction handles `sessions.revision` (STEP 1.3
+/// optimistic concurrency).
+enum RevisionOp {
+    /// The command creates the session now (`CreateSession`): it is inserted at
+    /// revision 0 and `expected_revision` is ignored (no prior session to guard).
+    Establish,
+    /// The command mutates an existing session's state: check `expected` (when
+    /// `Some`) against the live revision inside the tx, then advance it by one.
+    Bump { expected: Option<u64> },
 }
 
 /// The projection mutation a command performs inside its transaction.

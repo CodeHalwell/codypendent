@@ -116,6 +116,34 @@ macro_rules! build_runtime {
     }};
 }
 
+/// Seed a run row *and* its `RunStarted` event — exactly as the `StartRun`
+/// command (STEP 1.3, `commands::apply_start_run`) does before the agent loop
+/// runs. `execute_run` then executes an *already-started* run and must add zero
+/// further `RunStarted`s. (A macro, not a fn: the pool's type is unnameable
+/// here, like `store_sink!`.)
+macro_rules! seed_started_run {
+    ($pool:expr, $session:expr, $run:expr, $objective:expr, $mode:expr) => {{
+        projections::insert_run(&$pool, $run, $session, $objective, $mode, "hosted", "{}")
+            .await
+            .unwrap();
+        let started = SessionEvent {
+            sequence: ledger::next_sequence(&$pool, $session).await.unwrap(),
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunStarted {
+                run_id: $run,
+                objective: $objective.to_string(),
+                mode: $mode,
+            },
+        };
+        ledger::append_event(&$pool, $session, &started)
+            .await
+            .unwrap();
+    }};
+}
+
 // --- git worktree helpers (mirrors tools_it.rs) ----------------------------
 
 async fn git(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -189,21 +217,14 @@ async fn end_to_end_run_emits_full_event_sequence() {
     ledger::create_session(&pool, session, "agent-it")
         .await
         .unwrap();
-    projections::insert_run(
-        &pool,
-        run,
-        session,
-        "diagnose",
-        AgentMode::Build,
-        "hosted",
-        "{}",
-    )
-    .await
-    .unwrap();
+    // Seed the run + its `RunStarted` the way the StartRun command does, before
+    // the loop runs. The loop must not emit a second `RunStarted`.
+    seed_started_run!(pool, session, run, "diagnose", AgentMode::Build);
 
     let runtime = build_runtime!(pool, store, broker, hub);
 
-    // Subscribe BEFORE the run starts so no event is missed.
+    // Subscribe AFTER the run was started (so the seeded `RunStarted` is not in
+    // the published stream) but before the loop runs, so no loop event is missed.
     let mut rx = hub.subscribe(session);
 
     let driver = ScriptedDriver::new(vec![
@@ -273,9 +294,23 @@ async fn end_to_end_run_emits_full_event_sequence() {
         labels.push(label(&e.body));
     }
 
-    // Key events, in the required relative order.
-    assert_eq!(labels.first(), Some(&"RunStarted"));
-    let run_started = index_of(&labels, "RunStarted").unwrap();
+    // Key events, in the required relative order. The loop no longer emits
+    // `RunStarted` (the StartRun command did, and it was seeded before we
+    // subscribed), so the published stream opens on the first state transition.
+    assert!(
+        matches!(
+            events.first().map(|e| &e.body),
+            Some(EventBody::RunStateChanged {
+                state: RunState::Preparing,
+                ..
+            })
+        ),
+        "the loop's first published event is the Preparing transition, not a second RunStarted"
+    );
+    assert!(
+        !labels.contains(&"RunStarted"),
+        "execute_run must not emit a RunStarted"
+    );
     let running = events
         .iter()
         .position(|e| {
@@ -294,7 +329,6 @@ async fn end_to_end_run_emits_full_event_sequence() {
     let patch = index_of(&labels, "PatchProposed").expect("review node proposed a change-set");
     let completed = index_of(&labels, "RunCompleted").unwrap();
     assert!(index_of(&labels, "ModelStreamDelta").is_some());
-    assert!(run_started < running);
     assert!(running < tool_proposed);
     assert!(tool_proposed < tool_started);
     assert!(tool_started < tool_completed);
@@ -326,6 +360,40 @@ async fn end_to_end_run_emits_full_event_sequence() {
     assert!(ledger_events
         .iter()
         .any(|e| matches!(e.body, EventBody::RunCompleted { .. })));
+
+    // Exactly ONE RunStarted exists in the ledger — the one the StartRun command
+    // seeded — and it precedes the loop's first Running transition. `execute_run`
+    // added zero.
+    let run_started_count = ledger_events
+        .iter()
+        .filter(|e| matches!(e.body, EventBody::RunStarted { .. }))
+        .count();
+    assert_eq!(
+        run_started_count, 1,
+        "execute_run must not append a second RunStarted"
+    );
+    let run_started_seq = ledger_events
+        .iter()
+        .find(|e| matches!(e.body, EventBody::RunStarted { .. }))
+        .unwrap()
+        .sequence;
+    let running_seq = ledger_events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.body,
+                EventBody::RunStateChanged {
+                    state: RunState::Running,
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        .sequence;
+    assert!(
+        run_started_seq < running_seq,
+        "the seeded RunStarted precedes the loop's Running transition"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -348,17 +416,8 @@ async fn client_disconnect_does_not_stop_run() {
     ledger::create_session(&pool, session, "no-client")
         .await
         .unwrap();
-    projections::insert_run(
-        &pool,
-        run,
-        session,
-        "read",
-        AgentMode::Explore,
-        "hosted",
-        "{}",
-    )
-    .await
-    .unwrap();
+    // Seed the run + its `RunStarted` as the StartRun command does.
+    seed_started_run!(pool, session, run, "read", AgentMode::Explore);
 
     let runtime = build_runtime!(pool, store, broker, hub);
 
@@ -405,6 +464,73 @@ async fn client_disconnect_does_not_stop_run() {
     assert!(events
         .iter()
         .any(|e| matches!(e.body, EventBody::RunCompleted { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// The loop executes an already-started run: it must NOT emit a second
+// RunStarted (the StartRun command already appended one).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn execute_run_does_not_emit_a_second_run_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(repo.join("code.rs"), "fn main() {}\n").unwrap();
+
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "single-start")
+        .await
+        .unwrap();
+    // The StartRun command seeds exactly one RunStarted before the loop runs.
+    seed_started_run!(pool, session, run, "read", AgentMode::Explore);
+
+    let runtime = build_runtime!(pool, store, broker, hub);
+
+    // A trivial run that finishes immediately (read-only, no tools).
+    let driver = ScriptedDriver::new(vec![ModelStep::Finish {
+        summary: "done".to_string(),
+    }]);
+    let ctx = RunContext::new(
+        session,
+        run,
+        "read",
+        AgentMode::Explore,
+        repo.clone(),
+        repo.clone(),
+    );
+
+    runtime
+        .execute_run(&driver, ctx, CancellationToken::never())
+        .await
+        .unwrap();
+
+    // The ledger holds exactly one RunStarted (the seeded one); the loop added
+    // zero. It still drove the first RunStateChanged (→ Preparing/Running).
+    let events = ledger::load_events(&pool, session).await.unwrap();
+    let run_started = events
+        .iter()
+        .filter(|e| matches!(e.body, EventBody::RunStarted { .. }))
+        .count();
+    assert_eq!(
+        run_started, 1,
+        "execute_run must not append a second RunStarted"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::RunStateChanged {
+                state: RunState::Running,
+                ..
+            }
+        )),
+        "execute_run still drives the first RunStateChanged"
+    );
 }
 
 // ---------------------------------------------------------------------------

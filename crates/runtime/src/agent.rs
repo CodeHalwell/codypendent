@@ -479,17 +479,13 @@ impl FrameworkAgentRuntime {
             model: model_id.clone(),
         };
 
-        // Preparing → Running (persist-then-publish, transitions before exposure).
-        self.emit(
-            run.session_id,
-            run_actor.clone(),
-            EventBody::RunStarted {
-                run_id: run.run_id,
-                objective: run.objective.clone(),
-                mode: run.mode,
-            },
-        )
-        .await?;
+        // The run row and its `RunStarted` event were already created by the
+        // `StartRun` command (STEP 1.3, `commands::apply_start_run`); this loop
+        // executes an *already-started* run, so it must NOT emit a second
+        // `RunStarted` (a duplicate would fold the run into `active_runs` twice
+        // and show clients two starts). It resumes from the first state
+        // transition: Preparing → Running (persist-then-publish, transitions
+        // before exposure).
         self.transition(run.session_id, run.run_id, RunState::Preparing)
             .await?;
         self.transition(run.session_id, run.run_id, RunState::Running)

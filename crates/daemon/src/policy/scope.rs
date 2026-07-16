@@ -101,22 +101,30 @@ impl PathScope {
 /// The programs a run may execute and the wall-clock ceiling for each.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandScope {
-    /// Executables permitted by name (bare name or a matching leaf of a full
-    /// path).
+    /// Executables permitted to run. A bare command name (no path separator,
+    /// e.g. `cargo`) is resolved from the daemon's trusted `PATH` by the shell
+    /// tool; a path-bearing entry (e.g. `/usr/bin/cargo`) pins that exact
+    /// binary. Matching is by exact string equality — never by basename.
     pub allowed_programs: Vec<String>,
     /// Maximum wall-clock seconds a single command may run.
     pub maximum_seconds: u64,
 }
 
 impl CommandScope {
-    /// Whether `program` is allow-listed. Matches an exact entry, or an entry
-    /// equal to the final path component of `program` (so both `cargo` and
-    /// `/usr/bin/cargo` match an allow-list entry of `cargo`).
+    /// Whether `program` is allow-listed.
+    ///
+    /// Matching is by **exact string equality**, deliberately NOT by basename.
+    /// A bare command name (no path separator, e.g. `cargo`) matches a bare
+    /// allow-list entry and is then resolved from the daemon's trusted `PATH` by
+    /// the shell tool; a path-bearing program (e.g. `./cargo`, `/tmp/cargo`,
+    /// `/usr/bin/cargo`) is allowed only if that exact string is configured.
+    ///
+    /// Matching a path by its final component would let `./cargo`, `/tmp/cargo`,
+    /// or a model-planted `cargo` in the worktree impersonate an allow-listed
+    /// `cargo` and execute arbitrary code — the shell tool checks this on the
+    /// model-supplied program string before it spawns anything.
     pub fn allows_program(&self, program: &str) -> bool {
-        let leaf = Path::new(program).file_name();
-        self.allowed_programs
-            .iter()
-            .any(|p| p == program || leaf.is_some_and(|name| name == std::ffi::OsStr::new(p)))
+        self.allowed_programs.iter().any(|entry| entry == program)
     }
 }
 
@@ -216,13 +224,33 @@ mod tests {
     }
 
     #[test]
-    fn command_scope_matches_bare_and_full_path() {
+    fn command_scope_requires_exact_program_match() {
         let scope = CommandScope {
             allowed_programs: vec!["cargo".to_string()],
             maximum_seconds: 900,
         };
+        // A bare allow-listed name is permitted (resolved from a trusted PATH).
         assert!(scope.allows_program("cargo"));
-        assert!(scope.allows_program("/usr/bin/cargo"));
+        // Path-bearing impersonators are rejected — matching an allow-listed
+        // basename would let these run arbitrary code as `cargo`.
+        assert!(!scope.allows_program("./cargo"));
+        assert!(!scope.allows_program("../cargo"));
+        assert!(!scope.allows_program("/tmp/cargo"));
+        assert!(!scope.allows_program("/usr/bin/cargo"));
+        // A non-listed program is rejected.
         assert!(!scope.allows_program("rm"));
+    }
+
+    #[test]
+    fn command_scope_allows_an_exact_configured_path() {
+        // An admin may pin a specific binary by its full path.
+        let scope = CommandScope {
+            allowed_programs: vec!["/usr/bin/cargo".to_string()],
+            maximum_seconds: 900,
+        };
+        assert!(scope.allows_program("/usr/bin/cargo"));
+        // ...but only that exact path — not the bare name or another location.
+        assert!(!scope.allows_program("cargo"));
+        assert!(!scope.allows_program("/tmp/cargo"));
     }
 }
