@@ -1,0 +1,36 @@
+[package]
+name = "codypendent-runtime"
+description = "codypendent-runtime: agent runs, tools, approvals bridge, model integration, context, and compaction. The only crate that depends on agent-framework-rs (behind provider features, ADR-009)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+codypendent-daemon = { workspace = true }
+agent-framework-core = { workspace = true }
+agent-framework-openai = { workspace = true, optional = true }
+agent-framework-anthropic = { workspace = true, optional = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = ["provider-openai"]
+provider-openai = ["dep:agent-framework-openai"]
+provider-anthropic = ["dep:agent-framework-anthropic"]
+
+[lints]
+workspace = true

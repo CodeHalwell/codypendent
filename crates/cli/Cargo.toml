@@ -1,0 +1,29 @@
+[package]
+name = "codypendent-cli"
+description = "codypendent: the command-line entry point (daemon lifecycle in Phase 0; TUI attaches in Phase 1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "codypendent_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codypendent"
+path = "src/main.rs"
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true
