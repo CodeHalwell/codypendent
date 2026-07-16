@@ -5,6 +5,7 @@ members = [
     "crates/daemon",
     "crates/cli",
     "crates/tui",
+    "crates/runtime",
     "crates/test-support",
 ]
 
@@ -19,6 +20,7 @@ repository = "https://github.com/CodeHalwell/codypendent"
 codypendent-protocol = { path = "crates/protocol" }
 codypendent-daemon = { path = "crates/daemon" }
 codypendent-tui = { path = "crates/tui" }
+codypendent-runtime = { path = "crates/runtime" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
