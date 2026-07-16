@@ -552,10 +552,15 @@ async fn handle_attach(
     let gap = current_max.saturating_sub(last_seen);
 
     let catchup = if gap <= CATCHUP_EVENT_LIMIT {
+        // Cap replay at `current_max` — the live forwarder's drop watermark. An
+        // event committed between reading `current_max` and this `load_events`
+        // has sequence > current_max, so it is NOT dropped by the forwarder;
+        // excluding it here keeps it delivered exactly once (live), instead of
+        // both in catch-up and live.
         let events: Vec<SessionEvent> = ledger::load_events(&state.pool, session_id)
             .await?
             .into_iter()
-            .filter(|event| event.sequence > last_seen)
+            .filter(|event| event.sequence > last_seen && event.sequence <= current_max)
             .collect();
         Catchup::Events {
             from: last_seen + 1,

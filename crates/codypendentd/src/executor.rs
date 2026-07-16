@@ -233,7 +233,9 @@ impl RuntimeExecutor {
     /// never race the loop for a sequence. A fabric failure is warned and swallowed
     /// (context is an aid, never a gate on running).
     async fn emit_context(&self, session_id: SessionId, objective: &str) {
-        let scopes = [Scope::System];
+        // System (built-ins) + this repository (harvested run memories are stored
+        // at repository visibility), so a memory a prior run curated resurfaces.
+        let scopes = [Scope::System, Scope::Repository(self.repository)];
         match assemble_context(&self.pool, self.repository, objective, &scopes).await {
             Ok(manifest) => {
                 if let Err(error) = self.emit_note(session_id, manifest.render()).await {
@@ -261,9 +263,18 @@ impl RuntimeExecutor {
                 return;
             }
         };
-        // System-scoped, matching the scope `emit_context` queries, so a memory a
-        // run curates resurfaces in later runs' context.
-        let candidates = extract_candidates(&events, Scope::System);
+        // Extract under the SESSION scope so the event-range extractors (repeated
+        // `shell.run` procedures, explicit `memory.propose:` notes) can resolve
+        // their evidence session id — a System scope yields none, harvesting only
+        // chronicle memories. Then re-anchor each candidate to REPOSITORY
+        // visibility so the curated memory resurfaces in later runs' context
+        // (which `emit_context` queries at System + this repository); a
+        // session-scoped memory would never be seen again.
+        let repository_scope = Scope::Repository(self.repository);
+        let mut candidates = extract_candidates(&events, Scope::Session(session_id));
+        for candidate in &mut candidates {
+            candidate.scope = Some(repository_scope.clone());
+        }
         let store = MemoryStore::new();
         for candidate in candidates {
             match store.curate(&self.pool, candidate).await {

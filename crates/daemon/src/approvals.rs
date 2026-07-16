@@ -281,6 +281,15 @@ impl ApprovalBroker {
 
         tx.commit().await?;
 
+        // Register the waiter BEFORE publishing. Publishing `ApprovalRequested`
+        // can make a live controller resolve the approval immediately; if that
+        // `resolve()` ran before the waiter existed, its `wake()` would land on
+        // nothing and the runtime's later `await_decision()` would park forever.
+        // Pre-resolved for auto-approval so `await_decision` returns without a
+        // human step; empty (parked) otherwise.
+        let initial = auto_approve.then_some(ApprovalDecision::Approve);
+        self.register_waiter(approval_id, initial).await;
+
         // Persist before publish: only *after* the commit do the lifecycle events
         // fan out to attached clients — mirroring the agent loop's own
         // persist-then-publish for `ToolProposed`. A live controller's approval
@@ -322,10 +331,6 @@ impl ApprovalBroker {
             }
         }
 
-        // Register the waiter: pre-resolved for auto-approval so `await_decision`
-        // returns `Approve` without a human step; empty otherwise (parked).
-        let initial = auto_approve.then_some(ApprovalDecision::Approve);
-        self.register_waiter(approval_id, initial).await;
         Ok(approval_id)
     }
 
