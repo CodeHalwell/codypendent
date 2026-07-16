@@ -7,6 +7,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep the single job's `target/` inside the runner's disk. `clippy` and
+  # `test` must build the SAME feature set (both `--all-features`), or cargo
+  # keeps two full artifact sets (tantivy, tree-sitter, sqlx, both agent
+  # providers) side by side and the second compile overruns the disk — which is
+  # exactly what failed the Test step ~46 min in. Dropping debug info and
+  # incremental state shrinks `target/` further (CI never debugs these builds)
+  # and lowers link-time memory.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
 
 jobs:
   check:
@@ -14,10 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
-        # `clippy --all-targets --all-features` + `test --workspace` build a heavy
-        # tree (tantivy, tree-sitter, sqlx, and every agent-framework provider),
-        # which overruns the runner's ~14 GB. Reclaim the preinstalled SDKs we do
-        # not use (~20-30 GB) so the build fits.
+        # `clippy` + `test`, both `--all-features`, build a heavy tree (tantivy,
+        # tree-sitter, sqlx, and every agent-framework provider), which overruns
+        # the runner's ~14 GB. Reclaim the preinstalled SDKs we do not use
+        # (~20-30 GB) so the build fits.
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}"
@@ -35,4 +46,8 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        # `--all-features` so this reuses the exact artifacts `Lint` already
+        # built (same feature unification) instead of triggering a second
+        # full compile of the tree. The tests drive a `ScriptedDriver`, so the
+        # extra provider feature compiles but is never exercised over a network.
+        run: cargo test --workspace --all-features
