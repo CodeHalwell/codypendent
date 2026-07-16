@@ -17,6 +17,7 @@ pub mod db;
 pub mod manifest;
 pub mod outbox;
 pub mod registry;
+pub mod retrieval;
 pub mod types;
 
 pub use types::{
@@ -34,3 +35,9 @@ pub use manifest::{
     SkillTrust,
 };
 pub use registry::{resolve_shadowed, Registry, RegistryError};
+
+pub use retrieval::{
+    embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
+    RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery, RetrievalResult,
+    RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
+};
