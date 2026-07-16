@@ -28,8 +28,11 @@ use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::policy::PolicyEngine;
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections, recovery};
+use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{Actor, DataClassification, EventBody, SessionEvent, SessionId};
+use codypendent_protocol::{
+    Actor, DataClassification, EventBody, RepositoryId, SessionEvent, SessionId,
+};
 use codypendent_runtime::agent::{
     ApprovalRequest, CancellationToken, FrameworkAgentRuntime, FrameworkModelDriver, RunContext,
     RunJournal,
@@ -47,12 +50,19 @@ pub struct RuntimeExecutor {
     paths: RuntimePaths,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
+    /// The repository the knowledge fabric attributes this process's runs to.
+    /// Minted once at startup (in `main`) and shared with the code-graph scan, so
+    /// every run's context maps + memories share one stable repository identity.
+    repository: RepositoryId,
 }
 
 impl RuntimeExecutor {
     /// Build an executor over the daemon's pool + paths, minting the shared
     /// fan-out + approval broker the server binds to via [`Self::collaborators`].
-    pub fn new(pool: SqlitePool, paths: RuntimePaths) -> Self {
+    /// `repository` is the (process-stable) id `main` also feeds the startup
+    /// code-graph scan, so a run's repository map and its curated memories share
+    /// one identity.
+    pub fn new(pool: SqlitePool, paths: RuntimePaths, repository: RepositoryId) -> Self {
         let subscriptions = SubscriptionHub::new();
         // Bind the broker to the SAME hub the server fans out to, so an
         // `ApprovalRequested` raised by the agent loop reaches attached clients
@@ -63,6 +73,7 @@ impl RuntimeExecutor {
             paths,
             subscriptions,
             approvals,
+            repository,
         }
     }
 
@@ -196,6 +207,84 @@ impl RuntimeExecutor {
             .map(|_| ())
             .map_err(|e| format!("run failed: {e}"))
     }
+
+    /// Append a `NoteAppended` event to `session_id`'s ledger and publish it to
+    /// the shared fan-out — append-then-publish, mirroring [`recovery::fail_run`]
+    /// so an attached client observes the note live. Used to surface the context
+    /// manifest and the curated memories in a run's trace.
+    async fn emit_note(&self, session_id: SessionId, text: String) -> anyhow::Result<()> {
+        let sequence = ledger::next_sequence(&self.pool, session_id).await?;
+        let event = SessionEvent {
+            sequence,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::NoteAppended { text },
+        };
+        ledger::append_event(&self.pool, session_id, &event).await?;
+        // Persist-before-publish: only after the append does the note fan out.
+        self.subscriptions.publish(session_id, event);
+        Ok(())
+    }
+
+    /// Assemble the knowledge-fabric context (repository map + tool/skill cards +
+    /// cited memories) for `objective` and note its render into the trace, so
+    /// every run opens with the three manifests.
+    ///
+    /// Called **before** the agent loop, never concurrently with it — the note is
+    /// appended and published from the worker before `execute` spawns, so it can
+    /// never race the loop for a sequence. A fabric failure is warned and swallowed
+    /// (context is an aid, never a gate on running).
+    async fn emit_context(&self, session_id: SessionId, objective: &str) {
+        let scopes = [Scope::System];
+        match assemble_context(&self.pool, self.repository, objective, &scopes).await {
+            Ok(manifest) => {
+                if let Err(error) = self.emit_note(session_id, manifest.render()).await {
+                    warn!(%session_id, %error, "could not emit run context note");
+                }
+            }
+            Err(error) => warn!(%session_id, %error, "could not assemble run context"),
+        }
+    }
+
+    /// After a run reaches a terminal state, harvest curated memories from its own
+    /// event trace and note each durable one, so "a run produces a curated memory
+    /// whose provenance opens to its source" holds for every run.
+    ///
+    /// Runs **after** `execute` returns (the loop is no longer appending), so the
+    /// note appends never race the agent loop. The curator redacts secrets before
+    /// anything is stored, so a `remembered:` note can never carry secret text.
+    /// Every failure is warned and swallowed — a harvesting error must not turn a
+    /// finished run into a failed one.
+    async fn harvest_memories(&self, session_id: SessionId) {
+        let events = match ledger::load_events(&self.pool, session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%session_id, %error, "could not load events for memory harvest");
+                return;
+            }
+        };
+        // System-scoped, matching the scope `emit_context` queries, so a memory a
+        // run curates resurfaces in later runs' context.
+        let candidates = extract_candidates(&events, Scope::System);
+        let store = MemoryStore::new();
+        for candidate in candidates {
+            match store.curate(&self.pool, candidate).await {
+                Ok(Curation::Accepted(record)) | Ok(Curation::Superseded { record, .. }) => {
+                    if let Err(error) = self
+                        .emit_note(session_id, format!("remembered: {}", record.statement))
+                        .await
+                    {
+                        warn!(%session_id, %error, "could not emit curated-memory note");
+                    }
+                }
+                // Redacted / Duplicate / Rejected: nothing durable, nothing to note.
+                Ok(_) => {}
+                Err(error) => warn!(%session_id, %error, "memory curation failed"),
+            }
+        }
+    }
 }
 
 impl RunExecutor for RuntimeExecutor {
@@ -206,6 +295,12 @@ impl RunExecutor for RuntimeExecutor {
             let session_id = launch.session_id;
             let run_id = launch.run_id;
             let objective = launch.objective.clone();
+
+            // Open the run's trace with the knowledge-fabric context (repository
+            // map + retrieved tool/skill cards + cited memories). Emitted here,
+            // BEFORE the agent loop, so the note never races the loop's own
+            // sequence allocations.
+            executor.emit_context(session_id, &objective).await;
 
             // Run the work in a CHILD task so even a panic in the agent loop
             // becomes a clean terminal failure (a `JoinError`) rather than a
@@ -235,6 +330,12 @@ impl RunExecutor for RuntimeExecutor {
                     error!(%run_id, error = %e, "could not fail run cleanly");
                 }
             }
+
+            // The run has now reached a terminal state (either the loop finished
+            // it, or `fail_run` above did). Harvest any curated memories from its
+            // event trace and note each durable one — emitted AFTER the loop, so
+            // these appends never race it either.
+            executor.harvest_memories(session_id).await;
         });
     }
 

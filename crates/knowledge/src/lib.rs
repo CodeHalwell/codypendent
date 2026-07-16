@@ -14,6 +14,7 @@
 
 pub mod builtin;
 pub mod codegraph;
+pub mod context;
 pub mod db;
 pub mod manifest;
 pub mod memory;
@@ -54,3 +55,5 @@ pub use memory::{
     MemoryStore, ProvenanceCard,
 };
 pub use observer::extract_candidates;
+
+pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
