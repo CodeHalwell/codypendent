@@ -19,7 +19,7 @@ use crate::stream::{self, RunExit};
 /// this call spawned and waited for one. Shared by the human-facing
 /// `codypendent daemon start` and the silent variant `run --jsonl` uses (its
 /// stdout must carry nothing but JSONL envelopes).
-enum EnsureOutcome {
+pub(crate) enum EnsureOutcome {
     AlreadyRunning,
     Started { pid: u32 },
 }
@@ -27,7 +27,7 @@ enum EnsureOutcome {
 /// Spawn `codypendentd` detached if nothing answers Ping yet, then wait for
 /// the socket to come up (5 second budget). No I/O beyond the daemon's own
 /// log file — callers decide how (or whether) to report the outcome.
-async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
+pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
     if client::ping(&paths.socket_path).await {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -325,7 +325,7 @@ pub async fn attach_over_connection<W: Write>(
 }
 
 /// Common `AttachSession` reply handling shared by `run` and `attach`.
-fn expect_catchup(
+pub(crate) fn expect_catchup(
     reply: codypendent_protocol::Envelope,
 ) -> anyhow::Result<codypendent_protocol::Catchup> {
     match reply.payload {

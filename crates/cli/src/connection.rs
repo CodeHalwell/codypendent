@@ -16,6 +16,7 @@ use codypendent_protocol::{
     read_envelope, write_envelope, ClientCapabilities, ClientHello, ClientId, Command, CommandBody,
     CommandId, Envelope, Payload, ServerHello, PROTOCOL_V1,
 };
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
 /// A persistent connection to the daemon. One `Connection` wraps one Unix
@@ -150,5 +151,20 @@ impl Connection {
         let pong = Envelope::request(self.client_id, Payload::Pong);
         write_envelope(&mut self.stream, &pong).await?;
         Ok(())
+    }
+
+    /// Consume the connection into independently-owned read and write halves for
+    /// a concurrent event loop (STEP 1.12 TUI): one task reads live events off
+    /// the read half while the main loop dispatches commands through the write
+    /// half. This is the split the request/reply model (`&mut self` for both
+    /// directions) cannot express.
+    ///
+    /// Returns the halves, the [`ClientId`] to stamp on outgoing envelopes, and
+    /// any envelopes already buffered by [`Connection::request`] during the
+    /// setup handshake (live events that outraced the attach reply) — the caller
+    /// must fold these before reading the wire so no event is lost.
+    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf, VecDeque<Envelope>, ClientId) {
+        let (read_half, write_half) = self.stream.into_split();
+        (read_half, write_half, self.pending, self.client_id)
     }
 }
