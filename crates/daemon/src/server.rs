@@ -460,9 +460,16 @@ async fn handle_request(
                             // With no executor injected (lib-only / tests) this
                             // is a no-op — the run stays `Queued`, exactly as
                             // before.
-                            if let (Some(run_id), Some(executor)) =
-                                (outcome.created_run, state.executor.as_ref())
-                            {
+                            // Gate on `newly_applied`: a duplicate `StartRun`
+                            // delivery replays the recorded outcome (with the same
+                            // `created_run`), and launching again would run two
+                            // agent loops for one run. A replayed outcome is never
+                            // `newly_applied`, so the executor fires exactly once.
+                            if let (true, Some(run_id), Some(executor)) = (
+                                outcome.newly_applied,
+                                outcome.created_run,
+                                state.executor.as_ref(),
+                            ) {
                                 if let CommandBody::StartRun {
                                     session_id,
                                     objective,

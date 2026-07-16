@@ -79,6 +79,13 @@ pub struct CommandOutcome {
     /// The sequence of the last event this command appended, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sequence: Option<u64>,
+    /// Whether THIS call freshly applied the command, as opposed to replaying a
+    /// recorded outcome for a duplicate idempotency key. Never persisted, so a
+    /// replayed outcome (deserialized from the `commands` row) is always `false`
+    /// — which is exactly how the server launches the executor **once** per run
+    /// instead of again on every duplicate `StartRun` delivery.
+    #[serde(skip)]
+    pub newly_applied: bool,
 }
 
 /// Applies commands through the crash-consistent write path, owning the shared
@@ -278,6 +285,7 @@ impl CommandProcessor {
             created_session: None,
             created_run: None,
             last_sequence,
+            newly_applied: false,
         };
         finalize_applied(pool, existing.command_id, &outcome)
             .await
@@ -645,6 +653,7 @@ impl CommandProcessor {
                     created_session: None,
                     created_run: None,
                     last_sequence,
+                    newly_applied: false,
                 };
                 finalize_applied(pool, command.command_id, &outcome)
                     .await
@@ -674,6 +683,7 @@ impl CommandProcessor {
             created_session: None,
             created_run: None,
             last_sequence,
+            newly_applied: false,
         };
         finalize_applied(pool, command.command_id, &outcome)
             .await
@@ -881,6 +891,11 @@ impl CommandProcessor {
             created_session: created.0,
             created_run: created.1,
             last_sequence: persisted.last().map(|e| e.sequence),
+            // `run_transaction` runs only on the FIRST application (the
+            // idempotency check returns a replay before reaching here), so this
+            // is the one place `newly_applied` is true — the signal the server
+            // uses to launch the executor exactly once per created run.
+            newly_applied: true,
         };
 
         // Flip received -> applied with the recorded outcome, still in the tx.
@@ -1421,7 +1436,19 @@ mod tests {
             .await
             .expect("second apply");
 
-        assert_eq!(first, second, "idempotent replay returns the same outcome");
+        // The first delivery freshly applies; the duplicate replays. That
+        // distinction (never sent to the client) is what makes the server launch
+        // the executor exactly once, while the user-facing outcome is identical.
+        assert!(first.newly_applied, "first delivery is a fresh application");
+        assert!(!second.newly_applied, "duplicate delivery is a replay");
+        assert_eq!(
+            CommandOutcome {
+                newly_applied: false,
+                ..first.clone()
+            },
+            second,
+            "idempotent replay returns the same (user-facing) outcome"
+        );
         assert_eq!(run_count(&pool, session).await, 1, "exactly one run row");
         assert!(first.created_run.is_some());
     }

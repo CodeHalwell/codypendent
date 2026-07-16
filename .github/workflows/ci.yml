@@ -13,6 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        # `clippy --all-targets --all-features` + `test --workspace` build a heavy
+        # tree (tantivy, tree-sitter, sqlx, and every agent-framework provider),
+        # which overruns the runner's ~14 GB. Reclaim the preinstalled SDKs we do
+        # not use (~20-30 GB) so the build fits.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}"
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

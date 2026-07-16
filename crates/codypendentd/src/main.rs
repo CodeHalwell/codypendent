@@ -95,6 +95,18 @@ async fn main() -> anyhow::Result<()> {
         repository,
     ));
 
+    // Re-launch any run left `Queued` by a crash between `StartRun`'s commit and
+    // its fire-and-forget spawn — recovery's live-state sweep does not cover
+    // `Queued`, so those runs would otherwise be stuck with no worker.
+    match executor.relaunch_queued_runs().await {
+        Ok(0) => {}
+        Ok(n) => info!(
+            relaunched = n,
+            "re-launched queued runs orphaned by a prior crash"
+        ),
+        Err(error) => warn!(%error, "could not re-launch queued runs at startup"),
+    }
+
     server::run_with_executor(pool, paths, boot, Some(executor)).await
 }
 

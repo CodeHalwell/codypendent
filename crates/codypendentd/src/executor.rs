@@ -80,6 +80,43 @@ impl RuntimeExecutor {
         ArtifactStore::new(self.paths.data_dir.join("artifacts"))
     }
 
+    /// Re-launch every run still `Queued` at startup. A crash between committing
+    /// the `StartRun` transaction and the fire-and-forget `spawn_run` leaves a run
+    /// `Queued` with no worker; startup recovery only sweeps *live* states and
+    /// skips `Queued`, so without this the run is stuck forever. Re-launching is
+    /// safe — the agent loop does not re-emit `RunStarted` for an existing run.
+    /// Returns how many were re-launched.
+    pub async fn relaunch_queued_runs(&self) -> anyhow::Result<usize> {
+        let rows: Vec<(String, String, String, String)> =
+            sqlx::query_as("SELECT id, session_id, objective, mode FROM runs WHERE state = ?")
+                .bind(projections::run_state_to_db(
+                    codypendent_protocol::RunState::Queued,
+                ))
+                .fetch_all(&self.pool)
+                .await?;
+
+        let repository = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut relaunched = 0usize;
+        for (id, session, objective, mode) in rows {
+            let (Ok(run_id), Ok(session_id)) = (
+                id.parse::<codypendent_protocol::RunId>(),
+                session.parse::<SessionId>(),
+            ) else {
+                warn!(run = %id, "skipping a queued run with an unparseable id");
+                continue;
+            };
+            self.spawn_run(RunLaunch {
+                session_id,
+                run_id,
+                objective,
+                mode: projections::agent_mode_from_db(&mode),
+                repository: repository.clone(),
+            });
+            relaunched += 1;
+        }
+        Ok(relaunched)
+    }
+
     /// Load a model registry + a Phase-1 policy from `<data_dir>/models.toml`,
     /// or an error string when none is configured. In a bare environment (no
     /// endpoint, no config) this is the expected path — the run is then failed

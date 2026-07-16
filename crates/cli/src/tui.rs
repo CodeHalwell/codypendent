@@ -105,7 +105,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
     // failure logs and continues with empty lists; it never fails the TUI. Done
     // before entering the terminal so any diagnostic reaches a cooked screen.
-    let (skills, memories) = load_knowledge(paths, workspace_id).await;
+    let (skills, memories) = load_knowledge(paths, workspace_id, &repo).await;
     state.skills = skills;
     state.memories = memories;
 
@@ -459,6 +459,7 @@ async fn resolve_or_create_session(
 async fn load_knowledge(
     paths: &RuntimePaths,
     workspace_id: WorkspaceId,
+    repo: &Path,
 ) -> (Vec<SkillCard>, Vec<MemoryCard>) {
     let database_path = paths.data_dir.join("codypendent.db");
     let pool = match knowledge_db::open(&database_path).await {
@@ -481,9 +482,16 @@ async fn load_knowledge(
         }
     };
 
-    // Visible memory scopes: the System tier plus this session's workspace. The
-    // store enforces cross-repository isolation in SQL; an empty result is fine.
-    let scopes = vec![Scope::System, Scope::Workspace(workspace_id)];
+    // Visible memory scopes: the System tier, this session's workspace, and THIS
+    // repository — where a run's harvested procedural/semantic memories are
+    // stored (the primary memory path), derived from the same canonical path the
+    // daemon uses. The store enforces cross-repository isolation in SQL; an empty
+    // result is fine.
+    let scopes = vec![
+        Scope::System,
+        Scope::Workspace(workspace_id),
+        Scope::Repository(codypendent_knowledge::stable_repository_id(repo)),
+    ];
     let memories = match MemoryStore::new().query(&pool, &scopes, None).await {
         Ok(records) => records.iter().map(memory_card).collect(),
         Err(error) => {

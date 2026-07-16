@@ -66,6 +66,18 @@ pub fn agent_mode_to_db(mode: AgentMode) -> &'static str {
     }
 }
 
+/// Parse a `runs.mode` string back into an [`AgentMode`]; an unrecognized string
+/// falls back to [`AgentMode::Build`] (the default preset).
+pub fn agent_mode_from_db(s: &str) -> AgentMode {
+    match s {
+        "Ask" => AgentMode::Ask,
+        "Explore" => AgentMode::Explore,
+        "Plan" => AgentMode::Plan,
+        "Review" => AgentMode::Review,
+        _ => AgentMode::Build,
+    }
+}
+
 /// Whether a run is in a terminal state (no further work). A terminal run is
 /// excluded from a session's `active_runs`.
 pub fn is_terminal(state: RunState) -> bool {
