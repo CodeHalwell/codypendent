@@ -16,6 +16,8 @@ pub mod builtin;
 pub mod codegraph;
 pub mod db;
 pub mod manifest;
+pub mod memory;
+pub mod observer;
 pub mod outbox;
 pub mod registry;
 pub mod repomap;
@@ -46,3 +48,9 @@ pub use retrieval::{
 
 pub use codegraph::{CodeGraphError, GraphDelta};
 pub use repomap::{ApiSymbol, ModuleEntry, PackageEntry, RepositoryMap};
+
+pub use memory::{
+    detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
+    MemoryStore, ProvenanceCard,
+};
+pub use observer::extract_candidates;
