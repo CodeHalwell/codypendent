@@ -13,10 +13,12 @@
 //! rebuildable at any time (`codypendent index rebuild`).
 
 pub mod builtin;
+pub mod codegraph;
 pub mod db;
 pub mod manifest;
 pub mod outbox;
 pub mod registry;
+pub mod repomap;
 pub mod retrieval;
 pub mod types;
 
@@ -41,3 +43,6 @@ pub use retrieval::{
     RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery, RetrievalResult,
     RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
 };
+
+pub use codegraph::{CodeGraphError, GraphDelta};
+pub use repomap::{ApiSymbol, ModuleEntry, PackageEntry, RepositoryMap};
