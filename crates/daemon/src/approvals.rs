@@ -10,8 +10,10 @@
 //! ## How a caller awaits a decision
 //!
 //! [`ApprovalBroker::request`] persists a `pending` row, appends an
-//! `ApprovalRequested` event, registers an in-memory waiter, and returns the new
-//! [`ApprovalId`]. The awaiting run then calls
+//! `ApprovalRequested` event, registers an in-memory waiter, publishes that
+//! event to any live subscribers (when the broker is bound to a
+//! [`SubscriptionHub`] via [`ApprovalBroker::with_subscriptions`]), and returns
+//! the new [`ApprovalId`]. The awaiting run then calls
 //! [`ApprovalBroker::await_decision`], which blocks until the waiter is woken by
 //! [`ApprovalBroker::resolve`] (a human decision) or
 //! [`ApprovalBroker::expire_due`] (a timeout, which behaves as a rejection).
@@ -45,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalId, ApprovalScope, EventBody, ProposedAction, Risk, RunId,
-    SessionId, UserId,
+    SessionEvent, SessionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +55,7 @@ use sqlx::SqlitePool;
 use tokio::sync::watch;
 
 use crate::policy::Capability;
+use crate::subscriptions::SubscriptionHub;
 
 /// The lifecycle state of an approval row, mirroring the `state` column
 /// (`pending | approved | rejected | expired`).
@@ -143,12 +146,36 @@ type Waiters = Arc<Mutex<HashMap<ApprovalId, watch::Sender<Option<ApprovalDecisi
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalBroker {
     waiters: Waiters,
+    /// The live fan-out to publish an approval's lifecycle events on, when the
+    /// broker is wired into a running daemon. `None` in the executor-less server
+    /// and in unit tests, where nothing is attached to observe them (the events
+    /// are still persisted — publishing to nobody is what we skip, not the
+    /// durable record).
+    subscriptions: Option<SubscriptionHub>,
 }
 
 impl ApprovalBroker {
-    /// A broker with an empty waiter registry.
+    /// A broker with an empty waiter registry and no live fan-out.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind this broker to the shared [`SubscriptionHub`] so [`Self::request`]
+    /// publishes its `ApprovalRequested` (and, on auto-approval, `ApprovalResolved`)
+    /// to attached clients.
+    ///
+    /// The agent loop reaches this broker through a pool-erased journal closure
+    /// that cannot itself publish (it only sees the pool), so unlike the
+    /// human-resolve path — where the `CommandProcessor` re-publishes the
+    /// broker's `ApprovalResolved` — the *request* path has no owner of the hub
+    /// downstream. Binding the hub here is what lets a live controller see a
+    /// parked approval (the TUI builds its pending-approval queue and its
+    /// `ResolveApproval` intent from `ApprovalRequested`); without it the run
+    /// sits in `WaitingForApproval` until the client re-attaches for catch-up.
+    #[must_use]
+    pub fn with_subscriptions(mut self, subscriptions: SubscriptionHub) -> Self {
+        self.subscriptions = Some(subscriptions);
+        self
     }
 
     /// Persist a `pending` approval, append `ApprovalRequested`, register a
@@ -215,38 +242,77 @@ impl ApprovalBroker {
         .await?;
 
         // ApprovalRequested is always recorded (RULE: persist before publish).
-        let seq = next_sequence(&mut *tx, session_id).await?;
+        let requested_seq = next_sequence(&mut *tx, session_id).await?;
+        let requested = EventBody::ApprovalRequested {
+            approval_id,
+            action,
+            risk,
+        };
         append_event(
             &mut *tx,
             session_id,
-            seq,
+            requested_seq,
             &Actor::System,
-            &EventBody::ApprovalRequested {
-                approval_id,
-                action,
-                risk,
-            },
+            &requested,
             &now_str,
         )
         .await?;
 
-        if auto_approve {
-            let seq = next_sequence(&mut *tx, session_id).await?;
+        // On auto-approval the resolution is recorded in the same transaction.
+        let resolved = if auto_approve {
+            let resolved_seq = next_sequence(&mut *tx, session_id).await?;
+            let body = EventBody::ApprovalResolved {
+                approval_id,
+                decision: ApprovalDecision::Approve,
+            };
             append_event(
                 &mut *tx,
                 session_id,
-                seq,
+                resolved_seq,
                 &Actor::System,
-                &EventBody::ApprovalResolved {
-                    approval_id,
-                    decision: ApprovalDecision::Approve,
-                },
+                &body,
                 &now_str,
             )
             .await?;
-        }
+            Some((resolved_seq, body))
+        } else {
+            None
+        };
 
         tx.commit().await?;
+
+        // Persist before publish: only *after* the commit do the lifecycle events
+        // fan out to attached clients — mirroring the agent loop's own
+        // persist-then-publish for `ToolProposed`. A live controller's approval
+        // queue is built from `ApprovalRequested`, so without this a parked run is
+        // invisible until re-attach. When no hub is bound (executor-less server,
+        // tests) this is a no-op; the durable events above are unaffected.
+        if let Some(hub) = &self.subscriptions {
+            hub.publish(
+                session_id,
+                SessionEvent {
+                    sequence: requested_seq as u64,
+                    occurred_at: now,
+                    causation_id: None,
+                    correlation_id: None,
+                    actor: Actor::System,
+                    body: requested,
+                },
+            );
+            if let Some((resolved_seq, body)) = resolved {
+                hub.publish(
+                    session_id,
+                    SessionEvent {
+                        sequence: resolved_seq as u64,
+                        occurred_at: now,
+                        causation_id: None,
+                        correlation_id: None,
+                        actor: Actor::System,
+                        body,
+                    },
+                );
+            }
+        }
 
         // Register the waiter: pre-resolved for auto-approval so `await_decision`
         // returns `Approve` without a human step; empty otherwise (parked).

@@ -1,9 +1,24 @@
-//! `codypendentd` — the persistent Codypendent daemon.
+//! `codypendentd` — the persistent Codypendent daemon (assembly binary).
+//!
+//! This is the composition root. It depends on BOTH `codypendent-daemon` (the
+//! server + persistence) and `codypendent-runtime` (the agent loop) — which the
+//! daemon crate itself cannot, because the runtime depends on the daemon (a
+//! cycle). It performs the daemon startup exactly as the old lib-side `main.rs`
+//! did (tracing, paths, db, boot, recovery), then constructs a [`RunExecutor`]
+//! that drives the runtime agent loop and injects it into the server.
+//!
+//! [`RunExecutor`]: codypendent_daemon::executor::RunExecutor
+
+mod executor;
+
+use std::sync::Arc;
 
 use codypendent_daemon::{db, instance, recovery, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+use crate::executor::RuntimeExecutor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,5 +54,10 @@ async fn main() -> anyhow::Result<()> {
         "startup recovery complete"
     );
 
-    server::run(pool, paths, boot).await
+    // The executor owns the shared event fan-out + approval broker the server
+    // binds to (`RunExecutor::collaborators`), and drives each accepted run
+    // through the runtime agent loop.
+    let executor = Arc::new(RuntimeExecutor::new(pool.clone(), paths.clone()));
+
+    server::run_with_executor(pool, paths, boot, Some(executor)).await
 }

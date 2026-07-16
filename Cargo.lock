@@ -383,6 +383,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codypendent-codypendentd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codypendent-daemon",
+ "codypendent-protocol",
+ "codypendent-runtime",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "codypendent-daemon"
 version = "0.1.0"
 dependencies = [

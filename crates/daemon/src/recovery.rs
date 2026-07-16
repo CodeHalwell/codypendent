@@ -31,7 +31,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, ApprovalId, DataClassification, EventBody, RunDisposition, RunId, RunState, SessionId,
+    Actor, ApprovalId, DataClassification, EventBody, RunDisposition, RunId, RunState,
+    SessionEvent, SessionId,
 };
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -248,6 +249,125 @@ async fn fail_live_run(
     .await?;
 
     tx.commit().await?;
+    Ok(())
+}
+
+/// Fail a run cleanly to a terminal `Failed` state — persisting a chronicle and
+/// both the `RunStateChanged { Failed }` and `RunCompleted { Failed }` events in
+/// one transaction — then **publish** those events to `subscriptions` so an
+/// attached client observes the terminal transition live.
+///
+/// Used by the assembly binary's run executor when a run cannot be executed
+/// (most commonly: no model is configured or reachable). The point is that the
+/// run reaches a TERMINAL state — never left `Queued`/`Running` — so a headless
+/// `codypendent run --jsonl` stops waiting instead of hanging.
+///
+/// Unlike [`fail_live_run`] (startup recovery, which runs *before* the socket
+/// opens and so has no subscribers, and routes a mid-flight run through
+/// `Recovering`), this is a *live* failure: it transitions straight to `Failed`
+/// and publishes, mirroring the agent loop's own terminal path
+/// (persist-before-publish).
+pub async fn fail_run(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    subscriptions: &SubscriptionHub,
+    run_id: RunId,
+    session_id: SessionId,
+    objective: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    // The run's last durable sequence, before this failure appends anything.
+    let last_sequence = crate::ledger::next_sequence(pool, session_id)
+        .await?
+        .saturating_sub(1);
+
+    let chronicle = RecoveryChronicle {
+        run_id,
+        objective: objective.to_string(),
+        disposition: "Failed".to_string(),
+        summary: reason.to_string(),
+        last_sequence,
+        recovered_at: Utc::now(),
+    };
+    // The chronicle blob is written before the failing transaction (its `put`
+    // runs its own commit); an unreferenced blob after a crash is harmless.
+    let chronicle_ref = artifacts
+        .put(
+            pool,
+            "application/json",
+            DataClassification::Internal,
+            Provenance::system(format!("run-failed:{run_id}")),
+            &serde_json::to_vec(&chronicle)?,
+        )
+        .await?;
+
+    // One transaction: the projection flip to `Failed` and both terminal events
+    // commit together, so a run never lands half-failed.
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let mut tx = pool.begin().await?;
+
+    let failed_state = EventBody::RunStateChanged {
+        run_id,
+        state: RunState::Failed,
+    };
+    let seq1 = next_sequence(&mut *tx, session_id).await?;
+    append_event(
+        &mut *tx,
+        session_id,
+        seq1,
+        &Actor::System,
+        &failed_state,
+        &now_str,
+    )
+    .await?;
+
+    projections::set_run_state(&mut *tx, run_id, RunState::Failed).await?;
+
+    let completed = EventBody::RunCompleted {
+        run_id,
+        disposition: RunDisposition::Failed {
+            reason: reason.to_string(),
+        },
+        chronicle: chronicle_ref,
+    };
+    let seq2 = next_sequence(&mut *tx, session_id).await?;
+    append_event(
+        &mut *tx,
+        session_id,
+        seq2,
+        &Actor::System,
+        &completed,
+        &now_str,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    // Persist-before-publish: only after the commit do the terminal events fan
+    // out to any attached client. Publishing to zero subscribers is normal.
+    subscriptions.publish(
+        session_id,
+        SessionEvent {
+            sequence: u64::try_from(seq1)?,
+            occurred_at: now,
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: failed_state,
+        },
+    );
+    subscriptions.publish(
+        session_id,
+        SessionEvent {
+            sequence: u64::try_from(seq2)?,
+            occurred_at: now,
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: completed,
+        },
+    );
     Ok(())
 }
 
