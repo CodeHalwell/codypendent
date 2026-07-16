@@ -106,7 +106,7 @@ New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 - [x] Memory never leaks across repositories (SQL scope filter; leak test green)
 - [x] `codypendent index rebuild` after deleting `<data_dir>/index/` restores identical results
 - [x] Every retrieved memory opens its source (provenance card + open-source affordance)
-- [~] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories — *run-lifecycle wiring landing*
+- [x] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories
 - [x] `fmt` / `clippy` / `test` green; commits made; tree clean
 
 ## Phase 3 — GitHub & IDE awareness ⬜
