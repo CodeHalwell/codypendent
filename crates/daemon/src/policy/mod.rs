@@ -460,10 +460,8 @@ fn expand_vars(raw: &str, ctx: &EvalContext, home: Option<&Path>) -> Option<Stri
         out = out.replace("$WORKTREE", &ctx.worktree.to_string_lossy());
     }
     if out.contains("$HOME") {
-        match home {
-            Some(path) => out = out.replace("$HOME", &path.to_string_lossy()),
-            None => return None,
-        }
+        let path = home?;
+        out = out.replace("$HOME", &path.to_string_lossy());
     }
     Some(out)
 }

@@ -352,11 +352,10 @@ impl CommandProcessor {
                 }
             }
             CommandBody::ResolveApproval { approval_id, .. } => {
-                if approval_session(pool, *approval_id)
+                let existing_session = approval_session(pool, *approval_id)
                     .await
-                    .map_err(internal_error)?
-                    .is_none()
-                {
+                    .map_err(internal_error)?;
+                if existing_session.is_none() {
                     return Err(CodypendentError::new(
                         "approval.not-found",
                         format!("no approval {approval_id}"),
@@ -1410,10 +1409,10 @@ mod tests {
                 EventBody::SessionCreated { title: t } => title = t.clone(),
                 EventBody::SessionClosed => closed = true,
                 EventBody::RunStarted { run_id, .. } => active.push(*run_id),
-                EventBody::RunStateChanged { run_id, state } => {
-                    if projections::is_terminal(*state) {
-                        active.retain(|r| r != run_id);
-                    }
+                EventBody::RunStateChanged { run_id, state }
+                    if projections::is_terminal(*state) =>
+                {
+                    active.retain(|r| r != run_id);
                 }
                 _ => {}
             }
