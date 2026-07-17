@@ -339,14 +339,29 @@ export class DaemonClient extends EventEmitter {
           daemon_instance: hello.daemon_instance,
           heartbeat_interval_ms: hello.heartbeat_interval_ms,
         });
+        // Send the attach, but do NOT claim "attached" yet: the daemon proves a
+        // successful attach by replying with a `Catchup`. Marking attached (and
+        // resetting reconnect backoff) only on that reply avoids showing a live
+        // panel for an attach the daemon rejected.
         this.setStatus("attaching");
         this.sendAttach();
-        this.setStatus("attached");
-        onAttached();
+        break;
+      }
+      case "Ping": {
+        // Answer the daemon's liveness probe. The daemon stamps liveness only on
+        // frames it reads from us and drops a client that is silent past three
+        // heartbeat intervals, so an idle panel MUST reply or it is disconnected
+        // on a fixed cycle. (Mirrors the Rust clients' Pong reply.)
+        this.sendEnvelope(this.buildEnvelope({ type: "Pong" }, { withSession: false }));
         break;
       }
       case "Catchup": {
         const catchup = (payload as { type: "Catchup"; catchup: Catchup }).catchup;
+        // A Catchup is the daemon's acknowledgement of a successful attach — only
+        // now is the connection truly attached and healthy, so reset backoff here
+        // rather than on attach-sent.
+        this.setStatus("attached");
+        onAttached();
         this.applyCatchup(catchup);
         this.emit("catchup", catchup);
         break;
@@ -470,10 +485,15 @@ export class DaemonClient extends EventEmitter {
   }
 
   private teardownSocket(): void {
-    if (this.socket) {
-      this.socket.removeAllListeners();
-      this.socket.destroy();
+    const socket = this.socket;
+    if (socket) {
+      // Clear our reference first, then destroy WITHOUT removing listeners, so
+      // the socket's own `close` handler still fires and settles the in-flight
+      // `connectOnce` promise. Removing listeners here would strand that promise
+      // and leak the run loop, so a later `start()` would spawn a second loop
+      // beside the zombie.
       this.socket = undefined;
+      socket.destroy();
     }
   }
 

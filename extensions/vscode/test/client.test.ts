@@ -74,6 +74,11 @@ function eventPayload(sequence: number): Payload {
   return { type: "Event", ...event };
 }
 
+/** The daemon's acknowledgement of a successful attach. */
+function catchupPayload(through = 0): Payload {
+  return { type: "Catchup", catchup: { type: "Events", from: 0, through, events: [] } };
+}
+
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 function attachCommand(socket: FakeSocket): Extract<Command["body"], { type: "AttachSession" }> {
@@ -140,7 +145,39 @@ describe("DaemonClient handshake + attach", () => {
     expect(attach.session_id).toBe(SESSION_ID);
     expect(attach.requested_role).toEqual({ type: "Approver" });
     expect(attach.last_seen_sequence).toBeUndefined();
+    // Attach sent, but not yet acknowledged: the daemon proves a successful
+    // attach with a Catchup, and only then is the client "attached".
+    expect(client.connectionStatus).toBe("attaching");
+    socket.deliver(catchupPayload());
     expect(client.connectionStatus).toBe("attached");
+
+    client.stop();
+  });
+
+  it("answers a heartbeat Ping with a Pong so an idle client is not dropped", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/x.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+
+    client.start();
+    await flush();
+    const socket = sockets[0];
+    socket.emit("connect");
+    socket.deliver(serverHelloPayload());
+
+    const before = socket.sent().length;
+    socket.deliver({ type: "Ping" });
+    const sent = socket.sent();
+    expect(sent.length).toBe(before + 1);
+    expect(sent[sent.length - 1].payload.type).toBe("Pong");
 
     client.stop();
   });
@@ -256,11 +293,13 @@ describe("DaemonClient reconnect with resume", () => {
     await flush();
     expect(waits).toEqual([100, 200]);
 
-    // Now a real attach happens on the third socket.
+    // Now a real attach happens on the third socket. Backoff resets only once
+    // the daemon acknowledges the attach with a Catchup, not on attach-sent.
     const third = sockets[2];
     third.emit("connect");
     third.deliver(serverHelloPayload());
     expect(third.sent().some((e) => e.payload.type === "Command")).toBe(true);
+    third.deliver(catchupPayload());
 
     // A subsequent drop should start backoff over from the initial delay.
     third.emit("close", false);

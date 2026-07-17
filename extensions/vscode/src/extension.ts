@@ -6,7 +6,7 @@
  *
  * Responsibilities:
  *   - resolve the daemon socket exactly as the daemon does and open a
- *     {@link DaemonClient} (attach as Contributor, reconnect + attach-resume);
+ *     {@link DaemonClient} (attach as Approver, reconnect + attach-resume);
  *   - render the session transcript and run state in a side-panel webview from
  *     the daemon's events / catch-up projections;
  *   - surface approvals as `showInformationMessage(Approve/Reject)` -> the
@@ -94,15 +94,25 @@ export function activate(context: vscode.ExtensionContext): void {
         cspSource: webviewView.webview.cspSource,
       });
       webviewView.webview.onDidReceiveMessage((raw: WebviewCommandMessage) => {
+        // The webview is CSP-sandboxed and only our own script posts here, but
+        // validate the forwarded fields anyway: a malformed approvalId would be
+        // serialized into a `Uuid` field and the daemon's deserialize failure
+        // would drop the whole connection.
         switch (raw.kind) {
           case "approve":
-            client?.resolveApproval(raw.approvalId, "Approve");
+            if (isUuid(raw.approvalId)) {
+              client?.resolveApproval(raw.approvalId, "Approve");
+            }
             break;
           case "reject":
-            client?.resolveApproval(raw.approvalId, "Reject");
+            if (isUuid(raw.approvalId)) {
+              client?.resolveApproval(raw.approvalId, "Reject");
+            }
             break;
           case "startRun":
-            client?.startRun(raw.objective);
+            if (raw.objective.trim().length > 0) {
+              client?.startRun(raw.objective, "Build", workspaceRepo());
+            }
             break;
         }
       });
@@ -110,7 +120,12 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   };
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("codypendent.sessionView", viewProvider),
+    vscode.window.registerWebviewViewProvider("codypendent.sessionView", viewProvider, {
+      // Keep the webview's DOM (transcript + pending approval cards) alive when
+      // the view is hidden, so switching the activity bar away and back does not
+      // blank the panel or drop an unresolved approval card.
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
   );
 
   // --- daemon client --------------------------------------------------------
@@ -155,6 +170,15 @@ export function activate(context: vscode.ExtensionContext): void {
       if (catchup.type === "Events") {
         for (const event of catchup.events) {
           handleEvent(event, post, showDiff, false);
+        }
+      } else if (catchup.type === "Snapshot") {
+        // A long session catches up as a compacted Snapshot (no event list).
+        // Seed the panel from the projection so it is not blank: the session
+        // title plus a stub per active run.
+        const projection = catchup.projection;
+        post({ kind: "event", sequence: projection.last_sequence, label: "session", detail: projection.title });
+        for (const runId of projection.active_runs ?? []) {
+          post({ kind: "runState", runId, state: "Running" });
         }
       }
     });
@@ -243,7 +267,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!objective) {
         return;
       }
-      client.startRun(objective);
+      client.startRun(objective, "Build", workspaceRepo());
     }),
   );
 
@@ -478,4 +502,13 @@ function buildIdeContext(diagnosticsRevision: number): IdeContextUpdate {
 
 function isUuid(value: string): boolean {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+}
+
+/**
+ * The first workspace folder's filesystem path, attributed to a started run so a
+ * shared daemon stores its memories under the run's repository — not the
+ * daemon's own startup directory (issue #6 item 1). Undefined outside a folder.
+ */
+function workspaceRepo(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
