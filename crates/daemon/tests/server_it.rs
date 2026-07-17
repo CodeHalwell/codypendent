@@ -280,13 +280,16 @@ async fn create_attach_and_two_clients_observe_one_event() {
 
     let mut got_accepted = false;
     let mut got_event = false;
-    for _ in 0..4 {
+    for _ in 0..8 {
         match read_frame(&mut s2).await.payload {
             Payload::CommandAccepted { .. } => got_accepted = true,
-            Payload::Event(event) => {
-                assert!(matches!(event.body, EventBody::NoteAppended { .. }));
-                got_event = true;
-            }
+            Payload::Event(event) => match event.body {
+                EventBody::NoteAppended { .. } => got_event = true,
+                // Presence is expected background noise (STEP 3.7): a client's own
+                // attach publishes a `ClientPresenceChanged` it then observes.
+                EventBody::ClientPresenceChanged { .. } => {}
+                other => panic!("unexpected event on client 2: {other:?}"),
+            },
             Payload::Ping => {}
             other => panic!("unexpected frame on client 2: {other:?}"),
         }
@@ -297,8 +300,14 @@ async fn create_attach_and_two_clients_observe_one_event() {
     assert!(got_accepted, "submitter must receive CommandAccepted");
     assert!(got_event, "submitter (subscribed) must observe the event");
 
-    // Client 1, the second observer of the same session, receives the same event.
-    let observed = read_until_event(&mut s1).await;
+    // Client 1, the second observer of the same session, receives the same event
+    // (skipping the presence events either client's attach produced).
+    let observed = loop {
+        let event = read_until_event(&mut s1).await;
+        if !matches!(event.body, EventBody::ClientPresenceChanged { .. }) {
+            break event;
+        }
+    };
     assert!(matches!(observed.body, EventBody::NoteAppended { .. }));
 
     shutdown(s1, task).await;

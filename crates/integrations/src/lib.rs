@@ -17,6 +17,7 @@
 //! layer (`codypendentd`) wires the GitHub client into the tool layer and the
 //! webhook listener into daemon startup.
 
+pub mod acp;
 pub mod github;
 pub mod ide;
 pub mod webhook;

@@ -5,6 +5,7 @@
 //! logic directly against a hand-rolled mock server, without spawning the
 //! `codypendent` binary itself.
 
+pub mod acp;
 pub mod client;
 pub mod commands;
 pub mod connection;

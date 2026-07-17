@@ -83,6 +83,14 @@ enum TopCommand {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
+    /// `agent_servers` config points at this; it is not meant to be run by hand.
+    Acp {
+        /// Repository the ACP-driven runs operate in. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
     /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
     /// same session — the run keeps going, it never restarts.
@@ -211,6 +219,13 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Acp { repo } => {
+            let repo = match repo {
+                Some(repo) => repo,
+                None => std::env::current_dir()?,
+            };
+            codypendent_cli::acp::serve(&paths, repo).await
+        }
         TopCommand::Open {
             session_id,
             ide,
