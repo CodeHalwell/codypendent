@@ -20,7 +20,7 @@ the release gate is the
 | **0** | Workspace bootstrap — daemon lifecycle, protocol, ledger, CI | ✅ |
 | **1** | Persistent coding-agent slice — sessions/runs, tools, approvals, TUI, JSONL | ✅ |
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
-| **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ⬜ |
+| **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | 🟡 |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | ⬜ |
 | **5** | Workflows & multi-agent orchestration | ⬜ |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
@@ -30,7 +30,12 @@ the release gate is the
 > knowledgeable: a governed registry with hybrid retrieval (recall@8 = 1.0 on the
 > eval set, unsafe items filtered), an always-on memory fabric with provenance and
 > absolute cross-repository isolation, and a tree-sitter code graph + repository
-> map. Phase 3 (GitHub & IDE awareness) is the next slice.
+> map. Phase 3 (GitHub & IDE awareness) is **in progress**: the backend
+> foundation has landed — a new `codypendent-integrations` crate with an
+> idempotent, approval-gated GitHub client, replay-safe webhook ingestion, and
+> the IDE bridge contract with normative source-provenance labels. The editor
+> extensions (VS Code/Cursor, Zed ACP) and full session handoff are the remaining
+> slice.
 
 ---
 
@@ -109,14 +114,27 @@ New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 - [x] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories
 - [x] `fmt` / `clippy` / `test` green; commits made; tree clean
 
-## Phase 3 — GitHub & IDE awareness ⬜
+## Phase 3 — GitHub & IDE awareness 🟡
 
-- [ ] GitHub read + draft-PR workflows; GitHub App option
-- [ ] VS Code/Cursor extension; Zed ACP adapter; IDE context (active file, selection, diagnostics, dirty buffers)
-- [ ] Shared session handoff (same run in TUI and IDE)
+New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::GitHubMutation`; migration `0004`→`0005` (webhook delivery idempotency).
+
+- [x] **3.1** GitHub personal-mode client — `GitHubApi` trait + `reqwest` client (get PR, check-runs, job logs, review comments, draft PR, update PR, check-run summary); opaque `GitHubToken` broker (`gh auth token`/`GITHUB_TOKEN`, redacted, never serialized); hidden-marker idempotency (list-before-create); `eval_github_mutation` policy gate (network-scoped to `api.github.com:443`, always approval-gated); wiremock tests
+- [ ] **3.2** `/fix-ci` failed-check workflow (hard-coded Phase 3 flow; wires the client into the agent loop) — *not started*
+- [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
+- [x] **3.4** IDE bridge contract (`IdeBridge`) + source provenance — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance` labels (`committed@<rev>` | `filesystem` | `unsaved-ide-buffer` | `generated-patch` | `agent-worktree`); dirty-buffer-over-filesystem resolution; deterministic debounce. *Live-path wiring into the model read path + TUI trace render is deferred with 3.5.*
+- [ ] **3.5** VS Code / Cursor extension (side panel, approvals, IDE context, diff view) — *not started*
+- [ ] **3.6** Zed via ACP adapter — *not started*
+- [ ] **3.7** Session handoff polish (`ClientPresenceChanged`, same run in TUI + IDE) — *not started*
 
 **Exit:** same run visible in TUI + IDE; unsaved-buffer provenance shown; PR
 actions idempotent + approval-gated; webhook replay safe.
+
+**Verified so far:** GitHub writes are idempotent (repeated key → one object) and
+approval-gated (`GitHubMutation` → `RequireApproval`, network-denied by default);
+token never enters `Debug`/serialization; replayed webhook delivery (same GUID)
+produces no second event and a forged signature is rejected before parsing. The
+IDE/TUI-visible-same-run and `/fix-ci` end-to-end criteria await the editor
+extensions and the `/fix-ci` workflow.
 
 ## Phase 4 — Docs Studio & richer code intelligence ⬜
 
