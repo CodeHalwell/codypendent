@@ -476,7 +476,8 @@ impl CommandProcessor {
             Actor::Client {
                 client_id: ctx.client_id,
             },
-            EventBody::NoteAppended { text },
+            // Session-level user input — not tied to one run's transcript.
+            EventBody::NoteAppended { text, run_id: None },
         )];
         self.run_transaction(
             pool,
@@ -997,6 +998,7 @@ impl CommandProcessor {
                 &Actor::System,
                 &EventBody::NoteAppended {
                     text: format!("pending-effect {id} ({kind}) reconciled as {new_state}"),
+                    run_id: None,
                 },
                 &now,
                 None,

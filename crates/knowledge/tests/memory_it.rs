@@ -557,6 +557,7 @@ async fn extract_candidates_yields_provenance_bearing_candidates() {
             6,
             EventBody::NoteAppended {
                 text: "memory.propose: CI runs on ubuntu-latest".to_string(),
+                run_id: None,
             },
         ),
     ];

@@ -156,6 +156,7 @@ fn note_event(sequence: u64, text: &str) -> SessionEvent {
         actor: Actor::System,
         body: EventBody::NoteAppended {
             text: text.to_string(),
+            run_id: None,
         },
     }
 }

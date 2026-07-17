@@ -68,6 +68,15 @@ pub enum EventBody {
     },
     NoteAppended {
         text: String,
+        /// The run this note belongs to, when it is run-scoped (a run's context
+        /// manifest or a curated-memory note). `None` for a session-level note
+        /// (e.g. user input, an effect-reconciliation record), which a client
+        /// attaches to whatever run is in focus. Without this, a run's note could
+        /// land on the wrong transcript when runs interleave (issue #6 item 3).
+        /// `#[serde(default)]` keeps old ledger bytes (which have no `run_id`)
+        /// parsing to `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
     },
     SessionClosed,
 

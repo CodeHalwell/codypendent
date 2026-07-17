@@ -93,6 +93,7 @@ mod tests {
             actor: Actor::System,
             body: EventBody::NoteAppended {
                 text: text.to_string(),
+                run_id: None,
             },
         }
     }

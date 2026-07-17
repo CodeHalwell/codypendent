@@ -253,18 +253,28 @@ impl RuntimeExecutor {
             .map_err(|e| format!("run failed: {e}"))
     }
 
-    /// Append a `NoteAppended` event to `session_id`'s ledger and publish it to
-    /// the shared fan-out — append-then-publish, mirroring [`recovery::fail_run`]
-    /// so an attached client observes the note live. Used to surface the context
-    /// manifest and the curated memories in a run's trace.
-    async fn emit_note(&self, session_id: SessionId, text: String) -> anyhow::Result<()> {
+    /// Append a run-scoped `NoteAppended` event to `session_id`'s ledger and
+    /// publish it to the shared fan-out — append-then-publish, mirroring
+    /// [`recovery::fail_run`] so an attached client observes the note live. Used
+    /// to surface the context manifest and the curated memories in a run's trace.
+    /// The note carries its `run_id` so a client routes it to the right run's
+    /// transcript even when runs interleave (issue #6 item 3).
+    async fn emit_note(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        text: String,
+    ) -> anyhow::Result<()> {
         // Atomic sequence claim — the note may race a concurrent client command
         // on the same session.
         let event = ledger::append_next_event(
             &self.pool,
             session_id,
             &Actor::System,
-            &EventBody::NoteAppended { text },
+            &EventBody::NoteAppended {
+                text,
+                run_id: Some(run_id),
+            },
             Utc::now(),
         )
         .await?;
@@ -281,14 +291,14 @@ impl RuntimeExecutor {
     /// appended and published from the worker before `execute` spawns, so it can
     /// never race the loop for a sequence. A fabric failure is warned and swallowed
     /// (context is an aid, never a gate on running).
-    async fn emit_context(&self, session_id: SessionId, objective: &str) {
+    async fn emit_context(&self, session_id: SessionId, run_id: RunId, objective: &str) {
         // System (built-ins) + this repository (harvested run memories are stored
         // at repository visibility), so a memory a prior run curated resurfaces.
         let scopes = [Scope::System, Scope::Repository(self.repository)];
         match assemble_context(&self.pool, self.repository, objective, &scopes).await {
             Ok(manifest) => {
-                if let Err(error) = self.emit_note(session_id, manifest.render()).await {
-                    warn!(%session_id, %error, "could not emit run context note");
+                if let Err(error) = self.emit_note(session_id, run_id, manifest.render()).await {
+                    warn!(%session_id, %run_id, %error, "could not emit run context note");
                 }
             }
             Err(error) => warn!(%session_id, %error, "could not assemble run context"),
@@ -304,7 +314,7 @@ impl RuntimeExecutor {
     /// anything is stored, so a `remembered:` note can never carry secret text.
     /// Every failure is warned and swallowed — a harvesting error must not turn a
     /// finished run into a failed one.
-    async fn harvest_memories(&self, session_id: SessionId) {
+    async fn harvest_memories(&self, session_id: SessionId, run_id: RunId) {
         let events = match ledger::load_events(&self.pool, session_id).await {
             Ok(events) => events,
             Err(error) => {
@@ -329,10 +339,14 @@ impl RuntimeExecutor {
             match store.curate(&self.pool, candidate).await {
                 Ok(Curation::Accepted(record)) | Ok(Curation::Superseded { record, .. }) => {
                     if let Err(error) = self
-                        .emit_note(session_id, format!("remembered: {}", record.statement))
+                        .emit_note(
+                            session_id,
+                            run_id,
+                            format!("remembered: {}", record.statement),
+                        )
                         .await
                     {
-                        warn!(%session_id, %error, "could not emit curated-memory note");
+                        warn!(%session_id, %run_id, %error, "could not emit curated-memory note");
                     }
                 }
                 // Redacted / Duplicate / Rejected: nothing durable, nothing to note.
@@ -367,7 +381,7 @@ impl RunExecutor for RuntimeExecutor {
             // map + retrieved tool/skill cards + cited memories). Emitted here,
             // BEFORE the agent loop, so the note never races the loop's own
             // sequence allocations.
-            executor.emit_context(session_id, &objective).await;
+            executor.emit_context(session_id, run_id, &objective).await;
 
             // Run the work in a CHILD task so even a panic in the agent loop
             // becomes a clean terminal failure (a `JoinError`) rather than a
@@ -411,7 +425,7 @@ impl RunExecutor for RuntimeExecutor {
             // it, or `fail_run` above did). Harvest any curated memories from its
             // event trace and note each durable one — emitted AFTER the loop, so
             // these appends never race it either.
-            executor.harvest_memories(session_id).await;
+            executor.harvest_memories(session_id, run_id).await;
         });
     }
 
