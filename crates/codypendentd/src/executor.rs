@@ -551,12 +551,24 @@ async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
 
 /// Parse an `owner/repo` [`RepoId`] from a GitHub remote URL, accepting both the
 /// HTTPS (`https://github.com/owner/repo.git`) and scp-like SSH
-/// (`git@github.com:owner/repo.git`) forms. Returns `None` for a non-GitHub URL.
+/// (`git@github.com:owner/repo.git`) forms. The host is matched **exactly**
+/// against `github.com` (never by substring), so `mygithub.com` or
+/// `github.com.evil.example` is rejected, and any embedded userinfo (a token in
+/// the URL) is discarded, not propagated.
 fn parse_github_slug(url: &str) -> Option<RepoId> {
-    let (_, rest) = url.split_once("github.com")?;
-    let rest = rest.trim_start_matches([':', '/']);
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    let mut parts = rest.split('/').filter(|segment| !segment.is_empty());
+    // Drop the scheme (`https://`, `ssh://`) and any `user[:pass]@` userinfo.
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, rest)| rest);
+    // The host runs up to the first delimiter: `/` in the URL form, `:` in the
+    // scp-like form. Everything after it is the path.
+    let boundary = rest.find(['/', ':'])?;
+    let host = &rest[..boundary];
+    if host != "github.com" {
+        return None;
+    }
+    let path = rest[boundary + 1..].trim_start_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/').filter(|segment| !segment.is_empty());
     let owner = parts.next()?;
     let repo = parts.next()?;
     Some(RepoId::new(owner.to_string(), repo.to_string()))
@@ -581,8 +593,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_github_remotes() {
+    fn discards_url_embedded_credentials() {
+        // A token in the URL must be dropped, and the host still matched exactly.
+        let repo = parse_github_slug("https://user:ghp_secret@github.com/octocat/hello-world.git")
+            .expect("parse");
+        assert_eq!(repo.owner, "octocat");
+        assert_eq!(repo.repo, "hello-world");
+    }
+
+    #[test]
+    fn rejects_non_github_and_lookalike_hosts() {
         assert!(parse_github_slug("https://gitlab.com/octocat/hello-world.git").is_none());
+        // Look-alike hosts that merely contain the substring must be rejected.
+        assert!(parse_github_slug("https://mygithub.com/octocat/hello-world.git").is_none());
+        assert!(parse_github_slug("https://github.com.evil.example/octocat/hello.git").is_none());
         assert!(parse_github_slug("").is_none());
     }
 }

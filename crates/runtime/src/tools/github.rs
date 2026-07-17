@@ -14,15 +14,15 @@
 //! [`ProposedAction::GitHubMutation`], which the policy engine always sends
 //! through approval.
 
+// Single source of truth for the endpoint: the policy engine owns it (a GitHub
+// mutation must be network-authorized against exactly this string), and the tool
+// layer reuses it so a read's `NetworkRequest` destination can never drift out of
+// sync with what the policy admits.
+use codypendent_daemon::policy::GITHUB_API_ENDPOINT;
 use codypendent_integrations::github::model::{CheckRun, NewPullRequest, PullRequest};
 use codypendent_integrations::github::{github_mutation_action, RepoId};
 use codypendent_protocol::ProposedAction;
 use serde_json::Value;
-
-/// The `host:port` a GitHub API call is network-scoped to. Mirrors the daemon
-/// policy's `GITHUB_API_ENDPOINT`; kept here so the tool layer does not reach
-/// into the policy engine for a constant.
-pub const GITHUB_API_ENDPOINT: &str = "api.github.com:443";
 
 /// The typed input for `github.get_pull_request`.
 pub struct GetPullRequestInput {
@@ -137,8 +137,9 @@ pub fn parse_create_draft_pull_request(
     let body = args.get("body").and_then(Value::as_str).map(str::to_string);
     // The head→base pair identifies a PR within a repository, so a re-issued
     // create for the same branch pair resolves (via the hidden marker) to the
-    // existing PR instead of a duplicate.
-    let idempotency_key = format!("{head}->{base}");
+    // existing PR instead of a duplicate. `:` is forbidden in git ref names, so
+    // it is an unambiguous delimiter — no branch-name pair can collide on it.
+    let idempotency_key = format!("{head}:{base}");
     Ok(CreateDraftPullRequestInput {
         title,
         head,
