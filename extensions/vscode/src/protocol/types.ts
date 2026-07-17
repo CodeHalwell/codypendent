@@ -155,18 +155,18 @@ export type ProposedAction =
   | { type: "GitCommit"; repository: string }
   | { type: "GitPush"; remote: string; branch: string }
   | { type: "GitHubMutation"; repository: string; summary: string }
-  | { type: string; [key: string]: unknown };
+  | { type: "Unknown" };
 
 export type ToolOutcome =
   | { type: "Succeeded" }
   | { type: "Failed"; message: string }
-  | { type: string; [key: string]: unknown };
+  | { type: "Unknown" };
 
 export type RunDisposition =
   | { type: "Completed"; summary?: string }
   | { type: "Failed"; reason: string }
   | { type: "Cancelled"; reason?: string }
-  | { type: string; [key: string]: unknown };
+  | { type: "Unknown" };
 
 export type BudgetDimension =
   | { type: "Tokens" }
@@ -253,7 +253,7 @@ export type EventBody =
   | { type: "SteeringApplied"; run_id: Uuid }
   | { type: "BudgetWarning"; run_id: Uuid; dimension: BudgetDimension; used: number; limit: number }
   | { type: "RunCompleted"; run_id: Uuid; disposition: RunDisposition; chronicle: ArtifactRef }
-  | { type: string; [key: string]: unknown };
+  | { type: "Unknown" };
 
 export interface SessionEvent {
   sequence: number;
@@ -279,7 +279,7 @@ export interface SessionProjection {
 export type Catchup =
   | { type: "Events"; from: number; through: number; events: SessionEvent[] }
   | { type: "Snapshot"; through: number; projection: SessionProjection }
-  | { type: string; [key: string]: unknown };
+  | { type: "Unknown" };
 
 // ---------------------------------------------------------------------------
 // ide.rs

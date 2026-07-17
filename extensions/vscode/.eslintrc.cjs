@@ -20,6 +20,10 @@ module.exports = {
       { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
     ],
     "@typescript-eslint/explicit-module-boundary-types": "off",
+    // The DaemonClient uses the standard typed-EventEmitter idiom: an interface
+    // of the same name declares strongly-typed on/once/off/emit overloads that
+    // merge onto the class. This is safe and intentional here.
+    "@typescript-eslint/no-unsafe-declaration-merging": "off",
     eqeqeq: ["error", "smart"],
     "no-console": "off",
   },

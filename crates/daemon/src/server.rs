@@ -210,6 +210,10 @@ struct ConnState {
     role: ClientRole,
     /// Whether a `ClientHello` has been seen (session interaction requires it).
     handshaken: bool,
+    /// Sessions this connection is attached to, with the role it attached under.
+    /// On disconnect a `ClientPresenceChanged { present: false }` is published for
+    /// each, so other clients see it leave (Phase 3 STEP 3.7).
+    attached: Vec<(SessionId, ClientRole)>,
 }
 
 impl ConnState {
@@ -218,6 +222,7 @@ impl ConnState {
             client_id: None,
             role: ClientRole::Controller,
             handshaken: false,
+            attached: Vec::new(),
         }
     }
 
@@ -289,6 +294,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     // A slow or vanished client must never wedge a forwarder; drop them all.
     for forwarder in forwarders {
         forwarder.abort();
+    }
+    // Announce this client's departure from every session it was attached to, so
+    // the remaining clients see it leave (STEP 3.7).
+    if let Some(client_id) = conn.client_id {
+        for (session_id, role) in &conn.attached {
+            publish_presence(&state, *session_id, client_id, *role, false).await;
+        }
     }
     result
 }
@@ -438,6 +450,9 @@ async fn handle_request(
                         subscriptions.clone(),
                     )
                     .await?;
+                    // Remember the attachment so a detach presence event fires when
+                    // this connection ends (STEP 3.7).
+                    conn.attached.push((*session_id, *requested_role));
                 }
                 // IDE context is latest-wins, high-frequency projection state, not
                 // a ledger command — upsert it directly and acknowledge, mirroring
@@ -650,7 +665,39 @@ async fn handle_attach(
         current_max,
     ));
     forwarders.push(handle);
+    // Announce this client's arrival so other attached clients (e.g. the TUI
+    // during a handoff to VS Code) see it join. Emitted after the forwarder is
+    // live so the arriving client also receives its own presence event.
+    publish_presence(state, session_id, client_id, conn.role, true).await;
     Ok(())
+}
+
+/// Append a `ClientPresenceChanged` event and fan it out to the session's
+/// attached clients (persist-before-publish). A failure is logged, never fatal —
+/// presence is a convenience signal, not a correctness gate.
+async fn publish_presence(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+    role: ClientRole,
+    present: bool,
+) {
+    match ledger::append_next_event(
+        &state.pool,
+        session_id,
+        &codypendent_protocol::Actor::Client { client_id },
+        &codypendent_protocol::EventBody::ClientPresenceChanged {
+            client_id,
+            role,
+            present,
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(event) => state.subscriptions.publish(session_id, event),
+        Err(error) => tracing::warn!(%error, "could not record client presence"),
+    }
 }
 
 /// Forward persisted session events to one attached client, filtered by its
