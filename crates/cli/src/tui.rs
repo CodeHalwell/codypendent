@@ -391,11 +391,21 @@ async fn resolve_or_create_session(
                 requested_role: ClientRole::Controller,
             })
             .await?;
+        // Only resume when the catch-up proves the session still exists. The
+        // daemon can't tell an *absent* session from an empty one — it reports max
+        // sequence 0 for both and replies with an empty `Catchup`, never a
+        // rejection — but a real session always replays at least its
+        // `SessionCreated` event (sequence 1). Accepting a zero-event catch-up
+        // would open a blank TUI bound to a dead id whose every `StartRun` is then
+        // rejected `session-not-found`; instead fall through and create a fresh
+        // session, keeping the workspace. (issue #6 item 6)
         if let Payload::Catchup { catchup } = reply.payload {
-            return Ok((stored.session_id, stored.workspace_id, catchup));
+            if catchup_proves_session_exists(&catchup) {
+                return Ok((stored.session_id, stored.workspace_id, catchup));
+            }
         }
-        // Rejected: the daemon no longer has that session (fresh data dir, or it
-        // was closed). Fall through and create a new one, keeping the workspace.
+        // Rejected, or a zero-event catch-up to a session the daemon no longer has
+        // (fresh data dir, GC'd, or closed): fall through and create a new one.
     }
 
     // Create a new session (reusing this repo's workspace id if we have one, so a
@@ -443,6 +453,19 @@ async fn resolve_or_create_session(
     store.save(paths); // best-effort: a persistence miss only costs the next
                        // launch a fresh session, never correctness.
     Ok((session_id, workspace, catchup))
+}
+
+/// Whether an attach-time [`Catchup`] proves its session still exists in the
+/// daemon. A live session always replays at least its `SessionCreated` event, so
+/// its watermark is `>= 1`; the daemon reports `0` for an absent session (it
+/// cannot distinguish "gone" from "empty"). An unrecognized future variant is
+/// accepted rather than needlessly discarding a resumable session — the concrete
+/// failure (issue #6 item 6) is specifically the provably-empty catch-up.
+fn catchup_proves_session_exists(catchup: &Catchup) -> bool {
+    match catchup {
+        Catchup::Events { through, .. } | Catchup::Snapshot { through, .. } => *through > 0,
+        _ => true,
+    }
 }
 
 /// Read the knowledge fabric's registry + memories directly from SQLite and map
@@ -790,5 +813,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
         assert!(SessionStore::load(&paths).sessions.is_empty());
+    }
+
+    #[test]
+    fn a_zero_event_catchup_is_treated_as_a_missing_session() {
+        // The helper keys off the watermark, not the event vec. An absent session
+        // watermarks at 0 and must not be resumed (issue #6 item 6); a live one
+        // replays at least its SessionCreated event, so its watermark is >= 1.
+        assert!(!catchup_proves_session_exists(&Catchup::Events {
+            from: 1,
+            through: 0,
+            events: vec![],
+        }));
+        assert!(catchup_proves_session_exists(&Catchup::Events {
+            from: 1,
+            through: 3,
+            events: vec![],
+        }));
+        // A forward-compat variant we can't inspect is accepted rather than
+        // discarding a possibly-resumable session against a newer daemon.
+        assert!(catchup_proves_session_exists(&Catchup::Unknown));
     }
 }
