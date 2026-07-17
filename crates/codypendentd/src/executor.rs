@@ -21,7 +21,8 @@
 //! builds those from plain closures rather than the macros the runtime's own
 //! integration tests use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -43,6 +44,8 @@ use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
+use crate::scan;
+
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
 #[derive(Clone)]
@@ -51,10 +54,13 @@ pub struct RuntimeExecutor {
     paths: RuntimePaths,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
-    /// The repository the knowledge fabric attributes this process's runs to.
-    /// Minted once at startup (in `main`) and shared with the code-graph scan, so
-    /// every run's context maps + memories share one stable repository identity.
-    repository: RepositoryId,
+    /// Repositories already folded into the code graph this process's lifetime.
+    /// A per-user daemon can serve several checkouts over one socket, so each run
+    /// derives its OWN repository identity from its repository root and the first
+    /// run for a repository warms it here (issue #6 item 1). Seeded with the
+    /// startup repository `main` already scanned, so the primary checkout is never
+    /// re-scanned. `Arc<Mutex<…>>` so every clone shares one set.
+    scanned: Arc<Mutex<HashSet<RepositoryId>>>,
     /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
     /// a run's handle before its loop starts and removes it once the loop is
     /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
@@ -68,22 +74,39 @@ pub struct RuntimeExecutor {
 impl RuntimeExecutor {
     /// Build an executor over the daemon's pool + paths, minting the shared
     /// fan-out + approval broker the server binds to via [`Self::collaborators`].
-    /// `repository` is the (process-stable) id `main` also feeds the startup
-    /// code-graph scan, so a run's repository map and its curated memories share
-    /// one identity.
-    pub fn new(pool: SqlitePool, paths: RuntimePaths, repository: RepositoryId) -> Self {
+    /// `startup_repository` is the id `main` already scanned from the daemon's own
+    /// directory; it seeds the "already scanned" set so the primary checkout is
+    /// not re-scanned when its first run arrives.
+    pub fn new(pool: SqlitePool, paths: RuntimePaths, startup_repository: RepositoryId) -> Self {
         let subscriptions = SubscriptionHub::new();
         // Bind the broker to the SAME hub the server fans out to, so an
         // `ApprovalRequested` raised by the agent loop reaches attached clients
         // live (not only on re-attach catch-up).
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
+        let mut scanned = HashSet::new();
+        scanned.insert(startup_repository);
         Self {
             pool,
             paths,
             subscriptions,
             approvals,
-            repository,
+            scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Warm `repository`'s code graph the first time this daemon serves a run for
+    /// it, so [`emit_context`](Self::emit_context) opens with the right repository
+    /// map. The lock is released before the (async) scan — a `std` mutex is never
+    /// held across an await — and only the first caller for a repository scans;
+    /// later runs reuse the graph.
+    async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
+        let newly = {
+            let mut seen = self.scanned.lock().expect("scanned set lock");
+            seen.insert(repository)
+        };
+        if newly {
+            scan::scan_repository(&self.pool, repository, root).await;
         }
     }
 
@@ -291,11 +314,17 @@ impl RuntimeExecutor {
     /// appended and published from the worker before `execute` spawns, so it can
     /// never race the loop for a sequence. A fabric failure is warned and swallowed
     /// (context is an aid, never a gate on running).
-    async fn emit_context(&self, session_id: SessionId, run_id: RunId, objective: &str) {
+    async fn emit_context(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+        objective: &str,
+    ) {
         // System (built-ins) + this repository (harvested run memories are stored
         // at repository visibility), so a memory a prior run curated resurfaces.
-        let scopes = [Scope::System, Scope::Repository(self.repository)];
-        match assemble_context(&self.pool, self.repository, objective, &scopes).await {
+        let scopes = [Scope::System, Scope::Repository(repository)];
+        match assemble_context(&self.pool, repository, objective, &scopes).await {
             Ok(manifest) => {
                 if let Err(error) = self.emit_note(session_id, run_id, manifest.render()).await {
                     warn!(%session_id, %run_id, %error, "could not emit run context note");
@@ -314,7 +343,12 @@ impl RuntimeExecutor {
     /// anything is stored, so a `remembered:` note can never carry secret text.
     /// Every failure is warned and swallowed — a harvesting error must not turn a
     /// finished run into a failed one.
-    async fn harvest_memories(&self, session_id: SessionId, run_id: RunId) {
+    async fn harvest_memories(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+    ) {
         let events = match ledger::load_events(&self.pool, session_id).await {
             Ok(events) => events,
             Err(error) => {
@@ -329,7 +363,7 @@ impl RuntimeExecutor {
         // visibility so the curated memory resurfaces in later runs' context
         // (which `emit_context` queries at System + this repository); a
         // session-scoped memory would never be seen again.
-        let repository_scope = Scope::Repository(self.repository);
+        let repository_scope = Scope::Repository(repository);
         let mut candidates = extract_candidates(&events, Scope::Session(session_id));
         for candidate in &mut candidates {
             candidate.scope = Some(repository_scope.clone());
@@ -365,6 +399,10 @@ impl RunExecutor for RuntimeExecutor {
             let session_id = launch.session_id;
             let run_id = launch.run_id;
             let objective = launch.objective.clone();
+            // This run's OWN repository identity, derived from its repository root
+            // (issue #6 item 1) — NOT the daemon's startup directory — so a shared
+            // daemon attributes its context map and curated memories correctly.
+            let repository = scan::repository_id_for(&launch.repository);
 
             // Register a cancellation handle BEFORE the loop starts, so a
             // `CancelRun` accepted at any point after this run was launched can
@@ -377,11 +415,19 @@ impl RunExecutor for RuntimeExecutor {
                 .expect("cancellations registry lock")
                 .insert(run_id, handle);
 
+            // Warm this repository's code graph the first time the daemon serves a
+            // run for it, so the context below opens with the right repository map.
+            executor
+                .ensure_scanned(repository, &launch.repository)
+                .await;
+
             // Open the run's trace with the knowledge-fabric context (repository
             // map + retrieved tool/skill cards + cited memories). Emitted here,
             // BEFORE the agent loop, so the note never races the loop's own
             // sequence allocations.
-            executor.emit_context(session_id, run_id, &objective).await;
+            executor
+                .emit_context(session_id, run_id, repository, &objective)
+                .await;
 
             // Run the work in a CHILD task so even a panic in the agent loop
             // becomes a clean terminal failure (a `JoinError`) rather than a
@@ -425,7 +471,9 @@ impl RunExecutor for RuntimeExecutor {
             // it, or `fail_run` above did). Harvest any curated memories from its
             // event trace and note each durable one — emitted AFTER the loop, so
             // these appends never race it either.
-            executor.harvest_memories(session_id, run_id).await;
+            executor
+                .harvest_memories(session_id, run_id, repository)
+                .await;
         });
     }
 

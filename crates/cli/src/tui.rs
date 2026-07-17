@@ -135,6 +135,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let repository = repo.to_string_lossy().into_owned();
     let result = event_loop(
         &mut guard,
         &theme,
@@ -146,6 +147,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
         &out_tx,
         client_id,
         session_id,
+        &repository,
     )
     .await;
 
@@ -173,6 +175,7 @@ async fn event_loop(
     out_tx: &mpsc::Sender<Envelope>,
     client_id: ClientId,
     session_id: SessionId,
+    repository: &str,
 ) -> anyhow::Result<()> {
     guard
         .terminal_mut()
@@ -199,7 +202,8 @@ async fn event_loop(
         reduce(state, action);
 
         for intent in state.drain_outbox() {
-            let envelope = command_envelope(client_id, intent_to_command(intent, session_id));
+            let envelope =
+                command_envelope(client_id, intent_to_command(intent, session_id, repository));
             if out_tx.send(envelope).await.is_err() {
                 return Ok(()); // writer gone → connection is down; leave cleanly
             }
@@ -302,12 +306,16 @@ fn spawn_input_thread(tx: mpsc::Sender<CrosstermEvent>, running: Arc<AtomicBool>
 /// the TUI is attached to. A pure 1:1 translation — the whole point of the
 /// outbox is that `reduce` stays I/O-free and this is the only place intents
 /// become protocol.
-fn intent_to_command(intent: Intent, session_id: SessionId) -> CommandBody {
+fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) -> CommandBody {
     match intent {
         Intent::StartRun { objective, mode } => CommandBody::StartRun {
             session_id,
             objective,
             mode,
+            // Attribute the run to the repository this TUI is attached to, so a
+            // shared daemon does not store its memories under its own directory
+            // (issue #6 item 1).
+            repository: Some(repository.to_owned()),
         },
         Intent::ResolveApproval {
             approval_id,
@@ -708,6 +716,7 @@ mod tests {
     fn intents_map_to_the_matching_command_bodies() {
         let session_id = SessionId::new();
         let run_id = RunId::new();
+        let repository = "/repo/one";
 
         assert_eq!(
             intent_to_command(
@@ -716,11 +725,13 @@ mod tests {
                     mode: AgentMode::Build,
                 },
                 session_id,
+                repository,
             ),
             CommandBody::StartRun {
                 session_id,
                 objective: "diagnose".into(),
                 mode: AgentMode::Build,
+                repository: Some(repository.to_owned()),
             }
         );
 
@@ -733,6 +744,7 @@ mod tests {
                     scope: ApprovalScope::Once,
                 },
                 session_id,
+                repository,
             ),
             CommandBody::ResolveApproval {
                 approval_id,
@@ -742,15 +754,15 @@ mod tests {
         );
 
         assert_eq!(
-            intent_to_command(Intent::PauseRun { run_id }, session_id),
+            intent_to_command(Intent::PauseRun { run_id }, session_id, repository),
             CommandBody::PauseRun { run_id }
         );
         assert_eq!(
-            intent_to_command(Intent::ResumeRun { run_id }, session_id),
+            intent_to_command(Intent::ResumeRun { run_id }, session_id, repository),
             CommandBody::ResumeRun { run_id }
         );
         assert_eq!(
-            intent_to_command(Intent::CancelRun { run_id }, session_id),
+            intent_to_command(Intent::CancelRun { run_id }, session_id, repository),
             CommandBody::CancelRun { run_id }
         );
         assert_eq!(
@@ -760,6 +772,7 @@ mod tests {
                     text: "focus on the failing test".into(),
                 },
                 session_id,
+                repository,
             ),
             CommandBody::QueueSteering {
                 run_id,

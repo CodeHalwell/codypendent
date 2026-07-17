@@ -51,6 +51,15 @@ pub enum CommandBody {
         session_id: SessionId,
         objective: String,
         mode: AgentMode,
+        /// The canonical filesystem root of the repository this run operates on.
+        /// A per-user daemon can serve several checkouts over one socket, so the
+        /// run — not the daemon's startup working directory — must decide which
+        /// repository its context map and curated memories are attributed to
+        /// (issue #6 item 1). `#[serde(default)]` keeps an older client (which
+        /// sends none) working: the daemon then falls back to its own directory,
+        /// exactly as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
     },
     ResolveApproval {
         approval_id: ApprovalId,
@@ -91,6 +100,27 @@ mod tests {
     }
 
     #[test]
+    fn start_run_repository_is_omitted_when_absent_and_reparses_to_none() {
+        // The per-run repository (issue #6 item 1) is optional on the wire: a
+        // client that sends none produces JSON without the key, and such a
+        // payload (also what an older client emits) parses back to `None` so the
+        // daemon falls back to its own directory.
+        let body = CommandBody::StartRun {
+            session_id: SessionId::new(),
+            objective: "diagnose".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            !json.contains("repository"),
+            "an absent repository is skipped on the wire: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body, "a payload without the key defaults to None");
+    }
+
+    #[test]
     fn every_command_body_round_trips() {
         round_trip(CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
@@ -111,6 +141,7 @@ mod tests {
             session_id: SessionId::new(),
             objective: "diagnose the failing test".to_string(),
             mode: AgentMode::Build,
+            repository: Some("/home/user/project".to_string()),
         });
         round_trip(CommandBody::ResolveApproval {
             approval_id: ApprovalId::new(),

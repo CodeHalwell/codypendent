@@ -146,6 +146,10 @@ impl CommandProcessor {
                 session_id,
                 objective,
                 mode,
+                // `repository` is consumed by the server when it builds the
+                // executor's `RunLaunch` (it decides the run's repository
+                // identity), not by the write path — the ledger row is the same.
+                ..
             } => {
                 self.apply_start_run(pool, &ctx, &command, session_id, objective, mode)
                     .await
@@ -1424,6 +1428,7 @@ mod tests {
                 session_id: session,
                 objective: "fix it".to_string(),
                 mode: AgentMode::Build,
+                repository: None,
             },
             "idem-start",
         );
@@ -1475,6 +1480,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1536,6 +1542,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1617,6 +1624,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1745,6 +1753,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),

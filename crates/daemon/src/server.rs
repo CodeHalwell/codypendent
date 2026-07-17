@@ -474,6 +474,7 @@ async fn handle_request(
                                     session_id,
                                     objective,
                                     mode,
+                                    repository,
                                 } = &command.body
                                 {
                                     executor.spawn_run(RunLaunch {
@@ -481,11 +482,19 @@ async fn handle_request(
                                         run_id,
                                         objective: objective.clone(),
                                         mode: *mode,
-                                        // Phase 1 carries no per-run repository
-                                        // path on the wire, so fall back to the
-                                        // daemon's working directory.
-                                        repository: std::env::current_dir()
-                                            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                                        // The run carries its own repository root
+                                        // so a shared daemon attributes it to the
+                                        // right checkout (issue #6 item 1); an
+                                        // older client that sends none falls back
+                                        // to the daemon's working directory.
+                                        repository: repository
+                                            .as_ref()
+                                            .map(std::path::PathBuf::from)
+                                            .unwrap_or_else(|| {
+                                                std::env::current_dir().unwrap_or_else(|_| {
+                                                    std::path::PathBuf::from(".")
+                                                })
+                                            }),
                                     });
                                 }
                             }
