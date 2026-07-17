@@ -19,6 +19,7 @@ pub mod error;
 pub mod events;
 pub mod framing;
 pub mod handshake;
+pub mod ide;
 pub mod ids;
 pub mod run;
 pub mod version;
@@ -32,6 +33,11 @@ pub use error::{CodypendentError, UserAction};
 pub use events::{Actor, EventBody, SessionEvent};
 pub use framing::{read_envelope, write_envelope, FrameError, MAX_FRAME_BYTES};
 pub use handshake::{ClientHello, ClientRole, ResumeToken, ServerHello, Subscription};
+pub use ide::{
+    Diagnostic, DiagnosticSeverity, DiffRequest, DirtyBufferDigest, EditorSelection,
+    IdeContextUpdate, IdeRequest, Location, Position, Range, SourceProvenance, TextEdit,
+    WorkspaceEdit,
+};
 pub use ids::*;
 pub use run::{
     AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel,

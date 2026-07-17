@@ -77,10 +77,10 @@ pub enum RunDisposition {
 /// A side-effecting action an agent proposes, pending policy evaluation and
 /// possibly approval.
 ///
-/// This is the Phase 1 minimal subset of the Chapter 14 shape: richer variants
-/// (`GitHubMutation`, `InstallPlugin`, structured `CommandRequest` /
-/// `NetworkDestination`) arrive in later phases. Paths and destinations are
-/// carried as strings on the wire.
+/// This started as the Phase 1 minimal subset of the Chapter 14 shape; Phase 3
+/// adds `GitHubMutation` for remote GitHub writes. Further variants
+/// (`InstallPlugin`, structured `CommandRequest` / `NetworkDestination`) arrive
+/// in later phases. Paths and destinations are carried as strings on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[non_exhaustive]
@@ -104,6 +104,17 @@ pub enum ProposedAction {
     GitPush {
         remote: String,
         branch: String,
+    },
+    /// A write to a remote GitHub resource (draft PR, review comment, PR
+    /// update, check-run summary) via the GitHub API (Phase 3 STEP 3.1). Every
+    /// such write is approval-gated and network-scoped to the GitHub API
+    /// endpoint by the policy engine.
+    GitHubMutation {
+        /// The `owner/repo` slug the mutation targets.
+        repository: String,
+        /// A short human-readable description of the write, rendered on the
+        /// approval card (e.g. `create draft PR on owner/repo`).
+        summary: String,
     },
     #[serde(other)]
     Unknown,
@@ -223,6 +234,10 @@ mod tests {
         });
         round_trip(ProposedAction::WritePatch {
             patch: ArtifactId::new(),
+        });
+        round_trip(ProposedAction::GitHubMutation {
+            repository: "octocat/hello-world".to_string(),
+            summary: "create draft PR on octocat/hello-world".to_string(),
         });
         round_trip(Risk {
             level: RiskLevel::High,

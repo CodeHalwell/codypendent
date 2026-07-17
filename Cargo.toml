@@ -8,6 +8,7 @@ members = [
     "crates/tui",
     "crates/runtime",
     "crates/knowledge",
+    "crates/integrations",
     "crates/test-support",
 ]
 
@@ -24,6 +25,7 @@ codypendent-daemon = { path = "crates/daemon" }
 codypendent-tui = { path = "crates/tui" }
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-knowledge = { path = "crates/knowledge" }
+codypendent-integrations = { path = "crates/integrations" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
@@ -40,6 +42,13 @@ crossterm = "0.28"
 # Hashing (content-addressed artifact store)
 sha2 = "0.10"
 hex = "0.4"
+
+# GitHub & IDE integrations (Phase 3). `reqwest` is the typed GitHub client's
+# HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook
+# `X-Hub-Signature-256`. `wiremock` (dev) is the mock GitHub server.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac = "0.12"
+wiremock = "0.6"
 
 # Async traits and config parsing
 async-trait = "0.1"
