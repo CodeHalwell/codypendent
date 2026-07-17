@@ -119,7 +119,7 @@ New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::GitHubMutation`; migration `0004`→`0005` (webhook delivery idempotency).
 
 - [x] **3.1** GitHub personal-mode client — `GitHubApi` trait + `reqwest` client (get PR, check-runs, job logs, review comments, draft PR, update PR, check-run summary); opaque `GitHubToken` broker (`gh auth token`/`GITHUB_TOKEN`, redacted, never serialized); hidden-marker idempotency (list-before-create); `eval_github_mutation` policy gate (network-scoped to `api.github.com:443`, always approval-gated); wiremock tests
-- [ ] **3.2** `/fix-ci` failed-check workflow (hard-coded Phase 3 flow; wires the client into the agent loop) — *not started*
+- [~] **3.2** GitHub in the agent loop — `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create draft PR as an approval-gated `GitHubMutation`), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, and `/fix-ci` registered as a built-in `Command` (surfaced in the Skill Studio). End-to-end tested: a write parks for approval, records a durable approval, and only then calls GitHub (rejected/denied writes never call it). *The full hard-coded `/fix-ci` orchestration (select PR → isolated worktree on the PR branch → investigate → patch → test → push → update PR) is the remaining piece.*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge contract (`IdeBridge`) + source provenance — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance` labels (`committed@<rev>` | `filesystem` | `unsaved-ide-buffer` | `generated-patch` | `agent-worktree`); dirty-buffer-over-filesystem resolution; deterministic debounce. *Live-path wiring into the model read path + TUI trace render is deferred with 3.5.*
 - [ ] **3.5** VS Code / Cursor extension (side panel, approvals, IDE context, diff view) — *not started*
@@ -130,11 +130,13 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 actions idempotent + approval-gated; webhook replay safe.
 
 **Verified so far:** GitHub writes are idempotent (repeated key → one object) and
-approval-gated (`GitHubMutation` → `RequireApproval`, network-denied by default);
-token never enters `Debug`/serialization; replayed webhook delivery (same GUID)
+approval-gated end-to-end through the agent loop (`GitHubMutation` →
+`RequireApproval` → parks → durable approval record → only then the API call;
+network-denied by default; rejected/denied writes never reach GitHub); the token
+never enters `Debug`/serialization/logs; replayed webhook delivery (same GUID)
 produces no second event and a forged signature is rejected before parsing. The
-IDE/TUI-visible-same-run and `/fix-ci` end-to-end criteria await the editor
-extensions and the `/fix-ci` workflow.
+IDE/TUI-visible-same-run criterion and the full `/fix-ci` orchestration await the
+editor extensions and the hard-coded repair flow.
 
 ## Phase 4 — Docs Studio & richer code intelligence ⬜
 
