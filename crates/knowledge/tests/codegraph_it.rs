@@ -230,11 +230,12 @@ async fn parses_expected_nodes_and_edges() {
 }
 
 #[tokio::test]
-async fn symbol_identity_survives_file_rename() {
+async fn symbol_identity_survives_line_movement() {
     let (_tmp, pool) = temp_pool().await;
     let repo = RepositoryId::new();
+    let path = "src/engine.rs";
 
-    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/engine.rs", FIXTURE)
+    codegraph::upsert_file_graph(&pool, repo, &rev(), path, FIXTURE)
         .await
         .unwrap();
     let before = codegraph::nodes(&pool, repo).await.unwrap();
@@ -244,9 +245,11 @@ async fn symbol_identity_survives_file_rename() {
         .expect("compute node")
         .id;
 
-    // Same symbols, different path: the durable symbols keep their id (SymbolKey
-    // is position-independent), even though a fresh File node appears.
-    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/core/engine.rs", FIXTURE)
+    // Same file, same symbols, every item shifted down by a leading comment:
+    // `SymbolKey` is byte-position-independent, so `compute` keeps its id across
+    // the reparse even though its start offset moved.
+    let moved = format!("// a new leading comment shifts every item down\n{FIXTURE}");
+    codegraph::upsert_file_graph(&pool, repo, &rev(), path, &moved)
         .await
         .unwrap();
     let after = codegraph::nodes(&pool, repo).await.unwrap();
@@ -256,9 +259,79 @@ async fn symbol_identity_survives_file_rename() {
         .expect("compute node")
         .id;
 
-    assert_eq!(compute_before, compute_after, "identity survives rename");
-    assert!(has_node(&after, "src/engine.rs", CodeNodeKind::File));
-    assert!(has_node(&after, "src/core/engine.rs", CodeNodeKind::File));
+    assert_eq!(
+        compute_before, compute_after,
+        "identity survives line movement within the file"
+    );
+}
+
+/// Issue #6 item 5: two files whose top-level symbols share a name *and* a
+/// signature must not collapse onto one node — the folded `source_path` keeps
+/// them distinct, so reparsing the second file can't delete the first's edges.
+#[tokio::test]
+async fn same_named_symbols_in_different_files_do_not_collide() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+
+    // `init` has an identical signature (`pub fn init() -> u32`) in both files and
+    // each calls a same-file helper. Before `source_path` entered the key these
+    // two `init`s were one row, and bar's edge-replacement deleted foo's call.
+    let foo = "pub fn init() -> u32 { helper() }\npub fn helper() -> u32 { 1 }\n";
+    let bar = "pub fn init() -> u32 { other() }\npub fn other() -> u32 { 2 }\n";
+
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/foo.rs", foo)
+        .await
+        .unwrap();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/bar.rs", bar)
+        .await
+        .unwrap();
+
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let inits: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.key.qualified_name == "init" && n.key.kind == CodeNodeKind::Function)
+        .collect();
+    assert_eq!(inits.len(), 2, "each file keeps its own init node");
+    assert_ne!(inits[0].id, inits[1].id, "distinct identities");
+    assert_ne!(inits[0].key.source_path, inits[1].key.source_path);
+
+    // Both call edges survive: bar's reparse did not collateral-delete foo's.
+    let edges = codegraph::edges(&pool, repo).await.unwrap();
+    let triples = edge_triples(&nodes, &edges);
+    assert!(
+        has_edge(&triples, "init", CodeRelation::Calls, "helper"),
+        "foo's call edge survived bar's reparse"
+    );
+    assert!(has_edge(&triples, "init", CodeRelation::Calls, "other"));
+}
+
+/// Issue #6 item 4: a single-file reparse retires a symbol the file no longer
+/// defines, without waiting for a whole-repository `clear_repository`.
+#[tokio::test]
+async fn reparse_retires_a_removed_symbol() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let path = "src/lib.rs";
+
+    let before = "pub fn kept() -> u32 { 0 }\npub fn dropped() -> u32 { 1 }\n";
+    codegraph::upsert_file_graph(&pool, repo, &rev(), path, before)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    assert!(has_node(&nodes, "kept", CodeNodeKind::Function));
+    assert!(has_node(&nodes, "dropped", CodeNodeKind::Function));
+
+    // Reparse with `dropped` gone: it is retired from the graph in place.
+    let after = "pub fn kept() -> u32 { 0 }\n";
+    codegraph::upsert_file_graph(&pool, repo, &rev(), path, after)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    assert!(has_node(&nodes, "kept", CodeNodeKind::Function));
+    assert!(
+        !has_node(&nodes, "dropped", CodeNodeKind::Function),
+        "the removed symbol was retired by the reparse"
+    );
 }
 
 /// A comparable, id-independent projection of a whole repository graph.

@@ -105,8 +105,16 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
 
     match body {
         EventBody::SessionCreated { title } => state.session_title = Some(title),
-        EventBody::NoteAppended { text } => {
-            if let Some(run) = state.selected_run_mut() {
+        EventBody::NoteAppended { text, run_id } => {
+            // A run-scoped note (context manifest, curated memory) is routed to
+            // its own run so it can't land on whatever run happens to be selected
+            // when runs interleave (issue #6 item 3); a session-level note (no
+            // run_id) still attaches to the focused run.
+            let target = match run_id {
+                Some(run_id) => state.run_mut(run_id),
+                None => state.selected_run_mut(),
+            };
+            if let Some(run) = target {
                 run.transcript.push(TranscriptEntry::Note { text });
             }
         }
@@ -619,6 +627,74 @@ mod tests {
             }),
         );
         assert_eq!(s.runs[0].state, RunState::Running);
+    }
+
+    fn note_count(s: &AppState, run_id: RunId) -> usize {
+        s.runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .map(|r| {
+                r.transcript
+                    .iter()
+                    .filter(|e| matches!(e, TranscriptEntry::Note { .. }))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_run_scoped_note_lands_on_its_run_not_the_selected_one() {
+        // Two runs; `ensure_run` selects the most-recently-started, so B is
+        // focused. This is exactly the interleaving that misrouted run-scoped
+        // notes before issue #6 item 3.
+        let mut s = AppState::new();
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        for (run_id, objective) in [(run_a, "a"), (run_b, "b")] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: objective.to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+        }
+        assert_eq!(
+            s.selected_run().map(|r| r.run_id),
+            Some(run_b),
+            "B is the selected run"
+        );
+
+        // A run-scoped note for A must attach to A even though B is selected.
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "context for A".to_owned(),
+                run_id: Some(run_a),
+            }),
+        );
+        assert_eq!(note_count(&s, run_a), 1, "A's note landed on A");
+        assert_eq!(note_count(&s, run_b), 0, "B did not receive A's note");
+
+        // A session-level note (no run_id) still attaches to the focused run.
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "session note".to_owned(),
+                run_id: None,
+            }),
+        );
+        assert_eq!(
+            note_count(&s, run_b),
+            1,
+            "session note went to the selected run"
+        );
+        assert_eq!(
+            note_count(&s, run_a),
+            1,
+            "A is unchanged by the session note"
+        );
     }
 
     #[test]

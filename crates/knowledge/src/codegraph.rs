@@ -55,14 +55,15 @@ pub fn stable_repository_id(canonical_path: &Path) -> RepositoryId {
 
 /// Retire a repository's entire code graph — every edge, then every node.
 ///
-/// The Phase-2 pipeline rebuilds the graph with a full working-tree scan on each
-/// startup (there is no live per-file watcher yet), and a per-file
-/// [`upsert_file_graph`] cannot by itself drop a *removed* symbol — the schema
-/// keys nodes by `symbol_key`, not by file. Wiping the repository before a full
-/// re-scan is therefore how removed functions/types stop lingering in the graph
-/// (and in the repository map, which reads every node for the repository). Code
-/// nodes are a derived, regenerable projection — nothing durable references their
-/// ids — so discarding and rebuilding them is safe.
+/// A per-file [`upsert_file_graph`] retires the symbols *its own file* no longer
+/// defines (nodes are keyed by `source_path`), but it never sees a file that was
+/// deleted outright — nothing reparses it, so its nodes would linger. The
+/// Phase-2 pipeline rebuilds the graph with a full working-tree scan on each
+/// startup (there is no live per-file watcher yet), and wiping the repository
+/// first is how a *removed file's* symbols stop lingering in the graph (and in
+/// the repository map, which reads every node for the repository). Code nodes are
+/// a derived, regenerable projection — nothing durable references their ids — so
+/// discarding and rebuilding them is safe.
 pub async fn clear_repository(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -132,11 +133,14 @@ pub struct GraphDelta {
 /// Parse `source` (repo-relative `path`) and fold it into the graph for
 /// `repository` at `revision`, in a single transaction.
 ///
-/// Nodes are upserted by their unique `(repository, symbol_key)` — a re-seen
-/// symbol keeps its `code_nodes.id` (so identity survives line movement and file
-/// rename) and only has its `revision` bumped; a new symbol gets a fresh id.
+/// Nodes are upserted by their unique `(repository, symbol_key)` — which now
+/// folds in the `source_path`, so identity is scoped to the file. A re-seen
+/// symbol keeps its `code_nodes.id` (identity survives line movement *within the
+/// file*) and only has its `revision` bumped; a new symbol gets a fresh id.
 /// The file's edges are then replaced wholesale (every edge whose `from_node` is
-/// one of this file's own nodes is deleted and reinserted), and one
+/// one of this file's own nodes — i.e. shares this `source_path` — is deleted and
+/// reinserted), any symbol this file *no longer* defines is retired (so a
+/// single-file reparse is self-sufficient; issue #6 item 4), and one
 /// `SymbolChanged` outbox event is enqueued per durable node — all atomic.
 pub async fn upsert_file_graph(
     pool: &SqlitePool,
@@ -178,14 +182,15 @@ pub async fn upsert_file_graph(
                 let id = CodeNodeId::new();
                 sqlx::query(
                     "INSERT INTO code_nodes \
-                     (id, repository, language, package, qualified_name, kind, signature_hash, \
-                      symbol_key, revision, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, repository, language, package, source_path, qualified_name, kind, \
+                      signature_hash, symbol_key, revision, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(id.to_string())
                 .bind(repository.to_string())
                 .bind(&node.key.language.0)
                 .bind(node.key.package.as_deref())
+                .bind(&node.key.source_path)
                 .bind(&node.key.qualified_name)
                 .bind(scalar(&node.key.kind))
                 .bind(node.key.signature_hash.as_ref().map(|h| h.0.as_str()))
@@ -209,16 +214,39 @@ pub async fn upsert_file_graph(
         }
     }
 
-    // 2. Replace this file's edges: every edge produced by parsing a file has a
-    //    `from_node` that is one of the file's own (owned) nodes, so deleting by
-    //    that set removes exactly the previous parse's edges and nothing else.
-    let mut removed_edges = 0u64;
-    for id in &owned_ids {
-        let result = sqlx::query("DELETE FROM code_edges WHERE from_node = ?")
-            .bind(id.to_string())
-            .execute(&mut *tx)
-            .await?;
-        removed_edges += result.rows_affected();
+    // 2. Replace this file's edges. Every edge produced by parsing a file has a
+    //    `from_node` that is one of the file's own nodes (they all carry this
+    //    `source_path`), so deleting by that set removes exactly the previous
+    //    parse's edges — including edges out of a symbol this reparse drops — and
+    //    nothing from any other file.
+    let removed = sqlx::query(
+        "DELETE FROM code_edges WHERE from_node IN \
+         (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?)",
+    )
+    .bind(repository.to_string())
+    .bind(path)
+    .execute(&mut *tx)
+    .await?;
+    let removed_edges = removed.rows_affected();
+
+    // 2b. Retire any symbol this file no longer defines (issue #6 item 4). Prior
+    //     nodes for this `source_path` that this parse did not re-see are now
+    //     edge-free (step 2 removed their outgoing edges, and every edge into
+    //     them came from this same file), so a single-file reparse drops removed
+    //     functions/types without waiting for a whole-repository `clear`.
+    if !ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM code_nodes WHERE repository = ? AND source_path = ? \
+             AND id NOT IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(repository.to_string()).bind(path);
+        for id in &ids {
+            query = query.bind(id.to_string());
+        }
+        query.execute(&mut *tx).await?;
     }
 
     // 3. Insert the fresh edges, each carrying its descriptive evidence ref.
@@ -282,7 +310,7 @@ pub async fn nodes(
     repository: RepositoryId,
 ) -> Result<Vec<CodeNode>, CodeGraphError> {
     let rows: Vec<NodeRow> = sqlx::query_as(
-        "SELECT id, language, package, qualified_name, kind, signature_hash, revision \
+        "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, revision \
          FROM code_nodes WHERE repository = ? ORDER BY created_at ASC, id ASC",
     )
     .bind(repository.to_string())
@@ -340,6 +368,7 @@ struct NodeRow {
     id: String,
     language: String,
     package: Option<String>,
+    source_path: Option<String>,
     qualified_name: String,
     kind: String,
     signature_hash: Option<String>,
@@ -354,6 +383,9 @@ impl NodeRow {
                 repository,
                 language: LanguageId(self.language),
                 package: self.package,
+                // Legacy rows written before the column existed read as "" — the
+                // startup scan rebuilds them with a real path.
+                source_path: self.source_path.unwrap_or_default(),
                 qualified_name: self.qualified_name,
                 kind: from_scalar(&self.kind)?,
                 signature_hash: self.signature_hash.map(ContentHash),
@@ -480,6 +512,9 @@ struct Ctx {
 
 struct Builder<'a> {
     repository: RepositoryId,
+    /// The repo-relative path being parsed; stamped onto every node's key so a
+    /// file's symbols are identified independently of any other file's.
+    path: &'a str,
     source: &'a str,
     nodes: Vec<BuiltNode>,
     edges: Vec<BuiltEdge>,
@@ -514,6 +549,7 @@ fn build_file_graph(
 
     let mut builder = Builder {
         repository,
+        path,
         source,
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -521,8 +557,10 @@ fn build_file_graph(
         index: HashMap::new(),
     };
 
-    // The File node anchors the graph; its qualified name is the path (so a
-    // rename creates a new File node while the symbols keep their identity).
+    // The File node anchors the graph; its qualified name is the path, and every
+    // node's key carries this path as its `source_path` — so a symbol's identity
+    // is scoped to its file (a same-named symbol in another file is distinct) and
+    // a rename to a new path yields fresh nodes for the file.
     let file_idx = builder.add_node(
         builder.make_key(path.to_owned(), CodeNodeKind::File, None),
         true,
@@ -556,6 +594,7 @@ impl Builder<'_> {
             repository: self.repository,
             language: LanguageId("rust".to_owned()),
             package: None,
+            source_path: self.path.to_owned(),
             qualified_name,
             kind,
             signature_hash,

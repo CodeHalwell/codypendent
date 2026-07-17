@@ -254,7 +254,7 @@ fn explicit_proposal_candidates(
     };
     let mut candidates = Vec::new();
     for event in events {
-        let EventBody::NoteAppended { text } = &event.body else {
+        let EventBody::NoteAppended { text, .. } = &event.body else {
             continue;
         };
         let trimmed = text.trim_start();

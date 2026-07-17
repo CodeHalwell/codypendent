@@ -439,21 +439,31 @@ pub enum EvidenceKind {
 pub const SYNTAX_CALL_CONFIDENCE: f32 = 0.45;
 
 /// The stable identity of a symbol (Chapter 07 `SymbolKey`) — survives line
-/// movement because it is derived from name + kind + signature, not position.
+/// movement within its file because it is derived from name + kind + signature,
+/// not byte position. `source_path` scopes that identity to the file the symbol
+/// is defined in, so a same-named, same-signature symbol in a different file is
+/// a distinct node (without it, two files' top-level `fn init`s would collapse
+/// onto one row; see issue #6 item 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolKey {
     pub repository: RepositoryId,
     pub language: LanguageId,
     pub package: Option<String>,
+    /// The repo-relative file the symbol was parsed from. Part of the identity:
+    /// two files never share a symbol node, and a single-file reparse can retire
+    /// exactly the symbols that file no longer defines.
+    pub source_path: String,
     pub qualified_name: String,
     pub kind: CodeNodeKind,
     pub signature_hash: Option<ContentHash>,
 }
 
 impl SymbolKey {
-    /// A stable composite string (`package::qualified_name#kind@sig`) used as the
-    /// durable per-repository identity in `code_nodes.symbol_key`. Independent of
-    /// file position, so moving a symbol does not change it.
+    /// A stable composite string (`source_path|package::qualified_name#kind@sig`)
+    /// used as the durable per-repository identity in `code_nodes.symbol_key`.
+    /// Independent of byte position, so moving a symbol *within its file* does not
+    /// change it; scoped by `source_path`, so the same name+signature in another
+    /// file is a separate identity.
     #[must_use]
     pub fn stable_key(&self) -> String {
         let package = self.package.as_deref().unwrap_or("");
@@ -463,8 +473,8 @@ impl SymbolKey {
             .map(|h| h.0.as_str())
             .unwrap_or("");
         format!(
-            "{package}::{}#{:?}@{signature}",
-            self.qualified_name, self.kind
+            "{}|{package}::{}#{:?}@{signature}",
+            self.source_path, self.qualified_name, self.kind
         )
     }
 }

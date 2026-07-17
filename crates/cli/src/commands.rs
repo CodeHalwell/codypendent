@@ -163,16 +163,12 @@ fn resolve_daemon_binary() -> PathBuf {
 /// failed, `130` cancelled); `main` is the only place that calls
 /// `std::process::exit`.
 ///
-/// `repo` is validated (must exist) but, honestly documented: Phase 1's
-/// `CommandBody::CreateSession` only carries an opaque `WorkspaceId`, and the
-/// daemon's `apply_create_session` does not persist even that (see
-/// `crates/daemon/src/commands.rs`) — there is currently no protocol field
-/// that carries a repository *path* to the daemon at session-creation time.
-/// Worktree allocation (STEP 1.8) binds a repository to a *run*, not a
-/// session, once the agent loop (STEP 1.10) is wired up. Wiring `--repo`
-/// through end-to-end is therefore a `codypendent-daemon`/`codypendent-runtime`
-/// change, out of this crate's scope; the flag is accepted and validated now
-/// so the CLI surface matches the guide, and so it is a no-op to wire later.
+/// `repo` is validated (must exist) and its canonical path is carried on
+/// `StartRun`, so the daemon attributes the run's repository map and curated
+/// memories to *this* checkout rather than to its own working directory — the
+/// per-user daemon can serve several checkouts over one socket (issue #6
+/// item 1). `CreateSession` still carries only an opaque `WorkspaceId`; binding
+/// a dedicated worktree to a run is a later step (STEP 1.8).
 pub async fn run(
     paths: &RuntimePaths,
     objective: String,
@@ -204,7 +200,8 @@ pub async fn run(
 
     let mut conn = Connection::connect(&paths.socket_path).await?;
     let mut stdout = std::io::stdout();
-    let exit = run_over_connection(&mut conn, objective, mode, &mut stdout).await?;
+    let repository = repo.to_string_lossy().into_owned();
+    let exit = run_over_connection(&mut conn, objective, mode, &repository, &mut stdout).await?;
     Ok(exit.exit_code())
 }
 
@@ -217,6 +214,7 @@ pub async fn run_over_connection<W: Write>(
     conn: &mut Connection,
     objective: String,
     mode: AgentMode,
+    repository: &str,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
@@ -276,6 +274,10 @@ pub async fn run_over_connection<W: Write>(
             session_id,
             objective,
             mode,
+            // Attribute the run to the `--repo` the client is operating on, so a
+            // shared daemon does not store its memories under its own directory
+            // (issue #6 item 1).
+            repository: Some(repository.to_owned()),
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {

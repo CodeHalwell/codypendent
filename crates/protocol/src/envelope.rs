@@ -184,6 +184,7 @@ mod tests {
                 session_id: SessionId::new(),
                 objective: "fix it".to_string(),
                 mode: AgentMode::Build,
+                repository: None,
             },
         });
         match round_trip_payload(command) {

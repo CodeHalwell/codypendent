@@ -20,18 +20,19 @@
 //!    'applied'` with its `result_json`, and COMMIT.
 //! 4. **Perform the external side effect** (if any) *outside* the transaction.
 //!    Almost every Phase 1 command has none — the real tool effects happen in
-//!    the agent loop (STEP 1.10). `ResolveApproval` is the exception: it
-//!    delegates to the [`crate::approvals::ApprovalBroker`], whose own
-//!    transaction is that effect.
+//!    the agent loop (STEP 1.10). `ResolveApproval`'s effect (flip the approval
+//!    row + append `ApprovalResolved`) is folded *into* the command transaction
+//!    via [`crate::approvals::ApprovalBroker::resolve_in_tx`], so its
+//!    `expected_revision` guard, the append, and the revision bump are all
+//!    atomic (issue #6 item 2); only the parked-waiter wake happens after commit.
 //! 5. **Persist the outcome** (`pending_effects` → `performed`/`reconciled`,
 //!    append an outcome event) once the effect completes.
 //! 6. **Publish** the persisted events through the [`SubscriptionHub`] — *after*
 //!    commit, never before (persist before publish, RULE 2).
 //!
 //! Because steps 3's `received`→`applied` transition is atomic, a committed
-//! `commands` row for a simple (effect-free) command is always `applied`; the
-//! `received` state is only durable for the two-commit `ResolveApproval` path
-//! and for rows written by a crash-injection test. Startup recovery
+//! `commands` row is always `applied`; the `received` state is only durable for
+//! rows written by a crash-injection test. Startup recovery
 //! ([`CommandProcessor::reconcile_pending_effects`]) sweeps any orphaned
 //! `pending_effects`; STEP 1.14 extends that recovery.
 
@@ -146,6 +147,10 @@ impl CommandProcessor {
                 session_id,
                 objective,
                 mode,
+                // `repository` is consumed by the server when it builds the
+                // executor's `RunLaunch` (it decides the run's repository
+                // identity), not by the write path — the ledger row is the same.
+                ..
             } => {
                 self.apply_start_run(pool, &ctx, &command, session_id, objective, mode)
                     .await
@@ -269,7 +274,7 @@ impl CommandProcessor {
             {
                 // Either we complete it now, or it was already resolved before
                 // the crash — both leave the effect done exactly once.
-                Ok(()) | Err(ApprovalError::AlreadyResolved { .. }) => {}
+                Ok(_) | Err(ApprovalError::AlreadyResolved { .. }) => {}
                 Err(e) => return Err(map_approval_error(e)),
             }
         }
@@ -476,7 +481,8 @@ impl CommandProcessor {
             Actor::Client {
                 client_id: ctx.client_id,
             },
-            EventBody::NoteAppended { text },
+            // Session-level user input — not tied to one run's transcript.
+            EventBody::NoteAppended { text, run_id: None },
         )];
         self.run_transaction(
             pool,
@@ -564,11 +570,16 @@ impl CommandProcessor {
         .await
     }
 
-    /// `ResolveApproval` is the one Phase 1 command with an external effect: the
-    /// broker's own transaction (row update + `ApprovalResolved` append + waiter
-    /// wake). We record the command `received` first (idempotency + crash
-    /// recovery), delegate to the broker (no double-append), then finalize
-    /// `applied` and re-publish the broker's event to session subscribers.
+    /// `ResolveApproval` is the one Phase 1 command with an external effect (flip
+    /// the approval row + append `ApprovalResolved` + wake the parked runtime
+    /// waiter). ONE transaction holds the whole command: the `received` command
+    /// row, the `expected_revision` guard, the broker's flip + append (via
+    /// [`ApprovalBroker::resolve_in_tx`]), the session-revision bump, and the flip
+    /// to `applied`. Holding the guard *and* the bump in the same transaction as
+    /// the append is what makes two commands sharing one `expected_revision`
+    /// mutually exclusive (issue #6 item 2b, previously three separate txs). After
+    /// commit we publish *exactly* the appended event (never the session tail,
+    /// which a concurrent append may have changed — item 2a) and wake the waiter.
     async fn apply_resolve_approval(
         &self,
         pool: &SqlitePool,
@@ -581,31 +592,32 @@ impl CommandProcessor {
         let session_id = approval_session(pool, approval_id)
             .await
             .map_err(internal_error)?
-            .ok_or_else(|| {
-                CodypendentError::new(
-                    "approval.not-found",
-                    format!("no approval {approval_id}"),
-                    false,
-                )
-            })?;
+            .ok_or_else(|| approval_not_found(approval_id))?;
 
-        // Record the `received` row and honor the optimistic-concurrency guard
-        // atomically (fix: `expected_revision`). A stale guard is rejected here,
-        // before the broker runs, so nothing is applied. A concurrent duplicate
-        // that lost the insert race replays the recorded outcome (fix:
-        // idempotency-key insert race), never `internal.command-apply-failed`.
-        if let Err(err) = insert_command_received(
-            pool,
-            ctx,
-            command,
-            Some(session_id),
-            command.expected_revision,
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+
+        // 1. Command row (received). A concurrent duplicate that loses this insert
+        //    replays the recorded outcome instead of erroring.
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
         )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
         .await
         {
-            if let Some(conflict) = err.downcast_ref::<RevisionConflict>() {
-                return Err(revision_conflict(conflict.expected, conflict.actual));
-            }
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
             if is_unique_violation(&err) {
                 if let Some(existing) = lookup_command(pool, &command.idempotency_key)
                     .await
@@ -617,67 +629,69 @@ impl CommandProcessor {
             return Err(internal_error(err));
         }
 
-        match self
+        // 2. Optimistic-concurrency guard, read under the write lock so no
+        //    concurrent ResolveApproval can slip between this check and the bump.
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        // 3. The external effect, INSIDE this tx: flip the approval and append
+        //    `ApprovalResolved`, getting back that exact event to publish.
+        let event = match self
             .approvals
-            .resolve(
-                pool,
+            .resolve_in_tx(
+                &mut tx,
                 approval_id,
                 decision,
                 scope,
                 ctx.client_id.to_string(),
+                now,
             )
             .await
         {
-            Ok(()) => {
-                // The broker appended `ApprovalResolved`; advance the session
-                // revision to reflect this applied session-state change so a
-                // later `expected_revision` sees it.
-                bump_session_revision(pool, session_id)
-                    .await
-                    .map_err(internal_error)?;
+            Ok(event) => {
+                // 4. Bump the session revision, atomic with the append it reflects.
+                sqlx::query(
+                    "UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?",
+                )
+                .bind(&now_str)
+                .bind(session_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+                Some(event)
             }
-            // FINALIZATION CHOICE (fix: reject-resolution consistency): treat
-            // "approval already resolved" as a *successful no-op* — the decision
-            // is already recorded on the ledger — and finalize the command
-            // `applied` (never leave it stranded `received`). This matches the
-            // `resume_received` replay path, which already folds
-            // `AlreadyResolved` into success, so the FIRST delivery and any
-            // same-key REPLAY return the SAME `applied` outcome (not "error then
-            // success"). No revision bump: this delivery appended no new event.
-            Err(ApprovalError::AlreadyResolved { .. }) => {
-                let last_sequence = max_sequence(pool, session_id)
-                    .await
-                    .map_err(internal_error)?;
-                let outcome = CommandOutcome {
-                    command_id: command.command_id,
-                    created_session: None,
-                    created_run: None,
-                    last_sequence,
-                    newly_applied: false,
-                };
-                finalize_applied(pool, command.command_id, &outcome)
-                    .await
-                    .map_err(internal_error)?;
-                return Ok(outcome);
+            // Already resolved (a prior delivery, another resolver, or an expiry):
+            // a successful no-op — the decision is already on the ledger. Record
+            // the command `applied` with no new event and no bump, matching the
+            // resume-replay path so first delivery and replay agree.
+            Err(ApprovalError::AlreadyResolved { .. }) => None,
+            Err(err @ ApprovalError::NotFound { .. }) => {
+                let _ = tx.rollback().await;
+                return Err(map_approval_error(err));
             }
-            Err(e) => return Err(map_approval_error(e)),
-        }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(map_approval_error(err));
+            }
+        };
 
-        // Re-publish the broker's persisted ApprovalResolved and capture the last
-        // sequence for the outcome. The broker appends the `ApprovalResolved` as
-        // the session's final event, so loading only that latest event (rather
-        // than the whole history) is enough.
-        let last_event = crate::ledger::load_last_event(pool, session_id)
-            .await
-            .map_err(internal_error)?;
-        if let Some(event) = &last_event {
-            if matches!(&event.body, EventBody::ApprovalResolved { approval_id: a, .. } if *a == approval_id)
-            {
-                self.subscriptions.publish(session_id, event.clone());
-            }
-        }
-        let last_sequence = last_event.map(|e| e.sequence);
-
+        // 5. Compute the outcome and flip the command to `applied`, still in the tx.
+        let last_sequence = match &event {
+            Some(event) => Some(event.sequence),
+            None => tx_max_sequence(&mut *tx, session_id)
+                .await
+                .map_err(internal_error)?,
+        };
         let outcome = CommandOutcome {
             command_id: command.command_id,
             created_session: None,
@@ -685,9 +699,25 @@ impl CommandProcessor {
             last_sequence,
             newly_applied: false,
         };
-        finalize_applied(pool, command.command_id, &outcome)
-            .await
-            .map_err(internal_error)?;
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        // 6. Post-commit (persist before publish): wake the parked runtime waiter
+        //    and publish exactly the appended event.
+        if let Some(event) = event {
+            self.approvals.wake(approval_id, decision).await;
+            self.subscriptions.publish(session_id, event);
+        }
+
         Ok(outcome)
     }
 
@@ -997,6 +1027,7 @@ impl CommandProcessor {
                 &Actor::System,
                 &EventBody::NoteAppended {
                     text: format!("pending-effect {id} ({kind}) reconciled as {new_state}"),
+                    run_id: None,
                 },
                 &now,
                 None,
@@ -1040,6 +1071,14 @@ fn internal_error(err: impl std::fmt::Display) -> CodypendentError {
 
 fn run_not_found(run_id: RunId) -> CodypendentError {
     CodypendentError::new("protocol.run-not-found", format!("no run {run_id}"), false)
+}
+
+fn approval_not_found(approval_id: codypendent_protocol::ApprovalId) -> CodypendentError {
+    CodypendentError::new(
+        "approval.not-found",
+        format!("no approval {approval_id}"),
+        false,
+    )
 }
 
 /// The structured `protocol.revision-conflict` returned when a command's
@@ -1086,16 +1125,24 @@ impl std::fmt::Display for RevisionConflict {
 
 impl std::error::Error for RevisionConflict {}
 
-/// Advance a session's `revision` by one (and touch `updated_at`) on the pool.
-/// Used by the `ResolveApproval` path, whose session append lives in the broker's
-/// own transaction and so cannot bump the revision inside [`CommandProcessor::commit`].
-async fn bump_session_revision(pool: &SqlitePool, session_id: SessionId) -> anyhow::Result<()> {
-    sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(session_id.to_string())
-        .execute(pool)
-        .await?;
-    Ok(())
+/// The highest event sequence for a session, read inside the caller's tx (so it
+/// reflects appends made earlier in the same transaction). `None` for a session
+/// with no events yet. Used by the `ResolveApproval` no-op (already-resolved)
+/// path to report a sensible `last_sequence`.
+async fn tx_max_sequence(
+    exec: impl sqlx::SqliteExecutor<'_>,
+    session_id: SessionId,
+) -> anyhow::Result<Option<u64>> {
+    let (max,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(exec)
+            .await?;
+    Ok(if max > 0 {
+        Some(u64::try_from(max)?)
+    } else {
+        None
+    })
 }
 
 /// Restated rejection for the `AttachSession`/`Unknown` arms of `apply` (already
@@ -1170,53 +1217,6 @@ async fn lookup_command(
             client_id,
         })),
     }
-}
-
-/// Insert a command row in `status = 'received'` on the pool (its own commit),
-/// honoring the `expected_revision` guard atomically with the insert. Used by the
-/// two-commit `ResolveApproval` path, whose external effect (the broker's
-/// transaction) cannot share this one. Returns a downcastable [`RevisionConflict`]
-/// when the guard fails (nothing is inserted), and surfaces a
-/// `UNIQUE`/PK violation verbatim so the caller can replay a duplicate delivery.
-async fn insert_command_received(
-    pool: &SqlitePool,
-    ctx: &ApplyContext,
-    command: &Command,
-    session: Option<SessionId>,
-    expected_revision: Option<u64>,
-) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
-    // Guard against a stale `expected_revision` before recording the command
-    // (only meaningful when the command targets an existing session).
-    if let (Some(session_id), Some(expected)) = (session, expected_revision) {
-        let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
-            .bind(session_id.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
-        let current = u64::try_from(current)?;
-        if expected != current {
-            return Err(RevisionConflict {
-                expected,
-                actual: current,
-            }
-            .into());
-        }
-    }
-    sqlx::query(
-        "INSERT INTO commands \
-         (id, idempotency_key, session_id, client_id, body, status, received_at) \
-         VALUES (?, ?, ?, ?, ?, 'received', ?)",
-    )
-    .bind(command.command_id.to_string())
-    .bind(&command.idempotency_key)
-    .bind(session.map(|s| s.to_string()))
-    .bind(ctx.client_id.to_string())
-    .bind(serde_json::to_string(&command.body)?)
-    .bind(Utc::now().to_rfc3339())
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(())
 }
 
 async fn finalize_applied(
@@ -1422,6 +1422,7 @@ mod tests {
                 session_id: session,
                 objective: "fix it".to_string(),
                 mode: AgentMode::Build,
+                repository: None,
             },
             "idem-start",
         );
@@ -1473,6 +1474,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1534,6 +1536,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1615,6 +1618,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1743,6 +1747,7 @@ mod tests {
                         session_id: session,
                         objective: "diagnose".to_string(),
                         mode: AgentMode::Build,
+                        repository: None,
                     },
                     "start",
                 ),
@@ -1803,5 +1808,132 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// issue #6 item 2b: the `expected_revision` guard and the revision bump are
+    /// held in the same transaction as the `ApprovalResolved` append, so a resolve
+    /// consumes exactly one revision and a second command carrying the now-stale
+    /// revision is rejected instead of also passing.
+    #[tokio::test]
+    async fn resolve_approval_guards_and_bumps_the_session_revision() {
+        use codypendent_protocol::{ProposedAction, Risk, RiskLevel};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let broker = ApprovalBroker::new();
+        let processor = CommandProcessor::new(SubscriptionHub::new(), broker.clone());
+        let session = create_session(&processor, &pool, "create").await;
+
+        let run = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                    },
+                    "start",
+                ),
+            )
+            .await
+            .unwrap()
+            .created_run
+            .unwrap();
+
+        // Two distinct pending approvals in this session.
+        let request = |program: &'static str| {
+            let broker = broker.clone();
+            let pool = pool.clone();
+            async move {
+                broker
+                    .request(
+                        &pool,
+                        session,
+                        run,
+                        ProposedAction::ExecuteCommand {
+                            program: program.to_string(),
+                            args: vec![],
+                        },
+                        Risk {
+                            level: RiskLevel::Medium,
+                            reasons: vec![],
+                        },
+                        vec![],
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let a1 = request("cargo").await;
+        let a2 = request("git").await;
+
+        let revision = |pool: SqlitePool| async move {
+            let (r,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            u64::try_from(r).unwrap()
+        };
+        let rev = revision(pool.clone()).await;
+
+        let resolve_cmd = |approval, key: &str, expected| {
+            let mut cmd = command(
+                CommandBody::ResolveApproval {
+                    approval_id: approval,
+                    decision: ApprovalDecision::Approve,
+                    scope: ApprovalScope::Once,
+                },
+                key,
+            );
+            cmd.expected_revision = expected;
+            cmd
+        };
+
+        // Resolve a1 at the current revision → applies and bumps by one.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Approver),
+                resolve_cmd(a1, "r1", Some(rev)),
+            )
+            .await
+            .expect("first resolve applies");
+        assert_eq!(
+            revision(pool.clone()).await,
+            rev + 1,
+            "resolving bumped the session revision"
+        );
+
+        // Resolve a2 carrying the stale revision → rejected, a2 untouched.
+        let err = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Approver),
+                resolve_cmd(a2, "r2", Some(rev)),
+            )
+            .await
+            .expect_err("a stale expected_revision is rejected");
+        assert_eq!(err.code, "protocol.revision-conflict");
+        let (state,): (String,) = sqlx::query_as("SELECT state FROM approvals WHERE id = ?")
+            .bind(a2.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "pending", "the rejected command applied nothing");
+
+        // Resolve a2 at the fresh revision → applies.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Approver),
+                resolve_cmd(a2, "r3", Some(rev + 1)),
+            )
+            .await
+            .expect("resolve at the fresh revision applies");
     }
 }

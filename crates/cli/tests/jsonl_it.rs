@@ -193,6 +193,7 @@ async fn drive(events: Vec<SessionEvent>) -> (Vec<u8>, RunExit) {
             &mut conn,
             "diagnose the failing test".to_string(),
             AgentMode::Build,
+            "/repo/under/test",
             &mut out,
         ),
     )

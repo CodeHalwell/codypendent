@@ -174,6 +174,7 @@ async fn kill9_daemon_recovers_parked_run_to_failed() {
             session_id: session,
             objective: "diagnose".to_string(),
             mode: AgentMode::Build,
+            repository: None,
         },
         "start",
     )

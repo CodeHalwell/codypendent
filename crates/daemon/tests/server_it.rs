@@ -156,6 +156,7 @@ fn note_event(sequence: u64, text: &str) -> SessionEvent {
         actor: Actor::System,
         body: EventBody::NoteAppended {
             text: text.to_string(),
+            run_id: None,
         },
     }
 }
@@ -435,6 +436,7 @@ async fn observer_start_run_is_role_denied() {
                     session_id,
                     objective: "diagnose".to_string(),
                     mode: AgentMode::Build,
+                    repository: None,
                 },
                 "start-denied",
             )),
