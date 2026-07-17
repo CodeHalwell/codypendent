@@ -381,6 +381,11 @@ impl ApprovalBroker {
     /// `ApprovalResolved`, then wake the parked waiter. `Run` scope leaves an
     /// approved row that [`request`](Self::request) treats as an auto-approval
     /// pattern for identical later proposals; `Once` does not.
+    ///
+    /// Returns the appended `ApprovalResolved` [`SessionEvent`] so a caller can
+    /// publish *exactly* it (issue #6 item 2). A standalone entry point (crash
+    /// resume, tests); the command write path drives [`resolve_in_tx`] inside its
+    /// own transaction so the append is atomic with the command's revision guard.
     pub async fn resolve(
         &self,
         pool: &SqlitePool,
@@ -388,16 +393,49 @@ impl ApprovalBroker {
         decision: ApprovalDecision,
         scope: ApprovalScope,
         resolved_by: String,
-    ) -> Result<(), ApprovalError> {
+    ) -> Result<SessionEvent, ApprovalError> {
+        let mut tx = pool.begin().await?;
+        let event = self
+            .resolve_in_tx(
+                &mut tx,
+                approval_id,
+                decision,
+                scope,
+                resolved_by,
+                Utc::now(),
+            )
+            .await?;
+        tx.commit().await?;
+        self.wake(approval_id, decision).await;
+        Ok(event)
+    }
+
+    /// Flip a pending approval and append its `ApprovalResolved` event **inside
+    /// the caller's transaction**, returning that exact event. Does NOT commit,
+    /// bump any session revision, or wake the waiter — the caller owns the
+    /// transaction boundary (so the append is atomic with, e.g., the command
+    /// write path's `expected_revision` check and bump) and performs the
+    /// post-commit wake/publish. `now` is a parameter so the caller can share one
+    /// timestamp across the whole command.
+    pub(crate) async fn resolve_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+        scope: ApprovalScope,
+        resolved_by: String,
+        now: DateTime<Utc>,
+    ) -> Result<SessionEvent, ApprovalError> {
         let state = decision_state(decision)?;
         let scope_db = scope_to_db(scope)?;
+        let now_str = now.to_rfc3339();
 
         let existing: Option<(String, String)> = sqlx::query_as(
             "SELECT a.state, r.session_id FROM approvals a \
              JOIN runs r ON a.run_id = r.id WHERE a.id = ?",
         )
         .bind(approval_id.to_string())
-        .fetch_optional(pool)
+        .fetch_optional(&mut **tx)
         .await?;
         let (current_state, session_id) =
             existing.ok_or(ApprovalError::NotFound { approval_id })?;
@@ -408,10 +446,7 @@ impl ApprovalBroker {
             });
         }
         let session_id = parse_session_id(&session_id)?;
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
 
-        let mut tx = pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE approvals SET state = ?, scope = ?, resolved_by = ?, resolved_at = ? \
              WHERE id = ? AND state = 'pending'",
@@ -421,7 +456,7 @@ impl ApprovalBroker {
         .bind(&resolved_by)
         .bind(&now_str)
         .bind(approval_id.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         // Lost the race to another resolver / an expiry between our read and here.
         if updated.rows_affected() != 1 {
@@ -431,25 +466,25 @@ impl ApprovalBroker {
             });
         }
 
-        let seq = next_sequence(&mut *tx, session_id).await?;
-        append_event(
-            &mut *tx,
-            session_id,
-            seq,
-            &Actor::Human {
-                user_id: UserId(resolved_by),
-            },
-            &EventBody::ApprovalResolved {
-                approval_id,
-                decision,
-            },
-            &now_str,
-        )
-        .await?;
-        tx.commit().await?;
+        let seq = next_sequence(&mut **tx, session_id).await?;
+        let actor = Actor::Human {
+            user_id: UserId(resolved_by),
+        };
+        let body = EventBody::ApprovalResolved {
+            approval_id,
+            decision,
+        };
+        append_event(&mut **tx, session_id, seq, &actor, &body, &now_str).await?;
 
-        self.wake(approval_id, decision).await;
-        Ok(())
+        Ok(SessionEvent {
+            sequence: u64::try_from(seq)
+                .map_err(|_| ApprovalError::Corrupt(format!("negative event sequence {seq}")))?,
+            occurred_at: now,
+            causation_id: None,
+            correlation_id: None,
+            actor,
+            body,
+        })
     }
 
     /// Expire every `pending` approval whose `expires_at` is at or before `now`:
@@ -564,7 +599,7 @@ impl ApprovalBroker {
     /// Deliver `decision` to a parked waiter, if any. `send_replace` never fails
     /// even when nobody is subscribed yet — the value is retained for a later
     /// subscriber.
-    async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
+    pub(crate) async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
         let guard = self.waiters.lock().expect("waiters mutex poisoned");
         if let Some(sender) = guard.get(&approval_id) {
             sender.send_replace(Some(decision));
