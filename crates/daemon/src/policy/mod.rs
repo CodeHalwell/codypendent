@@ -183,6 +183,20 @@ impl PolicyEngine {
         Self::from_merged(MergedPolicy::builtin_defaults())
     }
 
+    /// The built-in defaults, additionally admitting `endpoints` on the network
+    /// allow-list. GitHub mutations are network-scoped to [`GITHUB_API_ENDPOINT`],
+    /// so the daemon uses this (rather than [`with_defaults`]) when a GitHub
+    /// client is configured: the endpoint must be reachable for a mutation to
+    /// reach the approval gate at all, but admitting it grants nothing on its own
+    /// — every GitHub write still returns `RequireApproval`.
+    ///
+    /// [`with_defaults`]: PolicyEngine::with_defaults
+    pub fn with_defaults_allowing_network(endpoints: impl IntoIterator<Item = String>) -> Self {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.network_allow.extend(endpoints);
+        Self::from_merged(merged)
+    }
+
     /// Load and merge policy from explicit file paths over the built-in
     /// defaults: `config_policy` (User layer) then `repo_policy` (Repository
     /// layer, narrowest). A `None` path — or a path that does not exist — is

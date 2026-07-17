@@ -39,7 +39,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -60,10 +60,15 @@ use codypendent_protocol::{
     SessionEvent, SessionId, ToolOutcome,
 };
 
+use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
+
 use crate::models::ModelRegistry;
 use crate::tools::{
-    ApplyPatch, ApplyPatchInput, ArtifactSink, CommandRequest, EnvironmentBinding, GitDiff,
-    GitDiffInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
+    new_pull_request, parse_create_draft_pull_request, parse_get_pull_request,
+    parse_list_check_runs, render_check_runs, render_pull_request, ApplyPatch, ApplyPatchInput,
+    ArtifactSink, CommandRequest, CreateDraftPullRequest, CreateDraftPullRequestInput,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
+    ListCheckRunsInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -250,6 +255,9 @@ pub struct RunContext {
     pub repository: PathBuf,
     /// The run's writable worktree (`$WORKTREE`).
     pub worktree: PathBuf,
+    /// The GitHub repository this run targets (`owner/repo`), if GitHub is
+    /// configured. The client handle lives on the runtime; this names the target.
+    pub github_repo: Option<RepoId>,
     /// Optional channel of queued steering text, drained at safe points.
     pub steering: Option<mpsc::UnboundedReceiver<String>>,
 }
@@ -271,6 +279,7 @@ impl RunContext {
             mode,
             repository: repository.into(),
             worktree: worktree.into(),
+            github_repo: None,
             steering: None,
         }
     }
@@ -278,6 +287,13 @@ impl RunContext {
     /// Attach a steering channel.
     pub fn with_steering(mut self, steering: mpsc::UnboundedReceiver<String>) -> Self {
         self.steering = Some(steering);
+        self
+    }
+
+    /// Name the GitHub repository this run targets, enabling the `github.*`
+    /// tools (the client handle is injected on the runtime separately).
+    pub fn with_github_repo(mut self, repo: RepoId) -> Self {
+        self.github_repo = Some(repo);
         self
     }
 }
@@ -419,6 +435,9 @@ pub struct FrameworkAgentRuntime {
     subscriptions: SubscriptionHub,
     journal: RunJournal,
     sink: Box<dyn ArtifactSink>,
+    /// The GitHub client the `github.*` tools call, if configured. Process-wide
+    /// (one daemon token), so it lives on the runtime, not the run context.
+    github: Option<Arc<dyn GitHubApi>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -449,7 +468,16 @@ impl FrameworkAgentRuntime {
             subscriptions,
             journal,
             sink,
+            github: None,
         }
+    }
+
+    /// Inject the GitHub client the `github.*` tools call. Without it those tools
+    /// are unavailable (a call returns a clean failure). The daemon builds the
+    /// client from the personal-mode token at startup.
+    pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
+        self.github = Some(github);
+        self
     }
 
     /// The model registry (used by callers to build a [`FrameworkModelDriver`]).
@@ -908,8 +936,44 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::ApplyPatch(input),
                 })
             }
+            GetPullRequest::NAME => {
+                let repo = self.github_target(run)?;
+                let input = parse_get_pull_request(args)?;
+                Ok(Prepared {
+                    action: GetPullRequest::proposed_action(),
+                    tool: PreparedTool::GitHubGetPr { repo, input },
+                })
+            }
+            ListCheckRuns::NAME => {
+                let repo = self.github_target(run)?;
+                let input = parse_list_check_runs(args)?;
+                Ok(Prepared {
+                    action: ListCheckRuns::proposed_action(),
+                    tool: PreparedTool::GitHubListChecks { repo, input },
+                })
+            }
+            CreateDraftPullRequest::NAME => {
+                let repo = self.github_target(run)?;
+                let input = parse_create_draft_pull_request(args)?;
+                Ok(Prepared {
+                    action: CreateDraftPullRequest::proposed_action(&repo),
+                    tool: PreparedTool::GitHubCreateDraftPr { repo, input },
+                })
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
+    }
+
+    /// Resolve the GitHub target for a `github.*` tool call: the client must be
+    /// injected and the run must name a repository. A clear error otherwise lets
+    /// the model see why the tool is unavailable.
+    fn github_target(&self, run: &RunContext) -> Result<RepoId, String> {
+        if self.github.is_none() {
+            return Err("github is not configured (no token available)".to_string());
+        }
+        run.github_repo
+            .clone()
+            .ok_or_else(|| "no github repository is configured for this run".to_string())
     }
 
     /// Execute a prepared tool under the scopes minted from the policy for this
@@ -1013,6 +1077,37 @@ impl FrameworkAgentRuntime {
                     ),
                 }
             }
+            PreparedTool::GitHubGetPr { repo, input } => match self.github.as_ref() {
+                None => github_unconfigured(),
+                Some(client) => match client.get_pull_request(&repo, input.number).await {
+                    Ok(pr) => (render_pull_request(&pr), None, ToolOutcome::Succeeded),
+                    Err(e) => github_failure("github.get_pull_request", &e),
+                },
+            },
+            PreparedTool::GitHubListChecks { repo, input } => match self.github.as_ref() {
+                None => github_unconfigured(),
+                Some(client) => match client.list_check_runs(&repo, &input.git_ref).await {
+                    Ok(runs) => (render_check_runs(&runs), None, ToolOutcome::Succeeded),
+                    Err(e) => github_failure("github.list_check_runs", &e),
+                },
+            },
+            PreparedTool::GitHubCreateDraftPr { repo, input } => match self.github.as_ref() {
+                None => github_unconfigured(),
+                Some(client) => {
+                    let request = new_pull_request(&input);
+                    match client
+                        .create_draft_pull_request(&repo, &request, &input.idempotency_key)
+                        .await
+                    {
+                        Ok(pr) => (
+                            format!("opened draft PR #{} — {}", pr.number, pr.html_url),
+                            None,
+                            ToolOutcome::Succeeded,
+                        ),
+                        Err(e) => github_failure("github.create_draft_pull_request", &e),
+                    }
+                }
+            },
         }
     }
 
@@ -1104,11 +1199,46 @@ enum PreparedTool {
     Search(SearchInput),
     GitDiff(GitDiffInput),
     ApplyPatch(ApplyPatchInput),
+    GitHubGetPr {
+        repo: RepoId,
+        input: GetPullRequestInput,
+    },
+    GitHubListChecks {
+        repo: RepoId,
+        input: ListCheckRunsInput,
+    },
+    GitHubCreateDraftPr {
+        repo: RepoId,
+        input: CreateDraftPullRequestInput,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Argument parsing and observation rendering
 // ---------------------------------------------------------------------------
+
+/// The tool-result tuple for a `github.*` call made without a configured client.
+fn github_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        "github is not configured (no token available)".to_string(),
+        None,
+        ToolOutcome::Failed {
+            message: "github.unconfigured".to_string(),
+        },
+    )
+}
+
+/// The tool-result tuple for a failed `github.*` API call. The error's `Display`
+/// never contains the token (the client keeps it out of every error).
+fn github_failure(tool: &str, error: &GitHubError) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} error: {error}"),
+        None,
+        ToolOutcome::Failed {
+            message: "github.api-error".to_string(),
+        },
+    )
+}
 
 fn parse_command_request(args: &Value, worktree: &Path) -> Result<CommandRequest, String> {
     let program = args
@@ -1381,6 +1511,38 @@ impl FrameworkModelDriver {
                     "type": "object",
                     "properties": {"patch": {"type": "string"}},
                     "required": ["patch"]
+                }),
+            ),
+            decl(
+                GetPullRequest::NAME,
+                "Fetch a GitHub pull request by number (read-only).",
+                json!({
+                    "type": "object",
+                    "properties": {"number": {"type": "integer"}},
+                    "required": ["number"]
+                }),
+            ),
+            decl(
+                ListCheckRuns::NAME,
+                "List the GitHub check runs for a git ref (read-only).",
+                json!({
+                    "type": "object",
+                    "properties": {"ref": {"type": "string"}},
+                    "required": ["ref"]
+                }),
+            ),
+            decl(
+                CreateDraftPullRequest::NAME,
+                "Open a draft GitHub pull request (requires approval).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "head": {"type": "string"},
+                        "base": {"type": "string"},
+                        "body": {"type": "string"}
+                    },
+                    "required": ["title", "head", "base"]
                 }),
             ),
         ]

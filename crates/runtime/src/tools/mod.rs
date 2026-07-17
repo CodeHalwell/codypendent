@@ -28,6 +28,7 @@
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
 mod git;
+mod github;
 mod read_file;
 mod salient;
 mod search;
@@ -42,6 +43,12 @@ use codypendent_protocol::ArtifactRef;
 
 pub use git::{
     ApplyPatch, ApplyPatchInput, ApplyPatchOutcome, GitDiff, GitDiffInput, GitDiffOutcome,
+};
+pub use github::{
+    new_pull_request, parse_create_draft_pull_request, parse_get_pull_request,
+    parse_list_check_runs, render_check_runs, render_pull_request, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, GetPullRequest, GetPullRequestInput, ListCheckRuns,
+    ListCheckRunsInput,
 };
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use salient::{SalientStream, SalientView};
