@@ -906,6 +906,10 @@ async fn cancellation_while_parked_on_approval_reaches_cancelled() {
 struct RecordingGitHub {
     /// The `head->base` of every draft-PR create, for assertions.
     created: Arc<Mutex<Vec<String>>>,
+    /// The PR numbers passed to `update_pull_request`.
+    updated: Arc<Mutex<Vec<u64>>>,
+    /// The names passed to `create_check_run_summary`.
+    summaries: Arc<Mutex<Vec<String>>>,
 }
 
 fn sample_pull_request(number: u64) -> model::PullRequest {
@@ -988,18 +992,25 @@ impl GitHubApi for RecordingGitHub {
     async fn update_pull_request(
         &self,
         _repo: &RepoId,
-        _number: u64,
+        number: u64,
         _req: &model::UpdatePullRequest,
     ) -> Result<model::PullRequest, GitHubError> {
-        Err(unused_github_error())
+        self.updated.lock().unwrap().push(number);
+        Ok(sample_pull_request(number))
     }
 
     async fn create_check_run_summary(
         &self,
         _repo: &RepoId,
-        _req: &model::NewCheckRun,
+        req: &model::NewCheckRun,
     ) -> Result<model::CheckRun, GitHubError> {
-        Err(unused_github_error())
+        self.summaries.lock().unwrap().push(req.name.clone());
+        Ok(model::CheckRun {
+            id: 1,
+            name: req.name.clone(),
+            status: "completed".to_string(),
+            conclusion: req.conclusion.clone(),
+        })
     }
 }
 
@@ -1315,4 +1326,108 @@ async fn read_without_dirty_buffer_is_unlabeled() {
         "a plain filesystem read carries no source label; got: {text}"
     );
     assert!(text.contains("plain filesystem read"));
+}
+
+#[tokio::test]
+async fn fix_ci_sequence_updates_the_pr_after_approval() {
+    // STEP 3.2 /fix-ci: read the failing check, run a test, then update the PR
+    // and post a check summary — the two writes each parking for approval.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "fixci")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "fix ci", AgentMode::Build);
+
+    let gh = Arc::new(RecordingGitHub::default());
+    let updated = gh.updated.clone();
+    let summaries = gh.summaries.clone();
+
+    let runtime = {
+        let journal = run_journal!(pool, broker);
+        let sink: Box<dyn ArtifactSink> = Box::new(store_sink!(store, pool));
+        FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()]),
+            broker.clone(),
+            hub.clone(),
+            journal,
+            sink,
+        )
+        .with_github(gh as Arc<dyn GitHubApi>)
+    };
+
+    let mut rx = hub.subscribe(session);
+    let driver = ScriptedDriver::new(vec![
+        ModelStep::CallTool {
+            tool: "github.list_check_runs".to_string(),
+            args: json!({ "ref": "main" }),
+        },
+        ModelStep::CallTool {
+            tool: "shell.run".to_string(),
+            args: json!({ "program": "git", "args": ["--version"] }),
+        },
+        ModelStep::CallTool {
+            tool: "github.update_pull_request".to_string(),
+            args: json!({ "number": 7, "body": "fixed the failing check" }),
+        },
+        ModelStep::CallTool {
+            tool: "github.create_check_run_summary".to_string(),
+            args: json!({ "name": "ci", "head_sha": "abc", "summary": "green", "conclusion": "success" }),
+        },
+        ModelStep::Finish {
+            summary: "fixed".to_string(),
+        },
+    ]);
+    let ctx = RunContext::new(session, run, "fix ci", AgentMode::Build, repo.clone(), repo)
+        .with_github_repo(RepoId::new("octocat", "hello-world"));
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+
+    let mut github_mutations = 0;
+    loop {
+        let event = rx.recv().await.expect("event");
+        let done = matches!(event.body, EventBody::RunCompleted { .. });
+        if let EventBody::ToolProposed {
+            approval_id,
+            action,
+            ..
+        } = &event.body
+        {
+            if matches!(action, ProposedAction::GitHubMutation { .. }) {
+                github_mutations += 1;
+            }
+            broker
+                .resolve(
+                    &pool,
+                    *approval_id,
+                    ApprovalDecision::Approve,
+                    ApprovalScope::Once,
+                    "op".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        if done {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+
+    // Both writes happened, and each was an approval-gated GitHubMutation.
+    assert_eq!(*updated.lock().unwrap(), vec![7]);
+    assert_eq!(summaries.lock().unwrap().len(), 1);
+    assert_eq!(
+        github_mutations, 2,
+        "the PR update and the check summary each parked for approval"
+    );
 }

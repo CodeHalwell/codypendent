@@ -66,11 +66,13 @@ use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
 
 use crate::models::ModelRegistry;
 use crate::tools::{
-    new_pull_request, parse_create_draft_pull_request, parse_get_pull_request,
-    parse_list_check_runs, render_check_runs, render_pull_request, ApplyPatch, ApplyPatchInput,
-    ArtifactSink, CommandRequest, CreateDraftPullRequest, CreateDraftPullRequestInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
-    ListCheckRunsInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
+    new_pull_request, parse_create_check_run, parse_create_draft_pull_request,
+    parse_get_pull_request, parse_list_check_runs, parse_update_pull_request, render_check_runs,
+    render_pull_request, ApplyPatch, ApplyPatchInput, ArtifactSink, CommandRequest,
+    CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff,
+    GitDiffInput, ListCheckRuns, ListCheckRunsInput, ReadFile, ReadFileInput, Search, SearchInput,
+    Shell, UpdatePullRequestInput, UpdatePullRequestTool,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -975,6 +977,22 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::GitHubCreateDraftPr { repo, input },
                 })
             }
+            UpdatePullRequestTool::NAME => {
+                let repo = self.github_target(run)?;
+                let input = parse_update_pull_request(args)?;
+                Ok(Prepared {
+                    action: UpdatePullRequestTool::proposed_action(&repo),
+                    tool: PreparedTool::GitHubUpdatePr { repo, input },
+                })
+            }
+            CreateCheckRunSummary::NAME => {
+                let repo = self.github_target(run)?;
+                let input = parse_create_check_run(args)?;
+                Ok(Prepared {
+                    action: CreateCheckRunSummary::proposed_action(&repo),
+                    tool: PreparedTool::GitHubCheckSummary { repo, input },
+                })
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -1156,6 +1174,36 @@ impl FrameworkAgentRuntime {
                     }
                 }
             },
+            PreparedTool::GitHubUpdatePr { repo, input } => match self.github.as_ref() {
+                None => github_unconfigured(),
+                Some(client) => match client
+                    .update_pull_request(&repo, input.number, &input.request)
+                    .await
+                {
+                    Ok(pr) => (
+                        format!("updated PR #{} [{}]", pr.number, pr.state),
+                        None,
+                        ToolOutcome::Succeeded,
+                    ),
+                    Err(e) => github_failure("github.update_pull_request", &e),
+                },
+            },
+            PreparedTool::GitHubCheckSummary { repo, input } => match self.github.as_ref() {
+                None => github_unconfigured(),
+                Some(client) => {
+                    match client.create_check_run_summary(&repo, &input.request).await {
+                        Ok(check) => (
+                            format!(
+                                "posted check-run summary `{}` [{}]",
+                                check.name, check.status
+                            ),
+                            None,
+                            ToolOutcome::Succeeded,
+                        ),
+                        Err(e) => github_failure("github.create_check_run_summary", &e),
+                    }
+                }
+            },
         }
     }
 
@@ -1258,6 +1306,14 @@ enum PreparedTool {
     GitHubCreateDraftPr {
         repo: RepoId,
         input: CreateDraftPullRequestInput,
+    },
+    GitHubUpdatePr {
+        repo: RepoId,
+        input: UpdatePullRequestInput,
+    },
+    GitHubCheckSummary {
+        repo: RepoId,
+        input: CreateCheckRunInput,
     },
 }
 
@@ -1591,6 +1647,34 @@ impl FrameworkModelDriver {
                         "body": {"type": "string"}
                     },
                     "required": ["title", "head", "base"]
+                }),
+            ),
+            decl(
+                UpdatePullRequestTool::NAME,
+                "Update a GitHub pull request's title/body/state (requires approval).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "number": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "state": {"type": "string"}
+                    },
+                    "required": ["number"]
+                }),
+            ),
+            decl(
+                CreateCheckRunSummary::NAME,
+                "Post a GitHub check-run summary against a commit (requires approval).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "head_sha": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "conclusion": {"type": "string"}
+                    },
+                    "required": ["name", "head_sha", "summary"]
                 }),
             ),
         ]
