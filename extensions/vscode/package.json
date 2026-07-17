@@ -1,0 +1,89 @@
+{
+  "name": "codypendent",
+  "displayName": "Codypendent",
+  "description": "Editor-aware client for the Codypendent daemon: attach to a session, watch the transcript and run state, resolve approvals, and push IDE context. The extension never executes tools locally.",
+  "version": "0.1.0",
+  "publisher": "codypendent",
+  "license": "MIT",
+  "engines": {
+    "vscode": ">=1.90.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codypendent",
+          "title": "Codypendent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codypendent": [
+        {
+          "id": "codypendent.sessionView",
+          "name": "Session",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codypendent.openSession",
+        "title": "Codypendent: Open Session",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.approve",
+        "title": "Codypendent: Resolve Approval",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.startRun",
+        "title": "Codypendent: Start Run",
+        "category": "Codypendent"
+      }
+    ],
+    "configuration": {
+      "title": "Codypendent",
+      "properties": {
+        "codypendent.sessionId": {
+          "type": "string",
+          "default": "",
+          "description": "UUID of the session to attach to. Leave empty to be prompted when opening a session."
+        },
+        "codypendent.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the daemon Unix socket path. Leave empty to resolve it exactly as the daemon does (CODYPENDENT_SOCKET / CODYPENDENT_DATA_DIR / XDG_RUNTIME_DIR / platform data dir)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "node esbuild.config.mjs --production"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "esbuild": "^0.23.1",
+    "eslint": "^8.57.1",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.9"
+  }
+}

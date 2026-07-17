@@ -305,6 +305,17 @@ impl RuntimeExecutor {
             }
         }
 
+        // Seed the run with the session's latest IDE context (Phase 3 STEP 3.4),
+        // so the read path can flag a file whose disk bytes diverge from an unsaved
+        // editor buffer. Absent (no attached IDE) leaves the read path unchanged.
+        match projections::load_ide_context(&self.pool, launch.session_id).await {
+            Ok(Some(ide)) if !ide.dirty_buffers.is_empty() => {
+                ctx = ctx.with_ide_context(ide.dirty_buffers);
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not load IDE context for the run"),
+        }
+
         runtime
             .execute_run(&driver, ctx, token)
             .await

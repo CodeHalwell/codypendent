@@ -1,0 +1,20 @@
+# Everything that should not ship inside the packaged .vsix.
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+node_modules/**
+**/*.ts
+**/*.map
+.eslintrc.cjs
+.gitignore
+esbuild.config.mjs
+vitest.config.ts
+tsconfig.json
+**/tsconfig.json
+**/.eslintrc*
+**/*.test.ts
+
+# Keep: dist/**, media/**, package.json, README.md, LICENSE
+!dist/**
+!media/**

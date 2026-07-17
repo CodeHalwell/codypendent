@@ -61,6 +61,8 @@ use codypendent_protocol::{
 };
 
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
+use codypendent_integrations::ide::digest_bytes;
+use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
 
 use crate::models::ModelRegistry;
 use crate::tools::{
@@ -258,6 +260,10 @@ pub struct RunContext {
     /// The GitHub repository this run targets (`owner/repo`), if GitHub is
     /// configured. The client handle lives on the runtime; this names the target.
     pub github_repo: Option<RepoId>,
+    /// Digests of the IDE's unsaved ("dirty") buffers at run start (Phase 3 STEP
+    /// 3.4). The read path labels an excerpt whose on-disk bytes diverge from one
+    /// of these as `unsaved-ide-buffer`, so the trace flags possibly-stale reads.
+    pub ide_dirty_buffers: Vec<DirtyBufferDigest>,
     /// Optional channel of queued steering text, drained at safe points.
     pub steering: Option<mpsc::UnboundedReceiver<String>>,
 }
@@ -280,6 +286,7 @@ impl RunContext {
             repository: repository.into(),
             worktree: worktree.into(),
             github_repo: None,
+            ide_dirty_buffers: Vec::new(),
             steering: None,
         }
     }
@@ -294,6 +301,14 @@ impl RunContext {
     /// tools (the client handle is injected on the runtime separately).
     pub fn with_github_repo(mut self, repo: RepoId) -> Self {
         self.github_repo = Some(repo);
+        self
+    }
+
+    /// Seed the run with the IDE's unsaved-buffer digests (Phase 3 STEP 3.4), so
+    /// the read path can label a read whose disk bytes diverge from an editor
+    /// buffer as `unsaved-ide-buffer`.
+    pub fn with_ide_context(mut self, dirty_buffers: Vec<DirtyBufferDigest>) -> Self {
+        self.ide_dirty_buffers = dirty_buffers;
         self
     }
 }
@@ -964,6 +979,28 @@ impl FrameworkAgentRuntime {
         }
     }
 
+    /// The [`SourceProvenance`] of a just-read file (Phase 3 STEP 3.4). If the
+    /// IDE reported an unsaved buffer for this path, compare its digest to the
+    /// on-disk bytes: a match means the editor is in sync (`filesystem`); a
+    /// mismatch (or an unreadable file) means the disk content is stale relative
+    /// to the editor (`unsaved-ide-buffer`). With no dirty buffer, it is a plain
+    /// filesystem read.
+    async fn read_provenance(&self, path: &Path, run: &RunContext) -> SourceProvenance {
+        let path_str = path.to_string_lossy();
+        let dirty = run.ide_dirty_buffers.iter().find(|buffer| {
+            path_str == buffer.path.as_str()
+                || path_str.ends_with(&buffer.path)
+                || buffer.path.ends_with(path_str.as_ref())
+        });
+        match dirty {
+            Some(buffer) => match tokio::fs::read(path).await {
+                Ok(bytes) if digest_bytes(&bytes) == buffer.sha256 => SourceProvenance::Filesystem,
+                _ => SourceProvenance::UnsavedIdeBuffer,
+            },
+            None => SourceProvenance::Filesystem,
+        }
+    }
+
     /// Resolve the GitHub target for a `github.*` tool call: the client must be
     /// injected and the run must name a repository. A clear error otherwise lets
     /// the model see why the tool is unavailable.
@@ -1019,7 +1056,18 @@ impl FrameworkAgentRuntime {
                 }
             }
             PreparedTool::ReadFile(input) => match ReadFile::execute(&input, &read_scope).await {
-                Ok(excerpt) => (excerpt.content, None, ToolOutcome::Succeeded),
+                Ok(excerpt) => {
+                    // Label the excerpt with its origin (Phase 3 STEP 3.4). The
+                    // common `filesystem` case is left unmarked to keep the trace
+                    // quiet; a read whose disk bytes diverge from an unsaved editor
+                    // buffer is flagged so the model and the trace know the content
+                    // may be stale relative to the editor.
+                    let observation = match self.read_provenance(&excerpt.path, run).await {
+                        SourceProvenance::Filesystem => excerpt.content,
+                        other => format!("[source: {}]\n{}", other.label(), excerpt.content),
+                    };
+                    (observation, None, ToolOutcome::Succeeded)
+                }
                 Err(e) => (
                     format!("workspace.read_file error: {e}"),
                     None,

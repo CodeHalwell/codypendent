@@ -1180,3 +1180,139 @@ async fn github_write_denied_without_network_allow() {
     assert!(created.is_empty());
     assert!(has_failed_tool(&events));
 }
+
+// --- Phase 3 STEP 3.4: source provenance on the read path ------------------
+
+/// A driver that runs a fixed script and records the transcript it is handed on
+/// each step, so a test can inspect what the model actually saw (e.g. a read
+/// result's source-provenance label).
+struct CapturingDriver {
+    steps: std::sync::Mutex<std::collections::VecDeque<ModelStep>>,
+    seen: Arc<Mutex<Vec<codypendent_runtime::agent::TurnItem>>>,
+}
+
+#[async_trait]
+impl codypendent_runtime::agent::ModelDriver for CapturingDriver {
+    fn model_id(&self) -> codypendent_protocol::ModelId {
+        codypendent_protocol::ModelId("test".to_string())
+    }
+    async fn next_step(
+        &self,
+        transcript: &[codypendent_runtime::agent::TurnItem],
+    ) -> anyhow::Result<ModelStep> {
+        *self.seen.lock().unwrap() = transcript.to_vec();
+        Ok(self
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ModelStep::Finish {
+                summary: "done".to_string(),
+            }))
+    }
+}
+
+/// Drive one `workspace.read_file` of `file` with `dirty_buffers` seeded on the
+/// run, and return every transcript item the model was shown.
+async fn read_with_ide_context(
+    file: &std::path::Path,
+    repo: &std::path::Path,
+    dirty_buffers: Vec<codypendent_protocol::ide::DirtyBufferDigest>,
+) -> Vec<codypendent_runtime::agent::TurnItem> {
+    let dir = repo; // repo is a real dir owned by the caller
+    let pool = open_database(&dir.join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "ide-it")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "read", AgentMode::Build);
+
+    let runtime = build_runtime!(pool, store, broker, hub);
+    let mut rx = hub.subscribe(session);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let driver = CapturingDriver {
+        steps: std::sync::Mutex::new(
+            vec![ModelStep::CallTool {
+                tool: "workspace.read_file".to_string(),
+                args: json!({ "path": file.to_string_lossy() }),
+            }]
+            .into(),
+        ),
+        seen: seen.clone(),
+    };
+
+    let ctx = RunContext::new(session, run, "read", AgentMode::Build, repo, repo)
+        .with_ide_context(dirty_buffers);
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+
+    loop {
+        let event = rx.recv().await.expect("event");
+        if matches!(event.body, EventBody::RunCompleted { .. }) {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+fn read_result_text(items: &[codypendent_runtime::agent::TurnItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            codypendent_runtime::agent::TurnItem::ToolResult { tool, output }
+                if tool == "workspace.read_file" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn read_of_a_diverging_dirty_buffer_is_labeled_unsaved() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let file = repo.join("src.rs");
+    std::fs::write(&file, b"the committed, on-disk contents\n").unwrap();
+
+    // A dirty buffer whose digest does NOT match the file on disk.
+    let dirty = codypendent_protocol::ide::DirtyBufferDigest {
+        path: file.to_string_lossy().into_owned(),
+        sha256: "not-the-disk-digest".to_string(),
+        byte_length: 3,
+    };
+    let seen = read_with_ide_context(&file, &repo, vec![dirty]).await;
+    let text = read_result_text(&seen);
+    assert!(
+        text.contains("[source: unsaved-ide-buffer]"),
+        "diverging dirty buffer must be labeled unsaved-ide-buffer; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn read_without_dirty_buffer_is_unlabeled() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let file = repo.join("src.rs");
+    std::fs::write(&file, b"plain filesystem read\n").unwrap();
+
+    let seen = read_with_ide_context(&file, &repo, Vec::new()).await;
+    let text = read_result_text(&seen);
+    assert!(
+        !text.contains("[source:"),
+        "a plain filesystem read carries no source label; got: {text}"
+    );
+    assert!(text.contains("plain filesystem read"));
+}

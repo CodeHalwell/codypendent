@@ -13,6 +13,7 @@
 
 use std::str::FromStr;
 
+use codypendent_protocol::ide::IdeContextUpdate;
 use codypendent_protocol::{AgentMode, RunId, RunState, SessionId, SessionProjection};
 use sqlx::SqlitePool;
 
@@ -196,4 +197,96 @@ pub async fn session_projection(
         active_runs,
         closed,
     })
+}
+
+/// Upsert the latest IDE context for a session (Phase 3 STEP 3.4). Latest-wins:
+/// a session has at most one row, replaced on every `UpdateIdeContext`. Stored
+/// outside the event ledger — IDE context is high-frequency, ephemeral, derived
+/// state, not history.
+pub async fn upsert_ide_context(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    update: &IdeContextUpdate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(update)?;
+    sqlx::query(
+        "INSERT INTO ide_context (session_id, update_json, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(session_id) DO UPDATE SET update_json = excluded.update_json, \
+         updated_at = excluded.updated_at",
+    )
+    .bind(session_id.to_string())
+    .bind(json)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Load the latest IDE context for a session, if any has been pushed.
+pub async fn load_ide_context(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> anyhow::Result<Option<IdeContextUpdate>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT update_json FROM ide_context WHERE session_id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    match row {
+        Some((json,)) => Ok(Some(serde_json::from_str(&json)?)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod ide_context_tests {
+    use super::*;
+    use codypendent_protocol::ide::{DirtyBufferDigest, IdeContextUpdate};
+
+    #[tokio::test]
+    async fn ide_context_is_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::open_database(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        // A session must exist for the FK.
+        crate::ledger::create_session(&pool, session, "ide")
+            .await
+            .unwrap();
+
+        assert!(load_ide_context(&pool, session).await.unwrap().is_none());
+
+        let first = IdeContextUpdate {
+            active_file: Some("a.rs".to_string()),
+            ..Default::default()
+        };
+        upsert_ide_context(&pool, session, &first, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let second = IdeContextUpdate {
+            active_file: Some("b.rs".to_string()),
+            dirty_buffers: vec![DirtyBufferDigest {
+                path: "b.rs".to_string(),
+                sha256: "abc".to_string(),
+                byte_length: 5,
+            }],
+            ..Default::default()
+        };
+        upsert_ide_context(&pool, session, &second, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        // Latest wins: exactly one row, holding the second update.
+        let loaded = load_ide_context(&pool, session).await.unwrap().unwrap();
+        assert_eq!(loaded.active_file.as_deref(), Some("b.rs"));
+        assert_eq!(loaded.dirty_buffers.len(), 1);
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ide_context")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

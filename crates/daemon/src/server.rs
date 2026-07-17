@@ -439,6 +439,36 @@ async fn handle_request(
                     )
                     .await?;
                 }
+                // IDE context is latest-wins, high-frequency projection state, not
+                // a ledger command — upsert it directly and acknowledge, mirroring
+                // the AttachSession interception above (Phase 3 STEP 3.4).
+                CommandBody::UpdateIdeContext { session_id, update } => {
+                    let reply = match crate::projections::upsert_ide_context(
+                        &state.pool,
+                        *session_id,
+                        update,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "ide.context-store-failed",
+                                error.to_string(),
+                                true,
+                            )),
+                        ),
+                    };
+                    send(writer, &reply).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
