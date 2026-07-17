@@ -21,7 +21,7 @@
 //! builds those from plain closures rather than the macros the runtime's own
 //! integration tests use.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -54,13 +54,16 @@ pub struct RuntimeExecutor {
     paths: RuntimePaths,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
-    /// Repositories already folded into the code graph this process's lifetime.
-    /// A per-user daemon can serve several checkouts over one socket, so each run
-    /// derives its OWN repository identity from its repository root and the first
-    /// run for a repository warms it here (issue #6 item 1). Seeded with the
-    /// startup repository `main` already scanned, so the primary checkout is never
-    /// re-scanned. `Arc<Mutex<…>>` so every clone shares one set.
-    scanned: Arc<Mutex<HashSet<RepositoryId>>>,
+    /// Per-repository scan gates. A per-user daemon can serve several checkouts
+    /// over one socket, so each run derives its OWN repository identity from its
+    /// repository root and the first run for a repository warms it here (issue #6
+    /// item 1). Each repository maps to an async gate holding "already scanned":
+    /// concurrent runs for the SAME new repository serialize on it, so a later run
+    /// *waits* for the in-flight scan to finish (and then sees it done) rather than
+    /// racing ahead to query a half-built graph. The outer `std` mutex only guards
+    /// the map lookup (never held across an await); the inner `tokio` mutex is the
+    /// async gate. Seeded with the startup repository `main` already scanned.
+    scanned: Arc<Mutex<HashMap<RepositoryId, Arc<tokio::sync::Mutex<bool>>>>>,
     /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
     /// a run's handle before its loop starts and removes it once the loop is
     /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
@@ -83,8 +86,10 @@ impl RuntimeExecutor {
         // `ApprovalRequested` raised by the agent loop reaches attached clients
         // live (not only on re-attach catch-up).
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
-        let mut scanned = HashSet::new();
-        scanned.insert(startup_repository);
+        let mut scanned = HashMap::new();
+        // The startup repository is already scanned by `main`, so seed its gate as
+        // done — its first run neither re-scans nor waits.
+        scanned.insert(startup_repository, Arc::new(tokio::sync::Mutex::new(true)));
         Self {
             pool,
             paths,
@@ -97,16 +102,22 @@ impl RuntimeExecutor {
 
     /// Warm `repository`'s code graph the first time this daemon serves a run for
     /// it, so [`emit_context`](Self::emit_context) opens with the right repository
-    /// map. The lock is released before the (async) scan — a `std` mutex is never
-    /// held across an await — and only the first caller for a repository scans;
-    /// later runs reuse the graph.
+    /// map. Fetch (or create) the repository's async gate under the sync lock,
+    /// release the sync lock, then hold the async gate across the scan: the first
+    /// caller scans and marks it done, and concurrent callers for the same
+    /// repository *wait* on the gate and then observe it done — so no run queries
+    /// a half-built graph.
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
-        let newly = {
-            let mut seen = self.scanned.lock().expect("scanned set lock");
-            seen.insert(repository)
+        let gate = {
+            let mut seen = self.scanned.lock().expect("scanned map lock");
+            seen.entry(repository)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(false)))
+                .clone()
         };
-        if newly {
+        let mut done = gate.lock().await;
+        if !*done {
             scan::scan_repository(&self.pool, repository, root).await;
+            *done = true;
         }
     }
 

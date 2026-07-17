@@ -697,7 +697,12 @@ impl CommandProcessor {
             created_session: None,
             created_run: None,
             last_sequence,
-            newly_applied: false,
+            // Reaching here means THIS call ran the write path (a duplicate
+            // idempotency key returned early via `handle_existing`), so this is a
+            // fresh apply, not a replay — consistent with `run_transaction`. The
+            // flag is `#[serde(skip)]`, so a later replay of the recorded outcome
+            // still deserializes to `false`.
+            newly_applied: true,
         };
         sqlx::query(
             "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",

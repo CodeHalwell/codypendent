@@ -18,7 +18,7 @@
 //! `pool.begin()` transaction that also appends the index-outbox rows so the
 //! authoritative write and its `SymbolChanged` events are atomic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -37,6 +37,10 @@ use crate::types::{
 
 /// The IANA media type recorded on a file's descriptive evidence artifact.
 const RUST_MEDIA_TYPE: &str = "text/x-rust";
+
+/// Maximum ids bound into one `DELETE … IN (…)` when retiring stale nodes, kept
+/// safely under SQLite's default 999 bound-parameter ceiling.
+const SQLITE_BIND_CHUNK: usize = 900;
 
 /// Derive a **stable** [`RepositoryId`] from a repository's canonical path.
 ///
@@ -234,17 +238,32 @@ pub async fn upsert_file_graph(
     //     edge-free (step 2 removed their outgoing edges, and every edge into
     //     them came from this same file), so a single-file reparse drops removed
     //     functions/types without waiting for a whole-repository `clear`.
-    if !ids.is_empty() {
-        let placeholders = std::iter::repeat_n("?", ids.len())
+    //
+    //     Compute the retired set in Rust (existing file nodes minus the ones this
+    //     parse re-seeded) and delete only those, in bounded chunks. A clean
+    //     reparse retires nothing (no delete at all); binding every kept id in one
+    //     `NOT IN (…)` would instead risk SQLite's ~999 bound-parameter limit for
+    //     a file with very many symbols/reference nodes.
+    let existing: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?")
+            .bind(repository.to_string())
+            .bind(path)
+            .fetch_all(&mut *tx)
+            .await?;
+    let kept: HashSet<String> = ids.iter().map(|id| id.to_string()).collect();
+    let retired: Vec<String> = existing
+        .into_iter()
+        .map(|(id,)| id)
+        .filter(|id| !kept.contains(id))
+        .collect();
+    for chunk in retired.chunks(SQLITE_BIND_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "DELETE FROM code_nodes WHERE repository = ? AND source_path = ? \
-             AND id NOT IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql).bind(repository.to_string()).bind(path);
-        for id in &ids {
-            query = query.bind(id.to_string());
+        let sql = format!("DELETE FROM code_nodes WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
         }
         query.execute(&mut *tx).await?;
     }
