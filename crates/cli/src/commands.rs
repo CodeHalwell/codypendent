@@ -393,3 +393,63 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `codypendent open <session> --in <ide>` (STEP 3.7). Print how the IDE should
+/// attach to the session, then best-effort launch the editor with the session in
+/// its environment. The IDE joins as a *contributor* to the SAME session — the
+/// run is never restarted; the daemon publishes a `ClientPresenceChanged` so the
+/// TUI shows the editor arriving. A missing editor binary is not an error: the
+/// printed instructions still let a user attach manually.
+pub async fn open(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    ide_binary: &str,
+    ide_name: &str,
+    repo: PathBuf,
+) -> anyhow::Result<()> {
+    println!("{}", handoff_message(session_id, paths, ide_name));
+
+    // Best-effort launch. The extension reads `CODYPENDENT_SESSION` to attach to
+    // this exact session (rather than opening a fresh one).
+    let launched = std::process::Command::new(ide_binary)
+        .arg(&repo)
+        .env("CODYPENDENT_SESSION", session_id.to_string())
+        .env("CODYPENDENT_SOCKET", &paths.socket_path)
+        .spawn();
+    match launched {
+        Ok(_) => println!("Launched {ide_name}."),
+        Err(_) => println!(
+            "Could not launch `{ide_binary}` (is it on PATH?). \
+             Open {ide_name} yourself and attach to the session above."
+        ),
+    }
+    Ok(())
+}
+
+/// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
+fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) -> String {
+    format!(
+        "Handing session {session_id} off to {ide_name}.\n\
+         The editor attaches as a contributor to this session — the run keeps \
+         going, it does not restart.\n\
+         Session: {session_id}\n\
+         Socket:  {}",
+        paths.socket_path.display()
+    )
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[test]
+    fn handoff_message_names_the_session_and_socket() {
+        let paths = RuntimePaths::from_data_dir(std::path::PathBuf::from("/tmp/cp-test"));
+        let session = SessionId::new();
+        let message = handoff_message(session, &paths, "VS Code");
+        assert!(message.contains(&session.to_string()));
+        assert!(message.contains("VS Code"));
+        assert!(message.contains("does not restart"));
+        assert!(message.contains(&paths.socket_path.display().to_string()));
+    }
+}

@@ -35,6 +35,10 @@ use config::MergedPolicy;
 /// invocation-scoped and time-limited (Chapter 11).
 const CAPABILITY_GRANT_TTL_MINUTES: i64 = 15;
 
+/// The `host:port` a GitHub mutation must be network-authorized against. GitHub
+/// writes are network-scoped to exactly this endpoint (Phase 3 STEP 3.1).
+pub const GITHUB_API_ENDPOINT: &str = "api.github.com:443";
+
 /// The three possible dispositions of a policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -179,6 +183,20 @@ impl PolicyEngine {
         Self::from_merged(MergedPolicy::builtin_defaults())
     }
 
+    /// The built-in defaults, additionally admitting `endpoints` on the network
+    /// allow-list. GitHub mutations are network-scoped to [`GITHUB_API_ENDPOINT`],
+    /// so the daemon uses this (rather than [`with_defaults`]) when a GitHub
+    /// client is configured: the endpoint must be reachable for a mutation to
+    /// reach the approval gate at all, but admitting it grants nothing on its own
+    /// — every GitHub write still returns `RequireApproval`.
+    ///
+    /// [`with_defaults`]: PolicyEngine::with_defaults
+    pub fn with_defaults_allowing_network(endpoints: impl IntoIterator<Item = String>) -> Self {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.network_allow.extend(endpoints);
+        Self::from_merged(merged)
+    }
+
     /// Load and merge policy from explicit file paths over the built-in
     /// defaults: `config_policy` (User layer) then `repo_policy` (Repository
     /// layer, narrowest). A `None` path — or a path that does not exist — is
@@ -254,6 +272,7 @@ impl PolicyEngine {
             ProposedAction::NetworkRequest { destination } => self.eval_network(destination, ctx),
             ProposedAction::GitCommit { .. } => self.eval_git(GitOp::Commit, ctx),
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
+            ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -358,6 +377,35 @@ impl PolicyEngine {
             "policy.network-denied",
             format!("`{destination}` is not permitted by the network policy"),
         ))
+    }
+
+    /// Evaluate a remote GitHub write (Phase 3 STEP 3.1). A GitHub mutation is a
+    /// network write to the GitHub API endpoint: it is denied unless the active
+    /// mode permits network access and the network policy admits
+    /// [`GITHUB_API_ENDPOINT`], and it *always* requires approval — every remote
+    /// write is approval-gated (Chapter 10). The minted grant is a
+    /// `NetworkConnect` capability scoped to the GitHub endpoint.
+    fn eval_github_mutation(&self, ctx: &EvalContext) -> PolicyDecision {
+        if !ctx.mode.network_allowed {
+            return self.deny(PolicyReason::new(
+                "policy.github-denied-by-mode",
+                "the active mode forbids network connections",
+            ));
+        }
+        let scope = self.network_scope();
+        if !scope.allows(GITHUB_API_ENDPOINT) {
+            return self.deny(PolicyReason::new(
+                "policy.github-network-denied",
+                format!("`{GITHUB_API_ENDPOINT}` is not permitted by the network policy"),
+            ));
+        }
+        self.require(
+            Capability::NetworkConnect(scope),
+            PolicyReason::new(
+                "policy.github-requires-approval",
+                "GitHub writes require approval",
+            ),
+        )
     }
 
     fn eval_git(&self, op: GitOp, ctx: &EvalContext) -> PolicyDecision {
@@ -543,6 +591,66 @@ mod tests {
             &ctx(&repo, &repo),
         );
         assert_eq!(commit.decision, Decision::RequireApproval);
+    }
+
+    #[test]
+    fn github_mutation_denied_without_network_grant() {
+        // Built-in defaults have an empty network allow-list, so a GitHub write
+        // is denied before it can even reach the approval gate.
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::GitHubMutation {
+                repository: "octocat/hello-world".to_string(),
+                summary: "create draft PR".to_string(),
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(decision.reasons[0].code, "policy.github-network-denied");
+    }
+
+    #[test]
+    fn github_mutation_requires_approval_when_endpoint_allowed() {
+        // With the GitHub API endpoint on the network allow-list, a mutation is
+        // permitted only through approval — every remote write is gated.
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.network_allow = vec![GITHUB_API_ENDPOINT.to_string()];
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::GitHubMutation {
+                repository: "octocat/hello-world".to_string(),
+                summary: "create draft PR".to_string(),
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert_eq!(decision.reasons[0].code, "policy.github-requires-approval");
+        assert!(matches!(
+            decision.capability_grant.unwrap().capability,
+            Capability::NetworkConnect(_)
+        ));
+    }
+
+    #[test]
+    fn github_mutation_denied_by_mode() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.network_allow = vec![GITHUB_API_ENDPOINT.to_string()];
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::GitHubMutation {
+                repository: "octocat/hello-world".to_string(),
+                summary: "create draft PR".to_string(),
+            },
+            &ctx(&repo, &repo).with_mode(ModeOverlay::read_only()),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(decision.reasons[0].code, "policy.github-denied-by-mode");
     }
 
     #[test]

@@ -20,17 +20,19 @@ the release gate is the
 | **0** | Workspace bootstrap — daemon lifecycle, protocol, ledger, CI | ✅ |
 | **1** | Persistent coding-agent slice — sessions/runs, tools, approvals, TUI, JSONL | ✅ |
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
-| **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ⬜ |
+| **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | ⬜ |
 | **5** | Workflows & multi-agent orchestration | ⬜ |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
 | **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
 
-> **You are here:** Phases 0–2 are complete. The system is now editable and
-> knowledgeable: a governed registry with hybrid retrieval (recall@8 = 1.0 on the
-> eval set, unsafe items filtered), an always-on memory fabric with provenance and
-> absolute cross-repository isolation, and a tree-sitter code graph + repository
-> map. Phase 3 (GitHub & IDE awareness) is the next slice.
+> **You are here:** Phases 0–3 are complete. Beyond the editable, knowledgeable
+> core (governed registry, hybrid retrieval, memory fabric, code graph), the
+> runtime now reaches real developer surfaces: an idempotent, approval-gated
+> GitHub client wired into the agent loop (with the `/fix-ci` repair flow),
+> replay-safe webhook ingestion, source-provenance labeling of unsaved editor
+> buffers, a VS Code/Cursor extension, a Zed ACP adapter, and session handoff with
+> presence. Phase 4 (Docs Studio & richer code intelligence) is the next slice.
 
 ---
 
@@ -109,14 +111,30 @@ New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 - [x] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories
 - [x] `fmt` / `clippy` / `test` green; commits made; tree clean
 
-## Phase 3 — GitHub & IDE awareness ⬜
+## Phase 3 — GitHub & IDE awareness 🟡
 
-- [ ] GitHub read + draft-PR workflows; GitHub App option
-- [ ] VS Code/Cursor extension; Zed ACP adapter; IDE context (active file, selection, diagnostics, dirty buffers)
-- [ ] Shared session handoff (same run in TUI and IDE)
+New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::GitHubMutation` + `UpdateIdeContext`/`ClientPresenceChanged`; migrations `0005` (webhook delivery idempotency) and `0006` (IDE context); `extensions/vscode/`.
+
+- [x] **3.1** GitHub personal-mode client — `GitHubApi` trait + `reqwest` client (get PR, check-runs, job logs, review comments, draft PR, update PR, check-run summary); opaque `GitHubToken` broker (`gh auth token`/`GITHUB_TOKEN`, redacted, never serialized); hidden-marker idempotency (list-before-create); `eval_github_mutation` policy gate (network-scoped to `api.github.com:443`, always approval-gated); wiremock tests
+- [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
+- [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
+- [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Contributor` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 27 vitest tests + typecheck + lint green; Cursor compat note
+- [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
+- [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
 
 **Exit:** same run visible in TUI + IDE; unsaved-buffer provenance shown; PR
 actions idempotent + approval-gated; webhook replay safe.
+
+**Verified:** GitHub writes are idempotent and approval-gated end-to-end through
+the agent loop; the token never enters `Debug`/serialization/logs; a read of a
+diverging unsaved buffer is labeled `unsaved-ide-buffer` in the trace; a replayed
+webhook (same GUID) produces no second event and a forged signature is rejected
+before parsing; a second client attaching emits a `ClientPresenceChanged` the
+first observes; the ACP handshake/prompt/cancel round-trips over stdio; the VS
+Code extension's codec/discovery/reconnect pass 27 vitest tests. `fmt` / `clippy
+--all-features -D warnings` / `test --workspace` green; `extensions/vscode`
+typecheck/lint/test green.
 
 ## Phase 4 — Docs Studio & richer code intelligence ⬜
 

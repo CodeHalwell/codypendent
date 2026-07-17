@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactRef;
+use crate::handshake::ClientRole;
 use crate::ids::{
     AgentId, ApprovalId, ChangeSetId, ClientId, CommandId, CorrelationId, ModelId, RunId, UserId,
 };
@@ -148,6 +149,16 @@ pub enum EventBody {
         chronicle: ArtifactRef,
     },
 
+    /// A client attached to or detached from the session (Phase 3 STEP 3.7).
+    /// Emitted so every attached client can show who else is present — e.g. the
+    /// TUI showing that VS Code has joined the same session during a handoff.
+    ClientPresenceChanged {
+        client_id: ClientId,
+        role: ClientRole,
+        /// `true` when the client attached, `false` when it detached.
+        present: bool,
+    },
+
     /// Forward-compatibility fallback for an event type this build does not
     /// know (RULE 1). Receivers render a placeholder and continue.
     #[serde(other)]
@@ -267,6 +278,11 @@ mod tests {
                 summary: Some("fixed".to_string()),
             },
             chronicle: artifact_ref(),
+        });
+        round_trip(EventBody::ClientPresenceChanged {
+            client_id: crate::ids::ClientId::new(),
+            role: crate::handshake::ClientRole::Contributor,
+            present: true,
         });
     }
 

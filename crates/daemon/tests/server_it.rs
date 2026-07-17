@@ -280,13 +280,16 @@ async fn create_attach_and_two_clients_observe_one_event() {
 
     let mut got_accepted = false;
     let mut got_event = false;
-    for _ in 0..4 {
+    for _ in 0..8 {
         match read_frame(&mut s2).await.payload {
             Payload::CommandAccepted { .. } => got_accepted = true,
-            Payload::Event(event) => {
-                assert!(matches!(event.body, EventBody::NoteAppended { .. }));
-                got_event = true;
-            }
+            Payload::Event(event) => match event.body {
+                EventBody::NoteAppended { .. } => got_event = true,
+                // Presence is expected background noise (STEP 3.7): a client's own
+                // attach publishes a `ClientPresenceChanged` it then observes.
+                EventBody::ClientPresenceChanged { .. } => {}
+                other => panic!("unexpected event on client 2: {other:?}"),
+            },
             Payload::Ping => {}
             other => panic!("unexpected frame on client 2: {other:?}"),
         }
@@ -297,8 +300,14 @@ async fn create_attach_and_two_clients_observe_one_event() {
     assert!(got_accepted, "submitter must receive CommandAccepted");
     assert!(got_event, "submitter (subscribed) must observe the event");
 
-    // Client 1, the second observer of the same session, receives the same event.
-    let observed = read_until_event(&mut s1).await;
+    // Client 1, the second observer of the same session, receives the same event
+    // (skipping the presence events either client's attach produced).
+    let observed = loop {
+        let event = read_until_event(&mut s1).await;
+        if !matches!(event.body, EventBody::ClientPresenceChanged { .. }) {
+            break event;
+        }
+    };
     assert!(matches!(observed.body, EventBody::NoteAppended { .. }));
 
     shutdown(s1, task).await;
@@ -449,4 +458,80 @@ async fn observer_start_run_is_role_denied() {
     }
 
     shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn attaching_a_second_client_emits_presence() {
+    // STEP 3.7: presence events let each attached client see who else is here.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let client_a = ClientId::new();
+    let client_b = ClientId::new();
+
+    // A handshakes, creates a session, and attaches (SessionSummary sees all).
+    let mut a = connect(&paths).await;
+    handshake(&mut a, client_a).await;
+    let created = send_recv(
+        &mut a,
+        &Envelope::request(
+            client_a,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "handoff".to_string(),
+                },
+                "create-1",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut a,
+        client_a,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "attach-a",
+    )
+    .await;
+
+    // A receives its own arrival first.
+    let own = read_until_event(&mut a).await;
+    assert!(
+        matches!(&own.body, EventBody::ClientPresenceChanged { client_id, present: true, .. } if *client_id == client_a),
+        "expected A's own presence, got {:?}",
+        own.body
+    );
+
+    // B handshakes and attaches as a Contributor (the handoff to an IDE).
+    let mut b = connect(&paths).await;
+    handshake(&mut b, client_b).await;
+    attach(
+        &mut b,
+        client_b,
+        session_id,
+        Some(0),
+        ClientRole::Contributor,
+        vec![Subscription::SessionSummary],
+        "attach-b",
+    )
+    .await;
+
+    // A now sees B join, with B's role — the presence signal a handoff relies on.
+    let joined = read_until_event(&mut a).await;
+    assert!(
+        matches!(
+            &joined.body,
+            EventBody::ClientPresenceChanged { client_id, role, present: true }
+                if *client_id == client_b && *role == ClientRole::Contributor
+        ),
+        "expected B's presence, got {:?}",
+        joined.body
+    );
+
+    drop(b);
+    shutdown(a, task).await;
 }

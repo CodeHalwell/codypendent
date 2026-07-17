@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::handshake::{ClientRole, Subscription};
+use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, RunId, SessionId, WorkspaceId};
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
@@ -78,6 +79,14 @@ pub enum CommandBody {
     QueueSteering {
         run_id: RunId,
         text: String,
+    },
+    /// Push the IDE's live context (active file, selection, open documents, and
+    /// unsaved-buffer digests) for a session (Phase 3 STEP 3.4). Latest-wins and
+    /// high-frequency (debounced ≥ 300 ms client-side), so the daemon stores it
+    /// as a projection outside the event ledger rather than appending an event.
+    UpdateIdeContext {
+        session_id: SessionId,
+        update: IdeContextUpdate,
     },
     #[serde(other)]
     Unknown,
@@ -160,6 +169,18 @@ mod tests {
         round_trip(CommandBody::QueueSteering {
             run_id: RunId::new(),
             text: "focus on the parser".to_string(),
+        });
+        round_trip(CommandBody::UpdateIdeContext {
+            session_id: SessionId::new(),
+            update: IdeContextUpdate {
+                active_file: Some("src/lib.rs".to_string()),
+                dirty_buffers: vec![crate::ide::DirtyBufferDigest {
+                    path: "src/lib.rs".to_string(),
+                    sha256: "deadbeef".to_string(),
+                    byte_length: 12,
+                }],
+                ..Default::default()
+            },
         });
     }
 

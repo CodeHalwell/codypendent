@@ -31,6 +31,15 @@ use std::path::{Path, PathBuf};
 /// 108 on Linux).
 pub const MAX_SOCKET_PATH_BYTES: usize = 100;
 
+/// An environment override, or `None` when the variable is unset, empty, or
+/// whitespace-only. An empty override is a misconfiguration, not a real path.
+fn non_empty_env(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub data_dir: PathBuf,
@@ -55,7 +64,10 @@ pub enum DiscoveryError {
 impl RuntimePaths {
     /// Resolve paths from the environment (see module docs for the order).
     pub fn resolve() -> Result<Self, DiscoveryError> {
-        let data_dir_override = std::env::var_os("CODYPENDENT_DATA_DIR").map(PathBuf::from);
+        // An env var set to an empty (or whitespace-only) string is treated as
+        // unset — otherwise `CODYPENDENT_DATA_DIR=""` would make the data dir the
+        // empty path and yield relative socket paths like `run/daemon.sock`.
+        let data_dir_override = non_empty_env("CODYPENDENT_DATA_DIR");
         let data_dir = match &data_dir_override {
             Some(dir) => dir.clone(),
             None => directories::ProjectDirs::from("", "", "codypendent")
@@ -64,14 +76,12 @@ impl RuntimePaths {
                 .to_path_buf(),
         };
 
-        let socket_path = if let Some(socket) = std::env::var_os("CODYPENDENT_SOCKET") {
-            PathBuf::from(socket)
+        let socket_path = if let Some(socket) = non_empty_env("CODYPENDENT_SOCKET") {
+            socket
         } else if data_dir_override.is_some() {
             data_dir.join("run").join("daemon.sock")
-        } else if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(runtime_dir)
-                .join("codypendent")
-                .join("daemon.sock")
+        } else if let Some(runtime_dir) = non_empty_env("XDG_RUNTIME_DIR") {
+            runtime_dir.join("codypendent").join("daemon.sock")
         } else {
             data_dir.join("run").join("daemon.sock")
         };

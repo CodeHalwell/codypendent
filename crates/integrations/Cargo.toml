@@ -1,0 +1,36 @@
+[package]
+name = "codypendent-integrations"
+description = "GitHub and IDE integrations (Phase 3): the personal-mode GitHub client, webhook ingestion, and the IDE bridge contract with source provenance. A library the assembly layer consumes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Depends on the protocol (shared wire types) and external crates. It does not
+# depend on the daemon or runtime; the assembly crate (`codypendentd`) wires the
+# GitHub client into the tool layer and the webhook listener into startup.
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

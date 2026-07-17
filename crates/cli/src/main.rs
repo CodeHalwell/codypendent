@@ -83,6 +83,46 @@ enum TopCommand {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
+    /// `agent_servers` config points at this; it is not meant to be run by hand.
+    Acp {
+        /// Repository the ACP-driven runs operate in. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
+    /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
+    /// same session — the run keeps going, it never restarts.
+    Open {
+        /// The session to open in the IDE.
+        session_id: SessionId,
+        /// Which IDE to open the session in.
+        #[arg(long = "in", value_enum, default_value = "vscode")]
+        ide: IdeArg,
+        /// Repository path to open. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+/// The IDEs `codypendent open --in <IDE>` knows how to launch.
+#[derive(Clone, Copy, ValueEnum)]
+enum IdeArg {
+    Vscode,
+    Cursor,
+    Zed,
+}
+
+impl IdeArg {
+    /// The launcher binary and human name for this IDE.
+    fn binary_and_name(self) -> (&'static str, &'static str) {
+        match self {
+            IdeArg::Vscode => ("code", "VS Code"),
+            IdeArg::Cursor => ("cursor", "Cursor"),
+            IdeArg::Zed => ("zed", "Zed"),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -179,5 +219,24 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Acp { repo } => {
+            let repo = match repo {
+                Some(repo) => repo,
+                None => std::env::current_dir()?,
+            };
+            codypendent_cli::acp::serve(&paths, repo).await
+        }
+        TopCommand::Open {
+            session_id,
+            ide,
+            repo,
+        } => {
+            let repo = match repo {
+                Some(repo) => repo,
+                None => std::env::current_dir()?,
+            };
+            let (binary, name) = ide.binary_and_name();
+            commands::open(&paths, session_id, binary, name, repo).await
+        }
     }
 }

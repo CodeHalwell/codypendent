@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 codypendent-protocol = { workspace = true }
 codypendent-daemon = { workspace = true }
+codypendent-integrations = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
@@ -26,6 +27,7 @@ hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sqlx = { workspace = true }
 
 [features]
 default = ["provider-openai"]
