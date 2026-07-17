@@ -106,7 +106,11 @@ impl AcpBackend for DaemonAcpBackend {
             session_id: session,
             last_seen_sequence: None,
             subscriptions: vec![Subscription::SessionSummary],
-            requested_role: ClientRole::Contributor,
+            // Approver, not Contributor: this connection must both start runs AND
+            // resolve the approvals it surfaces as ACP permission requests. The
+            // daemon gates `ResolveApproval` to Approver/Controller, and Approver
+            // is a superset of Contributor's start/submit permissions.
+            requested_role: ClientRole::Approver,
         })
         .await
         .map_err(|e| AcpError::Backend(e.to_string()))?;
@@ -147,8 +151,13 @@ impl AcpBackend for DaemonAcpBackend {
                         EventBody::NoteAppended { text, .. } => {
                             ctx.update(json!({ "type": "note", "text": text })).await;
                         }
-                        EventBody::ToolProposed { approval_id, action, .. } => {
-                            resolve(&mut conn, ctx, approval_id, &action).await?;
+                        // A single approval surfaces as BOTH `ApprovalRequested`
+                        // (from the broker) and `ToolProposed` (from the runtime).
+                        // Prompt on exactly one — `ApprovalRequested` — so the
+                        // client sees one permission request and we send one
+                        // `ResolveApproval`; `ToolProposed` is display-only.
+                        EventBody::ToolProposed { run_id: _, action, .. } => {
+                            ctx.update(json!({ "type": "tool_proposed", "action": action })).await;
                         }
                         EventBody::ApprovalRequested { approval_id, action, .. } => {
                             resolve(&mut conn, ctx, approval_id, &action).await?;

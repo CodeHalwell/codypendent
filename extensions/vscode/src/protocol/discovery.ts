@@ -44,6 +44,15 @@ export class DiscoveryError extends Error {
 /** Env source; injectable so the resolution order is unit-testable. */
 export type Env = Record<string, string | undefined>;
 
+/**
+ * An environment override, or `undefined` when unset, empty, or whitespace-only.
+ * Mirrors the Rust `non_empty_env`: an empty `CODYPENDENT_DATA_DIR` must not make
+ * the data dir the empty path (which would yield relative socket paths).
+ */
+function nonEmpty(value: string | undefined): string | undefined {
+  return value !== undefined && value.trim().length > 0 ? value : undefined;
+}
+
 function homeDir(env: Env): string {
   const home = env.HOME ?? env.USERPROFILE ?? os.homedir();
   if (!home) {
@@ -82,16 +91,18 @@ export function resolveRuntimePaths(
   env: Env = process.env,
   platform: NodeJS.Platform = process.platform,
 ): RuntimePaths {
-  const dataDirOverride = env.CODYPENDENT_DATA_DIR;
+  const dataDirOverride = nonEmpty(env.CODYPENDENT_DATA_DIR);
+  const socketOverride = nonEmpty(env.CODYPENDENT_SOCKET);
+  const runtimeDir = nonEmpty(env.XDG_RUNTIME_DIR);
   const dataDir = dataDirOverride ?? platformDataDir(env, platform);
 
   let socketPath: string;
-  if (env.CODYPENDENT_SOCKET) {
-    socketPath = env.CODYPENDENT_SOCKET;
+  if (socketOverride) {
+    socketPath = socketOverride;
   } else if (dataDirOverride) {
     socketPath = path.join(dataDir, "run", "daemon.sock");
-  } else if (env.XDG_RUNTIME_DIR) {
-    socketPath = path.join(env.XDG_RUNTIME_DIR, "codypendent", "daemon.sock");
+  } else if (runtimeDir) {
+    socketPath = path.join(runtimeDir, "codypendent", "daemon.sock");
   } else {
     socketPath = path.join(dataDir, "run", "daemon.sock");
   }

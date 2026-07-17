@@ -42,6 +42,15 @@ pub async fn serve(listener: TcpListener, ingestor: Arc<WebhookIngestor>) -> std
     }
 }
 
+/// The most header bytes we buffer before a complete `\r\n\r\n` terminator. A
+/// client that never terminates its headers (or sends absurdly large ones) is
+/// rejected rather than allowed to grow our buffer without bound.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// The most body bytes we accept. GitHub caps deliveries at 25 MiB; this
+/// loopback listener is stricter, and a larger `Content-Length` is refused up
+/// front instead of read.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Read one request, run it through the ingestor, and write the status line.
 async fn handle_connection(
     mut stream: TcpStream,
@@ -51,10 +60,14 @@ async fn handle_connection(
     let mut chunk = [0u8; 4096];
 
     // Read until the end of the header block. The body may arrive in the same
-    // read, so we search the accumulated buffer each time.
+    // read, so we search the accumulated buffer each time — bounded by
+    // `MAX_HEADER_BYTES` so an unterminated header stream cannot exhaust memory.
     let header_end = loop {
         if let Some(position) = find_subslice(&buffer, b"\r\n\r\n") {
             break position;
+        }
+        if buffer.len() > MAX_HEADER_BYTES {
+            return write_response(&mut stream, 431, "Request Header Fields Too Large").await;
         }
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
@@ -94,6 +107,18 @@ async fn handle_connection(
         } else if name.eq_ignore_ascii_case("x-github-delivery") {
             delivery_id = value.to_string();
         }
+    }
+
+    // A GitHub delivery always carries its event type and a unique delivery id;
+    // without them the request is malformed. Rejecting an empty delivery id here
+    // is also what keeps a header-less request from poisoning the idempotency
+    // table with a `""` key that would make every later such request a duplicate.
+    if event_type.is_empty() || delivery_id.is_empty() {
+        return write_response(&mut stream, 400, "Bad Request").await;
+    }
+    // Refuse an over-large body up front rather than reading it.
+    if content_length > MAX_BODY_BYTES {
+        return write_response(&mut stream, 413, "Payload Too Large").await;
     }
 
     // The body is whatever followed the header terminator, extended until we

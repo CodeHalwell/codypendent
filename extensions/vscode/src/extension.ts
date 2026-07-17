@@ -145,7 +145,18 @@ export function activate(context: vscode.ExtensionContext): void {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
-      handleEvent(event, post, showDiff);
+      handleEvent(event, post, showDiff, true);
+    });
+    // Render the events replayed on attach/reconnect so the transcript is not
+    // blank after opening or reloading an existing session. Replay is
+    // non-interactive: historical approvals/diffs are shown as trace, never
+    // re-prompted (the live stream drives any still-pending approval).
+    nextClient.on("catchup", (catchup) => {
+      if (catchup.type === "Events") {
+        for (const event of catchup.events) {
+          handleEvent(event, post, showDiff, false);
+        }
+      }
     });
     nextClient.on("commandRejected", (error) => {
       void vscode.window.showWarningMessage(`Codypendent: command rejected (${error.code}): ${error.message}`);
@@ -165,6 +176,13 @@ export function activate(context: vscode.ExtensionContext): void {
     const configured = vscode.workspace.getConfiguration("codypendent").get<string>("sessionId")?.trim();
     if (configured && configured.length > 0) {
       return configured;
+    }
+    // `codypendent open --in vscode` launches the editor with the session in the
+    // environment; honor it (after validation) so the handoff auto-attaches
+    // instead of prompting for a UUID the user does not have.
+    const fromEnv = process.env.CODYPENDENT_SESSION?.trim();
+    if (fromEnv && isUuid(fromEnv)) {
+      return fromEnv;
     }
     const entered = await vscode.window.showInputBox({
       title: promptTitle,
@@ -281,6 +299,7 @@ function handleEvent(
   event: SessionEvent,
   post: (message: TranscriptMessage) => void,
   showDiff: (t: string, l: string, r: string, left: string, right: string) => Promise<void>,
+  interactive: boolean,
 ): void {
   const body = event.body;
   switch (body.type) {
@@ -291,14 +310,12 @@ function handleEvent(
     case "ModelStreamDelta":
       post({ kind: "event", sequence: event.sequence, label: "model", detail: body.text });
       break;
+    // A single approval surfaces as BOTH `ToolProposed` (from the runtime) and
+    // `ApprovalRequested` (from the broker). Prompt on exactly one —
+    // `ApprovalRequested`, which also carries the risk — so the user sees one
+    // dialog and we send one `ResolveApproval`; `ToolProposed` is trace-only.
     case "ToolProposed":
-      post({
-        kind: "approval",
-        approvalId: body.approval_id,
-        summary: describeAction(body.action),
-        risk: "pending",
-      });
-      void promptApproval(body.approval_id, describeAction(body.action), "pending");
+      post({ kind: "event", sequence: event.sequence, label: "tool", detail: describeAction(body.action) });
       break;
     case "ApprovalRequested":
       post({
@@ -307,7 +324,9 @@ function handleEvent(
         summary: describeAction(body.action),
         risk: describeRisk(body.risk),
       });
-      void promptApproval(body.approval_id, describeAction(body.action), describeRisk(body.risk));
+      if (interactive) {
+        void promptApproval(body.approval_id, describeAction(body.action), describeRisk(body.risk));
+      }
       break;
     case "ApprovalResolved":
       post({ kind: "approvalResolved", approvalId: body.approval_id, decision: body.decision.type });
@@ -321,13 +340,16 @@ function handleEvent(
       });
       // The patch bytes travel as an artifact (fetched out-of-band); show the
       // available metadata as a diff placeholder so the change set is visible.
-      void showDiff(
-        `Codypendent change set ${body.changeset_id.slice(0, 8)}`,
-        "HEAD",
-        "proposed",
-        "",
-        `# proposed patch\n# artifact ${body.artifact.id}\n# sha256 ${body.artifact.sha256}\n# ${body.artifact.byte_length} bytes, media ${body.artifact.media_type}\n`,
-      );
+      // Only for a live event — replaying history must not reopen old diffs.
+      if (interactive) {
+        void showDiff(
+          `Codypendent change set ${body.changeset_id.slice(0, 8)}`,
+          "HEAD",
+          "proposed",
+          "",
+          `# proposed patch\n# artifact ${body.artifact.id}\n# sha256 ${body.artifact.sha256}\n# ${body.artifact.byte_length} bytes, media ${body.artifact.media_type}\n`,
+        );
+      }
       break;
     case "RunStarted":
       post({ kind: "event", sequence: event.sequence, label: "run started", detail: body.objective });

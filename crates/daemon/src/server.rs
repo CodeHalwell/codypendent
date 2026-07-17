@@ -451,8 +451,12 @@ async fn handle_request(
                     )
                     .await?;
                     // Remember the attachment so a detach presence event fires when
-                    // this connection ends (STEP 3.7).
-                    conn.attached.push((*session_id, *requested_role));
+                    // this connection ends (STEP 3.7). De-duplicated by session: a
+                    // re-attach on the same connection must not queue a second
+                    // detach for the same client+session.
+                    if !conn.attached.iter().any(|(s, _)| s == session_id) {
+                        conn.attached.push((*session_id, *requested_role));
+                    }
                 }
                 // IDE context is latest-wins, high-frequency projection state, not
                 // a ledger command — upsert it directly and acknowledge, mirroring

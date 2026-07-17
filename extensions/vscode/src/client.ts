@@ -4,7 +4,7 @@
  *
  * Lifecycle of one connection:
  *   connect -> send `ClientHello` -> receive `ServerHello`
- *           -> send `Command(AttachSession { requested_role: Contributor })`
+ *           -> send `Command(AttachSession { requested_role: Approver })`
  *           -> receive `Catchup` and a live stream of `Event`s.
  *
  * The client holds NO session state beyond its live connection and
@@ -155,7 +155,12 @@ export class DaemonClient extends EventEmitter {
       { type: "SessionSummary" },
       { type: "AgentActivity" },
     ];
-    this.role = options.role ?? { type: "Contributor" };
+    // Approver, not Contributor: the extension both starts runs AND resolves the
+    // approvals it surfaces as native prompts. The daemon gates `ResolveApproval`
+    // to Approver/Controller, and Approver is a superset of Contributor's
+    // start/submit permissions, so a Contributor default would have every
+    // approval response rejected with `protocol.role-denied`.
+    this.role = options.role ?? { type: "Approver" };
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.connect =
       options.createConnection ?? ((p: string) => net.createConnection({ path: p }) as SocketLike);

@@ -110,7 +110,7 @@ describe("computeBackoff", () => {
 });
 
 describe("DaemonClient handshake + attach", () => {
-  it("sends ClientHello on connect, then attaches as Contributor with no resume cursor", async () => {
+  it("sends ClientHello on connect, then attaches as Approver with no resume cursor", async () => {
     const sockets: FakeSocket[] = [];
     const client = new DaemonClient({
       socketPath: "/tmp/does-not-matter.sock",
@@ -138,7 +138,7 @@ describe("DaemonClient handshake + attach", () => {
     socket.deliver(serverHelloPayload());
     const attach = attachCommand(socket);
     expect(attach.session_id).toBe(SESSION_ID);
-    expect(attach.requested_role).toEqual({ type: "Contributor" });
+    expect(attach.requested_role).toEqual({ type: "Approver" });
     expect(attach.last_seen_sequence).toBeUndefined();
     expect(client.connectionStatus).toBe("attached");
 
@@ -223,7 +223,7 @@ describe("DaemonClient reconnect with resume", () => {
     // The re-attach resumes from the last-seen sequence.
     const resumed = attachCommand(second);
     expect(resumed.last_seen_sequence).toBe(9);
-    expect(resumed.requested_role).toEqual({ type: "Contributor" });
+    expect(resumed.requested_role).toEqual({ type: "Approver" });
 
     client.stop();
   });
