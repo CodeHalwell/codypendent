@@ -81,11 +81,32 @@ async fn main() -> anyhow::Result<()> {
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run
     // through the runtime agent loop.
-    let executor = Arc::new(RuntimeExecutor::new(
-        pool.clone(),
-        paths.clone(),
-        repository,
-    ));
+    let mut executor = RuntimeExecutor::new(pool.clone(), paths.clone(), repository);
+
+    // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
+    // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the
+    // common case in CI/headless), the tools stay disabled and the daemon runs
+    // exactly as before. The token is a secret — only whether one was found is
+    // ever logged, never its value.
+    match codypendent_integrations::github::GitHubToken::discover().await {
+        Ok(token) => {
+            match codypendent_integrations::github::RestGitHubClient::new(
+                "https://api.github.com",
+                token,
+            ) {
+                Ok(client) => {
+                    executor = executor.with_github(Arc::new(client));
+                    info!("github personal-mode client enabled");
+                }
+                Err(error) => {
+                    warn!(%error, "could not build the github client; github tools disabled")
+                }
+            }
+        }
+        Err(_) => info!("no github token found; github tools disabled"),
+    }
+
+    let executor = Arc::new(executor);
 
     // Re-launch any run left `Queued` by a crash between `StartRun`'s commit and
     // its fire-and-forget spawn — recovery's live-state sweep does not cover

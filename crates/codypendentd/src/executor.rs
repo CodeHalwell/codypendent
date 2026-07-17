@@ -29,9 +29,10 @@ use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
-use codypendent_daemon::policy::PolicyEngine;
+use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections, recovery};
+use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{Actor, DataClassification, EventBody, RepositoryId, RunId, SessionId};
@@ -69,6 +70,10 @@ pub struct RuntimeExecutor {
     /// (cheap-to-clone) executor shares one registry — the clone the server holds
     /// must see the handle the worker task registered.
     cancellations: Arc<Mutex<HashMap<RunId, CancellationHandle>>>,
+    /// The GitHub client the `github.*` tools call, if a personal-mode token was
+    /// discovered at startup (Phase 3 STEP 3.2). `None` leaves those tools
+    /// unavailable and the run behaves exactly as before.
+    github: Option<Arc<dyn GitHubApi>>,
 }
 
 impl RuntimeExecutor {
@@ -92,7 +97,16 @@ impl RuntimeExecutor {
             approvals,
             scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            github: None,
         }
+    }
+
+    /// Inject the GitHub client (Phase 3 STEP 3.2). When set, the agent loop
+    /// gains the `github.*` tools and the policy admits the GitHub API endpoint
+    /// so a mutation reaches the approval gate (every write still needs approval).
+    pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
+        self.github = Some(github);
+        self
     }
 
     /// Warm `repository`'s code graph the first time this daemon serves a run for
@@ -251,17 +265,30 @@ impl RuntimeExecutor {
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
             .map_err(|e| format!("could not build model client: {e}"))?;
 
-        let runtime = FrameworkAgentRuntime::new(
+        // When a GitHub client is configured, admit the GitHub API endpoint on
+        // the network allow-list so a mutation reaches the approval gate rather
+        // than a hard network deny — every GitHub write still requires approval.
+        let policy = if self.github.is_some() {
+            PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()])
+        } else {
+            PolicyEngine::with_defaults()
+        };
+
+        let mut runtime = FrameworkAgentRuntime::new(
             registry,
-            PolicyEngine::with_defaults(),
+            policy,
             self.approvals.clone(),
             self.subscriptions.clone(),
             self.journal(),
             self.sink(self.artifacts()),
         );
+        if let Some(github) = &self.github {
+            runtime = runtime.with_github(github.clone());
+        }
+
         // Phase 1: the worktree is the repository itself (no per-run worktree
         // allocation yet — STEP 1.8 binds a dedicated worktree later).
-        let ctx = RunContext::new(
+        let mut ctx = RunContext::new(
             launch.session_id,
             launch.run_id,
             launch.objective.clone(),
@@ -269,6 +296,15 @@ impl RuntimeExecutor {
             launch.repository.clone(),
             launch.repository.clone(),
         );
+        // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
+        // so the `github.*` tools know their target. Only meaningful when a client
+        // is configured; a checkout with no GitHub origin leaves the tools inert.
+        if self.github.is_some() {
+            if let Some(repo) = resolve_github_repo(&launch.repository).await {
+                ctx = ctx.with_github_repo(repo);
+            }
+        }
+
         runtime
             .execute_run(&driver, ctx, token)
             .await
@@ -493,5 +529,60 @@ impl RunExecutor for RuntimeExecutor {
 
     fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker)> {
         Some((self.subscriptions.clone(), self.approvals.clone()))
+    }
+}
+
+/// Resolve a checkout's GitHub `owner/repo` from its `origin` remote, or `None`
+/// if the checkout has no GitHub origin (the `github.*` tools then stay inert).
+async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    parse_github_slug(url.trim())
+}
+
+/// Parse an `owner/repo` [`RepoId`] from a GitHub remote URL, accepting both the
+/// HTTPS (`https://github.com/owner/repo.git`) and scp-like SSH
+/// (`git@github.com:owner/repo.git`) forms. Returns `None` for a non-GitHub URL.
+fn parse_github_slug(url: &str) -> Option<RepoId> {
+    let (_, rest) = url.split_once("github.com")?;
+    let rest = rest.trim_start_matches([':', '/']);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/').filter(|segment| !segment.is_empty());
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    Some(RepoId::new(owner.to_string(), repo.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_github_slug;
+
+    #[test]
+    fn parses_https_and_ssh_remotes() {
+        for url in [
+            "https://github.com/octocat/hello-world.git",
+            "https://github.com/octocat/hello-world",
+            "git@github.com:octocat/hello-world.git",
+            "ssh://git@github.com/octocat/hello-world.git",
+        ] {
+            let repo = parse_github_slug(url).expect("parse");
+            assert_eq!(repo.owner, "octocat");
+            assert_eq!(repo.repo, "hello-world");
+        }
+    }
+
+    #[test]
+    fn rejects_non_github_remotes() {
+        assert!(parse_github_slug("https://gitlab.com/octocat/hello-world.git").is_none());
+        assert!(parse_github_slug("").is_none());
     }
 }

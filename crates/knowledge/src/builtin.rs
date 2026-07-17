@@ -101,14 +101,43 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
     ]
 }
 
-/// Register (or refresh) every built-in tool.
+/// The built-in commands as governed registry items.
+///
+/// Phase 3 ships `/fix-ci` (STEP 3.2): investigate a failed GitHub check and
+/// prepare a verified change set. Registering it as a [`RegistryItemKind::Command`]
+/// item makes it discoverable in the Skill Studio alongside tools and skills; the
+/// invocation (`/fix-ci`) drives the hard-coded repair workflow.
+#[must_use]
+pub fn builtin_commands() -> Vec<RegistryItem> {
+    vec![command(
+        "fix-ci",
+        "Investigate a failed GitHub check and prepare a verified change set. \
+         Invoked as `/fix-ci`; retrieves the check + logs, proposes a patch in an \
+         isolated worktree, runs tests, and — on approval — updates the pull request.",
+        &[
+            "fix the failing CI",
+            "repair a failed github check",
+            "the ci is red",
+            "make the checks pass",
+        ],
+        &["ci", "github", "check", "pull-request", "fix", "repair"],
+        // `/fix-ci` runs git and reaches GitHub with the personal-mode token, so
+        // its risk reflects both — the token bumps it to the highest tier.
+        vec![
+            CapabilityRequest::Command("git".into()),
+            CapabilityRequest::Secret("github-token".into()),
+        ],
+    )]
+}
+
+/// Register (or refresh) every built-in tool and command.
 ///
 /// Each is upserted at [`Scope::System`]; an existing registration of the same
 /// identity has its `id`/`created_at` reused so ids stay stable across restarts.
 /// Each upsert appends a `RegistryItemChanged` outbox row (via [`Registry::upsert`]).
 pub async fn register_builtins(pool: &SqlitePool) -> Result<(), RegistryError> {
     let registry = Registry::new();
-    for mut item in builtin_tools() {
+    for mut item in builtin_tools().into_iter().chain(builtin_commands()) {
         if let Some(existing) = registry
             .by_identity(pool, item.kind, &item.name, &item.scope)
             .await?
@@ -119,6 +148,21 @@ pub async fn register_builtins(pool: &SqlitePool) -> Result<(), RegistryError> {
         registry.upsert(pool, &item).await?;
     }
     Ok(())
+}
+
+/// Build one built-in command [`RegistryItem`] (kind [`RegistryItemKind::Command`]).
+/// Shares [`tool`]'s shape but is invoked, not called by the model as a tool.
+fn command(
+    name: &str,
+    description: &str,
+    intents: &[&str],
+    keywords: &[&str],
+    permissions: Vec<CapabilityRequest>,
+) -> RegistryItem {
+    RegistryItem {
+        kind: RegistryItemKind::Command,
+        ..tool(name, description, intents, keywords, permissions)
+    }
 }
 
 /// Build one built-in tool [`RegistryItem`] with risk derived from its

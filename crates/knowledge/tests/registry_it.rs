@@ -294,7 +294,16 @@ async fn register_builtins_registers_the_phase1_tools() {
     ] {
         assert!(names.contains(&expected), "missing built-in {expected}");
     }
-    assert!(items.iter().all(|i| i.kind == RegistryItemKind::Tool));
+    // Phase 3 also registers the `/fix-ci` command (STEP 3.2) as a Command-kind
+    // item, so the built-ins are a mix of tools and commands.
+    let fix_ci = items
+        .iter()
+        .find(|i| i.name == "fix-ci")
+        .expect("fix-ci command registered");
+    assert_eq!(fix_ci.kind, RegistryItemKind::Command);
+    assert!(items
+        .iter()
+        .all(|i| matches!(i.kind, RegistryItemKind::Tool | RegistryItemKind::Command)));
     assert!(items.iter().all(|i| i.scope == Scope::System));
     assert!(items.iter().all(|i| i.trust.tier == TrustTier::FirstParty));
     assert!(items.iter().all(|i| i.executable));
@@ -312,7 +321,8 @@ async fn register_builtins_registers_the_phase1_tools() {
         .unwrap()
         .unwrap();
     assert_eq!(shell_before.id, shell_after.id);
-    assert_eq!(registry.list(&pool).await.unwrap().len(), 5);
+    // Five tools plus the one command.
+    assert_eq!(registry.list(&pool).await.unwrap().len(), 6);
 }
 
 #[tokio::test]
