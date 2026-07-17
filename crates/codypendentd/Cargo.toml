@@ -15,6 +15,7 @@ codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }
 codypendent-protocol = { workspace = true }
 codypendent-knowledge = { workspace = true }
+codypendent-integrations = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

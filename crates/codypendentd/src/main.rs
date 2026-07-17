@@ -99,5 +99,61 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => warn!(%error, "could not re-launch queued runs at startup"),
     }
 
+    // Optionally open the GitHub webhook listener (Phase 3 STEP 3.3). It is
+    // disabled unless `<data_dir>/webhooks.toml` sets `enabled = true`, and even
+    // then binds loopback by default. Deliveries are verified, deduplicated by
+    // their `X-GitHub-Delivery` GUID, and normalized; they never trigger
+    // workflows here (that requires explicit policy, wired in a later phase). The
+    // listener runs concurrently with the blocking socket server below.
+    maybe_start_webhook_listener(&paths, &pool).await;
+
     server::run_with_executor(pool, paths, boot, Some(executor)).await
+}
+
+/// Start the webhook listener if `<data_dir>/webhooks.toml` enables it. Any
+/// failure is logged and never blocks daemon startup — the webhook endpoint is
+/// an optional, opt-in surface.
+async fn maybe_start_webhook_listener(paths: &RuntimePaths, pool: &sqlx::SqlitePool) {
+    use codypendent_integrations::webhook::{config, SqliteDeliveryStore, WebhookIngestor};
+
+    let config_path = paths.data_dir.join("webhooks.toml");
+    let webhooks = match config::load(&config_path) {
+        Ok(Some(webhooks)) if webhooks.enabled => webhooks,
+        Ok(_) => return, // absent or disabled — the default
+        Err(error) => {
+            warn!(%error, "failed to load webhooks configuration; listener not started");
+            return;
+        }
+    };
+
+    // The secret never reaches a log line: only its presence is reported.
+    let secret = webhooks
+        .secret
+        .as_ref()
+        .map(|value| value.as_bytes().to_vec());
+    let store = Arc::new(SqliteDeliveryStore::new(pool.clone()));
+    // Deliveries never trigger workflows in this phase (default-deny policy).
+    let ingestor = Arc::new(WebhookIngestor::new(store, secret, false));
+
+    match codypendent_integrations::webhook::server::bind(&webhooks.listen_addr).await {
+        Ok(listener) => {
+            info!(
+                addr = %webhooks.listen_addr,
+                signed = webhooks.secret.is_some(),
+                "webhook listener enabled"
+            );
+            tokio::spawn(async move {
+                if let Err(error) =
+                    codypendent_integrations::webhook::server::serve(listener, ingestor).await
+                {
+                    warn!(%error, "webhook listener stopped");
+                }
+            });
+        }
+        Err(error) => warn!(
+            %error,
+            addr = %webhooks.listen_addr,
+            "could not bind the webhook listener"
+        ),
+    }
 }

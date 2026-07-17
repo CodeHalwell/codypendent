@@ -436,6 +436,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "codypendent-daemon",
+ "codypendent-integrations",
  "codypendent-knowledge",
  "codypendent-protocol",
  "codypendent-runtime",
