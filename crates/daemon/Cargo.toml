@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 
 # Lib-only: the `codypendentd` binary now lives in `crates/codypendentd` (the
 # assembly layer that depends on BOTH this crate and `codypendent-runtime` and

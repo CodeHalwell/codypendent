@@ -2,6 +2,13 @@
 
 This timeline is scoped as a practical path from naming decision to public launch readiness.
 
+> **Note — historical planning doc.** This week-based "Phase" numbering
+> (Identity Lock, Core Runtime Slice, …) predates and differs from the build
+> phases the project actually ships against. The authoritative build-phase
+> tracker is [`ROADMAP.md`](../ROADMAP.md) (Phase 0 = workspace bootstrap,
+> Phase 1 = persistent agent slice, …); read this file as background intent,
+> not current status.
+
 ## Phase 0: Identity Lock (Week 0-1)
 
 Goal: lock naming and ownership prerequisites.

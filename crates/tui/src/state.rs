@@ -257,7 +257,7 @@ pub struct MemoryCard {
 /// The status-line projection (STEP 1.12 RULE 4, [Chapter 20] projections):
 /// mode, run state, model, context %, cost, worktree, pending-approval count.
 ///
-/// [Chapter 20]: ../../docs/docs/20-interaction-and-autonomy-model.md
+/// [Chapter 20]: ../../../docs/docs/20-interaction-and-autonomy-model.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusProjection {
     pub mode: Option<AgentMode>,

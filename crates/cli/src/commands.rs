@@ -220,23 +220,14 @@ pub async fn run_over_connection<W: Write>(
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
         .await?;
 
-    // CreateSession: the daemon's `CommandAccepted` reply carries no
-    // session/run id in its *payload* — `crates/daemon/src/server.rs` builds
-    // it from only `command_id` and `sequence`, dropping
-    // `CommandOutcome::created_session`/`created_run`. (Confirmed by the
-    // daemon's own integration test, `crates/daemon/tests/server_it.rs`'s
-    // `only_session_id`, which resorts to querying the session table
-    // directly — an option this crate does not have, since a client only
-    // ever speaks the wire protocol.) The one wire-level place a freshly
-    // created session's id *can* travel is the reply envelope's own
-    // `session_id` field (`Envelope.session_id`, Chapter 03) — general
-    // envelope metadata alongside any payload — so that is the contract this
-    // client relies on. A daemon that (like the currently committed STEP
-    // 1.11 server) never populates that field on a `CreateSession` reply
-    // cannot support `run` end-to-end; closing that gap is a
-    // `codypendent-daemon` change, out of this crate's scope. We fail
-    // loudly and specifically here rather than hang waiting for an id that
-    // will never arrive.
+    // CreateSession: the daemon's `CommandAccepted` *payload* is intentionally
+    // minimal (only `command_id` + `sequence`). The freshly created session's id
+    // travels on the reply envelope's own `session_id` field
+    // (`Envelope.session_id`, Chapter 03) — connection-level metadata the server
+    // sets on a `CreateSession` reply from `CommandOutcome::created_session`
+    // (`crates/daemon/src/server.rs`). This client reads it from there; if a
+    // daemon ever omits it we fail loudly and specifically below rather than
+    // hang waiting for an id that will never arrive.
     let workspace = WorkspaceId::new();
     let create_reply = conn
         .send_command(CommandBody::CreateSession {

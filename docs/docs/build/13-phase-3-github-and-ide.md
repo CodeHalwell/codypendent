@@ -50,7 +50,9 @@ In `codypendent-protocol`, add the IDE context types ([Chapter 03](../03-daemon-
 
 ## STEP 3.5 — VS Code / Cursor extension
 
-`extensions/vscode/` (TypeScript, esbuild, `vscode` engine ≥ 1.90): connects to the daemon socket (`net.createConnection` on the discovery path — reimplement discovery's resolution order in TS; it is 30 lines), speaks the JSON frame protocol, attaches as `Contributor`.
+`extensions/vscode/` (TypeScript, esbuild, `vscode` engine ≥ 1.90): connects to the daemon socket (`net.createConnection` on the discovery path — reimplement discovery's resolution order in TS; it is 30 lines), speaks the JSON frame protocol, attaches as `Approver` (it both starts runs and
+resolves the approvals it surfaces, so it needs the approval-resolving role — a
+superset of `Contributor`).
 
 Deliverables ([Chapter 10](../10-ide-github-and-inputs.md)): side panel webview rendering session transcript + run state from projections; approval prompts as native notifications with Approve/Reject; selection/active-file/diagnostics context pushed as `IdeContextUpdate`; diff display via `vscode.diff` for change sets; commands `codypendent.openSession`, `codypendent.approve`, `codypendent.startRun`. Cursor: same artifact, add a compatibility note + smoke-test checklist in the extension README.
 

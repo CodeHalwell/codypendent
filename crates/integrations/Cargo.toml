@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 
 # Depends on the protocol (shared wire types) and external crates. It does not
 # depend on the daemon or runtime; the assembly crate (`codypendentd`) wires the
