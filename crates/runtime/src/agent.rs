@@ -869,10 +869,15 @@ impl FrameworkAgentRuntime {
                 // Park on the decision, but never block a cancelled run: race the
                 // approval against cancellation. If cancellation wins, stop here
                 // (do not run the tool) and let the loop drive the run to
-                // Cancelled.
+                // Cancelled — dropping the broker's waiter entry, which only
+                // `await_decision` consuming a decision would otherwise remove
+                // (it would leak for the daemon's lifetime).
                 let decision = tokio::select! {
                     decision = self.approvals.await_decision(approval_id) => decision?,
-                    _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
+                    _ = cancel.cancelled() => {
+                        self.approvals.forget_waiter(approval_id);
+                        return Ok(ToolFlow::Cancelled);
+                    }
                 };
                 self.transition(run.session_id, run.run_id, RunState::Running)
                     .await?;

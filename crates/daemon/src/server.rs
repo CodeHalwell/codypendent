@@ -103,9 +103,31 @@ pub async fn run_with_executor(
     instance: InstanceRecord,
     executor: Option<Arc<dyn RunExecutor>>,
 ) -> anyhow::Result<()> {
-    prepare_socket(&paths).await?;
+    let listener = acquire_socket(&paths).await?;
+    run_with_executor_on(listener, pool, paths, instance, executor).await
+}
+
+/// Bind the daemon socket (refusing if a live daemon owns it) and write the
+/// pidfile. Split out so the assembly binary can claim single-instance
+/// exclusivity **before** running startup recovery — a second daemon must never
+/// get far enough to fail a live daemon's runs, relaunch its queued runs, or
+/// wipe its code graph before discovering the socket is taken.
+pub async fn acquire_socket(paths: &RuntimePaths) -> anyhow::Result<UnixListener> {
+    prepare_socket(paths).await?;
     let listener = UnixListener::bind(&paths.socket_path)?;
     std::fs::write(&paths.pid_path, std::process::id().to_string())?;
+    Ok(listener)
+}
+
+/// Like [`run_with_executor`], but on a pre-acquired [`acquire_socket`]
+/// listener (the assembly binary acquires it before recovery).
+pub async fn run_with_executor_on(
+    listener: UnixListener,
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    instance: InstanceRecord,
+    executor: Option<Arc<dyn RunExecutor>>,
+) -> anyhow::Result<()> {
     info!(socket = %paths.socket_path.display(), pid = std::process::id(), "daemon listening");
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -119,6 +141,31 @@ pub async fn run_with_executor(
         .as_ref()
         .and_then(|e| e.collaborators())
         .unwrap_or_else(|| (SubscriptionHub::new(), ApprovalBroker::new()));
+
+    // Drive approval expiry: without a periodic caller, `expires_at` deadlines
+    // are dead machinery — an approval with a deadline would simply never
+    // expire at runtime. The same tick prunes session fan-out channels whose
+    // last subscriber detached, so the hub does not grow for the daemon's
+    // lifetime. Aborted when the server stops.
+    let expiry_task = {
+        let broker = approvals.clone();
+        let hub = subscriptions.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match broker.expire_due(&pool, Utc::now()).await {
+                    Ok(0) => {}
+                    Ok(n) => info!(expired = n, "expired overdue approvals"),
+                    Err(error) => warn!(%error, "approval expiry sweep failed"),
+                }
+                hub.prune_idle();
+            }
+        })
+    };
+
     let commands = CommandProcessor::new(subscriptions.clone(), approvals);
     let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
     let secret = load_or_create_secret(&paths.data_dir)?;
@@ -169,6 +216,7 @@ pub async fn run_with_executor(
         }
     }
 
+    expiry_task.abort();
     let _ = std::fs::remove_file(&paths.socket_path);
     let _ = std::fs::remove_file(&paths.pid_path);
     info!("daemon stopped");
@@ -248,7 +296,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     let (mut read_half, write_half) = stream.into_split();
     let writer: SharedWriter = Arc::new(Mutex::new(write_half));
     let mut conn = ConnState::new();
-    let mut forwarders: Vec<JoinHandle<()>> = Vec::new();
+    // Keyed by session: a re-attach to the same session on this connection
+    // replaces (aborts) the prior forwarder instead of stacking a duplicate
+    // that would double-deliver every live event.
+    let mut forwarders: std::collections::HashMap<SessionId, JoinHandle<()>> =
+        std::collections::HashMap::new();
 
     // The read loop stamps this on every frame; the heartbeat task reads it to
     // decide when the client has gone silent. Locked only for the instant swap,
@@ -292,7 +344,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
 
     heartbeat.abort();
     // A slow or vanished client must never wedge a forwarder; drop them all.
-    for forwarder in forwarders {
+    for forwarder in forwarders.values() {
         forwarder.abort();
     }
     // Announce this client's departure from every session it was attached to, so
@@ -346,7 +398,7 @@ async fn handle_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     conn: &mut ConnState,
-    forwarders: &mut Vec<JoinHandle<()>>,
+    forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
     request: Envelope,
 ) -> anyhow::Result<bool> {
     // Major-version incompatibility is refused structurally; the connection
@@ -462,6 +514,20 @@ async fn handle_request(
                 // a ledger command — upsert it directly and acknowledge, mirroring
                 // the AttachSession interception above (Phase 3 STEP 3.4).
                 CommandBody::UpdateIdeContext { session_id, update } => {
+                    // Read-only clients must not overwrite the IDE-context
+                    // projection the run read-path uses for provenance labeling.
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not update IDE context".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let reply = match crate::projections::upsert_ide_context(
                         &state.pool,
                         *session_id,
@@ -610,7 +676,7 @@ async fn handle_attach(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     conn: &ConnState,
-    forwarders: &mut Vec<JoinHandle<()>>,
+    forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
     request: &Envelope,
     session_id: SessionId,
     last_seen: u64,
@@ -668,7 +734,9 @@ async fn handle_attach(
         session_id,
         current_max,
     ));
-    forwarders.push(handle);
+    if let Some(previous) = forwarders.insert(session_id, handle) {
+        previous.abort();
+    }
     // Announce this client's arrival so other attached clients (e.g. the TUI
     // during a handoff to VS Code) see it join. Emitted after the forwarder is
     // live so the arriving client also receives its own presence event.

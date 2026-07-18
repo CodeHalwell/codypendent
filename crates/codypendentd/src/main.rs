@@ -35,6 +35,14 @@ async fn main() -> anyhow::Result<()> {
     paths.ensure_directories()?;
     let database_path = paths.data_dir.join("codypendent.db");
 
+    // Claim single-instance exclusivity FIRST — before touching any shared
+    // state. Recovery fails live runs, the relaunch spawns workers, and the
+    // scan wipes/rebuilds the code graph; if a second daemon ran those against
+    // a live daemon's database before discovering the socket was taken, it
+    // would corrupt in-flight runs (contradictory terminal events, double
+    // execution). Binding the socket is the mutex; losers exit here.
+    let listener = server::acquire_socket(&paths).await?;
+
     let pool = db::open_database(&database_path).await?;
     let boot = instance::record_boot(&pool).await?;
     info!(
@@ -44,15 +52,16 @@ async fn main() -> anyhow::Result<()> {
         "codypendentd starting"
     );
 
-    // Reconcile state a previous process may have left mid-flight — before the
-    // socket opens, so no client observes a half-recovered run (STEP 1.14).
+    // Reconcile state a previous process may have left mid-flight — after the
+    // exclusivity claim, before serving, so no client observes a half-recovered
+    // run (STEP 1.14).
     let report = recovery::recover_on_startup(&pool, &paths).await?;
     info!(
         swept_tmp = report.swept_tmp,
         orphaned_leases = report.orphaned_leases.len(),
         reconciled_effects = report.reconciled_effects,
         failed_runs = report.failed_runs.len(),
-        resurfaced_approvals = report.resurfaced_approvals.len(),
+        expired_approvals = report.expired_approvals.len(),
         "startup recovery complete"
     );
 
@@ -128,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
     // listener runs concurrently with the blocking socket server below.
     maybe_start_webhook_listener(&paths, &pool).await;
 
-    server::run_with_executor(pool, paths, boot, Some(executor)).await
+    server::run_with_executor_on(listener, pool, paths, boot, Some(executor)).await
 }
 
 /// Start the webhook listener if `<data_dir>/webhooks.toml` enables it. Any

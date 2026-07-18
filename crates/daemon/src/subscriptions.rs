@@ -66,6 +66,14 @@ impl SubscriptionHub {
         self.lock().len()
     }
 
+    /// Drop channels whose last receiver has detached, so a long-lived daemon's
+    /// hub does not retain one channel per session ever subscribed. Safe: the
+    /// ledger is the durable record — a later subscriber lazily recreates the
+    /// channel and recovers anything missed via attach catch-up.
+    pub fn prune_idle(&self) {
+        self.lock().retain(|_, sender| sender.receiver_count() > 0);
+    }
+
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<SessionId, broadcast::Sender<SessionEvent>>> {

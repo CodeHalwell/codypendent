@@ -14,9 +14,12 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 /// The upper bound on files folded into the code graph in one scan. The scan is
-/// a best-effort warm-up so the repository map is non-empty; it is capped so a
-/// large tree never delays the socket opening (startup) or a run's first note.
-pub const SCAN_FILE_CAP: usize = 60;
+/// capped so a very large tree never delays the socket opening (startup) or a
+/// run's first note — but the cap must comfortably cover a real workspace: the
+/// `code_nodes` table is cleared and rebuilt from this scan on every boot, so a
+/// cap smaller than the repository silently truncates the *authoritative* graph
+/// (and, with an unsorted walk, truncates it differently on every boot).
+pub const SCAN_FILE_CAP: usize = 2000;
 
 /// Fold up to [`SCAN_FILE_CAP`] of `root`'s `*.rs` files into the code graph for
 /// `repository`, so the repository map is populated. Best-effort: a per-file
@@ -34,7 +37,13 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
         warn!(%error, "could not clear the prior code graph before re-scan");
     }
 
-    let files = collect_rust_sources(root, SCAN_FILE_CAP);
+    // The walk is blocking std::fs work — off the async runtime so a large tree
+    // does not stall this worker's other tasks.
+    let walk_root = root.to_path_buf();
+    let files =
+        tokio::task::spawn_blocking(move || collect_rust_sources(&walk_root, SCAN_FILE_CAP))
+            .await
+            .unwrap_or_default();
     let mut scanned = 0usize;
     let mut nodes = 0usize;
     for (relative, source) in files {
@@ -76,7 +85,10 @@ fn head_revision(root: &Path) -> GitRevision {
 
 /// Collect up to `cap` `(repo-relative-path, source)` pairs for the `*.rs` files
 /// under `root`, skipping `target/` and hidden (dot-prefixed) directories. A
-/// plain iterative walk (no `walkdir` dependency); unreadable entries are skipped.
+/// plain iterative walk (no `walkdir` dependency); unreadable entries are
+/// skipped. The traversal is **sorted** (per-directory, names ascending) so the
+/// cap — if it ever bites — truncates the same files on every boot instead of
+/// rebuilding a different graph per `read_dir` ordering.
 fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -88,7 +100,10 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
             Ok(entries) => entries,
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut subdirs = Vec::new();
+        for entry in entries {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -101,7 +116,7 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
                 Err(_) => continue,
             };
             if file_type.is_dir() {
-                stack.push(path);
+                subdirs.push(path);
             } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                 if out.len() >= cap {
                     break;
@@ -116,6 +131,10 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
                     .into_owned();
                 out.push((relative, source));
             }
+        }
+        // LIFO stack: push in reverse so subdirectories pop in ascending order.
+        for subdir in subdirs.into_iter().rev() {
+            stack.push(subdir);
         }
     }
     out

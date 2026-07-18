@@ -272,9 +272,18 @@ impl CommandProcessor {
                 )
                 .await
             {
-                // Either we complete it now, or it was already resolved before
-                // the crash — both leave the effect done exactly once.
-                Ok(_) | Err(ApprovalError::AlreadyResolved { .. }) => {}
+                // Completed now: publish the exact appended `ApprovalResolved`
+                // so live subscribers observe it instead of a sequence gap they
+                // only close on re-attach (persist-before-publish: `resolve`
+                // committed before returning the event).
+                Ok(event) => {
+                    if let Some(session_id) = existing.session_id {
+                        self.subscriptions.publish(session_id, event);
+                    }
+                }
+                // Already resolved before the crash — the effect is done exactly
+                // once and its event was published by whoever resolved it.
+                Err(ApprovalError::AlreadyResolved { .. }) => {}
                 Err(e) => return Err(map_approval_error(e)),
             }
         }
@@ -598,7 +607,10 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
 
         // 1. Command row (received). A concurrent duplicate that loses this insert
         //    replays the recorded outcome instead of erroring.
@@ -807,7 +819,7 @@ impl CommandProcessor {
     ) -> anyhow::Result<(CommandOutcome, Vec<SessionEvent>)> {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Optimistic-concurrency guard + revision advance, atomic (inside this
         // tx) with the append it protects. `Establish` (CreateSession) inserts a
@@ -1002,7 +1014,7 @@ impl CommandProcessor {
             .and_then(|s| SessionId::from_str(&s).ok());
 
         let now = Utc::now().to_rfc3339();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE pending_effects SET state = ?, resolved_at = ? WHERE id = ? AND state = ?",
         )

@@ -442,6 +442,7 @@ dependencies = [
  "codypendent-knowledge",
  "codypendent-protocol",
  "codypendent-runtime",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",

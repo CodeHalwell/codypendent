@@ -343,9 +343,25 @@ impl WorktreeManager {
         }
 
         // If we are forcibly discarding real work, still export it first so it is
-        // never lost, then remove the worktree.
+        // never lost, then remove the worktree. The export must SUCCEED and be
+        // NON-EMPTY before anything is deleted: a failed or empty diff for a
+        // worktree that provably has work means the safety patch did not capture
+        // it (corrupt base commit, git failure), and force-removing anyway would
+        // destroy the only copy. In that case the worktree is preserved instead.
         let patch = if has_work {
-            Some(self.export_patch(pool, artifacts, &lease).await?)
+            let exported = self.export_patch(pool, artifacts, &lease).await?;
+            if exported.byte_length == 0 {
+                mark_released(pool, lease_id).await?;
+                return Ok(ReleaseOutcome {
+                    lease_id,
+                    preserved: true,
+                    worktree_removed: false,
+                    patch: None,
+                    unmerged_commits,
+                    dirty,
+                });
+            }
+            Some(exported)
         } else {
             None
         };
@@ -475,20 +491,24 @@ impl WorktreeManager {
     ) -> Result<ArtifactRef, WorktreeError> {
         // `git diff <base>` in the worktree spans base -> working tree, capturing
         // both merged-into-branch commits and uncommitted edits in one patch.
+        // `--binary` so binary file content survives (a plain diff records only
+        // "Binary files differ" — useless for restoration). A diff FAILURE
+        // propagates: swallowing it would store an empty "safety patch" and let
+        // a force-release destroy the only copy of the work.
         let diff = if lease.worktree_path.exists() {
             // `git diff` omits *untracked* files, but a force-release that is
             // about to delete the worktree would then lose them silently. Mark
             // them intent-to-add first so they appear in the diff as additions
             // (the worktree is being torn down, so mutating its index is fine).
             let _ = run_git(&lease.worktree_path, &["add", "-A", "--intent-to-add"]).await;
-            run_git(&lease.worktree_path, &["diff", &lease.base_commit])
-                .await
-                .unwrap_or_default()
+            run_git(
+                &lease.worktree_path,
+                &["diff", "--binary", &lease.base_commit],
+            )
+            .await?
         } else {
             let range = format!("{}..{}", lease.base_commit, lease.branch);
-            run_git(&lease.repository_path, &["diff", &range])
-                .await
-                .unwrap_or_default()
+            run_git(&lease.repository_path, &["diff", "--binary", &range]).await?
         };
 
         artifacts

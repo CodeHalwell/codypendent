@@ -490,7 +490,19 @@ fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> Pat
     let expand = |entries: &[String]| -> Vec<PathBuf> {
         entries
             .iter()
-            .filter_map(|entry| expand_vars(entry, ctx, home.as_deref()))
+            .filter_map(|entry| {
+                let expanded = expand_vars(entry, ctx, home.as_deref());
+                if expanded.is_none() {
+                    // Dropping a DENY entry silently *weakens* the policy (e.g.
+                    // the `$HOME/.ssh` denial vanishes in a daemon started with
+                    // a stripped environment) — make the degradation loud.
+                    tracing::warn!(
+                        entry,
+                        "policy path entry dropped: $HOME is not set in this environment"
+                    );
+                }
+                expanded
+            })
             .map(|expanded| scope::canonicalize_lenient(Path::new(&expanded)))
             .collect()
     };
