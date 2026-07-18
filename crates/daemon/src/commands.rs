@@ -1764,6 +1764,8 @@ mod tests {
                 codypendent_protocol::ProposedAction::ExecuteCommand {
                     program: "cargo".to_string(),
                     args: vec!["test".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 codypendent_protocol::Risk {
                     level: codypendent_protocol::RiskLevel::Medium,
@@ -1856,6 +1858,8 @@ mod tests {
                         ProposedAction::ExecuteCommand {
                             program: program.to_string(),
                             args: vec![],
+                            environment: Vec::new(),
+                            cwd: None,
                         },
                         Risk {
                             level: RiskLevel::Medium,

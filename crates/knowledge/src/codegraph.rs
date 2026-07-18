@@ -492,9 +492,20 @@ struct PendingCall {
     site_end: usize,
 }
 
+/// Recursion ceiling for AST descent (item nesting and expression trees). The
+/// visitors recurse per nesting level, so without a guard one pathologically
+/// deep source file (tens of thousands of nested modules or expressions) would
+/// overflow the stack and abort the whole daemon — an uncatchable crash from a
+/// single crafted file in a scanned repository. Real code nests a handful of
+/// levels; past the ceiling the visitor stops descending (graceful truncation
+/// of that file's graph, never a crash).
+const MAX_PARSE_DEPTH: usize = 512;
+
 /// The lexical context threaded down the walk.
 #[derive(Clone)]
 struct Ctx {
+    /// AST descent depth, bounded by [`MAX_PARSE_DEPTH`].
+    depth: usize,
     /// The `::`-scope for qualified names (module/type/trait segments).
     scope_path: Vec<String>,
     /// Nearest enclosing File/Module/Trait node — the `Contains` parent.
@@ -566,6 +577,7 @@ fn build_file_graph(
         true,
     );
     let root_ctx = Ctx {
+        depth: 0,
         scope_path: Vec::new(),
         container: file_idx,
         definer: file_idx,
@@ -637,6 +649,9 @@ impl Builder<'_> {
     /// `declaration_list`), attaching each pending attribute run to the item that
     /// follows it, and dispatch each item to its handler.
     fn visit_item_list(&mut self, list: Node, ctx: &Ctx) {
+        if ctx.depth >= MAX_PARSE_DEPTH {
+            return; // graceful truncation, never a stack overflow (see the const)
+        }
         let children: Vec<Node> = list.named_children(&mut list.walk()).collect();
         let mut pending: Vec<String> = Vec::new();
         for child in children {
@@ -698,7 +713,7 @@ impl Builder<'_> {
         if let Some(body) = node.child_by_field_name("body") {
             let mut body_ctx = ctx.clone();
             body_ctx.current_fn = Some(idx);
-            self.collect_calls(body, &body_ctx);
+            self.collect_calls(body, &body_ctx, 0);
         }
     }
 
@@ -717,6 +732,7 @@ impl Builder<'_> {
             let mut child_scope = ctx.scope_path.clone();
             child_scope.push(name);
             let mod_ctx = Ctx {
+                depth: ctx.depth + 1,
                 scope_path: child_scope,
                 container: idx,
                 definer: idx,
@@ -756,6 +772,7 @@ impl Builder<'_> {
             let mut child_scope = ctx.scope_path.clone();
             child_scope.push(name);
             let trait_ctx = Ctx {
+                depth: ctx.depth + 1,
                 scope_path: child_scope,
                 container: idx,
                 definer: idx,
@@ -781,6 +798,7 @@ impl Builder<'_> {
             let mut child_scope = ctx.scope_path.clone();
             child_scope.push(type_name);
             let impl_ctx = Ctx {
+                depth: ctx.depth + 1,
                 scope_path: child_scope,
                 container: ctx.container,
                 definer: ctx.definer,
@@ -854,7 +872,10 @@ impl Builder<'_> {
     /// Descend a function body recording every call expression against the
     /// enclosing function. Nested `function_item`s are skipped (their calls
     /// belong to them, not the outer fn); closures are descended into.
-    fn collect_calls(&mut self, node: Node, ctx: &Ctx) {
+    fn collect_calls(&mut self, node: Node, ctx: &Ctx, depth: usize) {
+        if depth >= MAX_PARSE_DEPTH {
+            return; // graceful truncation, never a stack overflow (see the const)
+        }
         let children: Vec<Node> = node.named_children(&mut node.walk()).collect();
         for child in children {
             if child.kind() == "function_item" {
@@ -876,7 +897,7 @@ impl Builder<'_> {
                     }
                 }
             }
-            self.collect_calls(child, ctx);
+            self.collect_calls(child, ctx, depth + 1);
         }
     }
 

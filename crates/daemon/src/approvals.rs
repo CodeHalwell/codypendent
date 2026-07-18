@@ -795,6 +795,8 @@ mod tests {
         ProposedAction::ExecuteCommand {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
+            environment: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -995,6 +997,8 @@ mod tests {
                 ProposedAction::ExecuteCommand {
                     program: "cargo".to_string(),
                     args: vec!["build".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 sample_risk(),
                 vec![],

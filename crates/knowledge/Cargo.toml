@@ -28,9 +28,11 @@ tantivy = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 notify = { workspace = true }
+# For `spawn_blocking` around the package walk/hash (sqlx already binds this
+# crate to the tokio runtime; this only names it directly).
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

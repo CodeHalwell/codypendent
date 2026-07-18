@@ -770,6 +770,8 @@ mod tests {
                 action: ProposedAction::ExecuteCommand {
                     program: "cargo".to_owned(),
                     args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 risk: Risk {
                     level: RiskLevel::Medium,
@@ -812,6 +814,8 @@ mod tests {
                 action: ProposedAction::ExecuteCommand {
                     program: "cargo".to_owned(),
                     args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
             }),
         );

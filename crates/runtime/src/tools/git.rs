@@ -82,6 +82,10 @@ impl GitDiff {
                 "--no-pager".to_string(),
                 "diff".to_string(),
             ],
+            // git is a trusted daemon-issued invocation with no model-supplied
+            // bindings (its interposition vars are stripped at spawn time).
+            environment: Vec::new(),
+            cwd: Some(input.cwd.to_string_lossy().into_owned()),
         }
     }
 
@@ -95,17 +99,17 @@ impl GitDiff {
     ) -> Result<GitDiffOutcome, ToolError> {
         guard(&input.cwd, path_scope, command_scope)?;
 
-        let output = Command::new(GIT)
+        let mut command = Command::new(GIT);
+        command
             .arg("-C")
             .arg(&input.cwd)
             .arg("--no-pager")
             .arg("diff")
             .current_dir(&input.cwd)
             .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(map_spawn)?;
+            .kill_on_drop(true);
+        harden_git_env(&mut command);
+        let output = command.output().await.map_err(map_spawn)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -187,6 +191,8 @@ impl ApplyPatch {
                 input.cwd.to_string_lossy().into_owned(),
                 "apply".to_string(),
             ],
+            environment: Vec::new(),
+            cwd: Some(input.cwd.to_string_lossy().into_owned()),
         }
     }
 
@@ -223,7 +229,8 @@ async fn run_git_apply(
     args: &[&str],
     patch: &str,
 ) -> Result<std::process::Output, ToolError> {
-    let mut child = Command::new(GIT)
+    let mut command = Command::new(GIT);
+    command
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -231,9 +238,9 @@ async fn run_git_apply(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(map_spawn)?;
+        .kill_on_drop(true);
+    harden_git_env(&mut command);
+    let mut child = command.spawn().map_err(map_spawn)?;
 
     {
         let mut stdin = child
@@ -245,6 +252,27 @@ async fn run_git_apply(
     }
 
     child.wait_with_output().await.map_err(ToolError::Io)
+}
+
+/// Strip ambient git interposition variables (a repo config or the daemon's own
+/// environment could set these to run an arbitrary program during `diff`/`apply`)
+/// and disable credential prompting. Unlike `shell.run`, git legitimately
+/// inherits the daemon environment as a trusted, daemon-issued invocation, so
+/// this removes only the known execution hooks rather than clearing wholesale.
+fn harden_git_env(command: &mut Command) {
+    for key in [
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_PROXY_COMMAND",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_ASKPASS",
+        "GIT_CONFIG",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
 }
 
 /// Map a spawn failure, distinguishing a missing `git` binary.

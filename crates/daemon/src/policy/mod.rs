@@ -556,6 +556,8 @@ mod tests {
             &ProposedAction::ExecuteCommand {
                 program: "cargo".to_string(),
                 args: vec!["test".to_string()],
+                environment: Vec::new(),
+                cwd: None,
             },
             &ctx(&repo, &repo),
         );
@@ -565,6 +567,8 @@ mod tests {
             &ProposedAction::ExecuteCommand {
                 program: "rm".to_string(),
                 args: vec!["-rf".to_string()],
+                environment: Vec::new(),
+                cwd: None,
             },
             &ctx(&repo, &repo),
         );
@@ -707,6 +711,8 @@ mod tests {
             &ProposedAction::ExecuteCommand {
                 program: "cargo".to_string(),
                 args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
             },
             &ctx(&repo, &repo),
         );

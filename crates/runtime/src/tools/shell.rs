@@ -95,11 +95,20 @@ impl Shell {
         &[CapabilityKind::CommandExecute]
     }
 
-    /// The [`ProposedAction`] the middleware evaluates before granting.
+    /// The [`ProposedAction`] the middleware evaluates before granting. The full
+    /// child environment and `cwd` are carried on the action so the approver and
+    /// the audit ledger see exactly what the command will run with — not just its
+    /// program and args.
     pub fn proposed_action(request: &CommandRequest) -> ProposedAction {
         ProposedAction::ExecuteCommand {
             program: request.program.to_string_lossy().into_owned(),
             args: request.args.clone(),
+            environment: request
+                .environment
+                .iter()
+                .map(|b| (b.name.clone(), b.value.clone()))
+                .collect(),
+            cwd: Some(request.cwd.to_string_lossy().into_owned()),
         }
     }
 
@@ -129,6 +138,15 @@ impl Shell {
             ScopeVerdict::OutsideRoots => {
                 return Err(ToolError::CwdOutOfScope(request.cwd.clone()))
             }
+        }
+
+        // RULE 2d: refuse execution-hijacking environment bindings. The whole
+        // environment is also surfaced on the approval card (see `proposed_action`)
+        // so the approver sees every binding, but these specific names are denied
+        // outright — a re-used or auto-granted approval must not be able to smuggle
+        // an `LD_PRELOAD`/`RUSTC_WRAPPER`/shadowed-`PATH` past the gate.
+        if let Some(binding) = request.environment.iter().find(|b| is_denied_env(&b.name)) {
+            return Err(ToolError::EnvironmentNotAllowed(binding.name.clone()));
         }
 
         // Resolve the program to an absolute path using the daemon's PATH *now*,
@@ -209,6 +227,28 @@ impl Shell {
             salient: view,
         })
     }
+}
+
+/// Whether a model-supplied environment variable name can hijack what the
+/// command actually executes: shared-library interposers (`LD_*`/`DYLD_*`),
+/// compiler/tool wrappers (`*_WRAPPER`), git's external-program hooks, shell
+/// startup files, and `PATH` (which redirects the child's own subprocess
+/// lookups even though the top-level program is resolved on the daemon's PATH).
+fn is_denied_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_SSH"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_PROXY_COMMAND"
+            | "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+    ) || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.ends_with("_WRAPPER")
 }
 
 /// Spill a non-empty stream to the artifact store, returning its reference.

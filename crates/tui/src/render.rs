@@ -1016,8 +1016,23 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
             v
         }
         ProposedAction::WritePatch { patch } => vec![format!("apply patch: {patch}")],
-        ProposedAction::ExecuteCommand { program, args } => {
-            vec![format!("command: {program} {}", args.join(" "))]
+        ProposedAction::ExecuteCommand {
+            program,
+            args,
+            environment,
+            cwd,
+        } => {
+            // Render the FULL environment and cwd: an unshown binding could
+            // smuggle an execution-hijacking variable past a benign-looking
+            // command line, so the approver must see every one verbatim.
+            let mut v = vec![format!("command: {program} {}", args.join(" "))];
+            if let Some(cwd) = cwd {
+                v.push(format!("cwd: {cwd}"));
+            }
+            for (name, value) in environment {
+                v.push(format!("env: {name}={value}"));
+            }
+            v
         }
         ProposedAction::NetworkRequest { destination } => {
             vec![format!("network request: {destination}")]
@@ -1332,6 +1347,8 @@ mod tests {
                 action: ProposedAction::ExecuteCommand {
                     program: "cargo".to_owned(),
                     args: vec!["test".to_owned(), "--all".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 risk: Risk {
                     level: RiskLevel::High,

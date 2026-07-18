@@ -55,9 +55,9 @@ use codypendent_daemon::policy::{
 };
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_protocol::{
-    Actor, AgentId, AgentMode, ApprovalDecision, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId,
-    EventBody, ModelId, ProposedAction, Risk, RiskLevel, RunDisposition, RunId, RunState,
-    SessionEvent, SessionId, ToolOutcome,
+    Actor, AgentId, AgentMode, ApprovalDecision, ApprovalId, ArtifactId, ArtifactRef,
+    BudgetDimension, ChangeSetId, EventBody, ModelId, ProposedAction, Risk, RiskLevel,
+    RunDisposition, RunId, RunState, SessionEvent, SessionId, ToolOutcome,
 };
 
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
@@ -79,6 +79,11 @@ use crate::tools::{
 /// before the loop gives up. A well-behaved driver returns [`ModelStep::Finish`];
 /// this bounds a pathological or buggy one.
 const MAX_STEPS: usize = 256;
+
+/// Safety valve: the wall-clock ceiling for a single run. `MAX_STEPS` bounds how
+/// many model requests are made, not how long each (or its tools) takes; this
+/// bounds the total. A `BudgetWarning { WallClock }` is emitted at 80%.
+const MAX_WALL_CLOCK_SECS: u64 = 30 * 60;
 
 /// Default wall-clock timeout for a model-proposed `shell.run` when the model
 /// does not specify one (further clamped down by the command scope).
@@ -542,6 +547,8 @@ impl FrameworkAgentRuntime {
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
         let mut model_requests: u64 = 0;
+        let run_started = Instant::now();
+        let mut wall_clock_warned = false;
 
         // --- Inspect/Plan/Modify/Test: the model-driven inner loop ---
         let terminal = loop {
@@ -556,6 +563,30 @@ impl FrameworkAgentRuntime {
                 break Terminal::Failed("model step budget exhausted".to_string());
             }
 
+            // Wall-clock budget: MAX_STEPS bounds the number of model requests
+            // but not their (or the tools') duration, so a slow provider or long
+            // commands could otherwise burn unbounded time/spend. Warn once at
+            // 80%, fail at the ceiling — checked at the same safe point as the
+            // step budget so a run never dies mid-effect.
+            let elapsed_secs = run_started.elapsed().as_secs();
+            if elapsed_secs >= MAX_WALL_CLOCK_SECS {
+                break Terminal::Failed("wall-clock budget exhausted".to_string());
+            }
+            if !wall_clock_warned && elapsed_secs >= MAX_WALL_CLOCK_SECS * 4 / 5 {
+                wall_clock_warned = true;
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::BudgetWarning {
+                        run_id: run.run_id,
+                        dimension: BudgetDimension::WallClock,
+                        used: elapsed_secs,
+                        limit: MAX_WALL_CLOCK_SECS,
+                    },
+                )
+                .await?;
+            }
+
             let started = Instant::now();
             let step = match driver.next_step(&transcript).await {
                 Ok(step) => step,
@@ -565,6 +596,11 @@ impl FrameworkAgentRuntime {
             let trace = ModelRequestTrace {
                 model_id: model_id.clone(),
                 request_hash: hash_json(&transcript),
+                // Token/cost fields are structurally present but UNPOPULATED: the
+                // `ModelDriver` seam does not surface provider usage yet. Zero
+                // here means "not measured", never "free" — real accounting needs
+                // usage plumbed through the driver trait (tracked for Phase 7's
+                // budget ledger).
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 latency_ms: started.elapsed().as_millis(),

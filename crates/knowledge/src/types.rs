@@ -266,14 +266,29 @@ pub struct ToolCard {
 }
 
 impl ToolCard {
-    /// The compact card for an item (its description, truncated).
+    /// Byte ceiling for a card summary. A card is *progressive disclosure* — a
+    /// registry item's description is authored text (possibly community-sourced),
+    /// so an unbounded copy would let one item flood the context budget.
+    pub const MAX_SUMMARY_BYTES: usize = 280;
+
+    /// The compact card for an item (its description, truncated to
+    /// [`Self::MAX_SUMMARY_BYTES`] on a char boundary).
     #[must_use]
     pub fn of(item: &RegistryItem) -> Self {
+        let mut summary = item.description.clone();
+        if summary.len() > Self::MAX_SUMMARY_BYTES {
+            let mut end = Self::MAX_SUMMARY_BYTES;
+            while end > 0 && !summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            summary.truncate(end);
+            summary.push('…');
+        }
         Self {
             id: item.id,
             kind: item.kind,
             name: item.name.clone(),
-            summary: item.description.clone(),
+            summary,
             risk: item.risk,
         }
     }
