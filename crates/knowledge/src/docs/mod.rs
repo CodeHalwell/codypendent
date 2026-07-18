@@ -16,6 +16,7 @@ pub mod collab;
 pub mod crdt;
 pub mod model;
 pub mod render;
+pub mod staleness;
 pub mod store;
 
 pub use crdt::{DocCrdtError, DocumentCrdt};

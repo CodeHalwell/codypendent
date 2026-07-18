@@ -1,0 +1,236 @@
+//! STEP 4.6 staleness engine: resolving a document's `{{ symbol:… }}` links
+//! against the graph, then flagging exactly the documents whose linked symbols
+//! changed signature or disappeared — with a Maintain suggestion citing the
+//! causing commit — while leaving unlinked docs untouched.
+
+use codypendent_knowledge::codegraph;
+use codypendent_knowledge::db;
+use codypendent_knowledge::docs::collab::SuggestionStore;
+use codypendent_knowledge::docs::model::{
+    BlockContent, DocumentAuthor, DocumentBlock, DocumentMetadata,
+};
+use codypendent_knowledge::docs::staleness::{
+    detect_staleness, resolve_links, symbol_references, StalenessReason,
+};
+use codypendent_knowledge::docs::store::{DocumentStore, NewDocument};
+use codypendent_knowledge::{GitRevision, Scope};
+use codypendent_protocol::{RepositoryId, UserId};
+
+async fn temp_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = db::open(&tmp.path().join("codypendent.db")).await.unwrap();
+    (tmp, pool)
+}
+
+const V1: &str = "pub fn charge_customer(amount: u32) -> bool { true }";
+const V2: &str =
+    "pub fn charge_customer(amount: u32, currency: String) -> Result<bool, ()> { Ok(true) }";
+
+fn runbook_blocks() -> Vec<DocumentBlock> {
+    vec![
+        DocumentBlock::with_id(
+            "intro",
+            BlockContent::Paragraph {
+                text: "The charge path is {{ symbol:charge_customer }} — keep it current.".into(),
+            },
+        ),
+        DocumentBlock::with_id(
+            "embed",
+            BlockContent::EmbeddedSymbol {
+                symbol: "charge_customer".into(),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn symbol_references_finds_block_and_inline_markers() {
+    let refs = symbol_references(&runbook_blocks());
+    // The inline marker in the paragraph and the dedicated embed block.
+    let names: Vec<&str> = refs.iter().map(|r| r.qualified_name.as_str()).collect();
+    assert_eq!(names, ["charge_customer", "charge_customer"]);
+    assert!(refs.iter().any(|r| r.block_id.as_deref() == Some("intro")));
+    assert!(refs.iter().any(|r| r.block_id.as_deref() == Some("embed")));
+}
+
+#[tokio::test]
+async fn signature_change_flags_the_linked_document_with_evidence() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+
+    // Resolve the runbook's symbol links at rev1.
+    let links = resolve_links(&pool, repo, &runbook_blocks(), &rev1)
+        .await
+        .unwrap();
+    assert!(
+        links.iter().all(|l| l.resolved.is_some()),
+        "both refs resolved"
+    );
+    let doc_id = codypendent_protocol::DocumentId::new();
+
+    // The symbol's signature changes at rev2.
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev2, "src/payments.rs", V2)
+        .await
+        .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+
+    let findings = detect_staleness(doc_id, &links, &current, &rev2);
+    // One finding per resolved link (inline + embed both reference the symbol).
+    assert_eq!(findings.len(), 2);
+    for finding in &findings {
+        assert_eq!(finding.reason, StalenessReason::SignatureChanged);
+        assert_eq!(finding.qualified_name, "charge_customer");
+        assert_eq!(finding.revision, "rev2");
+        assert!(finding.before_signature != finding.after_signature);
+        assert!(finding.after_signature.is_some());
+    }
+}
+
+#[tokio::test]
+async fn disappearance_flags_the_document() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+    let links = resolve_links(&pool, repo, &runbook_blocks(), &rev1)
+        .await
+        .unwrap();
+
+    // The symbol is removed entirely at rev2.
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev2, "src/payments.rs", "pub fn other() {}")
+        .await
+        .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+
+    let findings = detect_staleness(
+        codypendent_protocol::DocumentId::new(),
+        &links,
+        &current,
+        &rev2,
+    );
+    assert!(findings
+        .iter()
+        .all(|f| f.reason == StalenessReason::Disappeared));
+    assert!(findings[0].after_signature.is_none());
+}
+
+#[tokio::test]
+async fn unlinked_documents_are_untouched() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+
+    // A document that references no symbols.
+    let plain = vec![DocumentBlock::with_id(
+        "p",
+        BlockContent::Paragraph {
+            text: "No code references here.".into(),
+        },
+    )];
+    let links = resolve_links(&pool, repo, &plain, &rev1).await.unwrap();
+    assert!(links.is_empty());
+
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev2, "src/payments.rs", V2)
+        .await
+        .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+    let findings = detect_staleness(
+        codypendent_protocol::DocumentId::new(),
+        &links,
+        &current,
+        &rev2,
+    );
+    assert!(findings.is_empty(), "unlinked docs are never flagged");
+}
+
+#[tokio::test]
+async fn maintenance_drafts_a_suggestion_citing_the_commit() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let store = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let maintainer = DocumentAuthor::Agent {
+        run_id: codypendent_protocol::RunId::new(),
+        model: codypendent_protocol::ModelId("claude-sonnet-5".into()),
+        policy_version: "v1".into(),
+    };
+
+    // A real, persisted document with the runbook blocks.
+    let mut doc = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Payment Runbook".into(),
+                scope: Scope::Repository(repo),
+                metadata: DocumentMetadata::default(),
+                blocks: runbook_blocks(),
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // Resolve + persist the links at rev1 (a metadata update, no revision bump).
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+    let links = resolve_links(&pool, repo, &doc.blocks().unwrap(), &rev1)
+        .await
+        .unwrap();
+    store.set_links(&pool, &mut doc, links).await.unwrap();
+    assert_eq!(
+        doc.revision, 1,
+        "resolving links does not bump the revision"
+    );
+
+    // rev2 changes the signature; detect staleness against the persisted links.
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev2, "src/payments.rs", V2)
+        .await
+        .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+    let findings = detect_staleness(doc.id, &doc.links, &current, &rev2);
+    assert!(!findings.is_empty());
+
+    // Maintain mode drafts a SUGGESTION (never a direct edit) that cites the commit.
+    let finding = &findings[0];
+    let new_suggestion = finding.as_suggestion(maintainer.clone()).unwrap();
+    assert!(new_suggestion
+        .rationale
+        .as_deref()
+        .unwrap()
+        .contains("rev2"));
+    let suggestion = suggestions
+        .propose(&pool, doc.id, new_suggestion)
+        .await
+        .unwrap();
+
+    // The document content is unchanged; the suggestion is pending for review.
+    let pending = suggestions.pending(&pool, doc.id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, suggestion.id);
+    assert!(pending[0]
+        .rationale
+        .as_deref()
+        .unwrap()
+        .contains("charge_customer"));
+    // Still revision 1 — Maintain proposed, it did not edit.
+    let reloaded = store.load(&pool, doc.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.revision, 1);
+}

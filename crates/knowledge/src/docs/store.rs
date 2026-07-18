@@ -242,6 +242,33 @@ impl DocumentStore {
         Ok(revision)
     }
 
+    /// Replace a document's knowledge-graph links (e.g. after resolving
+    /// `{{ symbol:… }}` references against the code graph, STEP 4.6). This is a
+    /// metadata update — it does **not** bump the document revision or record an
+    /// authorship entry, since it changes no content. Updates the in-memory `doc`
+    /// too.
+    pub async fn set_links(
+        &self,
+        pool: &SqlitePool,
+        doc: &mut Document,
+        links: Vec<DocumentLink>,
+    ) -> Result<(), DocStoreError> {
+        let links_json = serde_json::to_string(&links)?;
+        let affected =
+            sqlx::query("UPDATE documents SET links_json = ?, updated_at = ? WHERE id = ?")
+                .bind(&links_json)
+                .bind(Utc::now().to_rfc3339())
+                .bind(doc.id.to_string())
+                .execute(pool)
+                .await?
+                .rows_affected();
+        if affected == 0 {
+            return Err(DocStoreError::NoSuchDocument(doc.id));
+        }
+        doc.links = links;
+        Ok(())
+    }
+
     /// The attribution log for a document, oldest first.
     pub async fn authorship(
         &self,
