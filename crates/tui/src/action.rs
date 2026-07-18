@@ -98,6 +98,9 @@ pub enum Action {
     /// Toggle the code-graph edge inspector (`G`).
     OpenEdges,
 
+    /// Toggle the command palette (`/`): a searchable list of every command.
+    OpenPalette,
+
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).
     Help,

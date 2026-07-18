@@ -100,6 +100,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 _ => Overlay::Edges,
             }
         }
+        Action::OpenPalette => {
+            state.overlay = match state.overlay {
+                Overlay::Palette { .. } => Overlay::None,
+                _ => Overlay::Palette {
+                    query: String::new(),
+                    selected: 0,
+                },
+            }
+        }
 
         Action::Help => {
             state.overlay = match state.overlay {
@@ -443,6 +452,14 @@ fn nav(state: &mut AppState, delta: i32) {
             step(&mut state.selected_edge, state.edges.len(), delta);
             return;
         }
+        Overlay::Palette {
+            ref query,
+            ref mut selected,
+        } => {
+            let count = crate::palette::filtered_len(query);
+            step(selected, count, delta);
+            return;
+        }
         _ => {}
     }
     match state.focus {
@@ -562,6 +579,12 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
 fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
     match &mut state.overlay {
         Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
+        // Editing the palette query changes the filtered set, so the selection
+        // returns to the top rather than pointing past the new results.
+        Overlay::Palette { query, selected } => {
+            edit(query);
+            *selected = 0;
+        }
         _ => {}
     }
 }
@@ -584,8 +607,35 @@ fn submit_prompt(state: &mut AppState) {
                 state.outbox.push(Intent::QueueSteering { run_id, text });
             }
         }
+        // `mem::take` already closed the palette (left `None`); run the
+        // highlighted command, which may open its own overlay.
+        Overlay::Palette { query, selected } => {
+            if let Some(entry) = crate::palette::filtered(&query).get(selected) {
+                run_palette_command(state, entry.command);
+            }
+        }
         // Nothing to submit; restore the (non-text) overlay we took.
         other => state.overlay = other,
+    }
+}
+
+/// Run a command chosen from the palette. Each maps onto the same effect its
+/// single-key binding produces — the palette is a front door to the existing
+/// commands, not a second code path. The palette overlay is already closed when
+/// this runs, so a command that opens its own overlay simply sets it.
+fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCommand) {
+    use crate::palette::PaletteCommand;
+    match command {
+        PaletteCommand::NewRun => state.overlay = Overlay::NewRun(String::new()),
+        PaletteCommand::Steer => begin_steering(state),
+        PaletteCommand::PauseResume => pause_or_resume(state),
+        PaletteCommand::Cancel => request_cancel(state),
+        PaletteCommand::Skills => state.overlay = Overlay::Skills,
+        PaletteCommand::Memory => state.overlay = Overlay::Memory { source_open: false },
+        PaletteCommand::Docs => state.overlay = Overlay::Docs,
+        PaletteCommand::Edges => state.overlay = Overlay::Edges,
+        PaletteCommand::Help => state.overlay = Overlay::Help,
+        PaletteCommand::Detach => state.should_detach = true,
     }
 }
 
@@ -1331,6 +1381,95 @@ mod tests {
         assert_eq!(s.overlay, Overlay::Edges);
         reduce(&mut s, Action::OpenDocs);
         assert_eq!(s.overlay, Overlay::Docs);
+    }
+
+    #[test]
+    fn palette_opens_filters_and_stays_navigable() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        assert_eq!(
+            s.overlay,
+            Overlay::Palette {
+                query: String::new(),
+                selected: 0,
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+
+        // Navigation moves the selection within the (unfiltered) command list.
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(
+            s.overlay,
+            Overlay::Palette {
+                query: String::new(),
+                selected: 1,
+            }
+        );
+
+        // Typing filters and resets the selection to the top.
+        reduce(&mut s, Action::InputChar('d'));
+        reduce(&mut s, Action::InputChar('o'));
+        reduce(&mut s, Action::InputChar('c'));
+        assert_eq!(
+            s.overlay,
+            Overlay::Palette {
+                query: "doc".to_owned(),
+                selected: 0,
+            }
+        );
+        // Backspace edits the query too.
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(
+            s.overlay,
+            Overlay::Palette {
+                query: "do".to_owned(),
+                selected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn palette_submit_runs_the_highlighted_command() {
+        // Filter to "docs" and run it: the palette closes and the Docs browser opens.
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        for c in "docs".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::Docs);
+    }
+
+    #[test]
+    fn palette_submit_can_open_a_text_prompt() {
+        // "new run" routes through the palette to the new-run prompt overlay.
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        for c in "new".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(s.overlay, Overlay::NewRun(_)));
+    }
+
+    #[test]
+    fn palette_escape_closes_without_running_anything() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn palette_submit_with_no_match_is_inert() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        for c in "zzzz".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        // Closed (mem::take), nothing opened.
+        assert_eq!(s.overlay, Overlay::None);
     }
 
     #[test]

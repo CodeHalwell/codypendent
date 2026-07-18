@@ -28,6 +28,7 @@
 
 pub mod action;
 pub mod input;
+pub mod palette;
 pub mod reduce;
 pub mod render;
 pub mod state;

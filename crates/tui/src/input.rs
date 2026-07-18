@@ -113,6 +113,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "/",
+        description: "open the command palette (search every command)",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "q",
         description: "detach (the run keeps going)",
         mouse: None,
@@ -151,6 +156,7 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
     match mode {
         InputMode::Editing => map_editing_key(key),
         InputMode::Confirm => map_confirm_key(key),
+        InputMode::Palette => map_palette_key(key),
         InputMode::Normal => map_normal_key(key),
     }
 }
@@ -195,6 +201,7 @@ fn map_normal_char(c: char) -> Action {
         'o' => Action::OpenSource,
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
+        '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }
 }
@@ -204,6 +211,23 @@ fn map_editing_key(key: &KeyEvent) -> Action {
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
+        KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
+        KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
+        _ => Action::NoOp,
+    }
+}
+
+/// The command palette captures printable keys as a filter query but stays
+/// arrow-navigable: `Up`/`Down` move the selection, `Enter` runs the highlighted
+/// command, `Esc` (or `Ctrl-C`) dismisses. This mirrors [`map_editing_key`] plus
+/// navigation, so a query like `docs` filters while the selection still moves.
+fn map_palette_key(key: &KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Enter => Action::InputSubmit,
+        KeyCode::Esc => Action::InputCancel,
+        KeyCode::Backspace => Action::InputBackspace,
+        KeyCode::Up => Action::SelectPrev,
+        KeyCode::Down => Action::SelectNext,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         _ => Action::NoOp,
@@ -310,6 +334,36 @@ mod tests {
         );
         assert_eq!(map_event(&ch('D'), InputMode::Normal, W), Action::OpenDocs);
         assert_eq!(map_event(&ch('G'), InputMode::Normal, W), Action::OpenEdges);
+        assert_eq!(
+            map_event(&ch('/'), InputMode::Normal, W),
+            Action::OpenPalette
+        );
+    }
+
+    #[test]
+    fn palette_mode_filters_but_stays_navigable() {
+        // Printable keys become the filter query...
+        assert_eq!(
+            map_event(&ch('d'), InputMode::Palette, W),
+            Action::InputChar('d')
+        );
+        // ...while arrows still move the selection and Enter runs it.
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Palette, W),
+            Action::SelectPrev
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Down), InputMode::Palette, W),
+            Action::SelectNext
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Palette, W),
+            Action::InputSubmit
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Esc), InputMode::Palette, W),
+            Action::InputCancel
+        );
     }
 
     #[test]

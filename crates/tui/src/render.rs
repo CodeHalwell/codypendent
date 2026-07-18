@@ -522,6 +522,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::Docs => render_docs(frame, area, state, theme),
         Overlay::Edges => render_edges(frame, area, state, theme),
+        Overlay::Palette { query, selected } => {
+            render_palette(frame, area, theme, query, *selected);
+        }
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
@@ -1069,6 +1072,93 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
             .block(detail_block)
             .wrap(Wrap { trim: false }),
         cols[1],
+    );
+}
+
+/// The command palette: a filter line over a searchable list of every command,
+/// so the growing feature set is reachable without a permanent pane or a
+/// single-key binding each. Colors are Theme tokens only (RULE 7).
+fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, selected: usize) {
+    let rect = centered_rect(72, 70, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Command palette ",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input.
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            filter,
+            Line::styled(
+                "  ↑/↓ select · Enter run · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+        ])
+        .style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    // The filtered command list.
+    let matches = crate::palette::filtered(query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching command",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, entry) in matches.iter().enumerate() {
+        let is_selected = idx == selected;
+        let marker = if is_selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                format!("{:<20}", entry.title),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::styled(
+                entry.description.to_owned(),
+                Style::default().fg(theme.text.muted),
+            ),
+            Span::styled(
+                format!("  [{}]", entry.key),
+                Style::default().fg(theme.status.info),
+            ),
+        ]);
+        let item = ListItem::new(head);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
     );
 }
 
@@ -1884,6 +1974,32 @@ mod tests {
         assert!(
             text.contains("match the code path"),
             "suggestion rationale missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn command_palette_snapshot_lists_and_filters_commands() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let all = render_to_string(&state, 120, 40);
+        assert!(all.contains("Command palette"), "title missing:\n{all}");
+        // Unfiltered, it lists commands with their key hints.
+        assert!(all.contains("New run"), "command missing:\n{all}");
+        assert!(all.contains("Docs Studio"), "command missing:\n{all}");
+        assert!(all.contains("[n]"), "key hint missing:\n{all}");
+
+        // Typing filters the list down.
+        for c in "docs".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let filtered = render_to_string(&state, 120, 40);
+        assert!(
+            filtered.contains("Docs Studio"),
+            "match missing:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("New run"),
+            "non-match should be filtered out:\n{filtered}"
         );
     }
 

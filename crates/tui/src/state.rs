@@ -45,6 +45,9 @@ pub enum InputMode {
     Editing,
     /// A yes/no confirmation is awaiting a decision.
     Confirm,
+    /// The command palette is capturing a filter query while staying navigable
+    /// (printable keys filter; arrows move the selection; Enter runs it).
+    Palette,
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
@@ -80,6 +83,11 @@ pub enum Overlay {
     /// [`AppState::edges`] list on the left and, for the focused edge, its
     /// relation, confidence, evidence kind + source, and revision on the right.
     Edges,
+    /// The command palette: a searchable list of every command the TUI exposes,
+    /// so the growing feature set stays reachable without consuming a single-key
+    /// binding each. `query` is the live filter; `selected` indexes the filtered
+    /// results (reset to 0 whenever the query changes). Opened with `/`.
+    Palette { query: String, selected: usize },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -458,6 +466,9 @@ impl AppState {
         match self.overlay {
             Overlay::NewRun(_) | Overlay::Steering(_) => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
+            // The palette filters on printable keys but stays arrow-navigable, so
+            // it has its own input mode (see [`crate::input::map_palette_key`]).
+            Overlay::Palette { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges browsers are navigable with the
             // normal key table (arrows to select, a letter to toggle, Esc to
             // dismiss), so they stay in `Normal` mode.
