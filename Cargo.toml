@@ -11,6 +11,11 @@ members = [
     "crates/integrations",
     "crates/test-support",
 ]
+# The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
+# workspace so Automerge/Yrs — pulled in only for the comparison — never enter
+# the product's dependency graph. Excluded here so a root `cargo` command never
+# tries to fold it into this workspace.
+exclude = ["benches/crdt-bench"]
 
 [workspace.package]
 version = "0.1.0"

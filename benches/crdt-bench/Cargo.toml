@@ -1,0 +1,17 @@
+# Standalone workspace: the CRDT benchmark is deliberately NOT a member of the
+# root Codypendent workspace. It pulls in Automerge and Yrs purely for the
+# comparison (STEP 4.1); keeping it a separate workspace keeps those crates —
+# and their transitive dependencies — out of the product's Cargo.lock and CI
+# build. Only the *winner* (Loro) becomes a real product dependency (STEP 4.2).
+[workspace]
+
+[package]
+name = "crdt-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+loro = "1"
+automerge = "0"
+yrs = "0.23"
