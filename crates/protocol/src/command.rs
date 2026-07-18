@@ -7,9 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::document::DocumentMutation;
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
-use crate::ids::{ApprovalId, CommandId, RunId, SessionId, WorkspaceId};
+use crate::ids::{ApprovalId, CommandId, DocumentId, RunId, SessionId, WorkspaceId};
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
 /// An idempotent, optionally revision-guarded request.
@@ -87,6 +88,14 @@ pub enum CommandBody {
     UpdateIdeContext {
         session_id: SessionId,
         update: IdeContextUpdate,
+    },
+    /// Apply a semantic mutation to a collaborative document (Phase 4 STEP 4.3).
+    /// The daemon maps this onto the authoritative Loro document and, in a
+    /// non-`Edit` collaboration mode, records content edits as suggestions rather
+    /// than applying them directly.
+    MutateDocument {
+        document_id: DocumentId,
+        mutation: DocumentMutation,
     },
     #[serde(other)]
     Unknown,
@@ -180,6 +189,15 @@ mod tests {
                     byte_length: 12,
                 }],
                 ..Default::default()
+            },
+        });
+        round_trip(CommandBody::MutateDocument {
+            document_id: DocumentId::new(),
+            mutation: DocumentMutation::EditText {
+                block_id: "b1".to_string(),
+                position: 0,
+                delete_len: 0,
+                insert: "hello".to_string(),
             },
         });
     }

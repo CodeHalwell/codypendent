@@ -12,6 +12,7 @@
 //! rendering and Git publication (STEP 4.4), and the symbol-link staleness engine
 //! (STEP 4.6) are layered on in their own modules.
 
+pub mod collab;
 pub mod crdt;
 pub mod model;
 pub mod store;

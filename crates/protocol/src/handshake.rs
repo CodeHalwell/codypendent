@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::ClientCapabilities;
-use crate::ids::{DaemonInstanceId, RunId};
+use crate::ids::{DaemonInstanceId, DocumentId, RunId};
 use crate::version::ProtocolVersion;
 
 /// An opaque, daemon-signed reconnection token (STEP 1.11).
@@ -89,6 +89,10 @@ pub enum Subscription {
     RepositoryStatus,
     /// Budget usage and warnings.
     BudgetState,
+    /// A collaborative document's CRDT sync stream + suggestion/presence updates
+    /// (Phase 4 STEP 4.3). The daemon publishes `DocumentSync` messages to
+    /// subscribers as the authoritative replica advances.
+    Document { document_id: DocumentId },
     #[serde(other)]
     Unknown,
 }
