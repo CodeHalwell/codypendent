@@ -57,6 +57,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ScrollPageDown => scroll_page(state, false),
         Action::Expand => expand_selected(state),
 
+        Action::PrevRun => cycle_run(state, -1),
+        Action::NextRun => cycle_run(state, 1),
         Action::NewRun => state.overlay = Overlay::NewRun(String::new()),
         Action::Pause => pause_or_resume(state),
         Action::Cancel => request_cancel(state),
@@ -66,13 +68,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Approve(scope) => resolve_focused(state, ApprovalDecision::Approve, scope),
         Action::Reject => resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once),
 
-        Action::InputChar(c) => edit_prompt(state, |buf| buf.push(c)),
+        Action::InputChar(c) => input_char(state, c),
         Action::InputPaste(text) => edit_prompt(state, move |buf| buf.push_str(&text)),
         Action::InputBackspace => edit_prompt(state, |buf| {
             buf.pop();
         }),
         Action::InputSubmit => submit_prompt(state),
-        Action::InputCancel => state.overlay = Overlay::None,
+        Action::InputCancel => input_cancel(state),
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -462,6 +464,17 @@ fn nav(state: &mut AppState, delta: i32) {
         }
         _ => {}
     }
+    // Base view: a pending approval owns the arrows (move between stacked
+    // approvals). Otherwise the composer is active and the input layer routes
+    // arrows to scroll / run-switch, so this legacy pane path is inert.
+    if state.show_approval_modal() {
+        step(
+            &mut state.selected_approval,
+            state.pending_approvals.len(),
+            delta,
+        );
+        return;
+    }
     match state.focus {
         Pane::Sessions => step(&mut state.selected_run, state.runs.len(), delta),
         Pane::Approvals => step(
@@ -585,8 +598,38 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // The base view: text lands in the persistent composer draft.
+        Overlay::None => edit(&mut state.composer),
         _ => {}
     }
+}
+
+/// A typed character. In the base view `/` on an *empty* composer opens the
+/// command palette (the Codex-style slash entry); every other key extends the
+/// active text buffer.
+fn input_char(state: &mut AppState, c: char) {
+    if c == '/' && matches!(state.overlay, Overlay::None) && state.composer.is_empty() {
+        state.overlay = Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        };
+        return;
+    }
+    edit_prompt(state, |buf| buf.push(c));
+}
+
+/// `Esc`: clear the composer draft in the base view, or close the active overlay.
+fn input_cancel(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        state.composer.clear();
+    } else {
+        state.overlay = Overlay::None;
+    }
+}
+
+/// Switch the conversation to another run (`Ctrl-↑/↓`), clamping at the ends.
+fn cycle_run(state: &mut AppState, delta: i32) {
+    step(&mut state.selected_run, state.runs.len(), delta);
 }
 
 fn submit_prompt(state: &mut AppState) {
@@ -613,6 +656,25 @@ fn submit_prompt(state: &mut AppState) {
             if let Some(entry) = crate::palette::filtered(&query).get(selected) {
                 run_palette_command(state, entry.command);
             }
+        }
+        // Base view (`mem::take` left `None`): send the composer. A live run is
+        // steered; otherwise the message starts a fresh run. The draft clears
+        // either way.
+        Overlay::None => {
+            let text = state.composer.trim().to_owned();
+            if !text.is_empty() {
+                if state.selected_run_is_active() {
+                    if let Some(run_id) = state.selected_run().map(|r| r.run_id) {
+                        state.outbox.push(Intent::QueueSteering { run_id, text });
+                    }
+                } else {
+                    state.outbox.push(Intent::StartRun {
+                        objective: text,
+                        mode: state.default_mode,
+                    });
+                }
+            }
+            state.composer.clear();
         }
         // Nothing to submit; restore the (non-text) overlay we took.
         other => state.overlay = other,
@@ -1470,6 +1532,111 @@ mod tests {
         reduce(&mut s, Action::InputSubmit);
         // Closed (mem::take), nothing opened.
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn composer_captures_text_and_esc_clears_it() {
+        let mut s = AppState::new();
+        for c in "fix the bug".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer, "fix the bug");
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "fix the bu");
+        reduce(&mut s, Action::InputCancel);
+        assert!(s.composer.is_empty());
+    }
+
+    #[test]
+    fn slash_opens_the_palette_only_on_an_empty_composer() {
+        // Slash on an empty composer opens the palette.
+        let mut s = AppState::new();
+        reduce(&mut s, Action::InputChar('/'));
+        assert!(matches!(s.overlay, Overlay::Palette { .. }));
+        assert!(s.composer.is_empty());
+
+        // Slash after text is a literal character.
+        let mut s2 = AppState::new();
+        reduce(&mut s2, Action::InputChar('a'));
+        reduce(&mut s2, Action::InputChar('/'));
+        assert_eq!(s2.composer, "a/");
+        assert_eq!(s2.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn composer_submit_starts_a_run_when_idle() {
+        let mut s = AppState::new();
+        for c in "diagnose the failing test".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.composer.is_empty(), "draft cleared after send");
+        let intents = s.drain_outbox();
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [Intent::StartRun { objective, .. }] if objective == "diagnose the failing test"
+            ),
+            "expected a StartRun intent, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn composer_submit_steers_a_live_run() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // The run is live (non-terminal), so a message steers rather than restarts.
+        assert!(s.selected_run_is_active());
+        for c in "also add tests".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        let intents = s.drain_outbox();
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [Intent::QueueSteering { text, run_id: r }] if text == "also add tests" && *r == run_id
+            ),
+            "expected a QueueSteering intent, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn empty_composer_submit_sends_nothing() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.drain_outbox().is_empty());
+    }
+
+    #[test]
+    fn ctrl_arrows_cycle_between_runs() {
+        let mut s = AppState::new();
+        for (obj, _) in [("a", ()), ("b", ())] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id: RunId::new(),
+                    objective: obj.to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+        }
+        // The latest run is selected; Ctrl-↑ moves to the previous one.
+        assert_eq!(s.selected_run, 1);
+        reduce(&mut s, Action::PrevRun);
+        assert_eq!(s.selected_run, 0);
+        reduce(&mut s, Action::PrevRun); // clamps at the start
+        assert_eq!(s.selected_run, 0);
+        reduce(&mut s, Action::NextRun);
+        assert_eq!(s.selected_run, 1);
     }
 
     #[test]

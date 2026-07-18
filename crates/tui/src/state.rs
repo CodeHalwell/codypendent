@@ -39,7 +39,8 @@ impl Pane {
 /// [`crate::input::map_event`]). Derived from the active overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// The full navigation/command key table is live.
+    /// A navigable overlay (Skills / Memory / Docs / Edges / Help) is live: the
+    /// arrow/command key table drives it.
     Normal,
     /// A text prompt is capturing printable keys.
     Editing,
@@ -48,6 +49,13 @@ pub enum InputMode {
     /// The command palette is capturing a filter query while staying navigable
     /// (printable keys filter; arrows move the selection; Enter runs it).
     Palette,
+    /// The base conversation view: the persistent composer captures typed text;
+    /// `/` (on an empty composer) opens the palette; Enter sends; PgUp/PgDn
+    /// scroll the transcript; Ctrl-↑/↓ switch runs.
+    Composer,
+    /// A pending approval owns the screen: only the decision keys (`a`/`A`/`r`)
+    /// and selection arrows are live, so an approval is never typed past.
+    Approval,
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
@@ -407,8 +415,13 @@ pub struct AppState {
     pub edges: Vec<GraphEdgeCard>,
     /// Index into `edges` of the focused edge.
     pub selected_edge: usize,
-    /// The focused pane.
+    /// The focused pane. Vestigial in the conversation-centred shell (the
+    /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
+    /// The persistent composer buffer (the always-present bottom input). Typed
+    /// text lands here; Enter sends it (starting a run, or steering the active
+    /// one). Empty by default.
+    pub composer: String,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -451,6 +464,7 @@ impl AppState {
             edges: Vec::new(),
             selected_edge: 0,
             focus: Pane::Sessions,
+            composer: String::new(),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
@@ -469,15 +483,22 @@ impl AppState {
             // The palette filters on printable keys but stays arrow-navigable, so
             // it has its own input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. } => InputMode::Palette,
-            // The Skills / Memory / Docs / Edges browsers are navigable with the
-            // normal key table (arrows to select, a letter to toggle, Esc to
-            // dismiss), so they stay in `Normal` mode.
-            Overlay::None
-            | Overlay::Help
+            // The Skills / Memory / Docs / Edges / Help browsers are navigable with
+            // the arrow/command key table, so they stay in `Normal` mode.
+            Overlay::Help
             | Overlay::Skills
             | Overlay::Memory { .. }
             | Overlay::Docs
             | Overlay::Edges => InputMode::Normal,
+            // The base conversation view: an unresolved approval owns the screen
+            // (decision keys only); otherwise the composer captures typed text.
+            Overlay::None => {
+                if self.show_approval_modal() {
+                    InputMode::Approval
+                } else {
+                    InputMode::Composer
+                }
+            }
         }
     }
 
@@ -485,6 +506,19 @@ impl AppState {
     #[must_use]
     pub fn selected_run(&self) -> Option<&RunView> {
         self.runs.get(self.selected_run)
+    }
+
+    /// Whether the selected run is still live — i.e. a composer message should
+    /// *steer* it rather than start a fresh run. `false` when no run is selected
+    /// or the selected run has reached a terminal state.
+    #[must_use]
+    pub fn selected_run_is_active(&self) -> bool {
+        self.selected_run().is_some_and(|run| {
+            !matches!(
+                run.state,
+                RunState::Completed | RunState::Failed | RunState::Cancelled
+            )
+        })
     }
 
     /// Whether the approval modal should be shown: there is at least one pending

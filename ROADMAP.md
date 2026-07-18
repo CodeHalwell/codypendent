@@ -211,27 +211,35 @@ promotion attributable and reversible.
 
 ## Client & TUI experience — Codex-informed backlog
 
-A design review of the Codex TUI surfaced patterns worth adopting. The rule:
-borrow the **principles** (progressive disclosure, a contextual footer, a
-universal composer, rich approvals), not the chat-first **shape** — Codypendent's
-multi-pane workspace over an event-sourced transcript is the point of difference,
-and it already embodies several of these. (Visualized in a TUI mock + borrow
-review produced alongside this work.)
+Direction: adopt the **conversation-centred shell** — the Claude Code / Codex
+CLI look and feel (a transcript-dominant surface, a persistent composer, `/`
+slash commands, minimal permanent chrome) — as the base, and keep Codypendent's
+richer surfaces (runs, approvals, docs, knowledge, code graph, workflows) as
+overlays reachable from the palette. The feel is chat-first; the capability set
+is deliberately broader. (Visualized in a TUI mock + borrow review produced
+alongside this work.)
 
-- [x] **Command palette** (`/`) — one searchable surface for every command, so
-      the feature set grows without exhausting single-key bindings (the Docs/Edges
-      `D`/`G` additions had nearly filled the keymap). Pure-reducer; 52 TUI tests.
+- [x] **Conversation-centred shell** — the base view is now a full-width
+      transcript + a persistent bottom composer + a one-row status footer; the old
+      three-pane layout is retired. Type to send (a message starts a run, or
+      steers the live one); `/` on an empty composer opens the palette; PgUp/PgDn
+      scroll; Ctrl-↑/↓ switch runs; a pending approval owns the input until
+      resolved. Pure-reducer; 62 TUI tests green.
+- [x] **Command palette** (`/`) — one searchable surface for every command, the
+      command hub now that typing composes a message rather than firing single-key
+      actions.
 - [x] **Rich approval cards** — action + risk + requested capabilities verbatim,
-      at the point of decision (already shipped in the approval modal).
+      at the point of decision (the approval modal owns input when pending).
 - [x] **Narrative transcript** — typed, event-sourced cells (model prose, tool
-      cards, diffs, markers) in one attributable stream (already the model).
+      cards, diffs, markers) in one attributable stream — the shell's main surface.
 - [ ] 🟡 **Contextual footer** — a width-adaptive status line that separates
       instructional from ambient state and shifts by mode (idle / working + queue /
       plan / history-search). The `StatusProjection` already carries the fields —
       **next up**, pure-reducer.
-- [ ] **Universal composer** — the input as an action surface: multiline, history
-      + reverse-search, `/` commands and `@` mentions, large-paste placeholders,
-      and queue/steer-while-working (steering already queues mid-run).
+- [ ] **Composer polish** — the persistent composer exists; the rich editor
+      remains: multiline, input history + reverse-search, `@` file/symbol mentions,
+      large-paste placeholders, queue-while-working, and transcript auto-scroll to
+      the latest.
 - [ ] **Side conversations & forks** — inspect or branch without derailing the
       main run; converges with Phase 5 STEP 5.6 `ForkSession{checkpoint}`.
 - [ ] **Terminal-native polish** — resize reflow, paste-burst detection, IME

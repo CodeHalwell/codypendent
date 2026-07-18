@@ -33,114 +33,78 @@ pub struct KeyBinding {
 /// the mouse-parity guarantee.
 pub const KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
-        keys: "Tab",
-        description: "cycle panes",
-        mouse: Some("click a pane"),
-    },
-    KeyBinding {
-        keys: "Up / k",
-        description: "select previous / scroll up",
-        mouse: Some("wheel up"),
-    },
-    KeyBinding {
-        keys: "Down / j",
-        description: "select next / scroll down",
-        mouse: Some("wheel down"),
-    },
-    KeyBinding {
-        keys: "PgUp / PgDn",
-        description: "scroll transcript by a page",
+        keys: "type…",
+        description: "compose a message in the bottom composer",
         mouse: None,
     },
     KeyBinding {
         keys: "Enter",
-        description: "open / expand selected",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "n",
-        description: "new run",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "p",
-        description: "pause / resume run",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "c",
-        description: "cancel run (asks to confirm)",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "s",
-        description: "steer: queue a message for the next safe point",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "a / A",
-        description: "approve once / approve for the run",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "r",
-        description: "reject approval",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "S",
-        description: "open the Skill Studio (permissions verbatim)",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "M",
-        description: "open the memory browser (provenance cards)",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "o",
-        description: "open the focused memory's source",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "D",
-        description: "open Docs Studio (tree / editor / review rails)",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "G",
-        description: "open the code-graph edge inspector",
+        description: "send: start a run, or steer the active one",
         mouse: None,
     },
     KeyBinding {
         keys: "/",
-        description: "open the command palette (search every command)",
+        description: "command palette — every command, searchable",
         mouse: None,
     },
     KeyBinding {
-        keys: "q",
+        keys: "PgUp / PgDn",
+        description: "scroll the conversation",
+        mouse: Some("wheel"),
+    },
+    KeyBinding {
+        keys: "Ctrl-↑ / Ctrl-↓",
+        description: "switch to the previous / next run",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "a / A",
+        description: "approve once / for the run (when prompted)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "r",
+        description: "reject the pending action",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Esc",
+        description: "clear the draft, or close an overlay",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "↑ / ↓",
+        description: "move selection in a browser or the palette",
+        mouse: Some("wheel"),
+    },
+    KeyBinding {
+        keys: "Ctrl-C",
         description: "detach (the run keeps going)",
-        mouse: None,
-    },
-    KeyBinding {
-        keys: "?",
-        description: "toggle this help",
         mouse: None,
     },
 ];
 
 /// Translate a terminal event into a semantic [`Action`].
 ///
-/// `mode` decides whether printable keys are commands or text; `width` is the
-/// current terminal width, consulted only to resolve which pane a left-click
-/// hit. Keys ignore `width`. The mapping is total — anything unrecognized maps
-/// to [`Action::NoOp`].
+/// `mode` decides whether printable keys are text or navigation; `width` is the
+/// current terminal width (unused by the single-column shell, kept for the mouse
+/// signature). The mapping is total — anything unrecognized maps to
+/// [`Action::NoOp`].
 #[must_use]
 pub fn map_event(event: &Event, mode: InputMode, width: u16) -> Action {
     match event {
         Event::Key(key) => map_key(key, mode),
         Event::Mouse(mouse) => map_mouse(mouse, mode, width),
-        Event::Paste(text) if mode == InputMode::Editing => Action::InputPaste(text.clone()),
+        // Bracketed paste lands in whichever text buffer is capturing: the
+        // composer, a prompt, or the palette filter.
+        Event::Paste(text)
+            if matches!(
+                mode,
+                InputMode::Editing | InputMode::Composer | InputMode::Palette
+            ) =>
+        {
+            Action::InputPaste(text.clone())
+        }
         Event::Paste(_) | Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {
             Action::NoOp
         }
@@ -157,6 +121,8 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
         InputMode::Editing => map_editing_key(key),
         InputMode::Confirm => map_confirm_key(key),
         InputMode::Palette => map_palette_key(key),
+        InputMode::Composer => map_composer_key(key),
+        InputMode::Approval => map_approval_key(key),
         InputMode::Normal => map_normal_key(key),
     }
 }
@@ -234,6 +200,41 @@ fn map_palette_key(key: &KeyEvent) -> Action {
     }
 }
 
+/// The base conversation view. The composer captures typed text; Enter sends it;
+/// `/` is a literal character (the reducer opens the palette only when it lands on
+/// an empty composer); PgUp/PgDn scroll the transcript; Ctrl-↑/↓ switch runs;
+/// Ctrl-C detaches; Esc clears the draft.
+fn map_composer_key(key: &KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Enter => Action::InputSubmit,
+        KeyCode::Esc => Action::InputCancel,
+        KeyCode::Backspace => Action::InputBackspace,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
+        KeyCode::Up if ctrl(key) => Action::PrevRun,
+        KeyCode::Down if ctrl(key) => Action::NextRun,
+        KeyCode::Char('c') if ctrl(key) => Action::Detach,
+        KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
+        _ => Action::NoOp,
+    }
+}
+
+/// A pending approval owns the input: the decision keys, plus arrows to move
+/// between stacked approvals. Ctrl-C still detaches (the run keeps going).
+fn map_approval_key(key: &KeyEvent) -> Action {
+    if ctrl(key) && key.code == KeyCode::Char('c') {
+        return Action::Detach;
+    }
+    match key.code {
+        KeyCode::Char('a') => Action::Approve(ApprovalScope::Once),
+        KeyCode::Char('A') => Action::Approve(ApprovalScope::Run),
+        KeyCode::Char('r') => Action::Reject,
+        KeyCode::Up => Action::SelectPrev,
+        KeyCode::Down => Action::SelectNext,
+        _ => Action::NoOp,
+    }
+}
+
 fn map_confirm_key(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Action::ConfirmCancel,
@@ -244,16 +245,25 @@ fn map_confirm_key(key: &KeyEvent) -> Action {
     }
 }
 
-fn map_mouse(mouse: &MouseEvent, mode: InputMode, width: u16) -> Action {
-    // A prompt is capturing; don't let clicks fire commands underneath it.
-    if mode != InputMode::Normal {
-        return Action::NoOp;
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollUp => Action::SelectPrev,
-        MouseEventKind::ScrollDown => Action::SelectNext,
-        MouseEventKind::Down(MouseButton::Left) => Action::FocusPane(pane_at(mouse.column, width)),
-        _ => Action::NoOp,
+fn map_mouse(mouse: &MouseEvent, mode: InputMode, _width: u16) -> Action {
+    match mode {
+        // A text prompt / confirm captures nothing from the mouse.
+        InputMode::Editing | InputMode::Confirm => Action::NoOp,
+        // The conversation scrolls its transcript on the wheel.
+        InputMode::Composer => match mouse.kind {
+            MouseEventKind::ScrollUp => Action::ScrollPageUp,
+            MouseEventKind::ScrollDown => Action::ScrollPageDown,
+            _ => Action::NoOp,
+        },
+        // List surfaces — browsers, the palette, stacked approvals — move their
+        // selection on the wheel. A left click is inert (there are no panes to
+        // focus in the single-column shell).
+        InputMode::Normal | InputMode::Palette | InputMode::Approval => match mouse.kind {
+            MouseEventKind::ScrollUp => Action::SelectPrev,
+            MouseEventKind::ScrollDown => Action::SelectNext,
+            MouseEventKind::Down(MouseButton::Left) => Action::NoOp,
+            _ => Action::NoOp,
+        },
     }
 }
 
@@ -425,6 +435,68 @@ mod tests {
         assert_eq!(pane_at(W - 2, W), Pane::Approvals);
     }
 
+    fn ctrl(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn composer_mode_captures_text_and_controls() {
+        // Printable keys are text — including `/`, which the reducer (not the
+        // mapper) turns into a palette-open only on an empty composer.
+        assert_eq!(
+            map_event(&ch('h'), InputMode::Composer, W),
+            Action::InputChar('h')
+        );
+        assert_eq!(
+            map_event(&ch('/'), InputMode::Composer, W),
+            Action::InputChar('/')
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Composer, W),
+            Action::InputSubmit
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Esc), InputMode::Composer, W),
+            Action::InputCancel
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageUp), InputMode::Composer, W),
+            Action::ScrollPageUp
+        );
+        // Ctrl-C detaches rather than typing a 'c'; Ctrl-↑/↓ switch runs.
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W),
+            Action::Detach
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W),
+            Action::PrevRun
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Down), InputMode::Composer, W),
+            Action::NextRun
+        );
+    }
+
+    #[test]
+    fn approval_mode_only_decision_keys() {
+        assert_eq!(
+            map_event(&ch('a'), InputMode::Approval, W),
+            Action::Approve(ApprovalScope::Once)
+        );
+        assert_eq!(
+            map_event(&ch('A'), InputMode::Approval, W),
+            Action::Approve(ApprovalScope::Run)
+        );
+        assert_eq!(map_event(&ch('r'), InputMode::Approval, W), Action::Reject);
+        // Typing past an approval is swallowed, not sent to a composer.
+        assert_eq!(map_event(&ch('x'), InputMode::Approval, W), Action::NoOp);
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Approval, W),
+            Action::SelectPrev
+        );
+    }
+
     /// RULE 3: every mouse interaction has a keyboard equivalent.
     #[test]
     fn every_mouse_gesture_has_a_keyboard_equivalent() {
@@ -440,34 +512,36 @@ mod tests {
             }
         }
 
-        // (2) Live mapping: the actual Action a mouse gesture produces is
-        // reachable from the keyboard.
-        // wheel up  == Up / k  (SelectPrev)
+        // (2) Live mapping. In a list surface the wheel moves the selection,
+        // reachable from the arrows.
         let wheel_up = map_event(&wheel(MouseEventKind::ScrollUp, 10), InputMode::Normal, W);
         assert_eq!(wheel_up, Action::SelectPrev);
         assert_eq!(wheel_up, map_event(&key(KeyCode::Up), InputMode::Normal, W));
-        assert_eq!(wheel_up, map_event(&ch('k'), InputMode::Normal, W));
 
-        // wheel down == Down / j (SelectNext)
         let wheel_down = map_event(&wheel(MouseEventKind::ScrollDown, 10), InputMode::Normal, W);
         assert_eq!(wheel_down, Action::SelectNext);
         assert_eq!(
             wheel_down,
             map_event(&key(KeyCode::Down), InputMode::Normal, W)
         );
-        assert_eq!(wheel_down, map_event(&ch('j'), InputMode::Normal, W));
 
-        // left-click focuses a pane; Tab is the keyboard focus control. Both are
-        // focus-changing actions.
+        // In the conversation the wheel scrolls the transcript, reachable from
+        // PgUp / PgDn.
+        assert_eq!(
+            map_event(&wheel(MouseEventKind::ScrollUp, 10), InputMode::Composer, W),
+            Action::ScrollPageUp
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageUp), InputMode::Composer, W),
+            Action::ScrollPageUp
+        );
+
+        // A left click is inert in the single-column shell (no panes to focus).
         let click = map_event(
             &wheel(MouseEventKind::Down(MouseButton::Left), 1),
             InputMode::Normal,
             W,
         );
-        assert_eq!(click, Action::FocusPane(Pane::Sessions));
-        assert_eq!(
-            map_event(&key(KeyCode::Tab), InputMode::Normal, W),
-            Action::CyclePane
-        );
+        assert_eq!(click, Action::NoOp);
     }
 }

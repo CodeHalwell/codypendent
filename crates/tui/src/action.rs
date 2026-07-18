@@ -52,6 +52,10 @@ pub enum Action {
     Expand,
 
     // --- run control ---
+    /// Switch the conversation to the previous run (`Ctrl-↑`).
+    PrevRun,
+    /// Switch the conversation to the next run (`Ctrl-↓`).
+    NextRun,
     /// Open the new-run prompt (`n`).
     NewRun,
     /// Pause the selected run, or resume it if already paused (`p`).

@@ -22,7 +22,7 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    AppState, Overlay, Pane, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    AppState, Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -34,26 +34,110 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         area,
     );
 
+    // A conversation-centred shell: the transcript is the workspace, a
+    // persistent composer sits beneath it, and a one-row status footer spans the
+    // bottom. Every other surface (runs, approvals, docs, skills, memory, edges)
+    // is a centered overlay or the approval modal — minimal permanent chrome.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),                  // conversation transcript
+            Constraint::Length(COMPOSER_HEIGHT), // persistent composer
+            Constraint::Length(1),               // status footer
+        ])
         .split(area);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
-        ])
-        .split(rows[0]);
-
-    render_sessions(frame, panes[0], state, theme);
-    render_transcript(frame, panes[1], state, theme);
-    render_right(frame, panes[2], state, theme);
-    render_status_line(frame, rows[1], state, theme);
+    render_conversation(frame, rows[0], state, theme);
+    render_composer(frame, rows[1], state, theme);
+    render_status_line(frame, rows[2], state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+/// The composer's height in rows (a bordered box holding one input line).
+const COMPOSER_HEIGHT: u16 = 3;
+
+/// The conversation: the selected run's transcript, full width, as the primary
+/// surface. Its title names the session + active run (and a run counter when
+/// several are live, switchable with Ctrl-↑/↓).
+fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let session = state.session_title.as_deref().unwrap_or("Codypendent");
+    let title = match state.selected_run() {
+        Some(run) if state.runs.len() > 1 => format!(
+            "{session} — {} [{}/{}]",
+            truncate(&run.objective, 36),
+            state.selected_run + 1,
+            state.runs.len()
+        ),
+        Some(run) => format!("{session} — {}", truncate(&run.objective, 44)),
+        None => session.to_owned(),
+    };
+    let block = pane_block(&title, true, theme);
+
+    let Some(run) = state.selected_run() else {
+        let hint = Paragraph::new(vec![
+            Line::styled("No runs yet.", Style::default().fg(theme.text.secondary)),
+            Line::styled(
+                "Type a message below and press Enter to start one.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ])
+        .block(block);
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    // `focused = false`: the conversation shows no per-entry selection highlight
+    // (there is no in-transcript cursor in the composer-driven shell).
+    let lines = transcript_lines(run, theme, false);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((run.scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// The persistent composer: an always-present input line. Empty, it shows a
+/// context-aware placeholder (start a run vs. steer the live one); with a draft,
+/// it shows the text and a cursor.
+fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let steering = state.selected_run_is_active();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            if steering { " Steer " } else { " Message " },
+            Style::default().fg(theme.text.muted),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(Style::default().bg(theme.surface.panel));
+
+    let mut spans = vec![Span::styled(
+        "› ",
+        Style::default()
+            .fg(theme.focus.active)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if state.composer.is_empty() {
+        let hint = if steering {
+            "steer the run · Enter sends · / for commands"
+        } else {
+            "message the agent to start a run · Enter sends · / for commands"
+        };
+        spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
+    } else {
+        spans.push(Span::styled(
+            state.composer.as_str(),
+            Style::default().fg(theme.text.primary),
+        ));
+        spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
@@ -67,81 +151,6 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
         ))
         .border_style(Style::default().fg(theme.border_color(focused)))
         .style(theme.panel_style())
-}
-
-fn render_sessions(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Sessions;
-    let block = pane_block("Sessions & runs", focused, theme);
-
-    let mut items: Vec<ListItem> = Vec::new();
-    let title = state
-        .session_title
-        .clone()
-        .unwrap_or_else(|| "(no session)".to_owned());
-    items.push(ListItem::new(Line::styled(
-        title,
-        Style::default()
-            .fg(theme.text.secondary)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if state.runs.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no runs yet — press n",
-            Style::default().fg(theme.text.muted),
-        )));
-    }
-
-    for (idx, run) in state.runs.iter().enumerate() {
-        let selected = idx == state.selected_run;
-        let marker = if selected { "› " } else { "  " };
-        let line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
-            Span::styled(
-                run_state_dot(run.state),
-                Style::default().fg(run_state_color(run.state, theme)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                truncate(&run.objective, 22),
-                Style::default().fg(theme.text.primary),
-            ),
-        ]);
-        let item = ListItem::new(line);
-        items.push(if selected && focused {
-            item.style(theme.selection_style())
-        } else {
-            item
-        });
-    }
-
-    frame.render_widget(List::new(items).block(block), area);
-}
-
-fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Transcript;
-    let title = match state.selected_run() {
-        Some(run) => format!("Transcript — {}", truncate(&run.objective, 24)),
-        None => "Transcript".to_owned(),
-    };
-    let block = pane_block(&title, focused, theme);
-
-    let Some(run) = state.selected_run() else {
-        let hint = Paragraph::new(Line::styled(
-            "Nothing to show. Press n to start a run.",
-            Style::default().fg(theme.text.muted),
-        ))
-        .block(block);
-        frame.render_widget(hint, area);
-        return;
-    };
-
-    let lines = transcript_lines(run, theme, focused);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((run.scroll, 0));
-    frame.render_widget(paragraph, area);
 }
 
 fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
@@ -310,105 +319,6 @@ fn patch_lines<'a>(
             Style::default().fg(theme.text.muted),
         ));
     }
-}
-
-fn render_right(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Approvals;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    // Approvals list.
-    let block = pane_block(
-        &format!("Approvals ({})", state.pending_approvals.len()),
-        focused,
-        theme,
-    );
-    let mut items: Vec<ListItem> = Vec::new();
-    if state.pending_approvals.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  none pending",
-            Style::default().fg(theme.text.muted),
-        )));
-    }
-    for (idx, approval) in state.pending_approvals.iter().enumerate() {
-        let selected = idx == state.selected_approval;
-        let line = Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
-            ),
-            Span::styled(
-                risk_label(approval.risk.level).to_owned(),
-                Style::default().fg(risk_color(approval.risk.level, theme)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                action_kind(&approval.action).to_owned(),
-                Style::default().fg(theme.text.primary),
-            ),
-        ]);
-        let item = ListItem::new(line);
-        items.push(if selected && focused {
-            item.style(theme.selection_style())
-        } else {
-            item
-        });
-    }
-    frame.render_widget(List::new(items).block(block), rows[0]);
-
-    // Run details.
-    render_details(frame, rows[1], state, theme);
-}
-
-fn render_details(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = pane_block("Run details", false, theme);
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(run) = state.selected_run() {
-        let field = |k: &str, v: String| -> Line {
-            Line::from(vec![
-                Span::styled(format!("{k}: "), Style::default().fg(theme.text.muted)),
-                Span::styled(v, Style::default().fg(theme.text.primary)),
-            ])
-        };
-        lines.push(field("objective", run.objective.clone()));
-        lines.push(field("mode", mode_label(run.mode).to_owned()));
-        lines.push(Line::from(vec![
-            Span::styled("state: ", Style::default().fg(theme.text.muted)),
-            Span::styled(
-                run_state_label(run.state).to_owned(),
-                Style::default().fg(run_state_color(run.state, theme)),
-            ),
-        ]));
-        lines.push(field(
-            "model",
-            run.model
-                .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
-        ));
-        lines.push(field(
-            "worktree",
-            run.worktree.clone().unwrap_or_else(|| "—".to_owned()),
-        ));
-        lines.push(field(
-            "context",
-            run.context_percent
-                .map_or("—".to_owned(), |p| format!("{p}%")),
-        ));
-        lines.push(field("cost", format_cost(run.cost_minor)));
-    } else {
-        lines.push(Line::styled(
-            "no run selected",
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
 }
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1499,17 +1409,6 @@ fn run_state_label(state: RunState) -> &'static str {
     }
 }
 
-fn run_state_dot(state: RunState) -> &'static str {
-    match state {
-        RunState::Completed => "✓",
-        RunState::Failed => "✗",
-        RunState::Cancelled => "⊘",
-        RunState::WaitingForApproval | RunState::WaitingForUserInput => "◆",
-        RunState::Paused => "⏸",
-        _ => "●",
-    }
-}
-
 fn run_state_color(state: RunState, theme: &Theme) -> Color {
     match state {
         RunState::Running | RunState::Preparing => theme.status.running,
@@ -1598,7 +1497,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::reduce::reduce;
-    use crate::state::{MemoryCard, SkillCard};
+    use crate::state::{MemoryCard, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
         Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
@@ -1781,7 +1680,7 @@ mod tests {
         reduce(&mut state, Action::Help);
         let text = render_to_string(&state, 110, 34);
         assert!(text.contains("Help"));
-        assert!(text.contains("cycle panes"));
+        assert!(text.contains("command palette"));
         assert!(text.contains("detach"));
     }
 
@@ -1830,7 +1729,43 @@ mod tests {
     fn renders_empty_state_without_panicking() {
         let state = AppState::new();
         let text = render_to_string(&state, 80, 24);
-        assert!(text.contains("no runs yet"));
+        // The empty conversation invites the first message.
+        assert!(text.contains("No runs yet"));
+        assert!(text.contains("start one"));
+    }
+
+    #[test]
+    fn conversation_shell_shows_transcript_composer_and_footer() {
+        // A live run: the transcript is the main surface, the composer offers to
+        // steer it, and the status footer spans the bottom.
+        let state = running_build_state();
+        let text = render_to_string(&state, 100, 30);
+
+        // Conversation title names the session + active run objective.
+        assert!(text.contains("fix-tests"), "session in title:\n{text}");
+        assert!(
+            text.contains("diagnose the failing test"),
+            "run objective:\n{text}"
+        );
+        // The persistent composer + its steering placeholder (the run is live).
+        assert!(text.contains("›"), "composer prompt:\n{text}");
+        assert!(text.contains("Enter sends"), "composer hint:\n{text}");
+        assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
+        // The status footer is still present.
+        assert!(text.contains("mode"), "status footer:\n{text}");
+    }
+
+    #[test]
+    fn composer_shows_a_typed_draft() {
+        let mut state = running_build_state();
+        for c in "add a boundary check".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("add a boundary check"),
+            "draft not shown:\n{text}"
+        );
     }
 
     #[test]
