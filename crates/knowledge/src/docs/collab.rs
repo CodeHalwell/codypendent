@@ -130,6 +130,11 @@ pub struct NewSuggestion {
     pub block_id: String,
     pub range_start: usize,
     pub range_end: usize,
+    /// The document revision the proposer computed these offsets against. `propose`
+    /// refuses if the document has already advanced past it (the offsets would be
+    /// stale on arrival), and it is stored so accept can refuse later drift — this
+    /// is the caller's *observed* revision, never the latest row read at write time.
+    pub source_revision: u64,
     /// The text currently at `[range_start, range_end)` as the proposer sees it —
     /// the anchor accept verifies before applying (empty for an insertion).
     pub original: String,
@@ -165,14 +170,24 @@ impl SuggestionStore {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
         let mut tx = pool.begin().await?;
-        // Anchor the suggestion to the document's current revision; accept refuses
-        // if the document has advanced since (also validates the document exists).
-        let source_revision: i64 =
+        // The suggestion is anchored to the revision the *proposer* observed, not
+        // whatever is current now: if the document advanced between the client
+        // computing the offsets and this write, the offsets are already stale, so
+        // refuse rather than store a suggestion whose accept-time guard would
+        // wrongly pass. (Also validates the document exists.)
+        let current_revision: i64 =
             sqlx::query_scalar("SELECT revision FROM documents WHERE id = ?")
                 .bind(document_id.to_string())
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(DocStoreError::NoSuchDocument(document_id))?;
+        if current_revision as u64 != new.source_revision {
+            return Err(DocStoreError::StaleRevision {
+                id: document_id,
+                expected: new.source_revision,
+            });
+        }
+        let source_revision = new.source_revision as i64;
         sqlx::query(
             "INSERT INTO document_suggestions \
              (id, document_id, block_id, range_start, range_end, source_revision, original, \

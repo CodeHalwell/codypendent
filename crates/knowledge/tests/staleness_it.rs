@@ -213,7 +213,9 @@ async fn maintenance_drafts_a_suggestion_citing_the_commit() {
     // text-bearing block), so a note can be drafted there.
     let blocks = doc.blocks().unwrap();
     let finding = &findings[0];
-    let new_suggestion = finding.as_suggestion(maintainer.clone(), &blocks).unwrap();
+    let new_suggestion = finding
+        .as_suggestion(maintainer.clone(), &blocks, doc.revision)
+        .unwrap();
     assert!(new_suggestion
         .rationale
         .as_deref()
@@ -419,7 +421,9 @@ async fn maintenance_skips_non_text_blocks() {
         .find(|f| f.block_id.as_deref() == Some("embed"))
         .unwrap();
     assert!(
-        embed.as_suggestion(human.clone(), &blocks).is_none(),
+        embed
+            .as_suggestion(human.clone(), &blocks, doc.revision)
+            .is_none(),
         "an embed block gets no (invisible) inline suggestion"
     );
     let intro = findings
@@ -427,7 +431,9 @@ async fn maintenance_skips_non_text_blocks() {
         .find(|f| f.block_id.as_deref() == Some("intro"))
         .unwrap();
     assert!(
-        intro.as_suggestion(human.clone(), &blocks).is_some(),
+        intro
+            .as_suggestion(human.clone(), &blocks, doc.revision)
+            .is_some(),
         "a text-bearing block still drafts a suggestion"
     );
 }

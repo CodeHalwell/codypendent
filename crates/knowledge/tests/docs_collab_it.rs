@@ -108,6 +108,7 @@ async fn accept_applies_exactly_the_annotated_range() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 5,
+                source_revision: doc.revision,
                 original: "hello".into(),
                 replacement: "HELLO".into(),
                 author: agent.clone(),
@@ -178,6 +179,7 @@ async fn reject_leaves_content_unchanged() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 4,
+                source_revision: doc.revision,
                 original: "keep".into(),
                 replacement: "drop".into(),
                 author: human.clone(),
@@ -228,6 +230,7 @@ async fn pending_suggestions_are_scoped_to_their_document() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 1,
+                source_revision: a.revision,
                 original: "x".into(),
                 replacement: "y".into(),
                 author: human.clone(),
@@ -278,6 +281,7 @@ async fn a_suggestion_cannot_be_accepted_twice() {
                 block_id: "p".into(),
                 range_start: 5,
                 range_end: 5,
+                source_revision: doc.revision,
                 original: String::new(),
                 replacement: " x".into(),
                 author: human.clone(),
@@ -349,6 +353,7 @@ async fn rejecting_a_suggestion_enqueues_a_document_changed_event() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 2,
+                source_revision: doc.revision,
                 original: "hi".into(),
                 replacement: "yo".into(),
                 author: human.clone(),
@@ -411,6 +416,7 @@ async fn accept_refuses_a_drifted_range() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 5,
+                source_revision: doc.revision,
                 original: "hello".into(),
                 replacement: "HELLO".into(),
                 author: human.clone(),
@@ -474,6 +480,7 @@ async fn accept_refuses_a_drifted_insertion() {
                 block_id: "p".into(),
                 range_start: 5,
                 range_end: 5,
+                source_revision: doc.revision,
                 original: String::new(),
                 replacement: " INSERT".into(),
                 author: human.clone(),
@@ -496,4 +503,69 @@ async fn accept_refuses_a_drifted_insertion() {
     assert!(matches!(err, DocStoreError::SuggestionRangeDrifted(_)));
     assert_eq!(doc.blocks().unwrap()[0].content_text(), "XXhello world");
     assert_eq!(suggestions.pending(&pool, doc.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn propose_refuses_a_stale_source_revision() {
+    // The proposer computed offsets against revision 1, but the document advances
+    // to revision 2 before the suggestion arrives. `propose` must refuse the
+    // already-stale offsets rather than record a suggestion anchored to a revision
+    // the client never saw — the offsets could point at the wrong characters.
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let mut doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph {
+                        text: "hello world".into(),
+                    },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    let stale_revision = doc.revision;
+
+    // The document advances before the (revision-1) proposal is submitted.
+    doc.crdt.insert_text("p", 0, "XX").unwrap();
+    docs.save(&pool, &mut doc, &human, MutationKind::EditText, Some("p"))
+        .await
+        .unwrap();
+    assert_eq!(doc.revision, 2);
+
+    let err = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 0,
+                range_end: 5,
+                source_revision: stale_revision,
+                original: "hello".into(),
+                replacement: "HELLO".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocStoreError::StaleRevision { expected, .. } if expected == stale_revision
+    ));
+
+    // Nothing was recorded — no stale suggestion lingers on the review rail.
+    assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
 }

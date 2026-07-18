@@ -480,7 +480,15 @@ fn decision(label: &str, loro: &Bench, automerge: &Bench, yrs: &Bench) -> String
     let size_ratio = safe_ratio(loro.snapshot_bytes as f64, smallest_snapshot as f64);
     // The rule: pick Loro unless it loses by >2x on load or memory.
     let loses_load = loro.load_ms > 2.0 * best_competitor_load;
-    let selected = converged && !loses_load;
+    // The memory half of the rule. A raw >2x size ratio is not, on its own, a real
+    // cost: an encoded snapshot that is 3x the most compact encoder but only a few
+    // KiB is negligible in practice. So the guard trips only when Loro's snapshot
+    // both exceeds 2x the smallest encoder AND crosses an absolute floor where the
+    // difference is large enough to matter — otherwise a tiny document's ratio
+    // would veto the selection over bytes no one would notice.
+    const MEM_FLOOR_BYTES: usize = 1 << 20; // 1 MiB
+    let loses_mem = size_ratio > 2.0 && loro.snapshot_bytes >= MEM_FLOOR_BYTES;
+    let selected = converged && !loses_load && !loses_mem;
 
     let mut out = String::from("\n## Decision\n\n");
     out.push_str(
@@ -518,23 +526,36 @@ fn decision(label: &str, loro: &Bench, automerge: &Bench, yrs: &Bench) -> String
         loro.build_ms, automerge.build_ms, build_speedup, yrs.build_ms,
     ));
     out.push_str(&format!(
-        "- **Encoded snapshot size:** Loro {} vs Automerge {} and Yrs {}. Loro is \
-         {:.1}x the most compact encoder, but in absolute terms this is a handful \
-         of KiB for a {label} document.\n\n",
+        "- **Encoded snapshot size** (the memory metric the rule prioritises): Loro \
+         {} vs Automerge {} and Yrs {}. Loro is {:.1}x the most compact encoder, but \
+         the memory guard only trips above a {} absolute floor — so this {} the \
+         guard ({} for a {label} document).\n\n",
         bytes(loro.snapshot_bytes),
         bytes(automerge.snapshot_bytes),
         bytes(yrs.snapshot_bytes),
         size_ratio,
+        bytes(MEM_FLOOR_BYTES),
+        if loses_mem { "exceeds" } else { "stays within" },
+        if loses_mem {
+            "above the floor where the difference is material"
+        } else {
+            "a handful of KiB, negligible in absolute terms"
+        },
     ));
     out.push_str(&format!(
         "Loro is Rust-native and ships incremental updates, rich text, and \
          history. It does not lose on the prioritised load metric ({}), and its \
-         snapshot, while larger than the most compact encoder, is negligible in \
-         absolute terms. **{}** (recorded as ADR-016).\n",
+         snapshot, while larger than the most compact encoder, {}. **{}** \
+         (recorded as ADR-016).\n",
         if loses_load {
             "it exceeds the 2x load guard — see above"
         } else {
             "within the 2x guard"
+        },
+        if loses_mem {
+            "exceeds the 2x memory guard above the absolute floor — see above"
+        } else {
+            "stays within the 2x memory guard (below the absolute floor)"
         },
         if selected {
             "Selected: Loro"

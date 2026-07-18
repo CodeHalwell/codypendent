@@ -209,12 +209,15 @@ impl StalenessFinding {
     /// `EmbeddedSymbol` block whose text container is ignored by rendering): a
     /// warning inserted there would be invisible in the published document, so no
     /// suggestion is drafted (the finding is still surfaced by
-    /// [`detect_staleness`]). `blocks` is the document's current block list.
+    /// [`detect_staleness`]). `blocks` is the document's current block list and
+    /// `document_revision` is the revision that block list belongs to (stored on
+    /// the suggestion so accept can detect later drift).
     #[must_use]
     pub fn as_suggestion(
         &self,
         author: DocumentAuthor,
         blocks: &[DocumentBlock],
+        document_revision: u64,
     ) -> Option<NewSuggestion> {
         let block_id = self.block_id.clone()?;
         // Only a text-bearing block can carry a visible inline note.
@@ -229,6 +232,7 @@ impl StalenessFinding {
             block_id,
             range_start: 0,
             range_end: 0,
+            source_revision: document_revision,
             original: String::new(),
             replacement: format!(
                 "> [!WARNING] `{}` {cause} in {} — review this section.\n",
