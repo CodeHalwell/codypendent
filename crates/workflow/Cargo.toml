@@ -1,0 +1,19 @@
+[package]
+name = "codypendent-workflow"
+description = "codypendent-workflow: declarative workflow definitions and the compiler that validates them into an executable node graph (Phase 5, STEP 5.1). Deliberately daemon- and framework-free — pure parsing and validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

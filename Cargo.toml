@@ -9,6 +9,7 @@ members = [
     "crates/runtime",
     "crates/knowledge",
     "crates/integrations",
+    "crates/workflow",
     "crates/test-support",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
@@ -32,6 +33,7 @@ codypendent-tui = { path = "crates/tui" }
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-knowledge = { path = "crates/knowledge" }
 codypendent-integrations = { path = "crates/integrations" }
+codypendent-workflow = { path = "crates/workflow" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
@@ -59,6 +61,10 @@ wiremock = "0.6"
 # Async traits and config parsing
 async-trait = "0.1"
 toml = "0.8"
+# Declarative workflow manifests (Phase 5, STEP 5.1) are YAML — the shape of
+# `docs/specs/workflow.yaml`. Kept out of every other crate's graph: only
+# `codypendent-workflow` depends on it.
+serde_yaml = "0.9"
 
 # Async runtime and serialization
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time", "process", "fs", "sync"] }

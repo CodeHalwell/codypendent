@@ -22,7 +22,7 @@ the release gate is the
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | 🟡 |
-| **5** | Workflows & multi-agent orchestration | ⬜ |
+| **5** | Workflows & multi-agent orchestration | 🟡 |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
 | **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
 
@@ -39,7 +39,10 @@ the release gate is the
 > projection seam (`D` / `G`). What remains for Phase 4 is the rest of that
 > wiring — live daemon CRDT transport and edit-lease enforcement, executing
 > publication through the approval-gated write path, and spawning a live language
-> server — tracked below.
+> server — all daemon-internal or external-tool work tracked below. With those
+> deferred, **Phase 5 has begun**: the `codypendent-workflow` crate now compiles
+> declarative `workflow.yaml` manifests into a validated node graph (STEP 5.1
+> compiler core), the foundation for durable multi-agent orchestration.
 
 ---
 
@@ -167,9 +170,19 @@ changes flag affected docs with evidence ✅; graph edges expose evidence +
 revision ✅ (data model + read-only TUI inspector render). ADR-016 recorded ✅;
 suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 
-## Phase 5 — Workflow & multi-agent orchestration ⬜
+## Phase 5 — Workflow & multi-agent orchestration 🟡
 
 - [ ] Declarative workflows; durable checkpoint storage; supervisor/specialist delegation; blackboard
+  - [x] **5.1 (compiler core)** `codypendent-workflow` crate: the declarative
+        `workflow.yaml` model + a compiler that validates a definition (schema
+        version, unique/non-empty step ids, exactly one action per step,
+        skill⇒agent, resolvable `depends_on`, acyclic graph via topological sort,
+        budget sanity, and the ADR-008 multi-agent `orchestration_reason` rule)
+        and lowers it into a topologically ordered node graph. The canonical
+        `repair-github-check` manifest compiles (regression test). *Remaining for
+        5.1:* agent-profile (`agent.toml`) loading, registry cross-checks
+        (unknown tool/skill/agent = error), lowering onto framework graphs, and
+        replacing the hard-coded `/fix-ci` flow with this definition.
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
