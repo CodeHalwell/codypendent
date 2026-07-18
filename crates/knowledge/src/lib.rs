@@ -16,6 +16,7 @@ pub mod builtin;
 pub mod codegraph;
 pub mod context;
 pub mod db;
+pub mod docs;
 pub mod manifest;
 pub mod memory;
 pub mod observer;
@@ -57,3 +58,11 @@ pub use memory::{
 pub use observer::extract_candidates;
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
+
+pub use docs::crdt::{DocCrdtError, DocumentCrdt};
+pub use docs::model::{
+    AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
+    DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,
+    LinkTarget, MutationKind, ResolvedSymbol,
+};
+pub use docs::store::{DocStoreError, Document, DocumentStore, DocumentSummary, NewDocument};

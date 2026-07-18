@@ -86,6 +86,11 @@ tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 notify = "7"
 
+# Collaborative-document CRDT (Phase 4, ADR-016). Selected over Automerge/Yrs by
+# the STEP 4.1 benchmark (`benches/crdt-bench`). The CRDT snapshot is
+# authoritative for document drafts; Git stores reviewed Markdown snapshots.
+loro = "1.13"
+
 # CLI and paths
 clap = { version = "4", features = ["derive"] }
 directories = "6"

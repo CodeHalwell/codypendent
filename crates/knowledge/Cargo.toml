@@ -28,6 +28,8 @@ tantivy = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 notify = { workspace = true }
+# Collaborative-document CRDT (Phase 4, ADR-016) — authoritative for drafts.
+loro = { workspace = true }
 # For `spawn_blocking` around the package walk/hash (sqlx already binds this
 # crate to the tokio runtime; this only names it directly).
 tokio = { workspace = true }
