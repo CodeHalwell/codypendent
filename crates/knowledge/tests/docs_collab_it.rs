@@ -108,6 +108,7 @@ async fn accept_applies_exactly_the_annotated_range() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 5,
+                original: "hello".into(),
                 replacement: "HELLO".into(),
                 author: agent.clone(),
                 rationale: Some("emphasise".into()),
@@ -177,6 +178,7 @@ async fn reject_leaves_content_unchanged() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 4,
+                original: "keep".into(),
                 replacement: "drop".into(),
                 author: human.clone(),
                 rationale: None,
@@ -226,6 +228,7 @@ async fn pending_suggestions_are_scoped_to_their_document() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 1,
+                original: "x".into(),
                 replacement: "y".into(),
                 author: human.clone(),
                 rationale: None,
@@ -275,6 +278,7 @@ async fn a_suggestion_cannot_be_accepted_twice() {
                 block_id: "p".into(),
                 range_start: 5,
                 range_end: 5,
+                original: String::new(),
                 replacement: " x".into(),
                 author: human.clone(),
                 rationale: None,
@@ -345,6 +349,7 @@ async fn rejecting_a_suggestion_enqueues_a_document_changed_event() {
                 block_id: "p".into(),
                 range_start: 0,
                 range_end: 2,
+                original: "hi".into(),
                 replacement: "yo".into(),
                 author: human.clone(),
                 rationale: None,
@@ -367,4 +372,67 @@ async fn rejecting_a_suggestion_enqueues_a_document_changed_event() {
         .filter(|r| r.event_kind == "document_changed" && r.entity_id == doc.id.to_string())
         .count();
     assert_eq!(n, 3);
+}
+
+#[tokio::test]
+async fn accept_refuses_a_drifted_range() {
+    // A suggestion targets "hello" at 0..5; the block is edited before it is
+    // accepted, shifting the range. Accept must refuse rather than corrupt the
+    // wrong characters, and leave the suggestion pending.
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let mut doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph {
+                        text: "hello world".into(),
+                    },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    let s = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 0,
+                range_end: 5,
+                original: "hello".into(),
+                replacement: "HELLO".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // An editor prepends text, shifting the target range (0..5 now covers "X hel").
+    doc.crdt.insert_text("p", 0, "X ").unwrap();
+    docs.save(&pool, &mut doc, &human, MutationKind::EditText, Some("p"))
+        .await
+        .unwrap();
+
+    let err = suggestions
+        .accept(&pool, &mut doc, &s.id, &human)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DocStoreError::SuggestionRangeDrifted(_)));
+
+    // The content is not corrupted and the suggestion is still pending.
+    assert_eq!(doc.blocks().unwrap()[0].content_text(), "X hello world");
+    assert_eq!(suggestions.pending(&pool, doc.id).await.unwrap().len(), 1);
 }

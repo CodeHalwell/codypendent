@@ -110,6 +110,9 @@ pub struct Suggestion {
     pub range_start: usize,
     /// Character offset (exclusive).
     pub range_end: usize,
+    /// The text the proposer saw at `[range_start, range_end)`. Accept refuses if
+    /// the block has since drifted so these offsets no longer cover it.
+    pub original: String,
     pub replacement: String,
     pub author: DocumentAuthor,
     pub rationale: Option<String>,
@@ -122,6 +125,9 @@ pub struct NewSuggestion {
     pub block_id: String,
     pub range_start: usize,
     pub range_end: usize,
+    /// The text currently at `[range_start, range_end)` as the proposer sees it —
+    /// the anchor accept verifies before applying (empty for an insertion).
+    pub original: String,
     pub replacement: String,
     pub author: DocumentAuthor,
     pub rationale: Option<String>,
@@ -156,15 +162,16 @@ impl SuggestionStore {
         let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO document_suggestions \
-             (id, document_id, block_id, range_start, range_end, replacement, author_json, \
-              rationale, status, created_at, resolved_at, resolved_by_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
+             (id, document_id, block_id, range_start, range_end, original, replacement, \
+              author_json, rationale, status, created_at, resolved_at, resolved_by_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
         )
         .bind(&id)
         .bind(document_id.to_string())
         .bind(&new.block_id)
         .bind(new.range_start as i64)
         .bind(new.range_end as i64)
+        .bind(&new.original)
         .bind(&new.replacement)
         .bind(serde_json::to_string(&new.author)?)
         .bind(new.rationale.as_deref())
@@ -185,6 +192,7 @@ impl SuggestionStore {
             block_id: new.block_id,
             range_start: new.range_start,
             range_end: new.range_end,
+            original: new.original,
             replacement: new.replacement,
             author: new.author,
             rationale: new.rationale,
@@ -199,8 +207,8 @@ impl SuggestionStore {
         document_id: DocumentId,
     ) -> Result<Vec<Suggestion>, DocStoreError> {
         let rows = sqlx::query(
-            "SELECT id, block_id, range_start, range_end, replacement, author_json, rationale, \
-             status FROM document_suggestions WHERE document_id = ? AND status = 'pending' \
+            "SELECT id, block_id, range_start, range_end, original, replacement, author_json, \
+             rationale, status FROM document_suggestions WHERE document_id = ? AND status = 'pending' \
              ORDER BY created_at ASC, id ASC",
         )
         .bind(document_id.to_string())
@@ -233,6 +241,21 @@ impl SuggestionStore {
         let suggestion = self.get(pool, doc.id, suggestion_id).await?;
         if suggestion.status != SuggestionStatus::Pending {
             return Err(DocStoreError::SuggestionNotPending(
+                suggestion_id.to_string(),
+            ));
+        }
+        // Guard against range drift: the block may have been edited between
+        // propose and accept, shifting or reshaping the target range. If the text
+        // now under the stored offsets is not what the proposer saw, applying the
+        // suggestion would corrupt the wrong characters — refuse instead. (An
+        // out-of-range range surfaces as OutOfBounds via `text_range`.)
+        let current = doc.crdt.text_range(
+            &suggestion.block_id,
+            suggestion.range_start,
+            suggestion.range_end,
+        )?;
+        if current != suggestion.original {
+            return Err(DocStoreError::SuggestionRangeDrifted(
                 suggestion_id.to_string(),
             ));
         }
@@ -332,8 +355,8 @@ impl SuggestionStore {
         suggestion_id: &str,
     ) -> Result<Suggestion, DocStoreError> {
         let row = sqlx::query(
-            "SELECT id, block_id, range_start, range_end, replacement, author_json, rationale, \
-             status FROM document_suggestions WHERE id = ? AND document_id = ?",
+            "SELECT id, block_id, range_start, range_end, original, replacement, author_json, \
+             rationale, status FROM document_suggestions WHERE id = ? AND document_id = ?",
         )
         .bind(suggestion_id)
         .bind(document_id.to_string())
@@ -382,6 +405,7 @@ fn decode_suggestion(
         block_id: row.get("block_id"),
         range_start: row.get::<i64, _>("range_start") as usize,
         range_end: row.get::<i64, _>("range_end") as usize,
+        original: row.get("original"),
         replacement: row.get("replacement"),
         author: serde_json::from_str(row.get::<String, _>("author_json").as_str())?,
         rationale: row.get("rationale"),

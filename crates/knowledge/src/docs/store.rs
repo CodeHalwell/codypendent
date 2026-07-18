@@ -46,6 +46,11 @@ pub enum DocStoreError {
     /// against a retried or concurrent accept re-applying its range.
     #[error("suggestion {0} is not pending")]
     SuggestionNotPending(String),
+    /// A suggestion's target range no longer covers the text the proposer saw —
+    /// the block was edited between propose and accept, so applying the stored
+    /// offsets would corrupt the wrong characters. The proposer must re-propose.
+    #[error("suggestion {0} no longer matches the block text (range drifted)")]
+    SuggestionRangeDrifted(String),
 }
 
 /// A new document to create.
@@ -268,6 +273,15 @@ impl DocumentStore {
                 DocStoreError::NoSuchDocument(doc.id)
             });
         }
+        // Replacing links is an index-relevant change (stale-link detection,
+        // link-backed indexes), so notify subscribers/index workers — in the same
+        // transaction as the write — just like content mutations do.
+        outbox::enqueue(
+            &mut *tx,
+            &KnowledgeIndexEvent::DocumentChanged(doc.id),
+            Utc::now(),
+        )
+        .await?;
         tx.commit().await?;
         doc.links = links;
         Ok(())

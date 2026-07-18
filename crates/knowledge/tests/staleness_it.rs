@@ -208,9 +208,12 @@ async fn maintenance_drafts_a_suggestion_citing_the_commit() {
     let findings = detect_staleness(doc.id, &doc.links, &current, &rev2);
     assert!(!findings.is_empty());
 
-    // Maintain mode drafts a SUGGESTION (never a direct edit) that cites the commit.
+    // Maintain mode drafts a SUGGESTION (never a direct edit) that cites the
+    // commit. findings[0] is the inline marker in the "intro" paragraph (a
+    // text-bearing block), so a note can be drafted there.
+    let blocks = doc.blocks().unwrap();
     let finding = &findings[0];
-    let new_suggestion = finding.as_suggestion(maintainer.clone()).unwrap();
+    let new_suggestion = finding.as_suggestion(maintainer.clone(), &blocks).unwrap();
     assert!(new_suggestion
         .rationale
         .as_deref()
@@ -371,4 +374,102 @@ async fn a_content_save_does_not_clobber_resolved_links() {
         !reloaded.links.is_empty(),
         "a content save must not clobber resolved links"
     );
+}
+
+#[tokio::test]
+async fn maintenance_skips_non_text_blocks() {
+    // A staleness finding on an EmbeddedSymbol block yields no suggestion (a note
+    // there would be invisible), while a text-bearing block still drafts one.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let store = DocumentStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+
+    let doc = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Runbook".into(),
+                scope: Scope::Repository(repo),
+                metadata: DocumentMetadata::default(),
+                blocks: runbook_blocks(),
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    let blocks = doc.blocks().unwrap();
+    let links = resolve_links(&pool, repo, &blocks, &rev1).await.unwrap();
+
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev2, "src/payments.rs", V2)
+        .await
+        .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+    let findings = detect_staleness(doc.id, &links, &current, &rev2);
+
+    let embed = findings
+        .iter()
+        .find(|f| f.block_id.as_deref() == Some("embed"))
+        .unwrap();
+    assert!(
+        embed.as_suggestion(human.clone(), &blocks).is_none(),
+        "an embed block gets no (invisible) inline suggestion"
+    );
+    let intro = findings
+        .iter()
+        .find(|f| f.block_id.as_deref() == Some("intro"))
+        .unwrap();
+    assert!(
+        intro.as_suggestion(human.clone(), &blocks).is_some(),
+        "a text-bearing block still drafts a suggestion"
+    );
+}
+
+#[tokio::test]
+async fn resolving_links_enqueues_a_document_changed_event() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let store = DocumentStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+    let mut doc = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Runbook".into(),
+                scope: Scope::Repository(repo),
+                metadata: DocumentMetadata::default(),
+                blocks: runbook_blocks(),
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    let links = resolve_links(&pool, repo, &doc.blocks().unwrap(), &rev1)
+        .await
+        .unwrap();
+    store.set_links(&pool, &mut doc, links).await.unwrap();
+
+    // create + set_links each enqueue a DocumentChanged row, so index workers and
+    // subscribers learn the document now has resolved links.
+    let rows = codypendent_knowledge::outbox::unprocessed(&pool, 100)
+        .await
+        .unwrap();
+    let n = rows
+        .iter()
+        .filter(|r| r.event_kind == "document_changed" && r.entity_id == doc.id.to_string())
+        .count();
+    assert_eq!(n, 2);
 }

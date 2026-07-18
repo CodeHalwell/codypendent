@@ -48,6 +48,7 @@ CREATE TABLE document_suggestions (
     block_id TEXT NOT NULL,           -- the block the suggestion targets
     range_start INTEGER NOT NULL,     -- character offset (inclusive) within the block text
     range_end INTEGER NOT NULL,       -- character offset (exclusive)
+    original TEXT NOT NULL,           -- the text the proposer saw at [range_start, range_end); accept refuses if it has drifted
     replacement TEXT NOT NULL,        -- the proposed text for [range_start, range_end)
     author_json TEXT NOT NULL,        -- DocumentAuthor who proposed it
     rationale TEXT,                   -- optional explanation / citation

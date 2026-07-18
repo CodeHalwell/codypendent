@@ -178,6 +178,30 @@ impl DocumentCrdt {
         Ok(())
     }
 
+    /// Read the current text of a block over `[start, end)` (character offsets).
+    /// Errors with [`DocCrdtError::OutOfBounds`] if the range no longer fits the
+    /// block — used to detect that a suggestion's target range has drifted since
+    /// it was proposed.
+    pub fn text_range(
+        &self,
+        block_id: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<String, DocCrdtError> {
+        let map = self.block_map_by_id(block_id)?;
+        let container = text_container(&map)?;
+        let length = container.len_unicode();
+        if start > end || end > length {
+            return Err(DocCrdtError::OutOfBounds { pos: end, length });
+        }
+        Ok(container
+            .to_string()
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect())
+    }
+
     /// Delete `len` characters at position `pos` inside a text block.
     pub fn delete_text(&self, block_id: &str, pos: usize, len: usize) -> Result<(), DocCrdtError> {
         let map = self.block_map_by_id(block_id)?;

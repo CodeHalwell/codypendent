@@ -197,11 +197,25 @@ pub fn detect_staleness(
 impl StalenessFinding {
     /// Draft a `Maintain`-mode suggestion for this finding: a *proposed* note (never
     /// a direct edit) on the stale block, citing the causing revision. The
-    /// suggestion inserts at the start of the block (an empty range) so nothing is
-    /// overwritten until a human accepts it.
+    /// suggestion inserts at the start of the block (an empty range, so `original`
+    /// is empty) — nothing is overwritten until a human accepts it.
+    ///
+    /// Returns `None` when the finding's block is **not text-bearing** (e.g. an
+    /// `EmbeddedSymbol` block whose text container is ignored by rendering): a
+    /// warning inserted there would be invisible in the published document, so no
+    /// suggestion is drafted (the finding is still surfaced by
+    /// [`detect_staleness`]). `blocks` is the document's current block list.
     #[must_use]
-    pub fn as_suggestion(&self, author: DocumentAuthor) -> Option<NewSuggestion> {
+    pub fn as_suggestion(
+        &self,
+        author: DocumentAuthor,
+        blocks: &[DocumentBlock],
+    ) -> Option<NewSuggestion> {
         let block_id = self.block_id.clone()?;
+        // Only a text-bearing block can carry a visible inline note.
+        let block = blocks.iter().find(|b| b.id == block_id)?;
+        block.primary_text()?;
+
         let cause = match self.reason {
             StalenessReason::SignatureChanged => "signature changed",
             StalenessReason::Disappeared => "was removed",
@@ -210,6 +224,7 @@ impl StalenessFinding {
             block_id,
             range_start: 0,
             range_end: 0,
+            original: String::new(),
             replacement: format!(
                 "> [!WARNING] `{}` {cause} in {} — review this section.\n",
                 self.qualified_name, self.revision
