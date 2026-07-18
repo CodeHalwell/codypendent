@@ -224,6 +224,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         None => session.to_owned(),
     };
     let block = pane_block(&title, true, theme);
+    let inner = block.inner(area);
 
     let Some(run) = state.selected_run() else {
         let hint = Paragraph::new(vec![
@@ -241,11 +242,44 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // `focused = false`: the conversation shows no per-entry selection highlight
     // (there is no in-transcript cursor in the composer-driven shell).
     let lines = transcript_lines(run, theme, false);
+
+    // Auto-scroll: measure the wrapped height, cache the bottom offset (so the
+    // reducer's paging can leave/enter follow mode precisely), and pin the view to
+    // the tail while following; otherwise honor the manual offset.
+    let max_scroll = max_scroll_offset(&lines, inner.width, inner.height);
+    state.transcript_max_scroll.set(max_scroll);
+    let offset = if run.follow {
+        max_scroll
+    } else {
+        run.scroll.min(max_scroll)
+    };
+
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((run.scroll, 0));
+        .scroll((offset, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The largest useful scroll offset: total wrapped rows minus the viewport
+/// height (0 when everything fits). Wrapped rows are estimated as
+/// `ceil(line_width / inner_width)` per line — close enough for scrolling; the
+/// exact word-wrap boundary differs by at most a row.
+fn max_scroll_offset(lines: &[Line], width: u16, height: u16) -> u16 {
+    let inner_width = width.max(1) as usize;
+    let total: usize = lines
+        .iter()
+        .map(|line| {
+            let w = line.width();
+            if w == 0 {
+                1
+            } else {
+                w.div_ceil(inner_width)
+            }
+        })
+        .sum();
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    total.saturating_sub(height)
 }
 
 /// The persistent composer: an always-present input line. Empty, it shows a
@@ -473,9 +507,7 @@ fn patch_lines<'a>(
 }
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let status = state.status();
-    let sep = Span::styled("  ", Style::default().fg(theme.text.muted));
-    let mut spans: Vec<Span> = Vec::new();
+    let bg = Style::default().bg(theme.surface.overlay);
 
     // A transient notice (rejected command, presence change) takes the line:
     // it is the only channel for "the daemon said no", so it must not compete
@@ -492,23 +524,33 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         return;
     }
 
-    let field = |label: &str, value: String, color: Color| -> Vec<Span> {
+    let status = state.status();
+    let width = area.width;
+    // Two tiers: full fields on a wide terminal, then progressively fewer as the
+    // width shrinks, so mode/state/attention always survive.
+    let full = width >= 96;
+    let mid = width >= 64;
+
+    let field = |label: &str, value: String, color: Color| -> Vec<Span<'static>> {
         vec![
             Span::styled(format!("{label} "), Style::default().fg(theme.text.muted)),
             Span::styled(value, Style::default().fg(color)),
         ]
     };
+    let sep = || Span::styled("  ", Style::default().fg(theme.text.muted));
 
-    spans.push(Span::raw(" "));
-    spans.extend(field(
-        "mode",
-        status
-            .mode
-            .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
-        theme.status.info,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
+    // --- ambient state (left) ---
+    let mut ambient: Vec<Vec<Span>> = Vec::new();
+    if mid {
+        ambient.push(field(
+            "mode",
+            status
+                .mode
+                .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
+            theme.status.info,
+        ));
+    }
+    ambient.push(field(
         "state",
         status
             .run_state
@@ -517,37 +559,38 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             .run_state
             .map_or(theme.text.muted, |s| run_state_color(s, theme)),
     ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "model",
-        status
-            .model
-            .as_ref()
-            .map_or("—".to_owned(), ToString::to_string),
-        theme.text.secondary,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "ctx",
-        status
-            .context_percent
-            .map_or("—".to_owned(), |p| format!("{p}%")),
-        theme.status.info,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "cost",
-        format_cost(status.cost_minor),
-        theme.status.warning,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "wt",
-        status.worktree.clone().unwrap_or_else(|| "—".to_owned()),
-        theme.text.secondary,
-    ));
-    spans.push(sep);
-    spans.extend(field(
+    if full {
+        ambient.push(field(
+            "model",
+            status
+                .model
+                .as_ref()
+                .map_or("—".to_owned(), ToString::to_string),
+            theme.text.secondary,
+        ));
+    }
+    if mid {
+        ambient.push(field(
+            "ctx",
+            status
+                .context_percent
+                .map_or("—".to_owned(), |p| format!("{p}%")),
+            theme.status.info,
+        ));
+    }
+    if full {
+        ambient.push(field(
+            "cost",
+            format_cost(status.cost_minor),
+            theme.status.warning,
+        ));
+        ambient.push(field(
+            "wt",
+            status.worktree.clone().unwrap_or_else(|| "—".to_owned()),
+            theme.text.secondary,
+        ));
+    }
+    ambient.push(field(
         "approvals",
         status.pending_approvals.to_string(),
         if status.pending_approvals > 0 {
@@ -557,7 +600,45 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         },
     ));
 
-    let bg = Style::default().bg(theme.surface.overlay);
+    let mut left: Vec<Span> = vec![Span::raw(" ")];
+    for (i, group) in ambient.into_iter().enumerate() {
+        if i > 0 {
+            left.push(sep());
+        }
+        left.extend(group);
+    }
+
+    // --- instructional hint (right), by what the user should do next ---
+    let key = |k: &str| Span::styled(k.to_owned(), Style::default().fg(theme.focus.active));
+    let word = |w: &str| Span::styled(w.to_owned(), Style::default().fg(theme.text.muted));
+    let scrolled_up = state.selected_run().is_some_and(|r| !r.follow);
+    let hint: Vec<Span> = if status.pending_approvals > 0 {
+        vec![
+            key("a"),
+            word(" approve  "),
+            key("A"),
+            word(" run  "),
+            key("r"),
+            word(" reject"),
+        ]
+    } else if scrolled_up {
+        vec![key("PgDn"), word(" ↧ latest")]
+    } else if !state.composer.is_empty() {
+        vec![key("⏎"), word(" send  "), key("Esc"), word(" clear")]
+    } else {
+        vec![key("/"), word(" cmds  "), key("F2"), word(" layout")]
+    };
+    let hint = Line::from(hint);
+
+    // Right-align the hint by padding between it and the ambient fields.
+    let left_line = Line::from(left.clone());
+    let used = left_line.width() + hint.width();
+    let pad = (width as usize).saturating_sub(used + 1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(hint.spans);
+    spans.push(Span::raw(" "));
+
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
@@ -1953,6 +2034,41 @@ mod tests {
         reduce(&mut state, Action::ToggleLayout);
         let chat = render_to_string(&state, 120, 30);
         assert!(!chat.contains("Runs ("), "should be single-column:\n{chat}");
+    }
+
+    #[test]
+    fn contextual_footer_switches_hint_by_context() {
+        // Idle: full ambient fields + a command hint.
+        let mut state = running_build_state();
+        let idle = render_to_string(&state, 120, 30);
+        assert!(idle.contains("mode"), "ambient fields:\n{idle}");
+        assert!(idle.contains("model"), "model field at full width:\n{idle}");
+        assert!(
+            idle.contains("cmds") || idle.contains("F2"),
+            "command hint:\n{idle}"
+        );
+
+        // Drafting: the hint invites sending.
+        for c in "hello".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let drafting = render_to_string(&state, 120, 30);
+        assert!(
+            drafting.contains("send"),
+            "send hint while drafting:\n{drafting}"
+        );
+    }
+
+    #[test]
+    fn contextual_footer_narrows_by_dropping_low_priority_fields() {
+        let state = running_build_state();
+        let narrow = render_to_string(&state, 50, 30);
+        // State survives; the model field is dropped at a narrow width.
+        assert!(narrow.contains("state"), "state kept:\n{narrow}");
+        assert!(
+            !narrow.contains("model"),
+            "model dropped when narrow:\n{narrow}"
+        );
     }
 
     #[test]

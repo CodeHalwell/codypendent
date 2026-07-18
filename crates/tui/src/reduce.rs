@@ -494,14 +494,25 @@ fn nav(state: &mut AppState, delta: i32) {
 }
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    const PAGE: u16 = 10;
+    // The renderer cached the true bottom last frame; use it so leaving follow
+    // mode starts a page up from the bottom (not a jump to the top), and paging
+    // back to the bottom re-enters follow.
+    let max = state.transcript_max_scroll.get();
     let idx = state.selected_run;
     if let Some(run) = state.runs.get_mut(idx) {
-        const PAGE: u16 = 10;
-        run.scroll = if up {
-            run.scroll.saturating_sub(PAGE)
+        if up {
+            if run.follow {
+                run.follow = false;
+                run.scroll = max;
+            }
+            run.scroll = run.scroll.saturating_sub(PAGE);
         } else {
-            run.scroll.saturating_add(PAGE)
-        };
+            run.scroll = run.scroll.saturating_add(PAGE).min(max);
+            if run.scroll >= max {
+                run.follow = true;
+            }
+        }
     }
 }
 
@@ -676,6 +687,10 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
             state.composer.clear();
+            // Snap the conversation back to the latest so the reply is in view.
+            if let Some(run) = state.selected_run_mut() {
+                run.follow = true;
+            }
         }
         // Nothing to submit; restore the (non-text) overlay we took.
         other => state.overlay = other,
@@ -1639,6 +1654,57 @@ mod tests {
         assert_eq!(s.selected_run, 0);
         reduce(&mut s, Action::NextRun);
         assert_eq!(s.selected_run, 1);
+    }
+
+    #[test]
+    fn paging_leaves_and_re_enters_follow_mode() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // The renderer would cache the bottom offset; simulate a tall transcript.
+        s.transcript_max_scroll.set(50);
+        assert!(s.runs[0].follow, "runs follow by default");
+
+        // Paging up leaves follow, starting a page up from the true bottom.
+        reduce(&mut s, Action::ScrollPageUp);
+        assert!(!s.runs[0].follow);
+        assert_eq!(s.runs[0].scroll, 40);
+
+        // Paging back down to the bottom re-enters follow.
+        reduce(&mut s, Action::ScrollPageDown);
+        assert_eq!(s.runs[0].scroll, 50);
+        assert!(s.runs[0].follow);
+    }
+
+    #[test]
+    fn sending_a_message_re_follows_the_latest() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s.transcript_max_scroll.set(50);
+        reduce(&mut s, Action::ScrollPageUp);
+        assert!(!s.runs[0].follow);
+
+        // Sending snaps the conversation back to the latest.
+        for c in "keep going".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.runs[0].follow);
     }
 
     #[test]

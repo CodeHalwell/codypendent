@@ -235,14 +235,18 @@ alongside this work.)
       at the point of decision (the approval modal owns input when pending).
 - [x] **Narrative transcript** — typed, event-sourced cells (model prose, tool
       cards, diffs, markers) in one attributable stream — the shell's main surface.
-- [ ] 🟡 **Contextual footer** — a width-adaptive status line that separates
-      instructional from ambient state and shifts by mode (idle / working + queue /
-      plan / history-search). The `StatusProjection` already carries the fields —
-      **next up**, pure-reducer.
+- [x] **Contextual footer** — the status line drops fields by priority as the
+      terminal narrows (mode/model/cost/worktree fall away first; state +
+      attention always survive) and carries a right-aligned instructional hint
+      that shifts by context: approve/reject when an approval is pending, `↧ latest`
+      when scrolled up, send/clear while drafting, else `/ cmds · F2 layout`.
+- [x] **Auto-scroll** — the conversation follows the latest by default (streaming
+      stays pinned to the bottom); PgUp leaves follow to read history, PgDn (or
+      sending a message) snaps back. The renderer measures the wrapped height and
+      caches the bottom so paging is exact.
 - [ ] **Composer polish** — the persistent composer exists; the rich editor
       remains: multiline, input history + reverse-search, `@` file/symbol mentions,
-      large-paste placeholders, queue-while-working, and transcript auto-scroll to
-      the latest.
+      large-paste placeholders, queue-while-working.
 - [ ] **Side conversations & forks** — inspect or branch without derailing the
       main run; converges with Phase 5 STEP 5.6 `ForkSession{checkpoint}`.
 - [ ] **Terminal-native polish** — resize reflow, paste-burst detection, IME

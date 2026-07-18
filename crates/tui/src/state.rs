@@ -5,6 +5,8 @@
 //! derived deterministically from the ordered [`SessionEvent`] stream plus local
 //! navigation, so replaying the same events yields the same state.
 
+use std::cell::Cell;
+
 use codypendent_protocol::{
     AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, ModelId, ProposedAction,
     Risk, RunDisposition, RunId, RunState, ToolOutcome,
@@ -223,8 +225,13 @@ pub struct RunView {
     pub transcript: Vec<TranscriptEntry>,
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
-    /// Transcript scroll offset in rows.
+    /// Transcript scroll offset in rows (used only when not following).
     pub scroll: u16,
+    /// Whether the conversation is pinned to the latest content. `true` by
+    /// default and after sending; scrolling up with PgUp leaves follow mode, and
+    /// paging back to the bottom re-enters it. When following, the renderer shows
+    /// the tail of the transcript regardless of `scroll`.
+    pub follow: bool,
 }
 
 impl RunView {
@@ -242,6 +249,7 @@ impl RunView {
             transcript: Vec::new(),
             transcript_selected: 0,
             scroll: 0,
+            follow: true,
         }
     }
 }
@@ -449,6 +457,13 @@ pub struct AppState {
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
+    /// The maximum transcript scroll offset (rows below the top that still fill
+    /// the viewport), cached by the renderer each frame. The renderer knows the
+    /// wrapped height and viewport; the reducer reads this cache so PgUp can leave
+    /// follow mode at the true bottom and PgDn can re-enter it. A one-frame-stale
+    /// layout metric — never domain state — which is why it is a [`Cell`] the
+    /// draw-only renderer may update through a shared reference.
+    pub transcript_max_scroll: Cell<u16>,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -493,6 +508,7 @@ impl AppState {
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
+            transcript_max_scroll: Cell::new(0),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
