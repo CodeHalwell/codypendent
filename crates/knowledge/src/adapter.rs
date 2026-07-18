@@ -170,7 +170,11 @@ fn collect_sources(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
         entries.sort_by_key(std::fs::DirEntry::path);
         for entry in entries {
             let path = entry.path();
-            if path.is_dir() {
+            // Use the entry's own file type, which does NOT follow the final
+            // symlink — a circular directory symlink would otherwise recurse
+            // forever and overflow the stack when scanning an untrusted workspace.
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if is_dir {
                 // Skip the usual noise directories.
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if matches!(

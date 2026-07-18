@@ -92,6 +92,7 @@ pub async fn resolve_links(
             .find(|n| n.key.qualified_name == reference.qualified_name);
         let resolved = node.map(|n| ResolvedSymbol {
             symbol_key: n.key.stable_key(),
+            source_path: n.key.source_path.clone(),
             signature_hash: n.key.signature_hash.clone().map(|h| h.0),
             revision: revision.0.clone(),
         });
@@ -144,12 +145,23 @@ pub fn detect_staleness(
     current: &[SymbolSnapshot],
     after_revision: &GitRevision,
 ) -> Vec<StalenessFinding> {
+    // Index the live snapshot once by (source_path, qualified_name) — the resolved
+    // symbol identity. This makes lookup O(1) instead of a linear scan per link,
+    // and keeps two same-named symbols in different files distinct so a link only
+    // flags on a change to the *exact* symbol it was resolved against.
+    let current_by_identity: std::collections::HashMap<(&str, &str), &SymbolSnapshot> = current
+        .iter()
+        .map(|s| ((s.source_path.as_str(), s.qualified_name.as_str()), s))
+        .collect();
+
     let mut findings = Vec::new();
     for link in links {
         let (LinkTarget::Symbol(name), Some(resolved)) = (&link.target, &link.resolved) else {
             continue;
         };
-        let live = current.iter().find(|s| &s.qualified_name == name);
+        let live = current_by_identity
+            .get(&(resolved.source_path.as_str(), name.as_str()))
+            .copied();
         match live {
             None => findings.push(StalenessFinding {
                 document_id,

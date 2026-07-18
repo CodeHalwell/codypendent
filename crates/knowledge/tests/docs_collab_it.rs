@@ -9,7 +9,7 @@ use codypendent_knowledge::docs::collab::{
 use codypendent_knowledge::docs::model::{
     BlockContent, DocumentAuthor, DocumentBlock, DocumentMetadata, MutationKind,
 };
-use codypendent_knowledge::docs::store::{DocumentStore, NewDocument};
+use codypendent_knowledge::docs::store::{DocStoreError, DocumentStore, NewDocument};
 use codypendent_knowledge::Scope;
 use codypendent_protocol::{ModelId, OrganizationId, RunId, UserId};
 
@@ -122,7 +122,7 @@ async fn accept_applies_exactly_the_annotated_range() {
 
     // A human accepts it — exactly the annotated range is applied.
     let rev = suggestions
-        .accept(&pool, &docs, &mut doc, &suggestion.id, &human)
+        .accept(&pool, &mut doc, &suggestion.id, &human)
         .await
         .unwrap();
     assert_eq!(rev, 2);
@@ -236,4 +236,79 @@ async fn pending_suggestions_are_scoped_to_their_document() {
 
     assert_eq!(suggestions.pending(&pool, a.id).await.unwrap().len(), 1);
     assert!(suggestions.pending(&pool, b.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_suggestion_cannot_be_accepted_twice() {
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+
+    let mut doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph {
+                        text: "hello world".into(),
+                    },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // Insert " x" at position 5 (an insertion, so a double-apply would duplicate).
+    let suggestion = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 5,
+                range_end: 5,
+                replacement: " x".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // First accept applies it once.
+    suggestions
+        .accept(&pool, &mut doc, &suggestion.id, &human)
+        .await
+        .unwrap();
+    assert_eq!(doc.blocks().unwrap()[0].content_text(), "hello x world");
+
+    // A retried accept is rejected — the range is NOT applied a second time.
+    let err = suggestions
+        .accept(&pool, &mut doc, &suggestion.id, &human)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DocStoreError::SuggestionNotPending(_)));
+
+    // Content and revision are unchanged by the rejected retry.
+    let reloaded = docs.load(&pool, doc.id).await.unwrap().unwrap();
+    assert_eq!(
+        reloaded.blocks().unwrap()[0].content_text(),
+        "hello x world"
+    );
+    assert_eq!(reloaded.revision, 2);
+
+    // A reject after an accept is likewise refused (already resolved).
+    let reject_err = suggestions
+        .reject(&pool, doc.id, &suggestion.id, &human)
+        .await
+        .unwrap_err();
+    assert!(matches!(reject_err, DocStoreError::SuggestionNotPending(_)));
 }

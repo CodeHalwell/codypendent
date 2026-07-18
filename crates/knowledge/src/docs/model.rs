@@ -259,6 +259,11 @@ pub enum LinkTarget {
 pub struct ResolvedSymbol {
     /// `SymbolKey::stable_key()` of the resolved node.
     pub symbol_key: String,
+    /// The repo-relative file the symbol was defined in at resolution time. Part
+    /// of the identity staleness matches on, so two symbols that share a
+    /// qualified name in different files are tracked independently (a change to
+    /// the *other* file's symbol never flags this link).
+    pub source_path: String,
     /// The signature hash at resolution time — a change flags staleness.
     pub signature_hash: Option<String>,
     /// The graph revision the link was resolved at.

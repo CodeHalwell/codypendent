@@ -38,6 +38,13 @@ pub enum DocCrdtError {
     /// A referenced block id was not present.
     #[error("no such block: {0}")]
     NoSuchBlock(String),
+    /// A text position/range fell outside the block's current text. Loro's text
+    /// operations panic on out-of-bounds indices, and concurrent edits can shift
+    /// or shorten a block between when a range is chosen and when it is applied
+    /// (e.g. accepting a stale suggestion), so callers get a recoverable error
+    /// instead of a daemon-crashing panic.
+    #[error("text position {pos} out of bounds (block length {length})")]
+    OutOfBounds { pos: usize, length: usize },
 }
 
 impl From<loro::LoroError> for DocCrdtError {
@@ -162,6 +169,10 @@ impl DocumentCrdt {
     pub fn insert_text(&self, block_id: &str, pos: usize, text: &str) -> Result<(), DocCrdtError> {
         let map = self.block_map_by_id(block_id)?;
         let container = text_container(&map)?;
+        let length = container.len_unicode();
+        if pos > length {
+            return Err(DocCrdtError::OutOfBounds { pos, length });
+        }
         container.insert(pos, text)?;
         self.doc.commit();
         Ok(())
@@ -171,6 +182,12 @@ impl DocumentCrdt {
     pub fn delete_text(&self, block_id: &str, pos: usize, len: usize) -> Result<(), DocCrdtError> {
         let map = self.block_map_by_id(block_id)?;
         let container = text_container(&map)?;
+        let length = container.len_unicode();
+        // `pos + len` cannot overflow into bounds: check the endpoint against the
+        // length without adding (which could wrap).
+        if pos > length || len > length - pos {
+            return Err(DocCrdtError::OutOfBounds { pos, length });
+        }
         container.delete(pos, len)?;
         self.doc.commit();
         Ok(())

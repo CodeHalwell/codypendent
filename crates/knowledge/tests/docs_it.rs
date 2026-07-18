@@ -3,11 +3,11 @@
 //! export→import→export is byte-identical, and every mutation is attributed.
 
 use codypendent_knowledge::db;
-use codypendent_knowledge::docs::crdt::DocumentCrdt;
+use codypendent_knowledge::docs::crdt::{DocCrdtError, DocumentCrdt};
 use codypendent_knowledge::docs::model::{
     BlockContent, ChecklistItem, DocumentAuthor, DocumentBlock, DocumentMetadata, MutationKind,
 };
-use codypendent_knowledge::docs::store::{DocumentStore, NewDocument};
+use codypendent_knowledge::docs::store::{DocStoreError, DocumentStore, NewDocument};
 use codypendent_knowledge::Scope;
 use codypendent_protocol::{ModelId, RepositoryId, RunId, UserId};
 
@@ -393,4 +393,92 @@ async fn writes_enqueue_document_changed_outbox_rows() {
         .filter(|r| r.event_kind == "document_changed" && r.entity_id == doc.id.to_string())
         .collect();
     assert_eq!(doc_events.len(), 2, "one on create, one on save");
+}
+
+#[test]
+fn text_ops_out_of_bounds_error_instead_of_panicking() {
+    // Loro's text ops panic on out-of-bounds indices; a stale concurrent range
+    // must surface a recoverable error, never crash the daemon.
+    let crdt = DocumentCrdt::from_blocks(&[DocumentBlock::with_id(
+        "p",
+        BlockContent::Paragraph { text: "hi".into() },
+    )])
+    .unwrap();
+
+    // "hi" has length 2; inserting past the end or deleting past the end errors.
+    assert!(matches!(
+        crdt.insert_text("p", 5, "x"),
+        Err(DocCrdtError::OutOfBounds { pos: 5, length: 2 })
+    ));
+    assert!(matches!(
+        crdt.delete_text("p", 0, 5),
+        Err(DocCrdtError::OutOfBounds { length: 2, .. })
+    ));
+    // In-bounds ops still work and the block is intact.
+    crdt.insert_text("p", 2, "!").unwrap();
+    assert_eq!(crdt.to_blocks().unwrap()[0].content_text(), "hi!");
+}
+
+#[tokio::test]
+async fn save_guards_against_a_stale_revision() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = DocumentStore::new();
+    let author = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let created = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph { text: "hi".into() },
+                )],
+            },
+            &author,
+        )
+        .await
+        .unwrap();
+
+    // Two replicas load the same revision-1 document.
+    let mut first = store.load(&pool, created.id).await.unwrap().unwrap();
+    let mut second = store.load(&pool, created.id).await.unwrap().unwrap();
+
+    // The first editor saves, advancing the document to revision 2.
+    first.crdt.insert_text("p", 2, " there").unwrap();
+    store
+        .save(
+            &pool,
+            &mut first,
+            &author,
+            MutationKind::EditText,
+            Some("p"),
+        )
+        .await
+        .unwrap();
+
+    // The second, still at revision 1, is rejected instead of clobbering.
+    second.crdt.insert_text("p", 0, "oops ").unwrap();
+    let err = store
+        .save(
+            &pool,
+            &mut second,
+            &author,
+            MutationKind::EditText,
+            Some("p"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocStoreError::StaleRevision { expected: 1, .. }
+    ));
+
+    // The first editor's content survived; the stale write was not applied.
+    let reloaded = store.load(&pool, created.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.revision, 2);
+    assert_eq!(reloaded.blocks().unwrap()[0].content_text(), "hi there");
 }

@@ -69,9 +69,11 @@ pub struct DocumentSync {
     pub document_id: DocumentId,
     /// The document revision this update advances to (for ordering/UX).
     pub revision: u64,
-    /// Opaque CRDT bytes (base64 is applied by the envelope's JSON encoder via
-    /// `serde_bytes`-style handling at the framing layer; here it is a raw byte
-    /// vector).
+    /// Opaque CRDT bytes. Serialized on the wire as a JSON array of byte values
+    /// (see the [`byte_vec`] module) — the framing layer emits plain
+    /// `serde_json`, so there is no base64 step; a client sends the raw bytes and
+    /// they round-trip as numbers. Large documents are exchanged as incremental
+    /// updates rather than full snapshots to stay under the frame-size bound.
     #[serde(with = "byte_vec")]
     pub update: Vec<u8>,
 }

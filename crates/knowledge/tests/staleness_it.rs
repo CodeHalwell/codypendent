@@ -234,3 +234,78 @@ async fn maintenance_drafts_a_suggestion_citing_the_commit() {
     let reloaded = store.load(&pool, doc.id).await.unwrap().unwrap();
     assert_eq!(reloaded.revision, 1);
 }
+
+#[tokio::test]
+async fn staleness_matches_the_resolved_file_not_a_same_named_symbol() {
+    // Two files define a symbol with the same qualified name. A link resolves to
+    // exactly one of them; a change to the OTHER must not flag the document.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev1,
+        "src/a.rs",
+        "pub fn charge() -> bool { true }",
+    )
+    .await
+    .unwrap();
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev1,
+        "src/b.rs",
+        "pub fn charge() -> bool { true }",
+    )
+    .await
+    .unwrap();
+
+    let blocks = vec![DocumentBlock::with_id(
+        "e",
+        BlockContent::EmbeddedSymbol {
+            symbol: "charge".into(),
+        },
+    )];
+    let links = resolve_links(&pool, repo, &blocks, &rev1).await.unwrap();
+    assert_eq!(links.len(), 1);
+    let resolved_path = links[0].resolved.as_ref().unwrap().source_path.clone();
+    let other_path = if resolved_path == "src/a.rs" {
+        "src/b.rs"
+    } else {
+        "src/a.rs"
+    };
+
+    // Change the OTHER same-named symbol; the resolved one is untouched.
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev2,
+        other_path,
+        "pub fn charge(x: u32) -> bool { true }",
+    )
+    .await
+    .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+    let doc_id = codypendent_protocol::DocumentId::new();
+    assert!(
+        detect_staleness(doc_id, &links, &current, &rev2).is_empty(),
+        "a change to a same-named symbol in another file must not flag the doc"
+    );
+
+    // Now change the RESOLVED file's symbol — that DOES flag it.
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev2,
+        &resolved_path,
+        "pub fn charge(y: u64) -> bool { true }",
+    )
+    .await
+    .unwrap();
+    let current = codegraph::symbol_snapshot(&pool, repo).await.unwrap();
+    let findings = detect_staleness(doc_id, &links, &current, &rev2);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].reason, StalenessReason::SignatureChanged);
+}

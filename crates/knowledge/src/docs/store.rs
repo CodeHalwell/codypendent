@@ -37,6 +37,15 @@ pub enum DocStoreError {
     Corrupt(String),
     #[error("no such document: {0}")]
     NoSuchDocument(DocumentId),
+    /// The document was modified since this replica loaded it — an optimistic
+    /// concurrency conflict. The caller should reload (merging the CRDT
+    /// snapshots) and retry rather than silently clobber the other writer.
+    #[error("stale document revision for {id}: expected {expected}")]
+    StaleRevision { id: DocumentId, expected: u64 },
+    /// A suggestion is no longer pending (already accepted/rejected) — guards
+    /// against a retried or concurrent accept re-applying its range.
+    #[error("suggestion {0} is not pending")]
+    SuggestionNotPending(String),
 }
 
 /// A new document to create.
@@ -195,6 +204,11 @@ impl DocumentStore {
     /// one authorship entry for `(mutation, block_id)` attributed to `author`.
     /// Snapshot write, authorship, and the `DocumentChanged` outbox row land in
     /// one transaction. Returns and updates the new revision on `doc`.
+    ///
+    /// **Optimistic concurrency:** the write is guarded on `doc.revision`, so if
+    /// another replica advanced the document since this one loaded it, the save
+    /// fails with [`DocStoreError::StaleRevision`] instead of silently
+    /// overwriting the other writer's content (the lost-update anomaly).
     pub async fn save(
         &self,
         pool: &SqlitePool,
@@ -203,41 +217,10 @@ impl DocumentStore {
         mutation: MutationKind,
         block_id: Option<&str>,
     ) -> Result<u64, DocStoreError> {
-        let snapshot = doc.crdt.snapshot()?;
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-        let revision = doc.revision + 1;
-        let links_json = serde_json::to_string(&doc.links)?;
-        let citations_json = serde_json::to_string(&doc.citations)?;
-        let metadata_json = serde_json::to_string(&doc.metadata)?;
-
         let mut tx = pool.begin().await?;
-        let affected = sqlx::query(
-            "UPDATE documents SET crdt_snapshot = ?, status = ?, metadata_json = ?, \
-             links_json = ?, citations_json = ?, revision = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&snapshot)
-        .bind(doc.status.as_str())
-        .bind(&metadata_json)
-        .bind(&links_json)
-        .bind(&citations_json)
-        .bind(revision as i64)
-        .bind(&now_str)
-        .bind(doc.id.to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if affected == 0 {
-            return Err(DocStoreError::NoSuchDocument(doc.id));
-        }
-
-        insert_authorship(
-            &mut tx, doc.id, block_id, author, mutation, revision, &now_str,
-        )
-        .await?;
-        outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::DocumentChanged(doc.id), now).await?;
+        let revision =
+            write_document_tx(&mut tx, doc, author, mutation, block_id, Utc::now()).await?;
         tx.commit().await?;
-
         doc.revision = revision;
         Ok(revision)
     }
@@ -376,6 +359,73 @@ pub struct DocumentSummary {
     pub title: String,
     pub status: DocumentStatus,
     pub revision: u64,
+}
+
+/// Write `doc`'s current CRDT snapshot inside the caller's transaction, guarded
+/// on the document's loaded revision (optimistic concurrency), and record the
+/// authorship + `DocumentChanged` outbox row. Returns the new revision.
+///
+/// Shared by [`DocumentStore::save`] and the suggestion-accept flow so the
+/// document write and a suggestion's resolution can commit atomically in one
+/// transaction. Does **not** mutate `doc.revision` — the caller does that only
+/// after the transaction commits.
+pub(crate) async fn write_document_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    doc: &Document,
+    author: &DocumentAuthor,
+    mutation: MutationKind,
+    block_id: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Result<u64, DocStoreError> {
+    let snapshot = doc.crdt.snapshot()?;
+    let now_str = now.to_rfc3339();
+    let revision = doc.revision + 1;
+    let links_json = serde_json::to_string(&doc.links)?;
+    let citations_json = serde_json::to_string(&doc.citations)?;
+    let metadata_json = serde_json::to_string(&doc.metadata)?;
+
+    let affected = sqlx::query(
+        "UPDATE documents SET crdt_snapshot = ?, status = ?, metadata_json = ?, \
+         links_json = ?, citations_json = ?, revision = ?, updated_at = ? \
+         WHERE id = ? AND revision = ?",
+    )
+    .bind(&snapshot)
+    .bind(doc.status.as_str())
+    .bind(&metadata_json)
+    .bind(&links_json)
+    .bind(&citations_json)
+    .bind(revision as i64)
+    .bind(&now_str)
+    .bind(doc.id.to_string())
+    .bind(doc.revision as i64)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if affected == 0 {
+        // Nothing matched (id, revision): either the row is gone or another
+        // writer advanced the revision. Distinguish the two.
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM documents WHERE id = ?")
+            .bind(doc.id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?;
+        return Err(if exists.is_some() {
+            DocStoreError::StaleRevision {
+                id: doc.id,
+                expected: doc.revision,
+            }
+        } else {
+            DocStoreError::NoSuchDocument(doc.id)
+        });
+    }
+
+    insert_authorship(tx, doc.id, block_id, author, mutation, revision, &now_str).await?;
+    outbox::enqueue(
+        &mut **tx,
+        &KnowledgeIndexEvent::DocumentChanged(doc.id),
+        now,
+    )
+    .await?;
+    Ok(revision)
 }
 
 /// Insert one authorship row inside the caller's transaction.
