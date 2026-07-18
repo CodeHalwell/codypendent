@@ -9,11 +9,23 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+# Durable workflow runs / node records / checkpoints (STEP 5.2). SQLite via the
+# shared migrations, mirroring the knowledge crate's own `db` helper so this crate
+# never has to depend on the daemon.
+sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+# Stable graph signature for the resume guard (STEP 5.2).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

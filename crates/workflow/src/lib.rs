@@ -12,15 +12,19 @@
 //! `orchestration_reason` rule) and lowers it into a [`CompiledWorkflow`] — a
 //! topologically ordered node graph the executor drives.
 //!
-//! This crate is intentionally small and dependency-light (serde + a YAML parser
-//! only): it holds **no** daemon, database, or agent-framework code, so the
-//! definition format and its validation can be exercised on their own. Lowering
-//! the compiled graph onto framework orchestration builders, and cross-checking
-//! tool/skill/agent references against the live registry, are wiring steps that
-//! belong to the runtime and are tracked separately in the roadmap.
+//! The definition + compiler layer holds **no** daemon or agent-framework code,
+//! so the format and its validation can be exercised on their own. Durable
+//! execution storage (STEP 5.2) — workflow runs, node records, and checkpoints —
+//! lives in [`store`] over a SQLite pool ([`db`]), still daemon-free so recovery
+//! and idempotency are testable in isolation. Lowering the compiled graph onto
+//! framework orchestration builders, cross-checking tool/skill/agent references
+//! against the live registry, and wiring recovery into the daemon are the
+//! remaining steps, tracked in the roadmap.
 
 pub mod compile;
+pub mod db;
 pub mod model;
+pub mod store;
 
 pub use compile::{
     compile, compile_yaml, CompileError, CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
@@ -28,4 +32,8 @@ pub use compile::{
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,
+};
+pub use store::{
+    Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord, WorkflowRunRecord, WorkflowRunSnapshot,
+    WorkflowRunState, WorkflowStore, WorkflowStoreError,
 };

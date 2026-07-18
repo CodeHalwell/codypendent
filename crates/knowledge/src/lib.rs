@@ -76,6 +76,7 @@ pub use docs::collab::{
     SuggestionStore,
 };
 pub use docs::crdt::{DocCrdtError, DocumentCrdt};
+pub use docs::leases::{DocumentLease, DocumentLeaseStore, LeaseError};
 pub use docs::model::{
     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
     DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,

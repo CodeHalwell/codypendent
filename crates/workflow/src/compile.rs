@@ -119,6 +119,37 @@ impl CompiledWorkflow {
             .filter(|node| matches!(node.action, NodeAction::Agent { .. }))
             .count()
     }
+
+    /// A stable hash of the graph's *shape*: the workflow id + version, then each
+    /// node's id, action kind, and sorted dependencies, in topological order. Two
+    /// definitions with the same shape produce the same signature regardless of
+    /// incidental field ordering; any structural change (a node, an edge, an
+    /// action-kind flip) changes it. A durable run stores this so resume can
+    /// refuse a graph that has changed under it (STEP 5.2).
+    #[must_use]
+    pub fn signature(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(self.version.to_le_bytes());
+        for node in &self.nodes {
+            hasher.update(b"\xff");
+            hasher.update(node.id.as_bytes());
+            let kind: &[u8] = match &node.action {
+                NodeAction::Agent { .. } => b"agent",
+                NodeAction::Tool { .. } => b"tool",
+            };
+            hasher.update(kind);
+            let mut deps = node.depends_on.clone();
+            deps.sort();
+            for dep in deps {
+                hasher.update(b"\x01");
+                hasher.update(dep.as_bytes());
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
 }
 
 /// A validated workflow node.

@@ -163,7 +163,7 @@ client-surface wiring is the remaining slice.
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
 - [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
-- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engine landed:* `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` to broadcast, and `Payload::DocumentSync` now carries it on the wire. *Remaining:* routing `MutateDocument` through the `codypendentd` seam, a per-document subscription/broadcast channel, and block-range edit-lease enforcement
+- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines landed:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the daemon's pre-mutation guard. *Remaining:* routing `MutateDocument` through the `codypendentd` seam, a per-document subscription/broadcast channel, and calling `acquire`/`require` from that path
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
@@ -185,6 +185,14 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         5.1:* agent-profile (`agent.toml`) loading, registry cross-checks
         (unknown tool/skill/agent = error), lowering onto framework graphs, and
         replacing the hard-coded `/fix-ci` flow with this definition.
+  - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
+        durable workflow runs, a per-node record (state / attempt / cost /
+        start+end times — the node-level provenance the graph view needs), and
+        checkpoints. `resume` reports the first incomplete node and **refuses a
+        changed graph signature** (`CompiledWorkflow::signature()` hashes the
+        graph shape). *Remaining for 5.2:* daemon startup recovery wiring,
+        node-lifecycle ledger events, pause/resume/retry-from-node commands, and
+        the TUI workflow-graph view.
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
