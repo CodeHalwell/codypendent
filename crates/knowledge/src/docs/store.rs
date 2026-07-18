@@ -468,7 +468,7 @@ pub(crate) async fn write_document_tx(
 }
 
 /// Insert one authorship row inside the caller's transaction.
-async fn insert_authorship(
+pub(crate) async fn insert_authorship(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     document_id: DocumentId,
     block_id: Option<&str>,

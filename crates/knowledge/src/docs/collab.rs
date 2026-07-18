@@ -15,7 +15,7 @@ use crate::outbox::{self, KnowledgeIndexEvent};
 use crate::types::Scope;
 
 use super::model::{DocumentAuthor, MutationKind};
-use super::store::{write_document_tx, DocStoreError, Document};
+use super::store::{insert_authorship, write_document_tx, DocStoreError, Document};
 
 /// How an agent may collaborate on a document (Chapter 08 table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -208,6 +208,19 @@ impl SuggestionStore {
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await?;
+        // Record the proposal in the authorship log (same transaction) so
+        // `authorship()` can audit who proposed generated text — the content is
+        // unchanged, so this stamps the current revision, not a new one.
+        insert_authorship(
+            &mut tx,
+            document_id,
+            Some(&new.block_id),
+            &new.author,
+            MutationKind::Suggest,
+            new.source_revision,
+            &now.to_rfc3339(),
+        )
+        .await?;
         outbox::enqueue(
             &mut *tx,
             &KnowledgeIndexEvent::DocumentChanged(document_id),
@@ -361,8 +374,9 @@ impl SuggestionStore {
         suggestion_id: &str,
         resolver: &DocumentAuthor,
     ) -> Result<(), DocStoreError> {
-        // Ensure it exists and belongs to the document.
-        let _ = self.get(pool, document_id, suggestion_id).await?;
+        // Ensure it exists and belongs to the document; keep it for the block the
+        // rejection is attributed against in the authorship log.
+        let suggestion = self.get(pool, document_id, suggestion_id).await?;
         let now = Utc::now();
         let mut tx = pool.begin().await?;
         let claimed = resolve_pending(
@@ -377,6 +391,26 @@ impl SuggestionStore {
                 suggestion_id.to_string(),
             ));
         }
+        // Record the rejection in the authorship log (same transaction) so
+        // `authorship()` can audit who rejected the suggestion, mirroring how
+        // accept records `AcceptSuggestion`. No content changed, so this stamps the
+        // document's current revision rather than a new one.
+        let current_revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM documents WHERE id = ?")
+                .bind(document_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DocStoreError::NoSuchDocument(document_id))?;
+        insert_authorship(
+            &mut tx,
+            document_id,
+            Some(&suggestion.block_id),
+            resolver,
+            MutationKind::RejectSuggestion,
+            current_revision as u64,
+            &now.to_rfc3339(),
+        )
+        .await?;
         outbox::enqueue(
             &mut *tx,
             &KnowledgeIndexEvent::DocumentChanged(document_id),

@@ -525,3 +525,70 @@ async fn resolve_prefers_a_real_definition_over_an_external_ref() {
         "the real function carries a signature"
     );
 }
+
+#[test]
+fn detect_staleness_flags_a_symbol_kind_change() {
+    use codypendent_knowledge::{
+        CodeNodeKind, DocumentLink, DocumentRelation, LinkTarget, ResolvedSymbol, SymbolSnapshot,
+    };
+    use codypendent_protocol::DocumentId;
+
+    // A doc resolved `Foo` as a struct (`Type`) carrying no signature hash. The
+    // graph later redefines `Foo` as a trait in the same file — same name, same
+    // (empty) signature, different kind. A hash-only comparison (`None == None`)
+    // would treat the link as fresh; the kind check must flag it stale.
+    let doc_id = DocumentId::new();
+    let link = DocumentLink {
+        relation: DocumentRelation::References,
+        target: LinkTarget::Symbol("Foo".into()),
+        block_id: Some("intro".into()),
+        resolved: Some(ResolvedSymbol {
+            symbol_key: "src/lib.rs|::Foo#Type@".into(),
+            source_path: "src/lib.rs".into(),
+            kind: CodeNodeKind::Type,
+            signature_hash: None,
+            revision: "rev1".into(),
+        }),
+    };
+    let current = vec![SymbolSnapshot {
+        qualified_name: "Foo".into(),
+        kind: CodeNodeKind::TraitOrInterface,
+        source_path: "src/lib.rs".into(),
+        signature_hash: None,
+    }];
+
+    let rev2 = GitRevision("rev2".into());
+    let findings = detect_staleness(doc_id, &[link], &current, &rev2);
+    assert_eq!(findings.len(), 1, "the kind change must produce a finding");
+    assert_eq!(findings[0].qualified_name, "Foo");
+    assert_eq!(findings[0].reason, StalenessReason::SignatureChanged);
+    assert!(
+        findings[0].review_scope.contains("changed kind"),
+        "the scope should cite the kind transition, not a signature change: {}",
+        findings[0].review_scope
+    );
+
+    // Same kind + same signature is not stale — the kind check must not over-fire.
+    let unchanged = vec![SymbolSnapshot {
+        qualified_name: "Foo".into(),
+        kind: CodeNodeKind::Type,
+        source_path: "src/lib.rs".into(),
+        signature_hash: None,
+    }];
+    let link2 = DocumentLink {
+        relation: DocumentRelation::References,
+        target: LinkTarget::Symbol("Foo".into()),
+        block_id: Some("intro".into()),
+        resolved: Some(ResolvedSymbol {
+            symbol_key: "src/lib.rs|::Foo#Type@".into(),
+            source_path: "src/lib.rs".into(),
+            kind: CodeNodeKind::Type,
+            signature_hash: None,
+            revision: "rev1".into(),
+        }),
+    };
+    assert!(
+        detect_staleness(doc_id, &[link2], &unchanged, &rev2).is_empty(),
+        "an unchanged kind and signature is not stale"
+    );
+}

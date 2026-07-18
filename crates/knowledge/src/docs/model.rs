@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use codypendent_protocol::{DocumentId, ModelId, RunId, UserId};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{EvidenceRef, Scope};
+use crate::types::{CodeNodeKind, EvidenceRef, Scope};
 
 /// The lifecycle status of a document. Stored scalar in `documents.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +264,11 @@ pub struct ResolvedSymbol {
     /// qualified name in different files are tracked independently (a change to
     /// the *other* file's symbol never flags this link).
     pub source_path: String,
+    /// The node kind at resolution time (e.g. `Type` vs `TraitOrInterface`). Part
+    /// of symbol identity: a `struct Foo` becoming a `trait Foo` is a stale-making
+    /// change even when neither carries a signature hash (so the hash comparison
+    /// alone — `None == None` — would miss it).
+    pub kind: CodeNodeKind,
     /// The signature hash at resolution time — a change flags staleness.
     pub signature_hash: Option<String>,
     /// The graph revision the link was resolved at.

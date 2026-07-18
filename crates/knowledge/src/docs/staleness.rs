@@ -98,6 +98,7 @@ pub async fn resolve_links(
         let resolved = node.map(|n| ResolvedSymbol {
             symbol_key: n.key.stable_key(),
             source_path: n.key.source_path.clone(),
+            kind: n.key.kind,
             signature_hash: n.key.signature_hash.clone().map(|h| h.0),
             revision: revision.0.clone(),
         });
@@ -178,22 +179,38 @@ pub fn detect_staleness(
                 revision: after_revision.0.clone(),
                 review_scope: format!("{name} was removed — review the referencing section"),
             }),
-            Some(sym) if sym.signature_hash != resolved.signature_hash => {
-                findings.push(StalenessFinding {
-                    document_id,
-                    block_id: link.block_id.clone(),
-                    qualified_name: name.clone(),
-                    reason: StalenessReason::SignatureChanged,
-                    before_signature: resolved.signature_hash.clone(),
-                    after_signature: sym.signature_hash.clone(),
-                    revision: after_revision.0.clone(),
-                    review_scope: format!(
-                        "{name} signature changed ({}) — review the referencing section",
-                        sym.source_path
-                    ),
-                });
+            Some(sym) => {
+                // A link is stale if the resolved symbol's *identity* moved: its
+                // signature changed, or its kind did (e.g. `struct Foo` → `trait
+                // Foo`). The kind check catches identity drift that a hash-only
+                // comparison misses when neither definition carries a signature
+                // (`None == None`).
+                let signature_changed = sym.signature_hash != resolved.signature_hash;
+                let kind_changed = sym.kind != resolved.kind;
+                if signature_changed || kind_changed {
+                    let review_scope = if kind_changed {
+                        format!(
+                            "{name} changed kind ({:?} → {:?}) in {} — review the referencing section",
+                            resolved.kind, sym.kind, sym.source_path
+                        )
+                    } else {
+                        format!(
+                            "{name} signature changed ({}) — review the referencing section",
+                            sym.source_path
+                        )
+                    };
+                    findings.push(StalenessFinding {
+                        document_id,
+                        block_id: link.block_id.clone(),
+                        qualified_name: name.clone(),
+                        reason: StalenessReason::SignatureChanged,
+                        before_signature: resolved.signature_hash.clone(),
+                        after_signature: sym.signature_hash.clone(),
+                        revision: after_revision.0.clone(),
+                        review_scope,
+                    });
+                }
             }
-            Some(_) => {}
         }
     }
     findings

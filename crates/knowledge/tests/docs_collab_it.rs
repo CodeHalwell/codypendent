@@ -569,3 +569,82 @@ async fn propose_refuses_a_stale_source_revision() {
     // Nothing was recorded — no stale suggestion lingers on the review rail.
     assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn propose_and_reject_are_recorded_in_the_authorship_log() {
+    // Accepting a suggestion is already attributed in `document_authorship`;
+    // proposing and rejecting must be too, so the log can audit who proposed
+    // generated text and who rejected it — not just who accepted it.
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("reviewer".into()),
+    };
+    let agent = DocumentAuthor::Agent {
+        run_id: RunId::new(),
+        model: ModelId("claude-sonnet-5".into()),
+        policy_version: "v1".into(),
+    };
+
+    let doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::Organization(OrganizationId::new()),
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph {
+                        text: "hello world".into(),
+                    },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // The agent proposes; the human rejects.
+    let s = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 0,
+                range_end: 5,
+                source_revision: doc.revision,
+                original: "hello".into(),
+                replacement: "HELLO".into(),
+                author: agent.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+    suggestions
+        .reject(&pool, doc.id, &s.id, &human)
+        .await
+        .unwrap();
+
+    let log = docs.authorship(&pool, doc.id).await.unwrap();
+    // The proposal is attributed to the agent, on the targeted block, and the
+    // content revision was not bumped (a suggestion mutates nothing).
+    let suggest = log
+        .iter()
+        .find(|e| e.mutation == MutationKind::Suggest)
+        .expect("propose is recorded in the authorship log");
+    assert_eq!(suggest.author, agent);
+    assert_eq!(suggest.block_id.as_deref(), Some("p"));
+    assert_eq!(suggest.revision, 1);
+    // The rejection is attributed to the human who rejected it.
+    let reject = log
+        .iter()
+        .find(|e| e.mutation == MutationKind::RejectSuggestion)
+        .expect("reject is recorded in the authorship log");
+    assert_eq!(reject.author, human);
+    assert_eq!(reject.block_id.as_deref(), Some("p"));
+    assert_eq!(reject.revision, 1);
+}
