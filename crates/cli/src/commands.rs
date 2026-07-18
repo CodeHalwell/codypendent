@@ -217,7 +217,7 @@ pub async fn run_over_connection<W: Write>(
     repository: &str,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
 
     // CreateSession: the daemon's `CommandAccepted` *payload* is intentionally
@@ -274,8 +274,16 @@ pub async fn run_over_connection<W: Write>(
     if let Payload::CommandRejected(error) = &start_reply.payload {
         anyhow::bail!("StartRun rejected: {} ({})", error.message, error.code);
     }
+    // Bind to exactly the run OUR StartRun created (the daemon reports it on
+    // the accept). Falling back to first-observed `RunStarted` is only for an
+    // older daemon that doesn't send it — under which a concurrent client's
+    // run starting first could otherwise capture the exit code.
+    let created_run = match &start_reply.payload {
+        Payload::CommandAccepted { created_run, .. } => *created_run,
+        _ => None,
+    };
 
-    stream::stream_until_terminal(conn, out).await
+    stream::stream_until_terminal(conn, out, created_run).await
 }
 
 /// `codypendent attach <SESSION_ID> [--from-sequence N] --events jsonl`.
@@ -304,7 +312,7 @@ pub async fn attach_over_connection<W: Write>(
     from_sequence: Option<u64>,
     out: &mut W,
 ) -> anyhow::Result<()> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
 
     let attach_reply = conn

@@ -38,7 +38,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.ensure_run(run_id, String::new(), mode);
             }
         }
-        Action::Tick => state.tick = state.tick.wrapping_add(1),
+        Action::Tick => {
+            state.tick = state.tick.wrapping_add(1);
+            if let Some((_, expires)) = &state.notice {
+                if state.tick >= *expires {
+                    state.notice = None;
+                }
+            }
+        }
+        // ~5 seconds at the 5 fps tick.
+        Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
 
         Action::CyclePane => state.focus = state.focus.next(),
         Action::FocusPane(pane) => state.focus = pane,
@@ -115,7 +124,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 None => state.selected_run_mut(),
             };
             if let Some(run) = target {
-                run.transcript.push(TranscriptEntry::Note { text });
+                AppState::push_entry(run, TranscriptEntry::Note { text });
             }
         }
         EventBody::SessionClosed => state.session_closed = true,
@@ -144,8 +153,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             action,
         } => {
             if let Some(run) = state.run_mut(run_id) {
-                run.transcript
-                    .push(TranscriptEntry::Tool(Box::new(ToolCard {
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Tool(Box::new(ToolCard {
                         tool: String::new(),
                         status: ToolStatus::Proposed,
                         action: Some(action),
@@ -154,7 +164,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         artifact: None,
                         approval_id: Some(approval_id),
                         expanded: false,
-                    })));
+                    })),
+                );
             }
             // Backfill the run link onto a matching pending approval.
             if let Some(pending) = state
@@ -229,11 +240,14 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             artifact,
         } => {
             if let Some(run) = state.run_mut(run_id) {
-                run.transcript.push(TranscriptEntry::Patch(PatchSummary {
-                    changeset_id,
-                    artifact,
-                    expanded: false,
-                }));
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Patch(PatchSummary {
+                        changeset_id,
+                        artifact,
+                        expanded: false,
+                    }),
+                );
             }
         }
         EventBody::ApprovalRequested {
@@ -290,11 +304,14 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     BudgetDimension::Cost => run.cost_minor = Some(used),
                     _ => {}
                 }
-                run.transcript.push(TranscriptEntry::Budget {
-                    dimension,
-                    used,
-                    limit,
-                });
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Budget {
+                        dimension,
+                        used,
+                        limit,
+                    },
+                );
             }
         }
         EventBody::RunCompleted {
@@ -304,22 +321,58 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         } => {
             if let Some(run) = state.run_mut(run_id) {
                 run.state = terminal_state(&disposition);
-                run.transcript.push(TranscriptEntry::Completed {
-                    disposition: disposition.clone(),
-                });
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Completed {
+                        disposition: disposition.clone(),
+                    },
+                );
                 run.disposition = Some(disposition);
             }
+        }
+
+        // Presence: another client joined or left this session (STEP 3.7). A
+        // transient status notice, not a transcript entry — presence is
+        // ambient, and the flagship handoff demo must not read as
+        // "unsupported event".
+        EventBody::ClientPresenceChanged {
+            client_id,
+            role,
+            present,
+        } => {
+            let id = client_id.to_string();
+            let short = id.get(..8).unwrap_or(&id);
+            let verb = if present { "joined" } else { "left" };
+            state.notice = Some((
+                format!("client {short} {verb} ({})", role_label(role)),
+                state.tick + 25,
+            ));
         }
 
         // `Unknown` and any future event type this build predates render a
         // placeholder and keep going (protocol RULE 1).
         _ => {
             if let Some(run) = state.selected_run_mut() {
-                run.transcript.push(TranscriptEntry::Unsupported {
-                    label: "unsupported event".to_owned(),
-                });
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Unsupported {
+                        label: "unsupported event".to_owned(),
+                    },
+                );
             }
         }
+    }
+}
+
+/// A short human label for a client role (presence notices).
+fn role_label(role: codypendent_protocol::ClientRole) -> &'static str {
+    use codypendent_protocol::ClientRole;
+    match role {
+        ClientRole::Observer => "observer",
+        ClientRole::Contributor => "contributor",
+        ClientRole::Controller => "controller",
+        ClientRole::Approver => "approver",
+        _ => "unknown role",
     }
 }
 
@@ -382,7 +435,7 @@ fn nav(state: &mut AppState, delta: i32) {
             let idx = state.selected_run;
             if let Some(run) = state.runs.get_mut(idx) {
                 step(&mut run.transcript_selected, run.transcript.len(), delta);
-                run.scroll = run.transcript_selected as u16;
+                run.scroll = run.transcript_selected.min(usize::from(u16::MAX)) as u16;
             }
         }
     }

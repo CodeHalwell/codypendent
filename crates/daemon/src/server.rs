@@ -458,6 +458,12 @@ async fn handle_request(
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 daemon_instance: state.instance.instance_id,
                 heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+                // Issue the token the verify path above consumes: the client
+                // stores it opaquely and presents it on its next ClientHello,
+                // resuming this identity across a client-process restart.
+                resume_token: Some(codypendent_protocol::ResumeToken(
+                    resume::mint_resume_token(&state.secret, client_id, 0),
+                )),
             };
             send(
                 writer,
@@ -541,6 +547,7 @@ async fn handle_request(
                             Payload::CommandAccepted {
                                 command_id: command.command_id,
                                 sequence: None,
+                                created_run: None,
                             },
                         ),
                         Err(error) => Envelope::reply_to(
@@ -631,6 +638,9 @@ async fn handle_request(
                                 Payload::CommandAccepted {
                                     command_id: outcome.command_id,
                                     sequence: outcome.last_sequence,
+                                    // Bind the issuing client to exactly the run
+                                    // its StartRun created (None otherwise).
+                                    created_run: outcome.created_run,
                                 },
                             );
                             // Surface the created session id so a fresh client
@@ -960,7 +970,6 @@ mod resume {
     }
 
     /// Mint a token binding `client_id` + `last_sequence`, valid for 24h.
-    #[allow(dead_code)] // Minting half of the pair: exercised by unit tests, issued to clients in later steps.
     pub(super) fn mint_resume_token(
         secret: &[u8],
         client_id: ClientId,

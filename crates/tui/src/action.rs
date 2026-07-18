@@ -31,6 +31,9 @@ pub enum Action {
     },
     /// A periodic timer tick (spinner animation, elapsed timers). No I/O.
     Tick,
+    /// A transient status-line notice from the harness (e.g. a rejected
+    /// command's code + message). Cleared automatically a few seconds later.
+    Notice(String),
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).

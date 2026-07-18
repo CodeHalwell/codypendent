@@ -80,17 +80,29 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
 
     commands::ensure_daemon(paths).await?;
     let mut conn = Connection::connect(&paths.socket_path).await?;
-    conn.handshake("codypendent-tui", env!("CARGO_PKG_VERSION"))
+    let mut store = SessionStore::load(paths);
+    let resume = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    let hello = conn
+        .handshake("codypendent-tui", env!("CARGO_PKG_VERSION"), resume)
         .await?;
+    // Store the daemon-issued token so the NEXT launch resumes this client
+    // identity (best-effort; an absent token just means a fresh identity).
+    if let Some(token) = hello.resume_token {
+        store.resume_token = Some(token.0);
+        store.save(paths);
+    }
 
     let (session_id, workspace_id, catchup) =
-        resolve_or_create_session(&mut conn, paths, &repo).await?;
+        resolve_or_create_session(&mut conn, &mut store, paths, &repo).await?;
 
     // Seed the state from catch-up, then from any live event that outraced the
     // attach reply and was buffered during setup — both before the loop reads a
     // single new frame, so no event is dropped or reordered.
     let mut state = AppState::new();
-    fold_catchup(&mut state, catchup);
+    let attach_watermark = fold_catchup(&mut state, catchup);
     let (read_half, write_half, pending, client_id) = conn.into_split();
     for envelope in pending {
         if let Payload::Event(event) = envelope.payload {
@@ -148,6 +160,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
         client_id,
         session_id,
         &repository,
+        attach_watermark,
     )
     .await;
 
@@ -176,15 +189,61 @@ async fn event_loop(
     client_id: ClientId,
     session_id: SessionId,
     repository: &str,
+    attach_watermark: u64,
 ) -> anyhow::Result<()> {
     guard
         .terminal_mut()
         .draw(|frame| render(frame, state, theme))?;
 
+    // The highest ledger sequence folded so far. Live fan-out is lossy for a
+    // slow client (the daemon skips `Lagged` spans), so a jump past
+    // `last_seen + 1` means events were dropped from the live view; a
+    // re-attach with `last_seen_sequence` replays exactly the gap. Also
+    // dedups: catch-up + live can overlap during that window.
+    let mut last_seen: u64 = attach_watermark;
+
     loop {
         let action = tokio::select! {
             signal = event_rx.recv() => match signal {
-                Some(ReaderSignal::Event(event)) => Action::DaemonEvent(event),
+                Some(ReaderSignal::Event(event)) => {
+                    if event.sequence != 0 && event.sequence <= last_seen {
+                        Action::NoOp // duplicate of something already folded
+                    } else {
+                        if last_seen != 0 && event.sequence > last_seen + 1 {
+                            // Gap: re-attach to replay the missed span. The
+                            // daemon replaces this connection's forwarder and
+                            // replies with a Catchup the reader forwards back.
+                            let attach = command_envelope(
+                                client_id,
+                                CommandBody::AttachSession {
+                                    session_id,
+                                    last_seen_sequence: Some(last_seen),
+                                    subscriptions: default_subscriptions(),
+                                    requested_role: ClientRole::Controller,
+                                },
+                            );
+                            let _ = out_tx.send(attach).await;
+                        }
+                        last_seen = last_seen.max(event.sequence);
+                        Action::DaemonEvent(event)
+                    }
+                }
+                Some(ReaderSignal::Rejected { code, message }) => {
+                    Action::Notice(format!("command rejected: {message} ({code})"))
+                }
+                Some(ReaderSignal::Catchup(catchup)) => {
+                    // Fold the gap replay; live events past it resume above.
+                    if let Catchup::Events { events, through, .. } = *catchup {
+                        for event in events {
+                            if event.sequence > last_seen {
+                                last_seen = last_seen.max(event.sequence);
+                                reduce(state, Action::DaemonEvent(Box::new(event)));
+                            }
+                        }
+                        last_seen = last_seen.max(through);
+                    }
+                    Action::NoOp
+                }
                 // The daemon closed the stream (shutdown / dropped client). The
                 // run is unaffected; we simply leave the TUI.
                 Some(ReaderSignal::Closed) | None => return Ok(()),
@@ -224,6 +283,12 @@ enum ReaderSignal {
     /// A live session event to fold into state (boxed: it is a large payload and
     /// every other message here is tiny).
     Event(Box<SessionEvent>),
+    /// The daemon rejected a command this TUI sent (code + message). Surfaced
+    /// as a transient status notice — silence here meant a rejected StartRun
+    /// showed the user nothing at all.
+    Rejected { code: String, message: String },
+    /// A catch-up reply (from the loop's own gap-triggered re-attach).
+    Catchup(Box<Catchup>),
     /// The daemon closed the connection.
     Closed,
 }
@@ -256,10 +321,30 @@ async fn read_loop(
                         break;
                     }
                 }
-                // Command replies (Accepted/Rejected), catch-up, and any other
-                // payload are not inputs to the reducer's live loop — the TUI's
-                // state is driven purely by durable events (the JSONL stream and
-                // the TUI observe the same events, Chapter 03). Drop them.
+                Payload::CommandRejected(error) => {
+                    if event_tx
+                        .send(ReaderSignal::Rejected {
+                            code: error.code,
+                            message: error.message,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::Catchup { catchup } => {
+                    if event_tx
+                        .send(ReaderSignal::Catchup(Box::new(catchup)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // Everything else (CommandAccepted, stray replies) is not an
+                // input to the reducer's live loop — the TUI's state is driven
+                // by durable events (Chapter 03). Drop it.
                 _ => {}
             },
             Ok(None) | Err(_) => {
@@ -354,16 +439,22 @@ fn command_envelope(client_id: ClientId, body: CommandBody) -> Envelope {
 /// too far behind — Chapter 03's cap) and a future `Unknown` variant carry no
 /// individual events, so the transcript simply begins from the next live event
 /// (Phase 1 keeps runs short enough that this is rare).
-fn fold_catchup(state: &mut AppState, catchup: Catchup) {
+fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
     match catchup {
-        Catchup::Events { events, .. } => {
+        Catchup::Events {
+            events, through, ..
+        } => {
             for event in events {
                 reduce(state, Action::DaemonEvent(Box::new(event)));
             }
+            through
         }
         // Too far behind for an event replay — fold the projection so a reopened
         // long-running session shows its title + active runs instead of blank.
-        Catchup::Snapshot { projection, .. } => {
+        Catchup::Snapshot {
+            through,
+            projection,
+        } => {
             reduce(
                 state,
                 Action::CatchupSnapshot {
@@ -372,8 +463,9 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) {
                     runs: projection.active_runs,
                 },
             );
+            through
         }
-        _ => {}
+        _ => 0,
     }
 }
 
@@ -383,10 +475,10 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) {
 /// continued" work: the mapping persists across launches.
 async fn resolve_or_create_session(
     conn: &mut Connection,
+    store: &mut SessionStore,
     paths: &RuntimePaths,
     repo: &Path,
 ) -> anyhow::Result<(SessionId, WorkspaceId, Catchup)> {
-    let mut store = SessionStore::load(paths);
     let key = repo.to_string_lossy().into_owned();
 
     // Try to resume the repo's remembered session.
@@ -408,7 +500,12 @@ async fn resolve_or_create_session(
         // rejected `session-not-found`; instead fall through and create a fresh
         // session, keeping the workspace. (issue #6 item 6)
         if let Payload::Catchup { catchup } = reply.payload {
-            if catchup_proves_session_exists(&catchup) {
+            // A CLOSED session resumes technically (through > 0) but the event
+            // loop exits the moment it folds `SessionClosed` — and with the
+            // store never overwritten, every later launch would re-open the
+            // closed session and instantly exit: a permanent lockout. Treat
+            // closed like missing and fall through to create a fresh session.
+            if catchup_proves_session_exists(&catchup) && !catchup_shows_closed(&catchup) {
                 return Ok((stored.session_id, stored.workspace_id, catchup));
             }
         }
@@ -469,6 +566,21 @@ async fn resolve_or_create_session(
 /// cannot distinguish "gone" from "empty"). An unrecognized future variant is
 /// accepted rather than needlessly discarding a resumable session — the concrete
 /// failure (issue #6 item 6) is specifically the provably-empty catch-up.
+/// Whether an attach-time [`Catchup`] shows the session is already CLOSED — a
+/// `SessionClosed` in the replayed events, or the snapshot's `closed` flag. A
+/// closed session must not be resumed from the store: the event loop exits the
+/// moment it folds the close, and the remembered mapping would re-open it on
+/// every later launch (a permanent lockout).
+fn catchup_shows_closed(catchup: &Catchup) -> bool {
+    match catchup {
+        Catchup::Events { events, .. } => events
+            .iter()
+            .any(|event| matches!(event.body, codypendent_protocol::EventBody::SessionClosed)),
+        Catchup::Snapshot { projection, .. } => projection.closed,
+        _ => false,
+    }
+}
+
 fn catchup_proves_session_exists(catchup: &Catchup) -> bool {
     match catchup {
         Catchup::Events { through, .. } | Catchup::Snapshot { through, .. } => *through > 0,
@@ -678,6 +790,10 @@ fn memory_class_label(class: MemoryClass) -> &'static str {
 struct SessionStore {
     /// Canonical repository path → the session last opened there.
     sessions: HashMap<String, StoredSession>,
+    /// The opaque daemon-issued resume token from the last handshake, presented
+    /// on the next launch so this client keeps one identity across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_token: Option<String>,
 }
 
 /// One remembered session: its id and the workspace it belongs to.

@@ -75,6 +75,7 @@ async fn mock_daemon(mut stream: UnixStream, session_id: SessionId, events: Vec<
         .expect("connection open");
     assert!(matches!(hello.payload, Payload::ClientHello(_)));
     let server_hello = ServerHello {
+        resume_token: None,
         selected_protocol: PROTOCOL_V1,
         daemon_version: "mock".to_string(),
         daemon_instance: DaemonInstanceId::new(),
@@ -101,6 +102,7 @@ async fn mock_daemon(mut stream: UnixStream, session_id: SessionId, events: Vec<
         Payload::CommandAccepted {
             command_id: command_id_of(&create),
             sequence: Some(1),
+            created_run: None,
         },
     );
     accepted.session_id = Some(session_id);
@@ -152,6 +154,7 @@ async fn mock_daemon(mut stream: UnixStream, session_id: SessionId, events: Vec<
             Payload::CommandAccepted {
                 command_id: command_id_of(&start),
                 sequence: Some(2),
+                created_run: None,
             },
         ),
     )
