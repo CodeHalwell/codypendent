@@ -42,8 +42,11 @@ pub fn resolve_source(
     in_agent_worktree: bool,
 ) -> SourceProvenance {
     if let Some(buffer) = dirty_buffers.iter().find(|buffer| buffer.path == path) {
+        // The IDE-supplied digest is untrusted text: normalize (trim + lowercase)
+        // before comparing so an editor that reports uppercase or padded hex does
+        // not make identical content read as a divergence.
         let diverges = match filesystem_digest {
-            Some(fs_digest) => buffer.sha256 != fs_digest,
+            Some(fs_digest) => !buffer.sha256.trim().eq_ignore_ascii_case(fs_digest.trim()),
             None => true,
         };
         if diverges {

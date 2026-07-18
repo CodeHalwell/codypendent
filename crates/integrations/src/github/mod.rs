@@ -85,6 +85,18 @@ pub enum GitHubError {
     /// A local I/O operation failed (e.g. spawning the `gh` CLI).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A path parameter (owner, repo, git ref) failed validation and was refused
+    /// before any request was built. Parameters are interpolated into the URL
+    /// path, where `..`/`?`/`#` in a hostile value would redirect the request to
+    /// a *different* api.github.com endpoint under the user's token.
+    #[error("invalid github {kind}: {value:?}")]
+    InvalidParameter {
+        /// Which parameter was rejected (`owner`, `repo`, `ref`).
+        kind: &'static str,
+        /// The offending value (never a secret).
+        value: String,
+    },
 }
 
 /// The typed GitHub surface the tool layer depends on. Reads and writes are

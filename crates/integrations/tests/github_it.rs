@@ -198,3 +198,51 @@ async fn http_error_maps() {
         other => panic!("expected GitHubError::Api {{ status: 404 }}, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn hostile_path_parameters_are_refused_before_any_request() {
+    // No mocks mounted: a request reaching the server would 404 into
+    // GitHubError::Api. The refusal must be InvalidParameter, proving the
+    // request was never built — a traversal ref like this would otherwise
+    // normalize into a DIFFERENT api.github.com endpoint under the user's token.
+    let server = MockServer::start().await;
+    let gh = client(&server);
+
+    let traversal = RepoId::new("o", "r");
+    let err = gh
+        .list_check_runs(&traversal, "x/../../../../repos/evil/evil/issues")
+        .await
+        .expect_err("a traversal ref must be refused");
+    assert!(matches!(
+        err,
+        GitHubError::InvalidParameter { kind: "ref", .. }
+    ));
+
+    let bad_owner = RepoId::new("o/../evil", "r");
+    let err = gh
+        .get_pull_request(&bad_owner, 1)
+        .await
+        .expect_err("a slash-bearing owner must be refused");
+    assert!(matches!(
+        err,
+        GitHubError::InvalidParameter { kind: "owner", .. }
+    ));
+
+    let query_ref = RepoId::new("o", "r");
+    let err = gh
+        .list_check_runs(&query_ref, "HEAD?per_page=1")
+        .await
+        .expect_err("a query-injecting ref must be refused");
+    assert!(matches!(
+        err,
+        GitHubError::InvalidParameter { kind: "ref", .. }
+    ));
+
+    // Ordinary parameters still pass validation (the call then 404s at the
+    // mockless server, proving the request WAS built and sent).
+    let err = gh
+        .list_check_runs(&query_ref, "feature/branch-1.2")
+        .await
+        .expect_err("no mock mounted");
+    assert!(matches!(err, GitHubError::Api { .. }));
+}

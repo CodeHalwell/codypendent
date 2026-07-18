@@ -78,6 +78,16 @@ impl WebhookIngestor {
         headers: &DeliveryHeaders,
         body: &[u8],
     ) -> Result<IngestOutcome, WebhookError> {
+        // 0. A delivery id is the dedup key: an empty one must never reach the
+        // store, where it would be recorded once and then mark every later
+        // id-less delivery a `Duplicate`. The HTTP listener also rejects this,
+        // but the invariant belongs to the reusable ingestor, not one transport.
+        if headers.delivery_id.is_empty() || headers.event_type.is_empty() {
+            return Err(WebhookError::Malformed(
+                "missing X-GitHub-Delivery / X-GitHub-Event".to_string(),
+            ));
+        }
+
         // 1. Verify the signature over the raw bytes, before any parsing.
         if let Some(secret) = &self.secret {
             let Some(signature) = &headers.signature else {
@@ -162,6 +172,39 @@ mod tests {
             .await
             .expect("ingest");
         assert_eq!(outcome, IngestOutcome::SignatureInvalid);
+    }
+
+    #[tokio::test]
+    async fn forged_signature_on_unparseable_body_rejected_before_parse() {
+        // Pins the verify-BEFORE-parse ordering: with an invalid-JSON body and a
+        // bad signature, the outcome must be SignatureInvalid — a Malformed
+        // error would mean the body was parsed first.
+        let store = Arc::new(InMemoryDeliveryStore::default());
+        let ingestor = WebhookIngestor::new(store, Some(b"topsecret".to_vec()), false);
+        let body = b"this is not json {{{";
+        let forged = sign(b"a different secret", body);
+        let outcome = ingestor
+            .ingest(&headers("d1", Some(forged)), body)
+            .await
+            .expect("ingest");
+        assert_eq!(outcome, IngestOutcome::SignatureInvalid);
+    }
+
+    #[tokio::test]
+    async fn empty_delivery_id_is_malformed_not_recorded() {
+        let store = Arc::new(InMemoryDeliveryStore::default());
+        let ingestor = WebhookIngestor::new(Arc::clone(&store) as _, None, false);
+        let err = ingestor
+            .ingest(&headers("", None), &pull_request_body())
+            .await
+            .expect_err("an empty delivery id must be malformed");
+        assert!(matches!(err, WebhookError::Malformed(_)));
+        // And a later real delivery must still be fresh — nothing was recorded.
+        let outcome = ingestor
+            .ingest(&headers("d-real", None), &pull_request_body())
+            .await
+            .expect("ingest");
+        assert!(matches!(outcome, IngestOutcome::Accepted { .. }));
     }
 
     #[tokio::test]
