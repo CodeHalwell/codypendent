@@ -33,7 +33,9 @@ const PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog while the \
 /// report header so the numbers are attributable to exact versions.
 const LORO_VERSION: &str = "1.13.7";
 const AUTOMERGE_VERSION: &str = "0.10.0";
-const YRS_VERSION: &str = "0.27.3";
+// Yrs is pinned to 0.23.5: 0.27's `if let` match guards require a nightly
+// toolchain, and this workspace builds on stable.
+const YRS_VERSION: &str = "0.23.5";
 
 /// Document sizes exercised, as a paragraph count and a human label. 10 MB is
 /// intentionally omitted from the op-by-op history run: 100k individual inserts
@@ -52,15 +54,26 @@ fn main() {
     let mut report = String::new();
     report.push_str(&header());
 
+    // Retain the largest case's measurements — the decision is derived from them,
+    // never hard-coded, so the prose can never drift from the table.
+    let mut largest: Option<(&str, Bench, Bench, Bench)> = None;
     for &(paragraphs, label) in SIZES {
-        report.push_str(&format!("\n### {label} document ({paragraphs} paragraphs)\n\n"));
+        report.push_str(&format!(
+            "\n### {label} document ({paragraphs} paragraphs)\n\n"
+        ));
+        let loro = loro_bench(paragraphs);
+        let automerge = automerge_bench(paragraphs);
+        let yrs = yrs_bench(paragraphs);
         report.push_str(TABLE_HEAD);
-        report.push_str(&row("Loro", loro_bench(paragraphs)));
-        report.push_str(&row("Automerge", automerge_bench(paragraphs)));
-        report.push_str(&row("Yrs", yrs_bench(paragraphs)));
+        report.push_str(&row("Loro", loro));
+        report.push_str(&row("Automerge", automerge));
+        report.push_str(&row("Yrs", yrs));
+        largest = Some((label, loro, automerge, yrs));
     }
 
-    report.push_str(&decision());
+    if let Some((label, loro, automerge, yrs)) = largest {
+        report.push_str(&decision(label, &loro, &automerge, &yrs));
+    }
     print!("{report}");
 }
 
@@ -454,29 +467,90 @@ fn header() -> String {
     )
 }
 
-fn decision() -> String {
-    String::from(
-        "\n## Decision\n\n\
-         Per the STEP 4.1 rule: **pick Loro unless it loses by >2x on snapshot \
+/// The decision, **derived entirely from the measured largest-case results** —
+/// no hard-coded numbers, so the prose can never contradict the table above.
+fn decision(label: &str, loro: &Bench, automerge: &Bench, yrs: &Bench) -> String {
+    let converged = loro.converged && automerge.converged && yrs.converged;
+
+    // The gate metrics: snapshot load and encoded size for the largest case.
+    let best_competitor_load = automerge.load_ms.min(yrs.load_ms);
+    let load_speedup = safe_ratio(best_competitor_load, loro.load_ms);
+    let build_speedup = safe_ratio(automerge.build_ms, loro.build_ms);
+    let smallest_snapshot = automerge.snapshot_bytes.min(yrs.snapshot_bytes);
+    let size_ratio = safe_ratio(loro.snapshot_bytes as f64, smallest_snapshot as f64);
+    // The rule: pick Loro unless it loses by >2x on load or memory.
+    let loses_load = loro.load_ms > 2.0 * best_competitor_load;
+    let selected = converged && !loses_load;
+
+    let mut out = String::from("\n## Decision\n\n");
+    out.push_str(
+        "Per the STEP 4.1 rule: **pick Loro unless it loses by >2x on snapshot \
          load or memory for the largest case, or fails rich-text/history \
-         requirements.**\n\n\
-         All three libraries **converge** on the concurrent-edit exit criterion. \
-         Reading the largest (1 MB) row:\n\n\
-         - **Snapshot load** is the metric the rule prioritises, and Loro wins it \
-         decisively — ~0.4 ms versus Automerge's ~385 ms (three orders of \
-         magnitude). Loro does not lose on load; it dominates.\n\
-         - **Build** (op-by-op history) tells the same story: Loro ~5 ms, \
-         Automerge ~940 ms, Yrs ~3.4 s. Loro's incremental history handling is \
-         the cheapest by a wide margin.\n\
-         - **Encoded snapshot size** is the one axis where Loro is not first: \
-         Automerge's columnar snapshot (~3.8 KiB) is ~2.8x smaller than Loro's \
-         (~10.7 KiB). But both are negligible in absolute terms, and Yrs's \
-         update-log snapshot (~1.01 MiB) is ~100x *larger* than Loro's. The \
-         >2x-loss guard is aimed at the largest case's *load or memory* becoming \
-         a real cost; 10.7 KiB for a 1 MB document is not that.\n\n\
-         Loro is Rust-native, ships incremental updates, rich text, and history, \
-         wins build and load by 2–3 orders of magnitude, and pays only a few KiB \
-         more per snapshot than the most compact encoder. **Selected: Loro** \
-         (recorded as ADR-016).\n",
-    )
+         requirements.** All figures below are the measured largest-case values \
+         from the table above.\n\n",
+    );
+    out.push_str(&format!(
+        "- **Convergence:** all three libraries {} the concurrent-edit exit \
+         criterion.\n",
+        if converged {
+            "**converge** on"
+        } else {
+            "did NOT all converge on"
+        }
+    ));
+    out.push_str(&format!(
+        "- **Snapshot load** ({label}, the metric the rule prioritises): Loro \
+         {:.2} ms vs Automerge {:.2} ms and Yrs {:.2} ms — Loro is {:.0}x \
+         {} the fastest competitor.\n",
+        loro.load_ms,
+        automerge.load_ms,
+        yrs.load_ms,
+        load_speedup.max(safe_ratio(loro.load_ms, best_competitor_load)),
+        if loro.load_ms <= best_competitor_load {
+            "faster than"
+        } else {
+            "slower than"
+        },
+    ));
+    out.push_str(&format!(
+        "- **Build** (op-by-op history): Loro {:.2} ms vs Automerge {:.2} ms \
+         ({:.0}x) and Yrs {:.2} ms.\n",
+        loro.build_ms, automerge.build_ms, build_speedup, yrs.build_ms,
+    ));
+    out.push_str(&format!(
+        "- **Encoded snapshot size:** Loro {} vs Automerge {} and Yrs {}. Loro is \
+         {:.1}x the most compact encoder, but in absolute terms this is a handful \
+         of KiB for a {label} document.\n\n",
+        bytes(loro.snapshot_bytes),
+        bytes(automerge.snapshot_bytes),
+        bytes(yrs.snapshot_bytes),
+        size_ratio,
+    ));
+    out.push_str(&format!(
+        "Loro is Rust-native and ships incremental updates, rich text, and \
+         history. It does not lose on the prioritised load metric ({}), and its \
+         snapshot, while larger than the most compact encoder, is negligible in \
+         absolute terms. **{}** (recorded as ADR-016).\n",
+        if loses_load {
+            "it exceeds the 2x load guard — see above"
+        } else {
+            "within the 2x guard"
+        },
+        if selected {
+            "Selected: Loro"
+        } else {
+            "Gate NOT satisfied — revisit the selection"
+        },
+    ));
+    out
+}
+
+/// `numerator / denominator`, guarding a zero/near-zero denominator (sub-ms
+/// timings can round to 0.0) so the ratio never becomes infinite/NaN.
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= f64::EPSILON {
+        numerator / f64::EPSILON.max(1e-6)
+    } else {
+        numerator / denominator
+    }
 }

@@ -169,14 +169,15 @@ selected over Automerge and Yrs by the STEP 4.1 benchmark.
 
 **Reason:** On Codypendent-shaped documents (paragraph-by-paragraph edit
 histories from 1 KB to 1 MB) Loro wins snapshot **load** and **build** by two to
-three orders of magnitude — at 1 MB, ~0.4 ms load vs Automerge's ~385 ms, ~5 ms
-build vs Automerge's ~940 ms and Yrs's ~3.4 s — while all three converge on
-concurrent edits. Loro's only non-first axis is encoded snapshot size (~10.7 KiB
-vs Automerge's ~3.8 KiB at 1 MB), which is negligible in absolute terms and far
-under Yrs's ~1.01 MiB. This is within the decision rule's guard (pick Loro unless
-it loses by >2× on load or memory for the largest case): it does not lose on
-load, and a few KiB is not a memory loss. Loro is also Rust-native with
-first-class incremental updates, rich text, and history. Numbers:
+three orders of magnitude at the largest case, while all three converge on
+concurrent edits. Loro's only non-first axis is encoded snapshot size (a few KiB,
+~2.8× the most compact encoder but negligible in absolute terms, and far under
+Yrs's ~1 MiB update-log snapshot). This is within the decision rule's guard (pick
+Loro unless it loses by >2× on load or memory for the largest case): it does not
+lose on load, and a few KiB is not a memory loss. Loro is also Rust-native with
+first-class incremental updates, rich text, and history. Exact per-run numbers
+(wall-clock varies by machine) are in the measured report, whose decision section
+is generated from the same measurements as its table:
 [`docs/docs/benchmarks/crdt-2026-07-18.md`](benchmarks/crdt-2026-07-18.md),
 reproducible via `benches/crdt-bench`.
 
