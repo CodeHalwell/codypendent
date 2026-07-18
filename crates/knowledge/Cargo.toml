@@ -30,6 +30,8 @@ tree-sitter-rust = { workspace = true }
 notify = { workspace = true }
 # Collaborative-document CRDT (Phase 4, ADR-016) — authoritative for drafts.
 loro = { workspace = true }
+# The LanguageAdapter trait (Phase 4, Chapter 07) has async methods.
+async-trait = { workspace = true }
 # For `spawn_blocking` around the package walk/hash (sqlx already binds this
 # crate to the tokio runtime; this only names it directly).
 tokio = { workspace = true }

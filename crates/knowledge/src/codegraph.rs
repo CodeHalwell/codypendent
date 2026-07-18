@@ -339,6 +339,367 @@ pub async fn edges(
     rows.into_iter().map(EdgeRow::into_edge).collect()
 }
 
+/// A symbol produced by a pure parse of one file (no persistence, no repository
+/// id) — the shape a [`crate::adapter::LanguageAdapter`] returns from `parse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSymbol {
+    pub qualified_name: String,
+    pub kind: CodeNodeKind,
+    pub signature_hash: Option<String>,
+}
+
+/// Parse `source` (repo-relative `path`) into the durable symbols it defines,
+/// with no side effects. Reuses the exact tree-sitter walk that
+/// [`upsert_file_graph`] persists, so an adapter and the graph agree on symbols.
+pub fn parse_symbols(path: &str, source: &str) -> Result<Vec<ParsedSymbol>, CodeGraphError> {
+    // A nil repository id: `build_file_graph` needs one to shape `SymbolKey`s, but
+    // this pure parse discards the id, keeping only name/kind/signature.
+    let built = build_file_graph(RepositoryId(Uuid::nil()), path, source)?;
+    Ok(built
+        .nodes
+        .iter()
+        .filter(|n| n.owned)
+        .map(|n| ParsedSymbol {
+            qualified_name: n.key.qualified_name.clone(),
+            kind: n.key.kind,
+            signature_hash: n.key.signature_hash.clone().map(|h| h.0),
+        })
+        .collect())
+}
+
+// --------------------------------------------------------------------------
+// Semantic layer — LSP/compiler edge supersession (STEP 4.5)
+// --------------------------------------------------------------------------
+
+/// A semantic (LSP- or compiler-resolved) edge to fold into the graph. Its
+/// endpoints are named by the stable [`SymbolKey::stable_key`] rather than a node
+/// id, so an adapter that resolves references does not need to know the graph's
+/// internal ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticEdge {
+    pub from_symbol_key: String,
+    pub to_symbol_key: String,
+    pub relation: CodeRelation,
+    /// Must be [`EvidenceKind::LspResolved`] or [`EvidenceKind::CompilerResolved`]
+    /// — a semantic edge supersedes its syntax-inferred counterpart.
+    pub evidence_kind: EvidenceKind,
+    pub confidence: f32,
+    pub evidence: Option<EvidenceRef>,
+}
+
+/// Fold semantic edges into the graph, **superseding** any existing edge for the
+/// same `(from, to, relation)` rather than duplicating it (Chapter 07): a
+/// resolved LSP/compiler edge replaces the lower-confidence syntax-inferred one.
+///
+/// Endpoints are resolved by `symbol_key`; an edge whose endpoints are not both
+/// present in the graph is skipped (returned in the count of skipped edges).
+/// Returns `(applied, skipped)`. Each applied edge enqueues a `SymbolChanged`
+/// event for its `from` node, in the same transaction as the writes.
+pub async fn upsert_semantic_edges(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    revision: &GitRevision,
+    edges: &[SemanticEdge],
+) -> Result<(u64, u64), CodeGraphError> {
+    let now = Utc::now();
+    let created_at = now.to_rfc3339();
+    let mut applied = 0;
+    let mut skipped = 0;
+
+    let mut tx = pool.begin().await?;
+    for edge in edges {
+        let from = resolve_node_id(&mut *tx, repository, &edge.from_symbol_key).await?;
+        let to = resolve_node_id(&mut *tx, repository, &edge.to_symbol_key).await?;
+        let (Some(from), Some(to)) = (from, to) else {
+            skipped += 1;
+            continue;
+        };
+
+        // Supersede: drop any existing edge for this (from, to, relation) — the
+        // syntax-inferred one is replaced, not shadowed by a duplicate.
+        sqlx::query("DELETE FROM code_edges WHERE from_node = ? AND to_node = ? AND relation = ?")
+            .bind(from.to_string())
+            .bind(to.to_string())
+            .bind(scalar(&edge.relation))
+            .execute(&mut *tx)
+            .await?;
+
+        let evidence_json = match &edge.evidence {
+            Some(e) => Some(serde_json::to_string(e)?),
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO code_edges \
+             (id, from_node, to_node, relation, confidence, evidence_kind, evidence_artifact, \
+              revision, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .bind(scalar(&edge.relation))
+        .bind(f64::from(edge.confidence))
+        .bind(scalar(&edge.evidence_kind))
+        .bind(evidence_json)
+        .bind(&revision.0)
+        .bind(&created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::SymbolChanged(from), now).await?;
+        applied += 1;
+    }
+    tx.commit().await?;
+    Ok((applied, skipped))
+}
+
+// --------------------------------------------------------------------------
+// Revision-aware queries (STEP 4.5) — power staleness and the Phase 5 planner
+// --------------------------------------------------------------------------
+
+/// A symbol's identity + signature at one point in time. Keyed for change
+/// detection by `qualified_name` (the granularity a `{{ symbol:… }}` document
+/// reference names), with `signature_hash` as the value a change is detected on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSnapshot {
+    pub qualified_name: String,
+    pub kind: CodeNodeKind,
+    pub source_path: String,
+    pub signature_hash: Option<String>,
+}
+
+/// What changed between two symbol snapshots (`graph.changed_between`). A signature
+/// change is a `modified`; a disappearance is a `removed` — both flag stale docs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolDelta {
+    pub added: Vec<SymbolSnapshot>,
+    pub removed: Vec<SymbolSnapshot>,
+    /// `(before, after)` for symbols present in both whose signature changed.
+    pub modified: Vec<(SymbolSnapshot, SymbolSnapshot)>,
+}
+
+/// The current symbol snapshot for a repository (every graph node's identity +
+/// signature). Callers capture this at a commit (e.g. on publish) and diff a
+/// later snapshot against it with [`changed_between`].
+pub async fn symbol_snapshot(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<Vec<SymbolSnapshot>, CodeGraphError> {
+    Ok(nodes(pool, repository)
+        .await?
+        .into_iter()
+        .map(|node| SymbolSnapshot {
+            qualified_name: node.key.qualified_name,
+            kind: node.key.kind,
+            source_path: node.key.source_path,
+            signature_hash: node.key.signature_hash.map(|h| h.0),
+        })
+        .collect())
+}
+
+/// Diff two symbol snapshots (the `graph.changed_between(rev_a, rev_b)` query,
+/// with each revision represented by its snapshot). Symbols are matched by
+/// `qualified_name`; a differing `signature_hash` is a `modified`.
+#[must_use]
+pub fn changed_between(before: &[SymbolSnapshot], after: &[SymbolSnapshot]) -> SymbolDelta {
+    let index = |snaps: &[SymbolSnapshot]| -> HashMap<String, SymbolSnapshot> {
+        snaps
+            .iter()
+            .map(|s| (s.qualified_name.clone(), s.clone()))
+            .collect()
+    };
+    let before_by = index(before);
+    let after_by = index(after);
+
+    let mut delta = SymbolDelta::default();
+    for (name, after_sym) in &after_by {
+        match before_by.get(name) {
+            None => delta.added.push(after_sym.clone()),
+            Some(before_sym) if before_sym.signature_hash != after_sym.signature_hash => {
+                delta.modified.push((before_sym.clone(), after_sym.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, before_sym) in &before_by {
+        if !after_by.contains_key(name) {
+            delta.removed.push(before_sym.clone());
+        }
+    }
+    // Stable order so callers/tests see deterministic results.
+    delta
+        .added
+        .sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    delta
+        .removed
+        .sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    delta
+        .modified
+        .sort_by(|a, b| a.1.qualified_name.cmp(&b.1.qualified_name));
+    delta
+}
+
+/// The direct callers of the symbol identified by `symbol_key` — nodes with a
+/// `Calls`/`References` edge into it (`graph.callers_of`).
+pub async fn callers_of(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    symbol_key: &str,
+) -> Result<Vec<CodeNode>, CodeGraphError> {
+    let rows: Vec<NodeRow> = sqlx::query_as(
+        "SELECT n.id AS id, n.language AS language, n.package AS package, \
+                n.source_path AS source_path, n.qualified_name AS qualified_name, \
+                n.kind AS kind, n.signature_hash AS signature_hash, n.revision AS revision \
+         FROM code_nodes n \
+         JOIN code_edges e ON e.from_node = n.id \
+         JOIN code_nodes t ON e.to_node = t.id \
+         WHERE t.repository = ? AND t.symbol_key = ? \
+           AND e.relation IN ('calls', 'references') \
+         ORDER BY n.created_at ASC, n.id ASC",
+    )
+    .bind(repository.to_string())
+    .bind(symbol_key)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(|r| r.into_node(repository)).collect()
+}
+
+/// The transitive blast radius of a symbol: every node that reaches it through up
+/// to `depth` layers of `Calls`/`References` edges (`graph.blast_radius`). The
+/// target itself is excluded.
+pub async fn blast_radius(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    symbol_key: &str,
+    depth: usize,
+) -> Result<Vec<CodeNode>, CodeGraphError> {
+    let Some(start) = resolve_node_id(pool, repository, symbol_key).await? else {
+        return Ok(Vec::new());
+    };
+    let reached = reverse_reachable(pool, repository, &[start], depth).await?;
+    nodes_by_ids(pool, repository, &reached).await
+}
+
+/// The tests covering a path: `Test` nodes that reach any symbol defined in
+/// `path` through up to `depth` layers of `Calls`/`References` edges
+/// (`graph.tests_covering`).
+pub async fn tests_covering(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    path: &str,
+    depth: usize,
+) -> Result<Vec<CodeNode>, CodeGraphError> {
+    let seeds: Vec<CodeNodeId> = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?",
+    )
+    .bind(repository.to_string())
+    .bind(path)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(id,)| CodeNodeId::from_str(&id))
+    .collect::<Result<_, _>>()?;
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reached = reverse_reachable(pool, repository, &seeds, depth).await?;
+    Ok(nodes_by_ids(pool, repository, &reached)
+        .await?
+        .into_iter()
+        .filter(|n| n.key.kind == CodeNodeKind::Test)
+        .collect())
+}
+
+/// Resolve a node id from its stable `symbol_key`, within an executor.
+async fn resolve_node_id(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    repository: RepositoryId,
+    symbol_key: &str,
+) -> Result<Option<CodeNodeId>, CodeGraphError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM code_nodes WHERE repository = ? AND symbol_key = ?")
+            .bind(repository.to_string())
+            .bind(symbol_key)
+            .fetch_optional(executor)
+            .await?;
+    row.map(|(id,)| CodeNodeId::from_str(&id))
+        .transpose()
+        .map_err(CodeGraphError::from)
+}
+
+/// BFS over reverse (`caller → callee`) edges from `seeds`, up to `depth` layers.
+/// Returns every node reached, excluding the seeds themselves.
+async fn reverse_reachable(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    seeds: &[CodeNodeId],
+    depth: usize,
+) -> Result<Vec<CodeNodeId>, CodeGraphError> {
+    let mut visited: std::collections::HashSet<CodeNodeId> = seeds.iter().copied().collect();
+    let mut frontier: Vec<CodeNodeId> = seeds.to_vec();
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for id in &frontier {
+            for caller in direct_caller_ids(pool, *id).await? {
+                if visited.insert(caller) {
+                    next.push(caller);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    let _ = repository;
+    Ok(visited
+        .into_iter()
+        .filter(|id| !seeds.contains(id))
+        .collect())
+}
+
+/// The ids with a `Calls`/`References` edge directly into `node`.
+async fn direct_caller_ids(
+    pool: &SqlitePool,
+    node: CodeNodeId,
+) -> Result<Vec<CodeNodeId>, CodeGraphError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT from_node FROM code_edges WHERE to_node = ? \
+         AND relation IN ('calls', 'references')",
+    )
+    .bind(node.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(id,)| CodeNodeId::from_str(&id).map_err(CodeGraphError::from))
+        .collect()
+}
+
+/// Fetch full [`CodeNode`]s for a set of ids (order by creation for determinism).
+async fn nodes_by_ids(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    ids: &[CodeNodeId],
+) -> Result<Vec<CodeNode>, CodeGraphError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, revision \
+         FROM code_nodes WHERE repository = ? AND id IN ({placeholders}) \
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut query = sqlx::query_as::<_, NodeRow>(&sql).bind(repository.to_string());
+    for id in ids {
+        query = query.bind(id.to_string());
+    }
+    let rows = query.fetch_all(pool).await?;
+    rows.into_iter().map(|r| r.into_node(repository)).collect()
+}
+
 // --------------------------------------------------------------------------
 // Incremental pipeline — filesystem watcher (minimal)
 // --------------------------------------------------------------------------

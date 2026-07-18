@@ -453,6 +453,13 @@ pub enum EvidenceKind {
 /// Confidence for a syntax-inferred call edge (Chapter 07 table).
 pub const SYNTAX_CALL_CONFIDENCE: f32 = 0.45;
 
+/// Confidence for an LSP-resolved reference/definition edge (Chapter 07 table).
+/// A semantic edge at this confidence supersedes its syntax-inferred counterpart.
+pub const LSP_RESOLVED_CONFIDENCE: f32 = 0.90;
+
+/// Confidence for a compiler/indexer-resolved edge (Chapter 07 table).
+pub const COMPILER_RESOLVED_CONFIDENCE: f32 = 0.98;
+
 /// The stable identity of a symbol (Chapter 07 `SymbolKey`) — survives line
 /// movement within its file because it is derived from name + kind + signature,
 /// not byte position. `source_path` scopes that identity to the file the symbol

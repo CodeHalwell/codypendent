@@ -12,6 +12,7 @@
 //! (Tantivy, vectors) under `<data_dir>/index/`, which are deletable and
 //! rebuildable at any time (`codypendent index rebuild`).
 
+pub mod adapter;
 pub mod builtin;
 pub mod codegraph;
 pub mod context;
@@ -48,8 +49,18 @@ pub use retrieval::{
     RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
 };
 
-pub use codegraph::{stable_repository_id, CodeGraphError, GraphDelta};
-pub use repomap::{ApiSymbol, ModuleEntry, PackageEntry, RepositoryMap};
+pub use adapter::{
+    BuildMetadata, Diagnostic, DiagnosticSeverity, LanguageAdapter, PackageInfo, ParseInput,
+    ParseOutput, RustAdapter, ScriptAdapter, SemanticCapability, SymbolIndex, Workspace,
+};
+pub use codegraph::{
+    changed_between, stable_repository_id, CodeGraphError, GraphDelta, ParsedSymbol, SemanticEdge,
+    SymbolDelta, SymbolSnapshot,
+};
+pub use repomap::{
+    hierarchical_map, ApiSymbol, MapEvidence, MapLevel, MapNode, ModuleEntry, PackageEntry,
+    RepositoryMap,
+};
 
 pub use memory::{
     detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
