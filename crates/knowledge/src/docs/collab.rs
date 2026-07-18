@@ -110,6 +110,11 @@ pub struct Suggestion {
     pub range_start: usize,
     /// Character offset (exclusive).
     pub range_end: usize,
+    /// The document revision this suggestion was proposed against. Accept refuses
+    /// if the document has advanced, so a zero-length (insertion) suggestion —
+    /// whose empty `original` cannot detect a shift on its own — can never be
+    /// applied at a stale offset.
+    pub source_revision: u64,
     /// The text the proposer saw at `[range_start, range_end)`. Accept refuses if
     /// the block has since drifted so these offsets no longer cover it.
     pub original: String,
@@ -160,17 +165,27 @@ impl SuggestionStore {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
         let mut tx = pool.begin().await?;
+        // Anchor the suggestion to the document's current revision; accept refuses
+        // if the document has advanced since (also validates the document exists).
+        let source_revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM documents WHERE id = ?")
+                .bind(document_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DocStoreError::NoSuchDocument(document_id))?;
         sqlx::query(
             "INSERT INTO document_suggestions \
-             (id, document_id, block_id, range_start, range_end, original, replacement, \
-              author_json, rationale, status, created_at, resolved_at, resolved_by_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
+             (id, document_id, block_id, range_start, range_end, source_revision, original, \
+              replacement, author_json, rationale, status, created_at, resolved_at, \
+              resolved_by_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
         )
         .bind(&id)
         .bind(document_id.to_string())
         .bind(&new.block_id)
         .bind(new.range_start as i64)
         .bind(new.range_end as i64)
+        .bind(source_revision)
         .bind(&new.original)
         .bind(&new.replacement)
         .bind(serde_json::to_string(&new.author)?)
@@ -192,6 +207,7 @@ impl SuggestionStore {
             block_id: new.block_id,
             range_start: new.range_start,
             range_end: new.range_end,
+            source_revision: source_revision as u64,
             original: new.original,
             replacement: new.replacement,
             author: new.author,
@@ -207,7 +223,7 @@ impl SuggestionStore {
         document_id: DocumentId,
     ) -> Result<Vec<Suggestion>, DocStoreError> {
         let rows = sqlx::query(
-            "SELECT id, block_id, range_start, range_end, original, replacement, author_json, \
+            "SELECT id, block_id, range_start, range_end, source_revision, original, replacement, author_json, \
              rationale, status FROM document_suggestions WHERE document_id = ? AND status = 'pending' \
              ORDER BY created_at ASC, id ASC",
         )
@@ -244,11 +260,20 @@ impl SuggestionStore {
                 suggestion_id.to_string(),
             ));
         }
-        // Guard against range drift: the block may have been edited between
-        // propose and accept, shifting or reshaping the target range. If the text
-        // now under the stored offsets is not what the proposer saw, applying the
-        // suggestion would corrupt the wrong characters — refuse instead. (An
-        // out-of-range range surfaces as OutOfBounds via `text_range`.)
+        // Guard against range drift. First, refuse if the document has advanced
+        // since the suggestion was proposed: any saved edit can shift the stored
+        // offsets, and for a zero-length *insertion* the empty-text check below
+        // cannot detect that on its own. `doc` is the caller's current replica; a
+        // stale replica is additionally caught by the revision guard in
+        // `write_document_tx`.
+        if suggestion.source_revision != doc.revision {
+            return Err(DocStoreError::SuggestionRangeDrifted(
+                suggestion_id.to_string(),
+            ));
+        }
+        // Second, verify the text now under the stored offsets is what the
+        // proposer saw (catches unsaved in-place edits at the same revision). An
+        // out-of-range range surfaces as OutOfBounds via `text_range`.
         let current = doc.crdt.text_range(
             &suggestion.block_id,
             suggestion.range_start,
@@ -355,7 +380,7 @@ impl SuggestionStore {
         suggestion_id: &str,
     ) -> Result<Suggestion, DocStoreError> {
         let row = sqlx::query(
-            "SELECT id, block_id, range_start, range_end, original, replacement, author_json, \
+            "SELECT id, block_id, range_start, range_end, source_revision, original, replacement, author_json, \
              rationale, status FROM document_suggestions WHERE id = ? AND document_id = ?",
         )
         .bind(suggestion_id)
@@ -405,6 +430,7 @@ fn decode_suggestion(
         block_id: row.get("block_id"),
         range_start: row.get::<i64, _>("range_start") as usize,
         range_end: row.get::<i64, _>("range_end") as usize,
+        source_revision: row.get::<i64, _>("source_revision") as u64,
         original: row.get("original"),
         replacement: row.get("replacement"),
         author: serde_json::from_str(row.get::<String, _>("author_json").as_str())?,

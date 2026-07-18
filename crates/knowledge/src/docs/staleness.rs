@@ -15,7 +15,7 @@ use codypendent_protocol::{DocumentId, RepositoryId};
 use sqlx::SqlitePool;
 
 use crate::codegraph::{self, CodeGraphError, SymbolSnapshot};
-use crate::types::GitRevision;
+use crate::types::{CodeNodeKind, GitRevision};
 
 use super::collab::NewSuggestion;
 use super::model::{
@@ -87,9 +87,14 @@ pub async fn resolve_links(
     let nodes = codegraph::nodes(pool, repository).await?;
     let mut links = Vec::new();
     for reference in symbol_references(blocks) {
-        let node = nodes
-            .iter()
-            .find(|n| n.key.qualified_name == reference.qualified_name);
+        // Resolve to a real definition, not a synthesized `ExternalDependency`
+        // node (an unresolved call/import of the same name that may have been
+        // parsed first). An external ref carries no signature, so a link bound to
+        // it would never see the real symbol's later signature changes.
+        let node = nodes.iter().find(|n| {
+            n.key.qualified_name == reference.qualified_name
+                && n.key.kind != CodeNodeKind::ExternalDependency
+        });
         let resolved = node.map(|n| ResolvedSymbol {
             symbol_key: n.key.stable_key(),
             source_path: n.key.source_path.clone(),

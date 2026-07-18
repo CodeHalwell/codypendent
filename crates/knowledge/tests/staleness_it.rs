@@ -473,3 +473,49 @@ async fn resolving_links_enqueues_a_document_changed_event() {
         .count();
     assert_eq!(n, 2);
 }
+
+#[tokio::test]
+async fn resolve_prefers_a_real_definition_over_an_external_ref() {
+    // An unresolved call synthesizes an ExternalDependency node with the same name
+    // (parsed first). A `{{ symbol:charge }}` link must resolve to the real
+    // definition — which carries a signature — not the signature-less external ref.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev1,
+        "src/a.rs",
+        "pub fn caller() { charge(); }",
+    )
+    .await
+    .unwrap();
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev1,
+        "src/payments.rs",
+        "pub fn charge() -> bool { true }",
+    )
+    .await
+    .unwrap();
+
+    let blocks = vec![DocumentBlock::with_id(
+        "e",
+        BlockContent::EmbeddedSymbol {
+            symbol: "charge".into(),
+        },
+    )];
+    let links = resolve_links(&pool, repo, &blocks, &rev1).await.unwrap();
+    assert_eq!(links.len(), 1);
+    let resolved = links[0]
+        .resolved
+        .as_ref()
+        .expect("resolved to the real definition, not the external ref");
+    assert_eq!(resolved.source_path, "src/payments.rs");
+    assert!(
+        resolved.signature_hash.is_some(),
+        "the real function carries a signature"
+    );
+}
