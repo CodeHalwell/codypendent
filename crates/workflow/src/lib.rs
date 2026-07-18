@@ -21,11 +21,20 @@
 //! against the live registry, and wiring recovery into the daemon are the
 //! remaining steps, tracked in the roadmap.
 
+pub mod agent;
+pub mod blackboard;
 pub mod compile;
 pub mod db;
 pub mod model;
 pub mod store;
 
+pub use agent::{
+    parse_agent_profile, AgentBudget, AgentCompletion, AgentPermissions, AgentProfile,
+    AgentProfileError,
+};
+pub use blackboard::{
+    BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
+};
 pub use compile::{
     compile, compile_yaml, CompileError, CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };

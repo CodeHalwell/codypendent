@@ -40,11 +40,16 @@ the release gate is the
 > wiring — live daemon CRDT transport and edit-lease enforcement, executing
 > publication through the approval-gated write path, and spawning a live language
 > server — all daemon-internal or external-tool work tracked below. With those
-> deferred, **Phase 5 has begun**: the `codypendent-workflow` crate now compiles
-> declarative `workflow.yaml` manifests into a validated node graph (STEP 5.1
-> compiler core), the foundation for durable multi-agent orchestration. In
-> parallel, a **Codex-informed TUI backlog** is tracked near the end of this file:
-> the command palette (`/`) has shipped; a contextual footer is next.
+> deferred, **Phase 5 is underway**: the `codypendent-workflow` crate compiles
+> declarative `workflow.yaml` manifests into a validated node graph (5.1 compiler
+> core), persists runs / node records / checkpoints with resume-guarding in a
+> `WorkflowStore` (5.2 durable store), carries agent-profile (`agent.toml`)
+> parsing, and holds a per-run `BlackboardStore` for the typed, evidence-gated
+> artifact channel agents share (5.3) — the daemon-free foundation for durable
+> multi-agent orchestration. In parallel, a **Codex-informed TUI backlog** is
+> tracked near the end of this file: the conversation-centred shell, command
+> palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
+> have all shipped.
 
 ---
 
@@ -182,9 +187,11 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         budget sanity, and the ADR-008 multi-agent `orchestration_reason` rule)
         and lowers it into a topologically ordered node graph. The canonical
         `repair-github-check` manifest compiles (regression test). *Remaining for
-        5.1:* agent-profile (`agent.toml`) loading, registry cross-checks
-        (unknown tool/skill/agent = error), lowering onto framework graphs, and
-        replacing the hard-coded `/fix-ci` flow with this definition.
+        5.1:* registry cross-checks (unknown tool/skill/agent = error), lowering
+        onto framework graphs, and replacing the hard-coded `/fix-ci` flow with
+        this definition. Agent-profile (`agent.toml`) parsing has landed —
+        `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
+        permissions/budget/completion (the canonical profile parses in a test).
   - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
         durable workflow runs, a per-node record (state / attempt / cost /
         start+end times — the node-level provenance the graph view needs), and
@@ -193,6 +200,18 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         graph shape). *Remaining for 5.2:* daemon startup recovery wiring,
         node-lifecycle ledger events, pause/resume/retry-from-node commands, and
         the TUI workflow-graph view.
+  - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
+        `blackboard_items` table): the typed, attributed artifact channel agents
+        share *within* a workflow run — findings, hypotheses, decisions, code
+        locations, proposed patches, test results, document drafts, open
+        questions (Chapter 04's "communicate only via blackboard artifacts and
+        declared outputs, never raw transcripts"). Claim-like kinds (finding /
+        decision / test-result / proposed-patch / code-location) are **refused
+        without evidence**; a corrected item **supersedes** rather than deletes
+        (the chain is stamped in one transaction); boards are **isolated per
+        run**. Payload/author/evidence ride as opaque JSON so the crate stays
+        daemon-decoupled. *Remaining for 5.3:* daemon read/write commands +
+        subscription delivery, and the TUI blackboard surface.
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
