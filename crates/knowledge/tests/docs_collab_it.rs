@@ -312,3 +312,59 @@ async fn a_suggestion_cannot_be_accepted_twice() {
         .unwrap_err();
     assert!(matches!(reject_err, DocStoreError::SuggestionNotPending(_)));
 }
+
+#[tokio::test]
+async fn rejecting_a_suggestion_enqueues_a_document_changed_event() {
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph { text: "hi".into() },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    let s = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 0,
+                range_end: 2,
+                replacement: "yo".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+    suggestions
+        .reject(&pool, doc.id, &s.id, &human)
+        .await
+        .unwrap();
+
+    // create + propose + reject each enqueue a DocumentChanged row, so index
+    // workers and subscribers see the review rail change on rejection too.
+    let rows = codypendent_knowledge::outbox::unprocessed(&pool, 100)
+        .await
+        .unwrap();
+    let n = rows
+        .iter()
+        .filter(|r| r.event_kind == "document_changed" && r.entity_id == doc.id.to_string())
+        .count();
+    assert_eq!(n, 3);
+}

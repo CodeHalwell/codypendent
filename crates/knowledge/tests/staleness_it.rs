@@ -7,7 +7,7 @@ use codypendent_knowledge::codegraph;
 use codypendent_knowledge::db;
 use codypendent_knowledge::docs::collab::SuggestionStore;
 use codypendent_knowledge::docs::model::{
-    BlockContent, DocumentAuthor, DocumentBlock, DocumentMetadata,
+    BlockContent, DocumentAuthor, DocumentBlock, DocumentMetadata, MutationKind,
 };
 use codypendent_knowledge::docs::staleness::{
     detect_staleness, resolve_links, symbol_references, StalenessReason,
@@ -308,4 +308,67 @@ async fn staleness_matches_the_resolved_file_not_a_same_named_symbol() {
     let findings = detect_staleness(doc_id, &links, &current, &rev2);
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].reason, StalenessReason::SignatureChanged);
+}
+
+#[tokio::test]
+async fn a_content_save_does_not_clobber_resolved_links() {
+    // A resolver writes resolved symbol links while an editor holds an earlier
+    // snapshot; the editor's content save must not overwrite the resolved links
+    // (content saves do not manage links).
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let store = DocumentStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let rev1 = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev1, "src/payments.rs", V1)
+        .await
+        .unwrap();
+
+    let created = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Runbook".into(),
+                scope: Scope::Repository(repo),
+                metadata: DocumentMetadata::default(),
+                blocks: runbook_blocks(),
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // Two replicas at revision 1: an editor and a resolver.
+    let mut editor = store.load(&pool, created.id).await.unwrap().unwrap();
+    let mut resolver = store.load(&pool, created.id).await.unwrap().unwrap();
+    assert!(editor.links.is_empty());
+
+    // The resolver resolves + persists the symbol links (no revision bump).
+    let links = resolve_links(&pool, repo, &resolver.blocks().unwrap(), &rev1)
+        .await
+        .unwrap();
+    assert!(!links.is_empty());
+    store.set_links(&pool, &mut resolver, links).await.unwrap();
+
+    // The editor, still holding empty links, saves a content edit.
+    editor.crdt.insert_text("intro", 0, "x").unwrap();
+    store
+        .save(
+            &pool,
+            &mut editor,
+            &human,
+            MutationKind::EditText,
+            Some("intro"),
+        )
+        .await
+        .unwrap();
+
+    // The resolved links survived the content save.
+    let reloaded = store.load(&pool, created.id).await.unwrap().unwrap();
+    assert!(
+        !reloaded.links.is_empty(),
+        "a content save must not clobber resolved links"
+    );
 }

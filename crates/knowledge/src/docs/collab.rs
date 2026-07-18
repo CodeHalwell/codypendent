@@ -286,6 +286,11 @@ impl SuggestionStore {
 
     /// Reject a suggestion — no content changes; just stamps it rejected. Fails
     /// with [`DocStoreError::SuggestionNotPending`] if it was already resolved.
+    ///
+    /// The status stamp and a `DocumentChanged` outbox row commit **together**, so
+    /// subscribers and index workers learn the review rail changed — just as
+    /// `propose` and `accept` do — rather than the rejection staying invisible
+    /// until some later document mutation.
     pub async fn reject(
         &self,
         pool: &SqlitePool,
@@ -295,13 +300,27 @@ impl SuggestionStore {
     ) -> Result<(), DocStoreError> {
         // Ensure it exists and belongs to the document.
         let _ = self.get(pool, document_id, suggestion_id).await?;
-        let claimed =
-            resolve_pending(pool, suggestion_id, SuggestionStatus::Rejected, resolver).await?;
+        let now = Utc::now();
+        let mut tx = pool.begin().await?;
+        let claimed = resolve_pending(
+            &mut *tx,
+            suggestion_id,
+            SuggestionStatus::Rejected,
+            resolver,
+        )
+        .await?;
         if claimed == 0 {
             return Err(DocStoreError::SuggestionNotPending(
                 suggestion_id.to_string(),
             ));
         }
+        outbox::enqueue(
+            &mut *tx,
+            &KnowledgeIndexEvent::DocumentChanged(document_id),
+            now,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

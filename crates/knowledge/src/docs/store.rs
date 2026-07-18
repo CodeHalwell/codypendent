@@ -390,6 +390,12 @@ pub struct DocumentSummary {
 /// document write and a suggestion's resolution can commit atomically in one
 /// transaction. Does **not** mutate `doc.revision` — the caller does that only
 /// after the transaction commits.
+///
+/// **Does not write `links_json`.** Knowledge-graph links are machine-resolved
+/// against the code graph and owned exclusively by [`DocumentStore::set_links`]
+/// (STEP 4.6). If a content save also wrote its in-memory `doc.links`, an editor
+/// who loaded before a concurrent resolver ran would silently overwrite the
+/// resolved links; keeping links out of the content-save path prevents that.
 pub(crate) async fn write_document_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     doc: &Document,
@@ -401,19 +407,17 @@ pub(crate) async fn write_document_tx(
     let snapshot = doc.crdt.snapshot()?;
     let now_str = now.to_rfc3339();
     let revision = doc.revision + 1;
-    let links_json = serde_json::to_string(&doc.links)?;
     let citations_json = serde_json::to_string(&doc.citations)?;
     let metadata_json = serde_json::to_string(&doc.metadata)?;
 
     let affected = sqlx::query(
         "UPDATE documents SET crdt_snapshot = ?, status = ?, metadata_json = ?, \
-         links_json = ?, citations_json = ?, revision = ?, updated_at = ? \
+         citations_json = ?, revision = ?, updated_at = ? \
          WHERE id = ? AND revision = ?",
     )
     .bind(&snapshot)
     .bind(doc.status.as_str())
     .bind(&metadata_json)
-    .bind(&links_json)
     .bind(&citations_json)
     .bind(revision as i64)
     .bind(&now_str)
