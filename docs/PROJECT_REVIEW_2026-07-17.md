@@ -5,6 +5,18 @@
 (daemon core, integrations, runtime/knowledge, protocol/clients/docs), plus
 first-hand verification of every Critical finding against source.
 
+> **Remediation status (2026-07-18):** every Critical (C1–C3), every Major, and
+> the listed Minors were fixed on this branch in the commits following this
+> review — see the punch-list annotations at the bottom and the individual
+> commit messages for the fix details. Three items were consciously deferred
+> as design decisions: client-scoped command idempotency (needs a
+> `UNIQUE(client_id, idempotency_key)` table rebuild), the `AlwaysApproval`
+> veto of run-scoped approval reuse (needs policy↔broker threading), and
+> rejecting attach-to-missing-session (the TUI's remembered-session fallback
+> intentionally relies on the empty-catchup contract). The two product
+> decisions (wiring policy files + the retrieved-content trust boundary,
+> items 13–14) remain open for an owner's call.
+
 ---
 
 ## Bottom line
@@ -342,29 +354,63 @@ check, `Math.random()` nonce in the webview, etc. — available on request.)_
 ## Recommended punch list (in order)
 
 **Before any live-credential / networked use:**
-1. C1 — put shell `environment`+`cwd` into `ProposedAction`; denylist exec-affecting vars.
-2. C2 — exclusive lock before startup recovery.
-3. C3 — reply `Pong` to `Ping` in the VS Code client (one line).
-4. G1 — percent-encode GitHub URL path segments.
-5. D1 — `BEGIN IMMEDIATE` on write transactions + retry `fail_run`.
+1. ✅ C1 — shell `environment`+`cwd` on `ProposedAction` (rendered on the TUI
+   approval card) + an exec-hijacking env denylist enforced pre-spawn.
+2. ✅ C2 — socket exclusivity is claimed before startup recovery.
+3. ✅ C3 — the VS Code client answers `Ping` with `Pong` (with a test).
+4. ✅ G1 — `owner`/`repo`/`ref` validated before URL interpolation
+   (`InvalidParameter`; refusal proven pre-request by test).
+5. ✅ D1 — `BEGIN IMMEDIATE` on all daemon write transactions; `fail_run`
+   retried at the executor.
 
 **Before trusting idempotency / the webhook listener at scale:**
-6. G2 — webhook server timeouts + connection cap.
-7. G3 — paginate (or search) the idempotency marker scan.
-8. D4 — fix the approval wake-before-register race.
+6. ✅ G2 — 30s whole-connection timeout + 64-connection cap on the listener;
+   malformed Content-Length is a 400.
+7. ✅ G3 — marker scans paginate (`per_page=100`, `Link` next, `state=all`);
+   POSTs are no longer auto-retried.
+8. ✅ D4 — `wake` pre-creates a missing waiter with its decision;
+   `register_waiter` never clobbers.
 
 **Correctness / honesty cleanups (cheap, high signal):**
-9. D5 — append terminal `RunStateChanged{Failed}` in `fail_live_run` (one line).
-10. R1/R3 — cap salient error lines; add a per-run budget + real usage counts.
-11. P5 — add a LICENSE (or fix `package.json`).
-12. P6 + doc set — reconcile the ROADMAP Phase-3 status, MANIFEST.json, the stale
-    follow-ups, and the conflicting `TIMELINE`/`PROJECT_SCAFFOLD` taxonomies;
-    close issue #6.
+9. ✅ D5 — `fail_live_run` appends the terminal `RunStateChanged{Failed}`.
+10. ✅ R1/R3 — salient error lines capped (200); 30-min per-run wall-clock
+    budget with a `BudgetWarning` at 80%; token/cost fields documented as
+    unpopulated-not-free (real usage counts still need driver plumbing).
+11. ✅ P5 — MIT `LICENSE` + `license` fields across the workspace.
+12. ✅ P6 + doc set — ROADMAP reconciled (Phase 3 ✅, stale/unverifiable claims
+    corrected, Approver role), MANIFEST completed, TIMELINE/SCAFFOLD marked
+    historical, SECURITY.md given a real destination, issue #6 closed.
+
+Also fixed beyond the list: D2-adjacent `$HOME`-drop warning, D6 (queued-run
+repository recovery), P1 (resume tokens minted + stored + presented), P2 (ACP
+cancel over a fresh connection), P3 (presence + rejection notices in the TUI),
+M7/M8-vscode (webview state retention + Snapshot rendering), R4 (streamed,
+capped, spawn_blocking package hashing), codegraph depth guard, worktree
+safety-patch hardening (`--binary`, propagate-not-swallow, refuse-on-empty),
+orphaned-approval expiry at recovery + a live expiry driver, forwarder dedup,
+Observer gate on `UpdateIdeContext`, subscription-hub pruning, TUI transcript
+caps + gap re-attach, scan determinism (cap 2000, sorted), the approvals
+run-scope index (migration 0007), and the webhook verify-before-parse
+ordering test.
 
 **Product decisions (not bugs — need an owner's call):**
-13. D2/D3 — decide whether policy files are wired, and design a baseline layer
-    users may *extend* (not only narrow) before advertising config as a feature.
-14. R2 — trust-boundary/labeling for retrieved content injected into prompts.
+13. ⏳ D2/D3 — decide whether policy files are wired, and design a baseline
+    layer users may *extend* (not only narrow) before advertising config as a
+    feature. (The silent-`$HOME`-drop weakening now warns loudly; the
+    `..`/symlink intersection bypass remains latent until files are wired and
+    must be fixed together with that wiring.)
+14. ⏳ R2 — trust-boundary/labeling for retrieved content injected into
+    prompts (summaries are now truncated; the labeling design is open).
+
+**Deferred with rationale (design/coordination needed):**
+15. ⏳ Client-scoped command idempotency — needs a
+    `UNIQUE(client_id, idempotency_key)` table rebuild migration; exposure is
+    theoretical today (clients key by UUID).
+16. ⏳ `AlwaysApproval` veto of run-scoped approval reuse — needs the policy
+    verdict threaded into the broker's auto-approval check.
+17. ⏳ Structured rejection for attach-to-missing-session — the TUI's
+    remembered-session fallback deliberately consumes the empty-catchup
+    contract; changing the server contract requires coordinated client work.
 
 ---
 
