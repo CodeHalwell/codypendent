@@ -482,3 +482,54 @@ async fn save_guards_against_a_stale_revision() {
     assert_eq!(reloaded.revision, 2);
     assert_eq!(reloaded.blocks().unwrap()[0].content_text(), "hi there");
 }
+
+#[tokio::test]
+async fn set_links_guards_against_a_stale_revision() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = DocumentStore::new();
+    let author = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let created = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::System,
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph { text: "hi".into() },
+                )],
+            },
+            &author,
+        )
+        .await
+        .unwrap();
+
+    // A content editor advances the document while a resolver holds a revision-1
+    // snapshot; the stale link write is rejected rather than persisting links for
+    // a version that no longer exists.
+    let mut editor = store.load(&pool, created.id).await.unwrap().unwrap();
+    let mut resolver = store.load(&pool, created.id).await.unwrap().unwrap();
+    editor.crdt.insert_text("p", 2, "!").unwrap();
+    store
+        .save(
+            &pool,
+            &mut editor,
+            &author,
+            MutationKind::EditText,
+            Some("p"),
+        )
+        .await
+        .unwrap();
+
+    let err = store
+        .set_links(&pool, &mut resolver, Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocStoreError::StaleRevision { expected: 1, .. }
+    ));
+}

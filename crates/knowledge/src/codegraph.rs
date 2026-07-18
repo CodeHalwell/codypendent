@@ -230,14 +230,31 @@ pub async fn upsert_file_graph(
     let removed_edges = removed.rows_affected();
 
     // 2b. Retire any symbol this file no longer defines (issue #6 item 4). Prior
-    //     nodes for this `source_path` that this parse did not re-see are now
-    //     edge-free (step 2 removed their outgoing edges, and every edge into
-    //     them came from this same file), so a single-file reparse drops removed
-    //     functions/types without waiting for a whole-repository `clear`.
+    //     nodes for this `source_path` that this parse did not re-see must first
+    //     have their *incoming* edges removed: step 2 dropped only their outgoing
+    //     edges, and since Phase 4 a semantic (LSP) edge from ANOTHER file can
+    //     point at a symbol here (a cross-file call/test). Foreign keys are ON, so
+    //     deleting a still-referenced node would fail; an incoming edge to a
+    //     symbol that just changed/disappeared is stale anyway, so removing it is
+    //     correct (the next semantic pass re-adds it if still valid).
     if !ids.is_empty() {
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        // Delete edges whose `to_node` is one of the nodes about to be retired.
+        let edges_sql = format!(
+            "DELETE FROM code_edges WHERE to_node IN \
+             (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ? \
+              AND id NOT IN ({placeholders}))"
+        );
+        let mut edges_query = sqlx::query(&edges_sql)
+            .bind(repository.to_string())
+            .bind(path);
+        for id in &ids {
+            edges_query = edges_query.bind(id.to_string());
+        }
+        edges_query.execute(&mut *tx).await?;
+
         let sql = format!(
             "DELETE FROM code_nodes WHERE repository = ? AND source_path = ? \
              AND id NOT IN ({placeholders})"
@@ -502,18 +519,22 @@ pub async fn symbol_snapshot(
 /// `qualified_name`; a differing `signature_hash` is a `modified`.
 #[must_use]
 pub fn changed_between(before: &[SymbolSnapshot], after: &[SymbolSnapshot]) -> SymbolDelta {
-    let index = |snaps: &[SymbolSnapshot]| -> HashMap<String, SymbolSnapshot> {
+    // Symbol identity is file-scoped: two symbols may share a `qualified_name` in
+    // different files, so key the diff by `(source_path, qualified_name)`. Keying
+    // by name alone would collapse them — hiding a removal or attributing a
+    // `modified` to the wrong file.
+    let index = |snaps: &[SymbolSnapshot]| -> HashMap<(String, String), SymbolSnapshot> {
         snaps
             .iter()
-            .map(|s| (s.qualified_name.clone(), s.clone()))
+            .map(|s| ((s.source_path.clone(), s.qualified_name.clone()), s.clone()))
             .collect()
     };
     let before_by = index(before);
     let after_by = index(after);
 
     let mut delta = SymbolDelta::default();
-    for (name, after_sym) in &after_by {
-        match before_by.get(name) {
+    for (key, after_sym) in &after_by {
+        match before_by.get(key) {
             None => delta.added.push(after_sym.clone()),
             Some(before_sym) if before_sym.signature_hash != after_sym.signature_hash => {
                 delta.modified.push((before_sym.clone(), after_sym.clone()));
@@ -521,8 +542,8 @@ pub fn changed_between(before: &[SymbolSnapshot], after: &[SymbolSnapshot]) -> S
             Some(_) => {}
         }
     }
-    for (name, before_sym) in &before_by {
-        if !after_by.contains_key(name) {
+    for (key, before_sym) in &before_by {
+        if !after_by.contains_key(key) {
             delta.removed.push(before_sym.clone());
         }
     }

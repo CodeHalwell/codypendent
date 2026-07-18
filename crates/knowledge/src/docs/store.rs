@@ -230,6 +230,12 @@ impl DocumentStore {
     /// metadata update — it does **not** bump the document revision or record an
     /// authorship entry, since it changes no content. Updates the in-memory `doc`
     /// too.
+    ///
+    /// **Guarded on `doc.revision`:** link resolution runs from a document
+    /// snapshot, so if the document was edited concurrently (its markers may have
+    /// moved, appeared, or disappeared), this stale write fails with
+    /// [`DocStoreError::StaleRevision`] rather than persisting links for a version
+    /// that no longer exists. The caller reloads and re-resolves.
     pub async fn set_links(
         &self,
         pool: &SqlitePool,
@@ -237,17 +243,32 @@ impl DocumentStore {
         links: Vec<DocumentLink>,
     ) -> Result<(), DocStoreError> {
         let links_json = serde_json::to_string(&links)?;
-        let affected =
-            sqlx::query("UPDATE documents SET links_json = ?, updated_at = ? WHERE id = ?")
-                .bind(&links_json)
-                .bind(Utc::now().to_rfc3339())
-                .bind(doc.id.to_string())
-                .execute(pool)
-                .await?
-                .rows_affected();
+        let mut tx = pool.begin().await?;
+        let affected = sqlx::query(
+            "UPDATE documents SET links_json = ?, updated_at = ? WHERE id = ? AND revision = ?",
+        )
+        .bind(&links_json)
+        .bind(Utc::now().to_rfc3339())
+        .bind(doc.id.to_string())
+        .bind(doc.revision as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if affected == 0 {
-            return Err(DocStoreError::NoSuchDocument(doc.id));
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM documents WHERE id = ?")
+                .bind(doc.id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+            return Err(if exists.is_some() {
+                DocStoreError::StaleRevision {
+                    id: doc.id,
+                    expected: doc.revision,
+                }
+            } else {
+                DocStoreError::NoSuchDocument(doc.id)
+            });
         }
+        tx.commit().await?;
         doc.links = links;
         Ok(())
     }

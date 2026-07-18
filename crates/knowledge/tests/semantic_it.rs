@@ -350,3 +350,95 @@ async fn rust_adapter_reads_cargo_metadata() {
         .iter()
         .any(|p| p.name == "fixture-pkg" && p.version == "0.3.1"));
 }
+
+#[tokio::test]
+async fn reparse_retiring_a_symbol_removes_incoming_semantic_edges() {
+    // A cross-file LSP edge points INTO a symbol; reparsing that symbol's file to
+    // remove it must retire the node AND drop the now-stale incoming edge. With
+    // foreign keys enabled, leaving the edge behind would fail the retire delete.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev,
+        "src/a.rs",
+        "pub fn target() -> u32 { 0 }",
+    )
+    .await
+    .unwrap();
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev,
+        "tests/b.rs",
+        "#[test]\nfn covers() { assert_eq!(0, 0); }",
+    )
+    .await
+    .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let target = key_of(&nodes, "target");
+    let covers = key_of(&nodes, "covers");
+    codegraph::upsert_semantic_edges(
+        &pool,
+        repo,
+        &rev,
+        &[SemanticEdge {
+            from_symbol_key: covers.key.stable_key(),
+            to_symbol_key: target.key.stable_key(),
+            relation: CodeRelation::Calls,
+            evidence_kind: EvidenceKind::LspResolved,
+            confidence: LSP_RESOLVED_CONFIDENCE,
+            evidence: None,
+        }],
+    )
+    .await
+    .unwrap();
+    let target_id = target.id;
+
+    // Reparse src/a.rs, removing `target`. Must succeed (no FK violation).
+    let rev2 = GitRevision("rev2".into());
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev2,
+        "src/a.rs",
+        "pub fn other() -> u32 { 1 }",
+    )
+    .await
+    .unwrap();
+
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    assert!(
+        nodes.iter().all(|n| n.key.qualified_name != "target"),
+        "the removed symbol was retired"
+    );
+    let edges = codegraph::edges(&pool, repo).await.unwrap();
+    assert!(
+        edges.iter().all(|e| e.to != target_id),
+        "the stale incoming semantic edge was removed"
+    );
+}
+
+#[test]
+fn changed_between_is_file_scoped() {
+    let sym = |name: &str, path: &str, sig: Option<&str>| SymbolSnapshot {
+        qualified_name: name.into(),
+        kind: CodeNodeKind::Function,
+        source_path: path.into(),
+        signature_hash: sig.map(str::to_string),
+    };
+    // The same qualified name in two files; a.rs::init is removed, b.rs::init is
+    // unchanged. Keying by name alone would hide the removal.
+    let before = vec![
+        sym("init", "a.rs", Some("x")),
+        sym("init", "b.rs", Some("y")),
+    ];
+    let after = vec![sym("init", "b.rs", Some("y"))];
+    let delta = changed_between(&before, &after);
+    assert_eq!(delta.removed.len(), 1);
+    assert_eq!(delta.removed[0].source_path, "a.rs");
+    assert!(delta.added.is_empty());
+    assert!(delta.modified.is_empty());
+}
