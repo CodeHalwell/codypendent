@@ -46,6 +46,12 @@ pub struct ServerHello {
     pub daemon_instance: DaemonInstanceId,
     /// How often the client should expect (and send) heartbeats.
     pub heartbeat_interval_ms: u64,
+    /// A fresh [`ResumeToken`] for this connection's identity. The client stores
+    /// it opaquely and presents it on its next `ClientHello`, so a reconnect
+    /// resumes the same client identity even across a client-process restart.
+    /// Optional and defaulted for wire compatibility with older daemons/clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<ResumeToken>,
 }
 
 /// A client's authority over a session it observes (Chapter 03). Exclusivity is
@@ -119,10 +125,21 @@ mod tests {
             daemon_version: "0.1.0".to_string(),
             daemon_instance: DaemonInstanceId::new(),
             heartbeat_interval_ms: 15_000,
+            resume_token: Some(ResumeToken("opaque".to_string())),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: ServerHello = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, parsed);
+
+        // An older daemon's hello (no resume_token on the wire) still parses.
+        let legacy = serde_json::json!({
+            "selected_protocol": PROTOCOL_V1,
+            "daemon_version": "0.1.0",
+            "daemon_instance": DaemonInstanceId::new(),
+            "heartbeat_interval_ms": 15_000u64,
+        });
+        let parsed: ServerHello = serde_json::from_value(legacy).expect("legacy hello parses");
+        assert_eq!(parsed.resume_token, None);
     }
 
     #[test]

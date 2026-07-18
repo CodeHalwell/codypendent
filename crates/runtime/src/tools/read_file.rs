@@ -10,6 +10,10 @@ use super::{CapabilityKind, ToolError};
 
 /// Default line ceiling when no explicit range is requested.
 const DEFAULT_MAX_LINES: usize = 200;
+/// Upper bound on the bytes the reader will produce, so a single pathological
+/// line (e.g. a minified multi-hundred-MB file) can never be buffered whole.
+/// Far larger than any real source file; content beyond it is not read.
+const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Typed input for [`ReadFile::execute`].
 #[derive(Debug, Clone)]
@@ -101,11 +105,23 @@ impl ReadFile {
             None => (1, DEFAULT_MAX_LINES),
         };
 
+        // Refuse non-regular files: a FIFO/device inside the scope would block
+        // the read forever (a pipe never reaches EOF while a writer can appear).
+        let metadata = tokio::fs::metadata(&canonical).await?;
+        if !metadata.is_file() {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "not a regular file: {}",
+                canonical.display()
+            )));
+        }
+
         // Stream line by line, keeping only the window and counting the total, so
         // the excerpt semantics (total_lines, truncation) stay exact without the
-        // whole file ever residing in memory.
+        // whole file ever residing in memory. The reader is byte-bounded so one
+        // enormous newline-free line cannot be buffered whole either.
         let file = tokio::fs::File::open(&canonical).await?;
-        let mut lines = tokio::io::BufReader::new(file).lines();
+        let bounded = tokio::io::AsyncReadExt::take(file, MAX_READ_BYTES);
+        let mut lines = tokio::io::BufReader::new(bounded).lines();
         let mut total = 0usize;
         let mut window: Vec<String> = Vec::new();
         while let Some(line) = lines.next_line().await? {

@@ -202,6 +202,8 @@ fn map_confirm_key(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Action::ConfirmCancel,
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Action::Dismiss,
+        // Ctrl-C backs out of the modal like Esc (never silently swallowed).
+        KeyCode::Char('c') if ctrl(key) => Action::Dismiss,
         _ => Action::NoOp,
     }
 }

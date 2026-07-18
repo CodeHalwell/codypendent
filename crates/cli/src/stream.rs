@@ -119,8 +119,11 @@ pub fn replay_catchup<W: Write>(
 pub async fn stream_until_terminal<W: Write>(
     conn: &mut Connection,
     out: &mut W,
+    expected_run: Option<RunId>,
 ) -> anyhow::Result<RunExit> {
-    let mut run_id: Option<RunId> = None;
+    // The authoritative binding is the run id the daemon reported for OUR
+    // StartRun; first-observed `RunStarted` is only the older-daemon fallback.
+    let mut run_id: Option<RunId> = expected_run;
     loop {
         let envelope = conn.next_envelope().await?.ok_or_else(|| {
             anyhow!("daemon closed the connection before the run reached a terminal state")

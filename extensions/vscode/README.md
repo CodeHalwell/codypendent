@@ -35,7 +35,9 @@ suite exercises the protocol/transport logic with no VS Code runtime.
 - **Enums** are internally tagged with a `"type"` field and PascalCase variant
   names; unknown `type` values are ignored (forward-compatible).
 - **Handshake:** connect → `ClientHello` → `ServerHello` → `Command(AttachSession
-  { requested_role: Contributor })` → `Catchup` + a live `Event` stream.
+  { requested_role: Approver })` → `Catchup` + a live `Event` stream. (The
+  extension both starts runs and resolves the approvals it surfaces, so it
+  attaches as `Approver` — a superset of `Contributor` — not `Contributor`.)
 - **Approvals** arrive as `ToolProposed` / `ApprovalRequested` events and are
   resolved with `ResolveApproval { decision, scope: Once }`.
 - **IDE context** is pushed as `UpdateIdeContext { session_id, update }`,

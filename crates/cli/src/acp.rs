@@ -49,7 +49,7 @@ impl DaemonAcpBackend {
         let mut conn = Connection::connect(&self.socket)
             .await
             .map_err(|e| AcpError::Backend(e.to_string()))?;
-        conn.handshake("codypendent-acp", env!("CARGO_PKG_VERSION"))
+        conn.handshake("codypendent-acp", env!("CARGO_PKG_VERSION"), None)
             .await
             .map_err(|e| AcpError::Backend(e.to_string()))?;
         Ok(conn)
@@ -127,9 +127,27 @@ impl AcpBackend for DaemonAcpBackend {
         loop {
             tokio::select! {
                 // The client cancelled this turn: stop the run and report it.
+                // `next_envelope` is NOT cancellation-safe — if this arm wins
+                // mid-frame, `conn`'s read stream is desynchronized (the
+                // consumed prefix bytes are gone), so the cancel must never
+                // reuse it: a CancelRun written onto a desynced connection
+                // fails silently and the run keeps executing while Zed shows
+                // "cancelled". Open a fresh connection for the cancel instead.
                 _ = ctx.cancelled() => {
                     if let Some(run) = run_id {
-                        let _ = conn.send_command(CommandBody::CancelRun { run_id: run }).await;
+                        match self.open().await {
+                            Ok(mut fresh) => {
+                                if let Err(error) = fresh
+                                    .send_command(CommandBody::CancelRun { run_id: run })
+                                    .await
+                                {
+                                    eprintln!("codypendent acp: cancel could not reach the daemon: {error}");
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("codypendent acp: cancel could not reconnect to the daemon: {error}");
+                            }
+                        }
                     }
                     return Ok(StopReason::Cancelled);
                 }

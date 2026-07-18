@@ -209,7 +209,7 @@ impl ApprovalBroker {
 
         let auto_approve = self.run_scoped_match(pool, run_id, &digest).await?;
 
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let state = if auto_approve {
             ApprovalState::Approved
         } else {
@@ -394,7 +394,7 @@ impl ApprovalBroker {
         scope: ApprovalScope,
         resolved_by: String,
     ) -> Result<SessionEvent, ApprovalError> {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let event = self
             .resolve_in_tx(
                 &mut tx,
@@ -520,7 +520,7 @@ impl ApprovalBroker {
             let session_id = parse_session_id(&session_str)?;
             let now_str = now.to_rfc3339();
 
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let updated = sqlx::query(
                 "UPDATE approvals SET state = 'expired', resolved_at = ? \
                  WHERE id = ? AND state = 'pending'",
@@ -549,9 +549,99 @@ impl ApprovalBroker {
             tx.commit().await?;
 
             self.wake(approval_id, ApprovalDecision::Reject).await;
+            self.publish_resolved(session_id, seq, now, approval_id);
             expired += 1;
         }
         Ok(expired)
+    }
+
+    /// Expire every `pending` approval whose run has already reached a terminal
+    /// state — the run can never consume the decision, so leaving the row
+    /// `pending` re-surfaces a dead request on every boot, forever. Used by
+    /// startup recovery after it fails the live runs. Marks each `expired` and
+    /// appends `ApprovalResolved { Reject }` exactly as a deadline expiry does.
+    pub async fn expire_orphaned(
+        &self,
+        pool: &SqlitePool,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ApprovalId>, ApprovalError> {
+        let candidates: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.id, r.session_id FROM approvals a \
+             JOIN runs r ON a.run_id = r.id \
+             WHERE a.state = 'pending' \
+               AND r.state IN ('Completed', 'Failed', 'Cancelled')",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let mut expired = Vec::new();
+        for (id_str, session_str) in candidates {
+            let approval_id = parse_approval_id(&id_str)?;
+            let session_id = parse_session_id(&session_str)?;
+            let now_str = now.to_rfc3339();
+
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            let updated = sqlx::query(
+                "UPDATE approvals SET state = 'expired', resolved_at = ? \
+                 WHERE id = ? AND state = 'pending'",
+            )
+            .bind(&now_str)
+            .bind(approval_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                continue;
+            }
+            let seq = next_sequence(&mut *tx, session_id).await?;
+            append_event(
+                &mut *tx,
+                session_id,
+                seq,
+                &Actor::System,
+                &EventBody::ApprovalResolved {
+                    approval_id,
+                    decision: ApprovalDecision::Reject,
+                },
+                &now_str,
+            )
+            .await?;
+            tx.commit().await?;
+
+            self.wake(approval_id, ApprovalDecision::Reject).await;
+            self.publish_resolved(session_id, seq, now, approval_id);
+            expired.push(approval_id);
+        }
+        Ok(expired)
+    }
+
+    /// Publish an `ApprovalResolved { Reject }` produced by an expiry to any
+    /// live subscribers (persist-before-publish: callers commit first). Without
+    /// this, an expiry is durable but invisible until the client re-attaches.
+    fn publish_resolved(
+        &self,
+        session_id: SessionId,
+        seq: i64,
+        now: DateTime<Utc>,
+        approval_id: ApprovalId,
+    ) {
+        if let Some(hub) = &self.subscriptions {
+            if let Ok(sequence) = u64::try_from(seq) {
+                hub.publish(
+                    session_id,
+                    SessionEvent {
+                        sequence,
+                        occurred_at: now,
+                        causation_id: None,
+                        correlation_id: None,
+                        actor: Actor::System,
+                        body: EventBody::ApprovalResolved {
+                            approval_id,
+                            decision: ApprovalDecision::Reject,
+                        },
+                    },
+                );
+            }
+        }
     }
 
     /// Re-load every `pending` approval on daemon restart and re-register a
@@ -586,24 +676,44 @@ impl ApprovalBroker {
         Ok(pending)
     }
 
-    /// Insert (or replace) a waiter for `approval_id`, optionally pre-loaded with
-    /// a decision (auto-approval).
+    /// Insert a waiter for `approval_id`, optionally pre-loaded with a decision
+    /// (auto-approval). Never *replaces* an existing entry: a resolution racing
+    /// in between the request's commit and this registration pre-creates the
+    /// waiter with its decision (see [`wake`](Self::wake)), and clobbering it
+    /// would drop that decision and park the run forever.
     async fn register_waiter(&self, approval_id: ApprovalId, initial: Option<ApprovalDecision>) {
-        let (sender, _rx) = watch::channel(initial);
+        let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
+        let sender = guard
+            .entry(approval_id)
+            .or_insert_with(|| watch::channel(None).0);
+        if let Some(decision) = initial {
+            sender.send_replace(Some(decision));
+        }
+    }
+
+    /// Deliver `decision` to a parked waiter. If none is registered yet — a
+    /// client that learned the approval id from the durable `ApprovalRequested`
+    /// event can resolve it in the window between the request's commit and its
+    /// waiter registration — the waiter is created pre-resolved so the decision
+    /// is retained for the runtime's later `await_decision`. `send_replace`
+    /// never fails even when nobody is subscribed yet.
+    pub(crate) async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
+        let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
+        guard
+            .entry(approval_id)
+            .or_insert_with(|| watch::channel(None).0)
+            .send_replace(Some(decision));
+    }
+
+    /// Drop the waiter for `approval_id`, if any. Called when the run that was
+    /// parked on this approval is cancelled — the `await_decision` future is
+    /// dropped without consuming the entry, which would otherwise leak for the
+    /// daemon's lifetime.
+    pub fn forget_waiter(&self, approval_id: ApprovalId) {
         self.waiters
             .lock()
             .expect("waiters mutex poisoned")
-            .insert(approval_id, sender);
-    }
-
-    /// Deliver `decision` to a parked waiter, if any. `send_replace` never fails
-    /// even when nobody is subscribed yet — the value is retained for a later
-    /// subscriber.
-    pub(crate) async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
-        let guard = self.waiters.lock().expect("waiters mutex poisoned");
-        if let Some(sender) = guard.get(&approval_id) {
-            sender.send_replace(Some(decision));
-        }
+            .remove(&approval_id);
     }
 
     /// Whether an identical action (by [`action_digest`]) was already approved
@@ -795,6 +905,8 @@ mod tests {
         ProposedAction::ExecuteCommand {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
+            environment: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -995,6 +1107,8 @@ mod tests {
                 ProposedAction::ExecuteCommand {
                     program: "cargo".to_string(),
                     args: vec!["build".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 sample_risk(),
                 vec![],

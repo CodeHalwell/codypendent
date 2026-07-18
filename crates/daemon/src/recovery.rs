@@ -18,8 +18,10 @@
 //!    with a chronicle artifact and its existing artifacts intact. The *only*
 //!    forbidden outcome is silent disappearance — "recovers or cleanly marks the
 //!    run" is the Phase 1 exit criterion.
-//! 5. **Approval re-surfacing** — [`ApprovalBroker::reload_pending`] re-loads the
-//!    `pending` approvals so newly attached clients see them again (STEP 1.6).
+//! 5. **Orphaned-approval expiry** — [`ApprovalBroker::expire_orphaned`] resolves
+//!    (as rejected) every `pending` approval whose run is now terminal; after
+//!    step 4 that is all of them, and a decision for a dead run can never be
+//!    consumed, so re-surfacing it on every boot would be noise forever.
 //!
 //! Recovery is **idempotent**: a run already `Failed` is not a live run, so it is
 //! never re-failed; a swept `tmp/` is already empty; reconciled effects are no
@@ -61,8 +63,9 @@ pub struct RecoveryReport {
     pub reconciled_effects: usize,
     /// Runs that were live at boot and were cleanly failed with a chronicle.
     pub failed_runs: Vec<RunId>,
-    /// Pending approvals re-surfaced for newly attached clients.
-    pub resurfaced_approvals: Vec<ApprovalId>,
+    /// Pending approvals expired because their run is terminal (they could
+    /// never be consumed; recovery resolves them as rejected).
+    pub expired_approvals: Vec<ApprovalId>,
 }
 
 /// Whether a run state is *live* — in flight when the daemon stopped, and so a
@@ -108,20 +111,22 @@ pub async fn recover_on_startup(
     // 4. Cleanly fail every live run (no mid-node checkpoint exists in Phase 1).
     let failed_runs = recover_live_runs(pool, &artifacts).await?;
 
-    // 5. Re-surface pending approvals for clients that re-attach.
-    let resurfaced_approvals = ApprovalBroker::new()
-        .reload_pending(pool)
-        .await?
-        .into_iter()
-        .map(|approval| approval.approval_id)
-        .collect();
+    // 5. Expire pending approvals whose run is now terminal — after step 4 that
+    //    is every pending approval, since a pending approval's run was by
+    //    definition live. The decision can never be consumed, so leaving the
+    //    rows `pending` would re-surface dead requests on every boot forever
+    //    (and the real broker, built later in the executor, would reload them).
+    //    Any survivor (none expected) is what a re-attaching client re-surfaces.
+    let expired_approvals = ApprovalBroker::new()
+        .expire_orphaned(pool, Utc::now())
+        .await?;
 
     Ok(RecoveryReport {
         swept_tmp,
         orphaned_leases,
         reconciled_effects,
         failed_runs,
-        resurfaced_approvals,
+        expired_approvals,
     })
 }
 
@@ -213,7 +218,7 @@ async fn fail_live_run(
     // One transaction ends the run. Sequences are allocated inside it, the
     // approvals/commands atomic-append pattern.
     let now = Utc::now().to_rfc3339();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let seq = next_sequence(&mut *tx, session_id).await?;
     append_event(
@@ -230,6 +235,25 @@ async fn fail_live_run(
     .await?;
 
     projections::set_run_state(&mut *tx, run_id, RunState::Failed).await?;
+
+    // The terminal `RunStateChanged { Failed }` must be in the ledger, not only
+    // the projection: clients fold run liveness from `RunStateChanged` events,
+    // so without it a folded catch-up shows the run stuck in `Recovering`
+    // forever while the projection says `Failed` — breaking
+    // `projection = fold(events)` for every recovered run.
+    let seq = next_sequence(&mut *tx, session_id).await?;
+    append_event(
+        &mut *tx,
+        session_id,
+        seq,
+        &Actor::System,
+        &EventBody::RunStateChanged {
+            run_id,
+            state: RunState::Failed,
+        },
+        &now,
+    )
+    .await?;
 
     let seq = next_sequence(&mut *tx, session_id).await?;
     append_event(
@@ -305,7 +329,7 @@ pub async fn fail_run(
     // commit together, so a run never lands half-failed.
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let failed_state = EventBody::RunStateChanged {
         run_id,

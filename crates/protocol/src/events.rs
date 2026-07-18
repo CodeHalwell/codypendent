@@ -226,6 +226,8 @@ mod tests {
             action: ProposedAction::ExecuteCommand {
                 program: "cargo".to_string(),
                 args: vec!["test".to_string()],
+                environment: Vec::new(),
+                cwd: None,
             },
         });
         round_trip(EventBody::ToolStarted {

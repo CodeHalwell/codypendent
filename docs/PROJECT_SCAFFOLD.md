@@ -2,6 +2,13 @@
 
 This scaffold keeps the repository lightweight while setting up clear implementation lanes.
 
+> **Note — historical planning doc.** Some crate names and CLI verbs sketched
+> below (e.g. `codypendent-skills`, `codypendent-fabric`, `codypendent agent
+> run`, `codypendent skills edit`) were early proposals and do not all match the
+> shipped workspace. For the current crate layout and CLI surface, see the
+> workspace `Cargo.toml` and [`ROADMAP.md`](../ROADMAP.md); read this file as
+> background intent, not current structure.
+
 ## 1) Repository Layout
 
 ```text

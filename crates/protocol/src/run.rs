@@ -94,6 +94,18 @@ pub enum ProposedAction {
     ExecuteCommand {
         program: String,
         args: Vec<String>,
+        /// The child's *complete* environment as name/value pairs (empty means it
+        /// inherits nothing). Carried on the action so the approver and the audit
+        /// ledger see exactly what the command runs with: an unshown,
+        /// model-controlled environment could otherwise smuggle
+        /// execution-hijacking variables (`LD_PRELOAD`, `RUSTC_WRAPPER`, a shadowed
+        /// `PATH`, …) past a benign-looking `run cargo test` approval. Defaulted so
+        /// an older client that sends none still parses.
+        #[serde(default)]
+        environment: Vec<(String, String)>,
+        /// The working directory the command runs in, when constrained.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     NetworkRequest {
         destination: String,
@@ -231,6 +243,8 @@ mod tests {
         round_trip(ProposedAction::ExecuteCommand {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
+            environment: vec![("RUST_BACKTRACE".to_string(), "1".to_string())],
+            cwd: Some("/repo".to_string()),
         });
         round_trip(ProposedAction::WritePatch {
             patch: ArtifactId::new(),

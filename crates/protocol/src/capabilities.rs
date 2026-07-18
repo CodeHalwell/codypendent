@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// explicitly opts in, so an unknown or minimal client is always served the
 /// safe, plain-text baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClientCapabilities {
     /// Renders styled text (bold, colour spans, links).
     pub rich_text: bool,

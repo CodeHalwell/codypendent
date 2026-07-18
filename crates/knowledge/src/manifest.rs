@@ -176,6 +176,11 @@ pub enum ManifestError {
     /// The `status` string is not one of `draft | active | modified | deprecated`.
     #[error("unknown status `{0}` (expected draft|active|modified|deprecated)")]
     UnknownStatus(String),
+    /// The package's total file bytes exceed [`MAX_PACKAGE_BYTES`] — refused so a
+    /// community package with a huge asset cannot exhaust daemon memory or stall
+    /// registration.
+    #[error("skill package exceeds the {limit}-byte size ceiling (at least {seen} bytes)")]
+    PackageTooLarge { seen: u64, limit: u64 },
 }
 
 /// Load and validate the skill package at `dir`, folding it into a
@@ -360,34 +365,58 @@ fn parse_status(status: &str) -> Result<RegistryStatus, ManifestError> {
     }
 }
 
+/// Ceiling on a package's total file bytes. A skill package is instructions,
+/// references, scripts, and small assets — far below this; anything larger is
+/// refused rather than read (see [`ManifestError::PackageTooLarge`]).
+const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Content-hash every file in the package directory.
 ///
 /// Walks `dir` recursively, sorts files by their normalized relative path (so the
 /// digest is independent of directory-read order and platform separators), and
 /// folds each path and its bytes — length-prefixed so no path/content boundary is
 /// ambiguous — into one SHA-256, hex-encoded. Any file added, removed, or edited
-/// changes the digest.
+/// changes the digest. Files are streamed through the hasher one chunk at a time
+/// — never all held in memory at once — and the total is capped at
+/// [`MAX_PACKAGE_BYTES`].
 fn hash_package(dir: &Path) -> Result<String, ManifestError> {
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;
-    files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    files.sort();
 
     let mut hasher = Sha256::new();
-    for (relative, bytes) in files {
+    let mut total: u64 = 0;
+    let mut chunk = vec![0u8; 64 * 1024];
+    for (relative, path) in files {
+        let size = std::fs::metadata(&path)?.len();
+        total = total.saturating_add(size);
+        if total > MAX_PACKAGE_BYTES {
+            return Err(ManifestError::PackageTooLarge {
+                seen: total,
+                limit: MAX_PACKAGE_BYTES,
+            });
+        }
         hasher.update((relative.len() as u64).to_le_bytes());
         hasher.update(relative.as_bytes());
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
+        hasher.update(size.to_le_bytes());
+        let mut file = std::fs::File::open(&path)?;
+        loop {
+            let n = std::io::Read::read(&mut file, &mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
     }
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Recursively gather `(normalized-relative-path, bytes)` for every regular file
-/// under `dir`.
+/// Recursively gather `(normalized-relative-path, absolute-path)` for every
+/// regular file under `dir`. Paths only — bytes are streamed at hash time.
 fn collect_files(
     root: &Path,
     dir: &Path,
-    out: &mut Vec<(String, Vec<u8>)>,
+    out: &mut Vec<(String, std::path::PathBuf)>,
 ) -> Result<(), ManifestError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -401,7 +430,7 @@ fn collect_files(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.push((relative, std::fs::read(&path)?));
+            out.push((relative, path));
         }
     }
     Ok(())

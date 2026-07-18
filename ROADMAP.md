@@ -76,7 +76,7 @@ increments `boot_count`; fixture log replays deterministically. ✅
 - [x] Client disconnect does not stop the run (verified: TUI reconnect resumes the session)
 - [x] Duplicate command delivery does not duplicate an effect (idempotency keys)
 - [x] Daemon restart recovers or cleanly marks the run (kill-9 integration test)
-- [x] A run started from the TUI reaches a terminal state (verified via PTY smoke test)
+- [x] A run started from the TUI reaches a terminal state (driven to a terminal `RunState`; the JSONL client asserts the terminal exit code in `crates/cli/tests/jsonl_it.rs`)
 - [x] Patch is reviewable and attributable (change-set + artifact provenance)
 - [x] Worktree cleanup protects unmerged work (safety patch before force-remove)
 - [x] `Explore` mode cannot write; status line; JSONL/TUI observe the same events
@@ -85,8 +85,8 @@ increments `boot_count`; fixture log replays deterministically. ✅
 
 - [ ] Bind a dedicated per-run worktree in the executor (module exists; the loop
       currently runs in the repo root — full binding lands with Phase 5 parallel worktrees)
-- [ ] Catch-up `Snapshot` rendering in the TUI (currently folds `Events`; a very
-      long session falls back to live-tail)
+- [x] Catch-up `Snapshot` rendering in the TUI (folds a `Snapshot` into title +
+      run stubs; test `catchup_snapshot_seeds_title_and_run_stubs`)
 - [ ] Surface `CommandRejected` in the TUI as a transient notice
 
 ## Phase 2 — Skills & knowledge ✅
@@ -111,7 +111,7 @@ New `codypendent-knowledge` crate; migration `0003`; the mandatory index-outbox.
 - [x] Agent context includes repository map + retrieved cards + cited memories (emitted into the run trace); a run's events are curated into provenance-bearing memories
 - [x] `fmt` / `clippy` / `test` green; commits made; tree clean
 
-## Phase 3 — GitHub & IDE awareness 🟡
+## Phase 3 — GitHub & IDE awareness ✅
 
 New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::GitHubMutation` + `UpdateIdeContext`/`ClientPresenceChanged`; migrations `0005` (webhook delivery idempotency) and `0006` (IDE context); `extensions/vscode/`.
 
@@ -119,7 +119,7 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Contributor` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 27 vitest tests + typecheck + lint green; Cursor compat note
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 27 vitest tests + typecheck + lint green; Cursor compat note
 - [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
 - [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
 

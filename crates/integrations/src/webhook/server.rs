@@ -14,9 +14,11 @@
 //! - a non-POST request → `405`
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use super::ingest::{DeliveryHeaders, IngestOutcome, WebhookIngestor};
 use super::WebhookError;
@@ -26,17 +28,43 @@ pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-/// Serve the webhook endpoint on `listener`, spawning a task per connection.
+/// Whole-connection deadline: read request + ingest + write response. A GitHub
+/// delivery completes in well under this; a client that dribbles bytes (or sends
+/// headers then stalls the body — a slowloris) is cut off instead of holding a
+/// connection and task open forever. `MAX_HEADER_BYTES` bounds memory; this
+/// bounds *time*.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Concurrent-connection ceiling, so a flood of held-open sockets cannot
+/// accumulate unbounded tasks/file descriptors. Excess connections wait for a
+/// slot rather than being dropped (GitHub retries are precious).
+const MAX_CONNECTIONS: usize = 64;
+
+/// Serve the webhook endpoint on `listener`, spawning a task per connection —
+/// bounded by [`MAX_CONNECTIONS`] and each subject to [`CONNECTION_TIMEOUT`].
 ///
 /// Returns only if the accept loop itself fails; per-connection errors are
 /// logged and do not stop the server.
 pub async fn serve(listener: TcpListener, ingestor: Arc<WebhookIngestor>) -> std::io::Result<()> {
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, _peer) = listener.accept().await?;
         let ingestor = Arc::clone(&ingestor);
+        let permits = Arc::clone(&permits);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, ingestor).await {
-                tracing::debug!(%error, "webhook connection ended with error");
+            // The semaphore is never closed, so acquire only fails on close.
+            let Ok(_permit) = permits.acquire().await else {
+                return;
+            };
+            match tokio::time::timeout(CONNECTION_TIMEOUT, handle_connection(stream, ingestor))
+                .await
+            {
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "webhook connection ended with error");
+                }
+                Err(_elapsed) => {
+                    tracing::debug!("webhook connection timed out");
+                }
+                Ok(Ok(())) => {}
             }
         });
     }
@@ -99,7 +127,12 @@ async fn handle_connection(
         let name = name.trim();
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse::<usize>().unwrap_or(0);
+            // A garbled length must be a 400, not silently "0" (which would
+            // misprocess a request that does carry a body).
+            match value.parse::<usize>() {
+                Ok(parsed) => content_length = parsed,
+                Err(_) => return write_response(&mut stream, 400, "Bad Request").await,
+            }
         } else if name.eq_ignore_ascii_case("x-hub-signature-256") {
             signature = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("x-github-event") {

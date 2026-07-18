@@ -69,8 +69,9 @@ enum TopCommand {
     Attach {
         /// The session to attach to.
         session_id: SessionId,
-        /// Replay from this sequence onward. Defaults to a live tail (no
-        /// catch-up replay beyond what the daemon already retains).
+        /// The last sequence already seen: replay resumes at the *next* event
+        /// (an exclusive cursor). Omit to replay the full retained history —
+        /// or a snapshot — from the beginning of what the daemon still holds.
         #[arg(long = "from-sequence")]
         from_sequence: Option<u64>,
         /// Output format for the event stream. `jsonl` is the only format

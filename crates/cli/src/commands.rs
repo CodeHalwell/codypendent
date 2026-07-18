@@ -217,26 +217,17 @@ pub async fn run_over_connection<W: Write>(
     repository: &str,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
 
-    // CreateSession: the daemon's `CommandAccepted` reply carries no
-    // session/run id in its *payload* — `crates/daemon/src/server.rs` builds
-    // it from only `command_id` and `sequence`, dropping
-    // `CommandOutcome::created_session`/`created_run`. (Confirmed by the
-    // daemon's own integration test, `crates/daemon/tests/server_it.rs`'s
-    // `only_session_id`, which resorts to querying the session table
-    // directly — an option this crate does not have, since a client only
-    // ever speaks the wire protocol.) The one wire-level place a freshly
-    // created session's id *can* travel is the reply envelope's own
-    // `session_id` field (`Envelope.session_id`, Chapter 03) — general
-    // envelope metadata alongside any payload — so that is the contract this
-    // client relies on. A daemon that (like the currently committed STEP
-    // 1.11 server) never populates that field on a `CreateSession` reply
-    // cannot support `run` end-to-end; closing that gap is a
-    // `codypendent-daemon` change, out of this crate's scope. We fail
-    // loudly and specifically here rather than hang waiting for an id that
-    // will never arrive.
+    // CreateSession: the daemon's `CommandAccepted` *payload* is intentionally
+    // minimal (only `command_id` + `sequence`). The freshly created session's id
+    // travels on the reply envelope's own `session_id` field
+    // (`Envelope.session_id`, Chapter 03) — connection-level metadata the server
+    // sets on a `CreateSession` reply from `CommandOutcome::created_session`
+    // (`crates/daemon/src/server.rs`). This client reads it from there; if a
+    // daemon ever omits it we fail loudly and specifically below rather than
+    // hang waiting for an id that will never arrive.
     let workspace = WorkspaceId::new();
     let create_reply = conn
         .send_command(CommandBody::CreateSession {
@@ -283,8 +274,16 @@ pub async fn run_over_connection<W: Write>(
     if let Payload::CommandRejected(error) = &start_reply.payload {
         anyhow::bail!("StartRun rejected: {} ({})", error.message, error.code);
     }
+    // Bind to exactly the run OUR StartRun created (the daemon reports it on
+    // the accept). Falling back to first-observed `RunStarted` is only for an
+    // older daemon that doesn't send it — under which a concurrent client's
+    // run starting first could otherwise capture the exit code.
+    let created_run = match &start_reply.payload {
+        Payload::CommandAccepted { created_run, .. } => *created_run,
+        _ => None,
+    };
 
-    stream::stream_until_terminal(conn, out).await
+    stream::stream_until_terminal(conn, out, created_run).await
 }
 
 /// `codypendent attach <SESSION_ID> [--from-sequence N] --events jsonl`.
@@ -313,7 +312,7 @@ pub async fn attach_over_connection<W: Write>(
     from_sequence: Option<u64>,
     out: &mut W,
 ) -> anyhow::Result<()> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"))
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
 
     let attach_reply = conn

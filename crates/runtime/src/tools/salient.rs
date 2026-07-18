@@ -20,6 +20,11 @@ const SALIENT_MAX_LINE_LEN: usize = 2048;
 /// Case-insensitive substrings that mark a line as salient regardless of its
 /// position (Chapter 09 / STEP 1.7 rule 4).
 const ERROR_MARKERS: [&str; 5] = ["error", "warning", "panic", "failed", "fatal"];
+/// Cap on error-matching lines kept beyond head/tail. Without it a failing
+/// `cargo build` (thousands of `error:`/`warning:` lines) would put *every* one
+/// into the "compacted" view — which is re-sent to the model every step — so the
+/// salient view could balloon to tens of MB exactly when the build is broken.
+const SALIENT_MAX_ERROR_LINES: usize = 200;
 
 /// The compacted, model-facing view of one command execution.
 #[derive(Debug, Clone)]
@@ -119,9 +124,14 @@ pub(crate) fn compute_stream(
     selected.extend(0..head_end);
     let tail_start = total_lines.saturating_sub(SALIENT_TAIL);
     selected.extend(tail_start..total_lines);
+    let mut error_lines = 0;
     for (i, line) in lines.iter().enumerate() {
         if is_error_line(line) {
             selected.push(i);
+            error_lines += 1;
+            if error_lines >= SALIENT_MAX_ERROR_LINES {
+                break;
+            }
         }
     }
     selected.sort_unstable();
@@ -243,6 +253,22 @@ mod tests {
         assert!(stream.lines.iter().any(|l| l.contains("lines omitted")));
         // Far fewer than 500 lines are retained.
         assert!(stream.lines.len() < 200);
+    }
+
+    #[test]
+    fn error_line_selection_is_capped() {
+        // A broken build that emits thousands of marker lines must not put all of
+        // them into the compacted view.
+        let mut text = String::new();
+        for i in 0..5000 {
+            text.push_str(&format!("error: problem {i}\n"));
+        }
+        let stream = compute_stream(text.as_bytes(), false, None);
+        assert_eq!(stream.total_lines, 5000);
+        assert!(stream.truncated);
+        // Bounded to head + tail + the error cap (plus a few omission markers),
+        // not all 5000 lines.
+        assert!(stream.lines.len() <= SALIENT_HEAD + SALIENT_TAIL + SALIENT_MAX_ERROR_LINES + 8);
     }
 
     #[test]

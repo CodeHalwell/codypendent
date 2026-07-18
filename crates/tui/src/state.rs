@@ -254,10 +254,16 @@ pub struct MemoryCard {
     pub source: String,
 }
 
+/// Ceiling on retained transcript entries per run (the ledger is the durable
+/// record; this is a bounded view for an in-terminal scrollback).
+pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
+/// Ceiling on one coalesced model-text entry's bytes.
+pub(crate) const MAX_MODEL_ENTRY_BYTES: usize = 256 * 1024;
+
 /// The status-line projection (STEP 1.12 RULE 4, [Chapter 20] projections):
 /// mode, run state, model, context %, cost, worktree, pending-approval count.
 ///
-/// [Chapter 20]: ../../docs/docs/20-interaction-and-autonomy-model.md
+/// [Chapter 20]: ../../../docs/docs/20-interaction-and-autonomy-model.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusProjection {
     pub mode: Option<AgentMode>,
@@ -307,6 +313,8 @@ pub struct AppState {
     pub should_detach: bool,
     /// A monotonic tick counter for spinner animation.
     pub tick: u64,
+    /// A transient status-line notice and the tick at which it expires.
+    pub notice: Option<(String, u64)>,
     /// Semantic commands the CLI must send to the daemon. Drained by the CLI
     /// after every reduce; never touched by the renderer.
     pub outbox: Vec<Intent>,
@@ -338,6 +346,7 @@ impl AppState {
             default_mode: AgentMode::Build,
             should_detach: false,
             tick: 0,
+            notice: None,
             outbox: Vec::new(),
         }
     }
@@ -438,11 +447,33 @@ impl AppState {
     /// Append model text, coalescing into a trailing `Model` entry.
     pub(crate) fn append_model_text(run: &mut RunView, text: &str) {
         if let Some(TranscriptEntry::Model { text: existing }) = run.transcript.last_mut() {
-            existing.push_str(text);
-        } else {
-            run.transcript.push(TranscriptEntry::Model {
+            // Bound one coalesced model entry: an hours-long stream must not grow
+            // a single String without limit (the full text is in the ledger; the
+            // transcript is a view). Past the cap, start a fresh entry so the
+            // entry-count cap in `push_entry` takes over.
+            if existing.len() + text.len() <= MAX_MODEL_ENTRY_BYTES {
+                existing.push_str(text);
+                return;
+            }
+        }
+        Self::push_entry(
+            run,
+            TranscriptEntry::Model {
                 text: text.to_owned(),
-            });
+            },
+        );
+    }
+
+    /// Append a transcript entry, holding the transcript to
+    /// [`MAX_TRANSCRIPT_ENTRIES`] by dropping the oldest — the ledger, not this
+    /// view, is the durable record. Selection/scroll indices shift with the
+    /// drop so the focused entry stays the same one.
+    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry) {
+        run.transcript.push(entry);
+        while run.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
+            run.transcript.remove(0);
+            run.transcript_selected = run.transcript_selected.saturating_sub(1);
+            run.scroll = run.scroll.saturating_sub(1);
         }
     }
 }

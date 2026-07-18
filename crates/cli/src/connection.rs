@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context};
 use codypendent_protocol::{
     read_envelope, write_envelope, ClientCapabilities, ClientHello, ClientId, Command, CommandBody,
-    CommandId, Envelope, Payload, ServerHello, PROTOCOL_V1,
+    CommandId, Envelope, Payload, ResumeToken, ServerHello, PROTOCOL_V1,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -57,20 +57,22 @@ impl Connection {
     }
 
     /// The first exchange on every connection (Chapter 03): send `ClientHello`
-    /// advertising `PROTOCOL_V1` and default capabilities (no resume token —
-    /// resuming a prior connection is a later concern), return the daemon's
-    /// `ServerHello`.
+    /// advertising `PROTOCOL_V1` and default capabilities, return the daemon's
+    /// `ServerHello`. Presenting the `resume` token a prior `ServerHello`
+    /// issued restores that connection's client identity daemon-side; the
+    /// caller stores the token from the returned hello for its next reconnect.
     pub async fn handshake(
         &mut self,
         client_name: &str,
         client_version: &str,
+        resume: Option<ResumeToken>,
     ) -> anyhow::Result<ServerHello> {
         let hello = ClientHello {
             client_name: client_name.to_string(),
             client_version: client_version.to_string(),
             supported_protocols: vec![PROTOCOL_V1],
             capabilities: ClientCapabilities::default(),
-            resume_token: None,
+            resume_token: resume,
         };
         let reply = self.request(Payload::ClientHello(hello)).await?;
         match reply.payload {

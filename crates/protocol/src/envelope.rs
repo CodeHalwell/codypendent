@@ -12,7 +12,7 @@ use crate::command::Command;
 use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
-use crate::ids::{ClientId, CommandId, DaemonInstanceId, MessageId, SessionId, WorkspaceId};
+use crate::ids::{ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId};
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +90,12 @@ pub enum Payload {
         command_id: CommandId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
+        /// The run a `StartRun` created, so the issuing client can bind to
+        /// exactly that run (never a concurrent client's run that happened to
+        /// start first). Absent on every other command; defaulted for wire
+        /// compatibility with older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_run: Option<RunId>,
     },
     /// The command was rejected; carries the full structured error.
     CommandRejected(CodypendentError),
@@ -167,6 +173,7 @@ mod tests {
             daemon_version: "0.1.0".to_string(),
             daemon_instance: DaemonInstanceId::new(),
             heartbeat_interval_ms: 15_000,
+            resume_token: None,
         });
         assert!(matches!(
             round_trip_payload(server_hello),
@@ -197,6 +204,7 @@ mod tests {
         let accepted = Payload::CommandAccepted {
             command_id: CommandId::new(),
             sequence: Some(7),
+            created_run: None,
         };
         assert!(matches!(
             round_trip_payload(accepted),

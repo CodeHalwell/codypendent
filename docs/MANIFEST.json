@@ -1,12 +1,23 @@
 {
   "name": "Codypendent Documentation Suite",
-  "version": "0.3",
-  "date": "2026-07-15",
+  "version": "0.4",
+  "date": "2026-07-17",
   "files": [
     "CONTRIBUTING.md",
     "README.md",
     "SECURITY.md",
+    "PROJECT_SCAFFOLD.md",
+    "TIMELINE.md",
     "book.toml",
+    "architecture/backend-daemon.md",
+    "architecture/protocol.md",
+    "architecture/policy-and-scope.md",
+    "product/positioning.md",
+    "product/terminology.md",
+    "product/launch-checklist.md",
+    "workflows/ci-fix-flow.md",
+    "workflows/pr-review-flow.md",
+    "workflows/release-flow.md",
     "docs/00-index.md",
     "docs/01-vision-and-invariants.md",
     "docs/02-system-architecture.md",
@@ -50,5 +61,5 @@
     "specs/skill.toml",
     "specs/workflow.yaml"
   ],
-  "description": "Architecture suite with competitive design synthesis, interaction/autonomy model, the consolidated Codypendent Story, and the end-to-end build guide (phases 0-7) for implementation agents."
+  "description": "Architecture suite with competitive design synthesis, interaction/autonomy model, the consolidated Codypendent Story, and the end-to-end build guide (phases 0-7) for implementation agents. The architecture/, product/, and workflows/ scaffold docs and the PROJECT_SCAFFOLD/TIMELINE planning docs are included; ROADMAP.md (repo root) is the authoritative build-phase tracker."
 }

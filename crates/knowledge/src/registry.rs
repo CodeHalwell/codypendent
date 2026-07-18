@@ -232,7 +232,16 @@ impl Registry {
         dir: &std::path::Path,
         scope: Scope,
     ) -> Result<RegistryItem, RegistryError> {
-        let mut item = manifest::load_package(dir, scope)?;
+        // `load_package` walks and content-hashes the whole package with blocking
+        // std::fs reads — off the async runtime so a large package cannot stall
+        // every other task on this worker.
+        let dir_owned = dir.to_owned();
+        let mut item =
+            tokio::task::spawn_blocking(move || manifest::load_package(&dir_owned, scope))
+                .await
+                .map_err(|join| {
+                    RegistryError::Corrupt(format!("package load task failed: {join}"))
+                })??;
 
         if let Some(existing) = self
             .by_identity(pool, item.kind, &item.name, &item.scope)

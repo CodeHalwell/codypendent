@@ -174,6 +174,36 @@ async fn shell_run_env_isolation_hides_daemon_canary() {
 }
 
 #[tokio::test]
+async fn shell_run_rejects_execution_hijacking_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let pool = open_database(&dir.path().join("test.db")).await.unwrap();
+    let sink = store_sink!(store, pool);
+
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    // A benign-looking `env` run that smuggles a compiler wrapper: refused before
+    // any process spawns, so a re-used/auto-granted approval can't be bypassed by
+    // an unshown, execution-hijacking environment binding.
+    let request = CommandRequest {
+        program: "env".into(),
+        args: vec![],
+        cwd,
+        environment: vec![EnvironmentBinding::new("RUSTC_WRAPPER", "/tmp/evil")],
+        timeout: Duration::from_secs(10),
+    };
+    let err = Shell::execute(
+        &request,
+        &canon_scope(dir.path()),
+        &cmd_scope(&["env"]),
+        &sink,
+        RunId::new(),
+    )
+    .await
+    .expect_err("a denied environment binding must refuse the run");
+    assert_eq!(err.code(), "tool.environment-not-allowlisted");
+}
+
+#[tokio::test]
 async fn shell_run_output_cap_spills_to_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let store = ArtifactStore::new(dir.path().join("artifacts"));

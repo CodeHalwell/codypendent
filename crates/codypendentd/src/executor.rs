@@ -144,7 +144,7 @@ impl RuntimeExecutor {
                 .fetch_all(&self.pool)
                 .await?;
 
-        let repository = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let fallback = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut relaunched = 0usize;
         for (id, session, objective, mode) in rows {
             let (Ok(run_id), Ok(session_id)) = (
@@ -154,12 +154,20 @@ impl RuntimeExecutor {
                 warn!(run = %id, "skipping a queued run with an unparseable id");
                 continue;
             };
+            // Recover the run's own repository from its originating StartRun
+            // command (issue #6 item 1): relaunching against the daemon's cwd
+            // would attribute a multi-checkout run's context and memories to the
+            // wrong repository. Fall back to the cwd exactly as the live path
+            // does for an older client that sent none.
+            let repository = queued_run_repository(&self.pool, &id)
+                .await
+                .unwrap_or_else(|| fallback.clone());
             self.spawn_run(RunLaunch {
                 session_id,
                 run_id,
                 objective,
                 mode: projections::agent_mode_from_db(&mode),
-                repository: repository.clone(),
+                repository,
             });
             relaunched += 1;
         }
@@ -490,18 +498,37 @@ impl RunExecutor for RuntimeExecutor {
 
             if let Some(reason) = failure {
                 warn!(%run_id, reason = %reason, "run did not execute; failing it cleanly");
-                if let Err(e) = recovery::fail_run(
-                    &executor.pool,
-                    &executor.artifacts(),
-                    &executor.subscriptions,
-                    run_id,
-                    session_id,
-                    &objective,
-                    &reason,
-                )
-                .await
-                {
-                    error!(%run_id, error = %e, "could not fail run cleanly");
+                // Retried: this is the last line of defense against a run being
+                // left non-terminal (a headless `codypendent run` then hangs
+                // forever), and a transient SQLITE_BUSY from a concurrently
+                // streaming run must not defeat it.
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match recovery::fail_run(
+                        &executor.pool,
+                        &executor.artifacts(),
+                        &executor.subscriptions,
+                        run_id,
+                        session_id,
+                        &objective,
+                        &reason,
+                    )
+                    .await
+                    {
+                        Ok(()) => break,
+                        Err(e) if attempt < 4 => {
+                            warn!(%run_id, error = %e, attempt, "failing the run did not stick; retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * u64::from(attempt),
+                            ))
+                            .await;
+                        }
+                        Err(e) => {
+                            error!(%run_id, error = %e, "could not fail run cleanly");
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -543,6 +570,32 @@ impl RunExecutor for RuntimeExecutor {
     }
 }
 
+/// The `repository` recorded on the StartRun command that created a queued run,
+/// if any. The commands table stores the applied outcome (`result_json`, with
+/// `created_run`) beside the body, so the originating command is found by the
+/// run id it created.
+async fn queued_run_repository(
+    pool: &sqlx::SqlitePool,
+    run_id: &str,
+) -> Option<std::path::PathBuf> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT body FROM commands \
+         WHERE status = 'applied' AND json_extract(result_json, '$.created_run') = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+    let (body_json,) = row?;
+    let body: codypendent_protocol::CommandBody = serde_json::from_str(&body_json).ok()?;
+    match body {
+        codypendent_protocol::CommandBody::StartRun { repository, .. } => {
+            repository.map(std::path::PathBuf::from)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a checkout's GitHub `owner/repo` from its `origin` remote, or `None`
 /// if the checkout has no GitHub origin (the `github.*` tools then stay inert).
 async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
@@ -577,7 +630,16 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
     if host != "github.com" {
         return None;
     }
-    let path = rest[boundary + 1..].trim_start_matches('/');
+    let mut path = rest[boundary + 1..].trim_start_matches('/');
+    // A URL-form remote may carry an explicit port (`github.com:443/owner/repo`);
+    // the `:` boundary would otherwise hand the port digits to the owner slot.
+    if rest.as_bytes()[boundary] == b':' {
+        if let Some((maybe_port, remainder)) = path.split_once('/') {
+            if !maybe_port.is_empty() && maybe_port.bytes().all(|b| b.is_ascii_digit()) {
+                path = remainder;
+            }
+        }
+    }
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut parts = path.split('/').filter(|segment| !segment.is_empty());
     let owner = parts.next()?;

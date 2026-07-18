@@ -8,6 +8,7 @@
  * truth lives in the daemon's ledger and is recovered on reload via
  * attach-resume, so nothing here is authoritative.
  */
+import { randomBytes } from "node:crypto";
 
 /** Messages posted from the extension host into the webview. */
 export type TranscriptMessage =
@@ -96,7 +97,14 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
   const approvalsEl = document.getElementById('approvals');
   const approvalNodes = new Map();
 
+  const MAX_ENTRIES = 500;
+  const scroller = document.scrollingElement || document.documentElement;
+  function nearBottom() {
+    return (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) < 40;
+  }
+
   function addEntry(sequence, label, detail) {
+    const stick = nearBottom();
     const entry = document.createElement('div');
     entry.className = 'entry';
     const seq = document.createElement('span');
@@ -111,7 +119,15 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
     entry.appendChild(lab);
     entry.appendChild(det);
     transcriptEl.appendChild(entry);
-    entry.scrollIntoView({ block: 'end' });
+    // Cap the DOM so an hours-long streaming session does not grow unbounded.
+    while (transcriptEl.childElementCount > MAX_ENTRIES) {
+      transcriptEl.removeChild(transcriptEl.firstChild);
+    }
+    // Only autoscroll if the user was already at the bottom — don't yank the
+    // view down while they are scrolled up reading history.
+    if (stick) {
+      entry.scrollIntoView({ block: 'end' });
+    }
   }
 
   function addApproval(approvalId, summary, risk) {
@@ -169,12 +185,7 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
 </html>`;
 }
 
-/** A cryptographically-unremarkable nonce for the webview CSP. */
+/** A cryptographically strong nonce for the webview CSP. */
 export function makeNonce(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  for (let i = 0; i < 32; i += 1) {
-    out += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return out;
+  return randomBytes(16).toString("hex");
 }

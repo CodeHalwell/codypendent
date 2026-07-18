@@ -16,7 +16,10 @@ Do not open a public issue for:
 - malicious event replay;
 - unsafe default capability.
 
-Use the repository's private vulnerability reporting feature or the security contact configured by the project.
+Report privately through GitHub's private vulnerability reporting for this
+repository: <https://github.com/CodeHalwell/codypendent/security/advisories/new>
+(Security → Report a vulnerability). This keeps the report and its discussion
+private until a fix is coordinated.
 
 ## Security expectations
 

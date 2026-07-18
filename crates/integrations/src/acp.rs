@@ -52,6 +52,13 @@ const DEFAULT_PROTOCOL_VERSION: u32 = 1;
 const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC implementation-defined server error, used when a backend call fails.
 const BACKEND_ERROR: i64 = -32000;
+/// Ceiling on one incoming JSON-RPC line. `read_line` would otherwise grow the
+/// buffer until a `\n` arrives — a single unterminated multi-GB line OOMs the
+/// process. An over-long line is skipped (tolerantly, like a malformed one).
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Outgoing-channel depth. Bounded so a backend streaming faster than a stalled
+/// client drains applies backpressure instead of growing the queue unboundedly.
+const OUT_CHANNEL_DEPTH: usize = 256;
 
 /// A failure inside the ACP adapter.
 #[derive(Debug, thiserror::Error)]
@@ -166,7 +173,9 @@ pub trait AcpBackend: Send + Sync {
 /// JSON-RPC request id.
 type PendingPermissions = Arc<Mutex<HashMap<i64, oneshot::Sender<PermissionOutcome>>>>;
 /// Per-session cancellation signals for in-flight prompts, keyed by session id.
-type CancelFlags = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
+/// The generation distinguishes prompts on the same session: a finished older
+/// prompt's cleanup must not remove a newer prompt's cancel flag.
+type CancelFlags = Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>;
 
 /// A tolerantly-parsed JSON-RPC message. Unknown fields (e.g. `jsonrpc`) are
 /// ignored; the combination of present fields classifies it as a request,
@@ -242,7 +251,7 @@ fn parse_outcome(result: Option<&Value>) -> PermissionOutcome {
 /// permission responses back through the [`PendingPermissions`] map.
 struct ClientSink {
     session_id: String,
-    out: mpsc::UnboundedSender<Value>,
+    out: mpsc::Sender<Value>,
     pending: PendingPermissions,
     id_counter: Arc<AtomicI64>,
     cancel: watch::Receiver<bool>,
@@ -256,7 +265,7 @@ impl PromptSink for ClientSink {
             "method": "session/update",
             "params": { "sessionId": self.session_id, "update": update },
         });
-        let _ = self.out.send(msg);
+        let _ = self.out.send(msg).await;
     }
 
     async fn request_permission(
@@ -280,13 +289,34 @@ impl PromptSink for ClientSink {
                 "options": options_json,
             },
         });
-        if self.out.send(msg).is_err() {
+        if self.out.send(msg).await.is_err() {
             self.pending.lock().await.remove(&id);
             return PermissionOutcome::Cancelled;
         }
-        match rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => PermissionOutcome::Cancelled,
+        // A `session/cancel` must interrupt an outstanding permission prompt —
+        // otherwise the backend stays parked here until the client answers,
+        // with the cancel flag set but never observed. (A manual borrow/changed
+        // loop rather than `wait_for`, whose returned guard is not `Send`; if
+        // the sender is gone the arm parks forever and `rx` decides.)
+        let mut cancel = self.cancel.clone();
+        tokio::select! {
+            outcome = rx => match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => PermissionOutcome::Cancelled,
+            },
+            _ = async {
+                loop {
+                    if *cancel.borrow() {
+                        break;
+                    }
+                    if cancel.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {
+                self.pending.lock().await.remove(&id);
+                PermissionOutcome::Cancelled
+            }
         }
     }
 
@@ -318,8 +348,9 @@ where
     let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
     let cancels: CancelFlags = Arc::new(Mutex::new(HashMap::new()));
     let id_counter = Arc::new(AtomicI64::new(1));
+    let mut prompt_generation: u64 = 0;
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Value>(OUT_CHANNEL_DEPTH);
 
     // Single writer task: one JSON object per line, flushed after each so the
     // client sees progress promptly and messages from different senders (the
@@ -340,14 +371,17 @@ where
         }
     });
 
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        let read = reader.read_line(&mut line).await?;
-        if read == 0 {
-            break; // EOF: client closed the input.
+        match read_line_bounded(&mut reader, &mut line).await? {
+            LineRead::Eof => break,          // client closed the input.
+            LineRead::Oversized => continue, // skipped, tolerated like malformed.
+            LineRead::Line => {}
         }
-        let trimmed = line.trim();
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue; // Tolerate non-UTF-8 noise.
+        };
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -369,14 +403,14 @@ where
                         "protocolVersion": version,
                         "agentCapabilities": { "promptCapabilities": { "image": false } },
                     });
-                    let _ = out_tx.send(response_msg(id, result));
+                    let _ = out_tx.send(response_msg(id, result)).await;
                 }
                 "session/new" => {
                     let msg = match backend.new_session().await {
                         Ok(session_id) => response_msg(id, json!({ "sessionId": session_id })),
                         Err(e) => error_msg(id, BACKEND_ERROR, &format!("new_session failed: {e}")),
                     };
-                    let _ = out_tx.send(msg);
+                    let _ = out_tx.send(msg).await;
                 }
                 "session/prompt" => {
                     let session_id = incoming
@@ -389,9 +423,16 @@ where
                     let text = extract_prompt_text(incoming.params.as_ref());
 
                     // Register the cancel flag before spawning so a cancel that
-                    // arrives on the very next line always finds it.
+                    // arrives on the very next line always finds it. Keyed with a
+                    // generation: if a newer prompt for this session has replaced
+                    // the entry, the older prompt's cleanup must leave it alone.
+                    prompt_generation += 1;
+                    let generation = prompt_generation;
                     let (cancel_tx, cancel_rx) = watch::channel(false);
-                    cancels.lock().await.insert(session_id.clone(), cancel_tx);
+                    cancels
+                        .lock()
+                        .await
+                        .insert(session_id.clone(), (generation, cancel_tx));
 
                     let backend = Arc::clone(&backend);
                     let out = out_tx.clone();
@@ -411,12 +452,20 @@ where
                             Ok(stop) => response_msg(id, json!({ "stopReason": stop.as_wire() })),
                             Err(e) => error_msg(id, BACKEND_ERROR, &format!("prompt failed: {e}")),
                         };
-                        let _ = out.send(response);
-                        cancels.lock().await.remove(&session_id);
+                        let _ = out.send(response).await;
+                        let mut cancels = cancels.lock().await;
+                        if cancels
+                            .get(&session_id)
+                            .is_some_and(|(current, _)| *current == generation)
+                        {
+                            cancels.remove(&session_id);
+                        }
                     });
                 }
                 _ => {
-                    let _ = out_tx.send(error_msg(id, METHOD_NOT_FOUND, "method not found"));
+                    let _ = out_tx
+                        .send(error_msg(id, METHOD_NOT_FOUND, "method not found"))
+                        .await;
                 }
             },
             // A notification from the client.
@@ -428,7 +477,7 @@ where
                         .and_then(|p| p.get("sessionId"))
                         .and_then(Value::as_str)
                     {
-                        if let Some(tx) = cancels.lock().await.get(session_id) {
+                        if let Some((_, tx)) = cancels.lock().await.get(session_id) {
                             let _ = tx.send(true);
                         }
                     }
@@ -454,6 +503,61 @@ where
     drop(out_tx);
     let _ = writer_handle.await;
     Ok(())
+}
+
+/// The outcome of one bounded line read.
+enum LineRead {
+    /// End of input with nothing buffered.
+    Eof,
+    /// A complete line (without its terminator) is in the buffer.
+    Line,
+    /// The line exceeded [`MAX_LINE_BYTES`]; it was consumed and discarded.
+    Oversized,
+}
+
+/// Read one `\n`-terminated line into `buf`, holding at most
+/// [`MAX_LINE_BYTES`] in memory. An over-long line is drained from the input
+/// (so framing stays intact) but not retained.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF. A partial trailing line (no `\n`) is still delivered.
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        if let Some(newline) = available.iter().position(|&b| b == b'\n') {
+            if !oversized && buf.len() + newline <= MAX_LINE_BYTES {
+                buf.extend_from_slice(&available[..newline]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(newline + 1);
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else {
+                LineRead::Line
+            });
+        }
+        let chunk_len = available.len();
+        if !oversized && buf.len() + chunk_len <= MAX_LINE_BYTES {
+            buf.extend_from_slice(available);
+        } else {
+            oversized = true;
+            buf.clear();
+        }
+        reader.consume(chunk_len);
+    }
 }
 
 #[cfg(test)]

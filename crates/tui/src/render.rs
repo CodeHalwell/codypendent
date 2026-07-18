@@ -416,6 +416,21 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     let sep = Span::styled("  ", Style::default().fg(theme.text.muted));
     let mut spans: Vec<Span> = Vec::new();
 
+    // A transient notice (rejected command, presence change) takes the line:
+    // it is the only channel for "the daemon said no", so it must not compete
+    // with the ambient fields for attention.
+    if let Some((notice, _)) = &state.notice {
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(notice.clone(), Style::default().fg(theme.status.warning)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.surface.panel)),
+            area,
+        );
+        return;
+    }
+
     let field = |label: &str, value: String, color: Color| -> Vec<Span> {
         vec![
             Span::styled(format!("{label} "), Style::default().fg(theme.text.muted)),
@@ -1016,8 +1031,23 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
             v
         }
         ProposedAction::WritePatch { patch } => vec![format!("apply patch: {patch}")],
-        ProposedAction::ExecuteCommand { program, args } => {
-            vec![format!("command: {program} {}", args.join(" "))]
+        ProposedAction::ExecuteCommand {
+            program,
+            args,
+            environment,
+            cwd,
+        } => {
+            // Render the FULL environment and cwd: an unshown binding could
+            // smuggle an execution-hijacking variable past a benign-looking
+            // command line, so the approver must see every one verbatim.
+            let mut v = vec![format!("command: {program} {}", args.join(" "))];
+            if let Some(cwd) = cwd {
+                v.push(format!("cwd: {cwd}"));
+            }
+            for (name, value) in environment {
+                v.push(format!("env: {name}={value}"));
+            }
+            v
         }
         ProposedAction::NetworkRequest { destination } => {
             vec![format!("network request: {destination}")]
@@ -1332,6 +1362,8 @@ mod tests {
                 action: ProposedAction::ExecuteCommand {
                     program: "cargo".to_owned(),
                     args: vec!["test".to_owned(), "--all".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
                 },
                 risk: Risk {
                     level: RiskLevel::High,

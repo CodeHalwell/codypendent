@@ -91,6 +91,10 @@ pub enum ToolError {
     /// The program is not in the granted command allow-list (no process spawned).
     #[error("program `{0}` is not in the command allow-list")]
     ProgramNotAllowed(String),
+    /// A model-supplied environment binding was refused because its name can
+    /// hijack what the command executes (no process spawned).
+    #[error("environment variable `{0}` is not permitted")]
+    EnvironmentNotAllowed(String),
     /// The program could not be found on the daemon's PATH.
     #[error("program `{0}` was not found")]
     ProgramNotFound(String),
@@ -124,6 +128,7 @@ impl ToolError {
             ToolError::PathDenied(_) => "tool.path-denied",
             ToolError::CwdOutOfScope(_) => "tool.cwd-out-of-scope",
             ToolError::ProgramNotAllowed(_) => "tool.program-not-allowlisted",
+            ToolError::EnvironmentNotAllowed(_) => "tool.environment-not-allowlisted",
             ToolError::ProgramNotFound(_) => "tool.program-not-found",
             ToolError::InvalidRange { .. } => "tool.invalid-range",
             ToolError::PatchDoesNotApply(_) => "tool.patch-does-not-apply",
