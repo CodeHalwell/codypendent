@@ -69,4 +69,8 @@ pub use docs::model::{
     DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,
     LinkTarget, MutationKind, ResolvedSymbol,
 };
+pub use docs::render::{
+    plan_publication, publications, record_publication, render_document, Publication, PublishPlan,
+    PublishTarget,
+};
 pub use docs::store::{DocStoreError, Document, DocumentStore, DocumentSummary, NewDocument};
