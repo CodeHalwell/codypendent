@@ -70,6 +70,7 @@ pub use observer::extract_candidates;
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
 
+pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use docs::collab::{
     CollaborationMode, EditDisposition, NewSuggestion, Suggestion, SuggestionStatus,
     SuggestionStore,

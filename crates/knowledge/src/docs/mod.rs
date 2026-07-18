@@ -12,6 +12,7 @@
 //! rendering and Git publication (STEP 4.4), and the symbol-link staleness engine
 //! (STEP 4.6) are layered on in their own modules.
 
+pub mod apply;
 pub mod collab;
 pub mod crdt;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod render;
 pub mod staleness;
 pub mod store;
 
+pub use apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use crdt::{DocCrdtError, DocumentCrdt};
 pub use model::{
     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,

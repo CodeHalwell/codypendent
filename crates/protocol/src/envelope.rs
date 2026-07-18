@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catchup::Catchup;
 use crate::command::Command;
+use crate::document::DocumentSync;
 use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
@@ -101,6 +102,11 @@ pub enum Payload {
     CommandRejected(CodypendentError),
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
+    /// A collaborative document's CRDT sync update, delivered to the clients
+    /// subscribed to that document (`Subscription::Document`) as the
+    /// authoritative replica advances (Phase 4 STEP 4.3). Opaque CRDT bytes ride
+    /// in [`DocumentSync::update`]; a receiver merges them into its local replica.
+    DocumentSync(DocumentSync),
     /// Attach-time catch-up (missed events or a snapshot). Wrapped in a named
     /// field so its internal `type` tag never collides with the payload tag.
     Catchup {
@@ -255,6 +261,27 @@ mod tests {
                 assert!(matches!(catchup, Catchup::Events { from: 1, .. }));
             }
             other => panic!("expected Catchup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_sync_payload_round_trips() {
+        use crate::document::DocumentSync;
+        use crate::ids::DocumentId;
+
+        let document_id = DocumentId::new();
+        let sync = Payload::DocumentSync(DocumentSync {
+            document_id,
+            revision: 5,
+            update: vec![1, 2, 3, 255],
+        });
+        match round_trip_payload(sync) {
+            Payload::DocumentSync(delivered) => {
+                assert_eq!(delivered.document_id, document_id);
+                assert_eq!(delivered.revision, 5);
+                assert_eq!(delivered.update, vec![1, 2, 3, 255]);
+            }
+            other => panic!("expected DocumentSync, got {other:?}"),
         }
     }
 }

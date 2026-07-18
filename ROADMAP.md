@@ -158,7 +158,7 @@ client-surface wiring is the remaining slice.
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
 - [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
-- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement
+- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engine landed:* `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` to broadcast, and `Payload::DocumentSync` now carries it on the wire. *Remaining:* routing `MutateDocument` through the `codypendentd` seam, a per-document subscription/broadcast channel, and block-range edit-lease enforcement
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
