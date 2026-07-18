@@ -21,18 +21,22 @@ the release gate is the
 | **1** | Persistent coding-agent slice — sessions/runs, tools, approvals, TUI, JSONL | ✅ |
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
-| **4** | Docs Studio & code intelligence — CRDT docs, semantic index | ⬜ |
+| **4** | Docs Studio & code intelligence — CRDT docs, semantic index | 🟡 |
 | **5** | Workflows & multi-agent orchestration | ⬜ |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
 | **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
 
-> **You are here:** Phases 0–3 are complete. Beyond the editable, knowledgeable
-> core (governed registry, hybrid retrieval, memory fabric, code graph), the
-> runtime now reaches real developer surfaces: an idempotent, approval-gated
-> GitHub client wired into the agent loop (with the `/fix-ci` repair flow),
-> replay-safe webhook ingestion, source-provenance labeling of unsaved editor
-> buffers, a VS Code/Cursor extension, a Zed ACP adapter, and session handoff with
-> presence. Phase 4 (Docs Studio & richer code intelligence) is the next slice.
+> **You are here:** Phases 0–3 are complete, and Phase 4's engine is in place.
+> The knowledge fabric now carries a Loro-backed collaborative document model
+> (selected by a real benchmark, ADR-016) with lossless block round-trip,
+> concurrent-merge convergence, per-mutation authorship, collaboration modes with
+> suggest-by-default for org docs, deterministic Markdown publication, a semantic
+> `LanguageAdapter` layer with LSP-edge supersession and revision-aware graph
+> queries (callers/blast-radius/tests-covering/changed-between), and a
+> documentation staleness engine (`/update-docs`). What remains for Phase 4 is
+> **client-surface wiring** — the TUI Docs view + edge inspector, live daemon CRDT
+> transport and edit-lease enforcement, executing publication through the
+> approval-gated write path, and spawning a live language server — tracked below.
 
 ---
 
@@ -136,13 +140,29 @@ Code extension's codec/discovery/reconnect pass 27 vitest tests. `fmt` / `clippy
 --all-features -D warnings` / `test --workspace` green; `extensions/vscode`
 typecheck/lint/test green.
 
-## Phase 4 — Docs Studio & richer code intelligence ⬜
+## Phase 4 — Docs Studio & richer code intelligence 🟡
 
-- [ ] CRDT benchmark + choice; collaborative documents; Git publication
-- [ ] Document ↔ code symbol links; Rust semantic index; Python/TS adapters; staleness workflows
+Engine complete and tested in `codypendent-knowledge` + `codypendent-protocol`;
+client-surface wiring is the remaining slice.
 
-**Exit:** concurrent edits merge; document snapshot reproducible; symbol changes
-flag affected docs; graph edges expose evidence + revision.
+- [x] **4.1** CRDT benchmark (Loro vs Automerge vs Yrs, `benches/crdt-bench`) → **ADR-016 selects Loro**, with the measured report in `docs/docs/benchmarks/`
+- [x] **4.2** Document model + storage (migration `0008`): `KnowledgeDocument`/`DocumentBlock`/authorship, a Loro CRDT layer (block↔CRDT bijection), lossless export/import, concurrent-merge convergence, per-mutation attribution, `DocumentChanged` outbox
+- [x] **4.3** Collaboration modes (Ask/Suggest/Edit/Co-author/Review/Maintain) + **suggest-by-default for org docs**; suggestions apply exactly the annotated range on accept; protocol `DocumentMutation`/`DocumentSync`/`MutateDocument`/`Document` subscription
+- [x] **4.4** Deterministic Markdown render (byte-identical) + `PublishPlan` (target/changed-files/git-action) + `(revision ↔ commit)` publication record
+- [x] **4.5** `LanguageAdapter` trait + Rust/Python/TypeScript adapters (graceful syntax-only degradation), **LSP-edge supersession** + confidence tiers, revision-aware queries (`callers_of`/`blast_radius`/`tests_covering`/`changed_between`), hierarchical repository map with evidence
+- [x] **4.6** Staleness engine: `{{ symbol:… }}` link resolution, signature-change/disappearance findings with evidence, Maintain-mode suggestions, `/update-docs` command
+
+**Deferred to a client-wiring follow-up (not blocking the engine):**
+
+- [ ] TUI Docs view (tree/editor/review rail) and the graph-edge inspector (edges already carry relation + confidence + evidence + revision; exit criterion 4 is a render)
+- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement
+- [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
+- [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
+
+**Exit:** concurrent edits merge ✅; document snapshot reproducible ✅; symbol
+changes flag affected docs with evidence ✅; graph edges expose evidence +
+revision ✅ (data model; TUI inspector render pending). ADR-016 recorded ✅;
+suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 
 ## Phase 5 — Workflow & multi-agent orchestration ⬜
 

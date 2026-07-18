@@ -166,6 +166,160 @@ impl RepositoryMap {
     }
 }
 
+// --------------------------------------------------------------------------
+// Hierarchical map (STEP 4.5) — workspace → package → module, with evidence
+// --------------------------------------------------------------------------
+
+/// The level of a [`MapNode`] in the hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapLevel {
+    Workspace,
+    Package,
+    Module,
+    Symbol,
+}
+
+/// Why a map node exists — the evidence a hierarchical map records at each level
+/// so the TUI can show why a symbol entered context (Chapter 07). `revision` is
+/// the graph revision that produced the node; `symbol_count` is how many durable
+/// symbols are folded beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEvidence {
+    pub revision: Option<String>,
+    pub symbol_count: usize,
+}
+
+/// One node of the hierarchical repository map. Built **bottom-up**: symbol leaves
+/// aggregate into modules, modules into packages, packages into the workspace,
+/// each parent's evidence summing its children's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapNode {
+    pub label: String,
+    pub level: MapLevel,
+    pub evidence: MapEvidence,
+    pub children: Vec<MapNode>,
+}
+
+/// Build the hierarchical repository map (workspace → package → module → symbol),
+/// bottom-up, each node recording the evidence (revision + symbol count) that
+/// produced it. For very large repositories this is the compact, foldable form
+/// the context builder surfaces instead of one flat symbol list.
+pub async fn hierarchical_map(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<MapNode, CodeGraphError> {
+    let all = codegraph::nodes(pool, repository).await?;
+
+    // module path -> (symbol leaves, revisions seen)
+    let mut modules: BTreeMap<String, Vec<MapNode>> = BTreeMap::new();
+    for node in &all {
+        let leaf_kind = matches!(
+            node.key.kind,
+            CodeNodeKind::Type
+                | CodeNodeKind::TraitOrInterface
+                | CodeNodeKind::Function
+                | CodeNodeKind::Method
+                | CodeNodeKind::Constant
+                | CodeNodeKind::Test
+        );
+        if !leaf_kind {
+            continue;
+        }
+        let module = module_of(&node.key.qualified_name).to_owned();
+        modules.entry(module).or_default().push(MapNode {
+            label: last_segment(&node.key.qualified_name).to_owned(),
+            level: MapLevel::Symbol,
+            evidence: MapEvidence {
+                revision: Some(node.revision.0.clone()),
+                symbol_count: 1,
+            },
+            children: Vec::new(),
+        });
+    }
+
+    // Fold symbols into module nodes (bottom-up: the module's evidence is the sum
+    // of its symbols').
+    let mut module_nodes = Vec::new();
+    for (module, mut symbols) in modules {
+        symbols.sort_by(|a, b| a.label.cmp(&b.label));
+        let revision = symbols.iter().find_map(|s| s.evidence.revision.clone());
+        let symbol_count = symbols.len();
+        module_nodes.push(MapNode {
+            label: if module.is_empty() {
+                "(crate root)".to_owned()
+            } else {
+                module
+            },
+            level: MapLevel::Module,
+            evidence: MapEvidence {
+                revision,
+                symbol_count,
+            },
+            children: symbols,
+        });
+    }
+
+    // Fold modules into the single synthetic package, and the package into the
+    // workspace root. (The syntax layer does not yet attribute nodes to Cargo
+    // packages; the semantic adapter's `build_metadata` supplies real packages.)
+    let total: usize = module_nodes.iter().map(|m| m.evidence.symbol_count).sum();
+    let revision = module_nodes
+        .iter()
+        .find_map(|m| m.evidence.revision.clone());
+    let package = MapNode {
+        label: CRATE_PACKAGE.to_owned(),
+        level: MapLevel::Package,
+        evidence: MapEvidence {
+            revision: revision.clone(),
+            symbol_count: total,
+        },
+        children: module_nodes,
+    };
+    Ok(MapNode {
+        label: repository.to_string(),
+        level: MapLevel::Workspace,
+        evidence: MapEvidence {
+            revision,
+            symbol_count: total,
+        },
+        children: if package.evidence.symbol_count == 0 && package.children.is_empty() {
+            Vec::new()
+        } else {
+            vec![package]
+        },
+    })
+}
+
+impl MapNode {
+    /// Render the hierarchy as an indented tree, annotating each node with the
+    /// evidence (symbol count + revision) that produced it.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_into(0, &mut out);
+        out
+    }
+
+    fn render_into(&self, depth: usize, out: &mut String) {
+        let indent = "  ".repeat(depth);
+        let level = match self.level {
+            MapLevel::Workspace => "workspace",
+            MapLevel::Package => "package",
+            MapLevel::Module => "module",
+            MapLevel::Symbol => "symbol",
+        };
+        let rev = self.evidence.revision.as_deref().unwrap_or("-");
+        let _ = writeln!(
+            out,
+            "{indent}{level} {} [{} symbols @ {rev}]",
+            self.label, self.evidence.symbol_count
+        );
+        for child in &self.children {
+            child.render_into(depth + 1, out);
+        }
+    }
+}
+
 /// A short label for an API symbol's kind used by [`RepositoryMap::render`].
 fn kind_label(kind: CodeNodeKind) -> &'static str {
     match kind {

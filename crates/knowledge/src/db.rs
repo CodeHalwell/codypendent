@@ -19,7 +19,11 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal);
+        .synchronous(SqliteSynchronous::Normal)
+        // Match the daemon's pool: foreign keys ON, so referential integrity
+        // (code_edges → code_nodes, document_authorship → documents, …) is
+        // enforced here and in the `index rebuild` CLI exactly as in production.
+        .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)

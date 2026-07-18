@@ -321,8 +321,8 @@ async fn register_builtins_registers_the_phase1_tools() {
         .unwrap()
         .unwrap();
     assert_eq!(shell_before.id, shell_after.id);
-    // Five tools plus the one command.
-    assert_eq!(registry.list(&pool).await.unwrap().len(), 6);
+    // Five tools plus the two commands (`/fix-ci`, `/update-docs`).
+    assert_eq!(registry.list(&pool).await.unwrap().len(), 7);
 }
 
 #[tokio::test]

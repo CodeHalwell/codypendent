@@ -11,6 +11,11 @@ members = [
     "crates/integrations",
     "crates/test-support",
 ]
+# The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
+# workspace so Automerge/Yrs — pulled in only for the comparison — never enter
+# the product's dependency graph. Excluded here so a root `cargo` command never
+# tries to fold it into this workspace.
+exclude = ["benches/crdt-bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -80,6 +85,11 @@ tantivy = "0.22"
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 notify = "7"
+
+# Collaborative-document CRDT (Phase 4, ADR-016). Selected over Automerge/Yrs by
+# the STEP 4.1 benchmark (`benches/crdt-bench`). The CRDT snapshot is
+# authoritative for document drafts; Git stores reviewed Markdown snapshots.
+loro = "1.13"
 
 # CLI and paths
 clap = { version = "4", features = ["derive"] }

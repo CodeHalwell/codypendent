@@ -157,3 +157,31 @@ Worktrees isolate executable filesystem state; change sets provide logical revie
 **Status:** Accepted
 
 JSONL, TUI, IDE and future remote clients consume the same domain event stream.
+
+---
+
+## ADR-016 — Loro is the collaborative-document CRDT
+
+**Status:** Accepted
+
+**Decision:** Back the Docs Studio's working documents (ADR-004) with **Loro**,
+selected over Automerge and Yrs by the STEP 4.1 benchmark.
+
+**Reason:** On Codypendent-shaped documents (paragraph-by-paragraph edit
+histories from 1 KB to 1 MB) Loro wins snapshot **load** and **build** by two to
+three orders of magnitude at the largest case, while all three converge on
+concurrent edits. Loro's only non-first axis is encoded snapshot size (a few KiB,
+~2.8× the most compact encoder but negligible in absolute terms, and far under
+Yrs's ~1 MiB update-log snapshot). This is within the decision rule's guard (pick
+Loro unless it loses by >2× on load or memory for the largest case): it does not
+lose on load, and a few KiB is not a memory loss. Loro is also Rust-native with
+first-class incremental updates, rich text, and history. Exact per-run numbers
+(wall-clock varies by machine) are in the measured report, whose decision section
+is generated from the same measurements as its table:
+[`docs/docs/benchmarks/crdt-2026-07-18.md`](benchmarks/crdt-2026-07-18.md),
+reproducible via `benches/crdt-bench`.
+
+**Consequence:** `loro` is a product dependency of `codypendent-knowledge`; the
+CRDT snapshot is authoritative for drafts (ADR-004) and Git stores reviewed
+Markdown snapshots. The benchmark harness stays a standalone workspace so
+Automerge/Yrs never enter the product's dependency graph.

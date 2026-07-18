@@ -134,12 +134,24 @@ async fn read_until_event(stream: &mut UnixStream) -> SessionEvent {
 }
 
 async fn shutdown(mut stream: UnixStream, task: ServerTask) {
-    let reply = send_recv(
+    write_envelope(
         &mut stream,
         &Envelope::request(ClientId::new(), Payload::Shutdown),
     )
-    .await;
-    assert!(matches!(reply.payload, Payload::ShutdownAck));
+    .await
+    .expect("write shutdown");
+    // Skip any frames still in flight when Shutdown is sent — a heartbeat Ping or
+    // an event/presence notification the subscription queued after catchup — until
+    // the ShutdownAck arrives. (The undrained frame is delivery-order dependent,
+    // which made a single read here flaky under CI scheduling.)
+    let mut acked = false;
+    for _ in 0..16 {
+        if matches!(read_frame(&mut stream).await.payload, Payload::ShutdownAck) {
+            acked = true;
+            break;
+        }
+    }
+    assert!(acked, "ShutdownAck must arrive");
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("server stops within 5s")

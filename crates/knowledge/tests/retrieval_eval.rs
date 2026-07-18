@@ -69,10 +69,12 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
     }
 
     let items = registry.list(&pool).await.unwrap();
-    // 5 built-in tools + the /fix-ci built-in command + the rust.fix-ci skill +
-    // 20 decoys. (The High-risk /fix-ci command is filtered by the Medium risk
-    // ceiling the eval queries under, so it never perturbs recall/exclusion.)
-    assert_eq!(items.len(), 27, "unexpected seeded item count");
+    // 5 built-in tools + 2 built-in commands (`/fix-ci`, `/update-docs`) + the
+    // rust.fix-ci skill + 20 decoys. (The High-risk `/fix-ci` command is filtered
+    // by the Medium risk ceiling the eval queries under; the Low-risk
+    // `/update-docs` command is eligible but its docs-only intents keep it out of
+    // the CI/tool query top-k, so neither perturbs recall/exclusion.)
+    assert_eq!(items.len(), 28, "unexpected seeded item count");
     (tmp, items, repo)
 }
 

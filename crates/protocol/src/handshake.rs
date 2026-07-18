@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::ClientCapabilities;
-use crate::ids::{DaemonInstanceId, RunId};
+use crate::ids::{DaemonInstanceId, DocumentId, RunId};
 use crate::version::ProtocolVersion;
 
 /// An opaque, daemon-signed reconnection token (STEP 1.11).
@@ -89,6 +89,17 @@ pub enum Subscription {
     RepositoryStatus,
     /// Budget usage and warnings.
     BudgetState,
+    /// A collaborative document's CRDT sync stream + suggestion/presence updates
+    /// (Phase 4 STEP 4.3). The intended behaviour is for the daemon to publish
+    /// `DocumentSync` messages to subscribers as the authoritative replica
+    /// advances.
+    ///
+    /// **Delivery is not yet wired.** This subscription variant is the wire
+    /// contract; the server's subscription matcher and a `Payload::DocumentSync`
+    /// delivery path are part of the Phase 4 *client-transport* slice tracked in
+    /// the roadmap. Until then, attaching with this subscription is accepted but
+    /// receives no document updates.
+    Document { document_id: DocumentId },
     #[serde(other)]
     Unknown,
 }

@@ -12,10 +12,12 @@
 //! (Tantivy, vectors) under `<data_dir>/index/`, which are deletable and
 //! rebuildable at any time (`codypendent index rebuild`).
 
+pub mod adapter;
 pub mod builtin;
 pub mod codegraph;
 pub mod context;
 pub mod db;
+pub mod docs;
 pub mod manifest;
 pub mod memory;
 pub mod observer;
@@ -47,8 +49,18 @@ pub use retrieval::{
     RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
 };
 
-pub use codegraph::{stable_repository_id, CodeGraphError, GraphDelta};
-pub use repomap::{ApiSymbol, ModuleEntry, PackageEntry, RepositoryMap};
+pub use adapter::{
+    BuildMetadata, Diagnostic, DiagnosticSeverity, LanguageAdapter, PackageInfo, ParseInput,
+    ParseOutput, RustAdapter, ScriptAdapter, SemanticCapability, SymbolIndex, Workspace,
+};
+pub use codegraph::{
+    changed_between, stable_repository_id, CodeGraphError, GraphDelta, ParsedSymbol, SemanticEdge,
+    SymbolDelta, SymbolSnapshot,
+};
+pub use repomap::{
+    hierarchical_map, ApiSymbol, MapEvidence, MapLevel, MapNode, ModuleEntry, PackageEntry,
+    RepositoryMap,
+};
 
 pub use memory::{
     detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
@@ -57,3 +69,23 @@ pub use memory::{
 pub use observer::extract_candidates;
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
+
+pub use docs::collab::{
+    CollaborationMode, EditDisposition, NewSuggestion, Suggestion, SuggestionStatus,
+    SuggestionStore,
+};
+pub use docs::crdt::{DocCrdtError, DocumentCrdt};
+pub use docs::model::{
+    AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
+    DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,
+    LinkTarget, MutationKind, ResolvedSymbol,
+};
+pub use docs::render::{
+    plan_publication, publications, record_publication, render_document, Publication, PublishPlan,
+    PublishTarget,
+};
+pub use docs::staleness::{
+    detect_staleness, resolve_links, symbol_references, StalenessFinding, StalenessReason,
+    SymbolRef,
+};
+pub use docs::store::{DocStoreError, Document, DocumentStore, DocumentSummary, NewDocument};

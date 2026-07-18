@@ -109,25 +109,45 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
 /// invocation (`/fix-ci`) drives the hard-coded repair workflow.
 #[must_use]
 pub fn builtin_commands() -> Vec<RegistryItem> {
-    vec![command(
-        "fix-ci",
-        "Investigate a failed GitHub check and prepare a verified change set. \
-         Invoked as `/fix-ci`; retrieves the check + logs, proposes a patch in an \
-         isolated worktree, runs tests, and — on approval — updates the pull request.",
-        &[
-            "fix the failing CI",
-            "repair a failed github check",
-            "the ci is red",
-            "make the checks pass",
-        ],
-        &["ci", "github", "check", "pull-request", "fix", "repair"],
-        // `/fix-ci` runs git and reaches GitHub with the personal-mode token, so
-        // its risk reflects both — the token bumps it to the highest tier.
-        vec![
-            CapabilityRequest::Command("git".into()),
-            CapabilityRequest::Secret("github-token".into()),
-        ],
-    )]
+    vec![
+        command(
+            "fix-ci",
+            "Investigate a failed GitHub check and prepare a verified change set. \
+             Invoked as `/fix-ci`; retrieves the check + logs, proposes a patch in an \
+             isolated worktree, runs tests, and — on approval — updates the pull request.",
+            &[
+                "fix the failing CI",
+                "repair a failed github check",
+                "the ci is red",
+                "make the checks pass",
+            ],
+            &["ci", "github", "check", "pull-request", "fix", "repair"],
+            // `/fix-ci` runs git and reaches GitHub with the personal-mode token, so
+            // its risk reflects both — the token bumps it to the highest tier.
+            vec![
+                CapabilityRequest::Command("git".into()),
+                CapabilityRequest::Secret("github-token".into()),
+            ],
+        ),
+        command(
+            "update-docs",
+            "Bring documentation in line with code changes (Phase 4 STEP 4.6). \
+             Invoked as `/update-docs`; diffs documents' resolved `{{ symbol:… }}` \
+             links against the live code graph and, for each stale reference, drafts \
+             a Maintain-mode suggestion (never a direct edit) citing the causing \
+             change for review.",
+            &[
+                "update the docs",
+                "the documentation is stale",
+                "docs reference an old symbol",
+                "fix stale documentation",
+            ],
+            &["docs", "documentation", "staleness", "maintain", "symbol"],
+            // Reads the repository to resolve symbols; proposes suggestions on
+            // documents (no direct writes, no network).
+            vec![CapabilityRequest::FilesystemRead(REPOSITORY_ROOT.into())],
+        ),
+    ]
 }
 
 /// Register (or refresh) every built-in tool and command.
