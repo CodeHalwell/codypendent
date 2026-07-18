@@ -88,6 +88,19 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::OpenSource => open_source(state),
 
+        Action::OpenDocs => {
+            state.overlay = match state.overlay {
+                Overlay::Docs => Overlay::None,
+                _ => Overlay::Docs,
+            }
+        }
+        Action::OpenEdges => {
+            state.overlay = match state.overlay {
+                Overlay::Edges => Overlay::None,
+                _ => Overlay::Edges,
+            }
+        }
+
         Action::Help => {
             state.overlay = match state.overlay {
                 Overlay::Help => Overlay::None,
@@ -420,6 +433,14 @@ fn nav(state: &mut AppState, delta: i32) {
             step(&mut state.selected_memory, state.memories.len(), delta);
             // Moving to a different memory collapses any revealed source.
             state.overlay = Overlay::Memory { source_open: false };
+            return;
+        }
+        Overlay::Docs => {
+            step(&mut state.selected_doc, state.docs.len(), delta);
+            return;
+        }
+        Overlay::Edges => {
+            step(&mut state.selected_edge, state.edges.len(), delta);
             return;
         }
         _ => {}
@@ -1214,6 +1235,102 @@ mod tests {
         // No overlay open: opening a source does nothing.
         reduce(&mut s, Action::OpenSource);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    fn doc(title: &str) -> crate::state::DocCard {
+        crate::state::DocCard {
+            title: title.to_owned(),
+            scope: "organization".to_owned(),
+            status: "draft".to_owned(),
+            mode: "suggest".to_owned(),
+            revision: "r3".to_owned(),
+            blocks: vec![crate::state::DocBlockView {
+                kind: "heading".to_owned(),
+                text: title.to_owned(),
+            }],
+            suggestions: vec![crate::state::DocSuggestionView {
+                status: "pending".to_owned(),
+                author: "agent".to_owned(),
+                range: "0..4".to_owned(),
+                replacement: "new".to_owned(),
+                rationale: Some("clearer".to_owned()),
+            }],
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> crate::state::GraphEdgeCard {
+        crate::state::GraphEdgeCard {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            relation: "calls".to_owned(),
+            confidence: 0.45,
+            evidence_kind: "syntax_inferred".to_owned(),
+            evidence: "artifact abc (src/lib.rs)".to_owned(),
+            revision: "79acbf1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn open_docs_toggles_the_docs_overlay() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Payments guide")];
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn open_edges_toggles_the_edge_inspector() {
+        let mut s = AppState::new();
+        s.edges = vec![edge("a::f", "b::g")];
+        reduce(&mut s, Action::OpenEdges);
+        assert_eq!(s.overlay, Overlay::Edges);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+        reduce(&mut s, Action::OpenEdges);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn docs_navigation_moves_selection_within_the_tree() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a"), doc("b")];
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.selected_doc, 0);
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_doc, 1);
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_doc, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_doc, 0);
+    }
+
+    #[test]
+    fn edge_navigation_moves_selection_within_the_inspector() {
+        let mut s = AppState::new();
+        s.edges = vec![edge("a::f", "b::g"), edge("c::h", "d::i")];
+        reduce(&mut s, Action::OpenEdges);
+        assert_eq!(s.selected_edge, 0);
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_edge, 1);
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_edge, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_edge, 0);
+    }
+
+    #[test]
+    fn opening_one_browser_replaces_another() {
+        // The overlays are mutually exclusive: opening Docs over an open Edges
+        // inspector swaps rather than stacks.
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        s.edges = vec![edge("a::f", "b::g")];
+        reduce(&mut s, Action::OpenEdges);
+        assert_eq!(s.overlay, Overlay::Edges);
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.overlay, Overlay::Docs);
     }
 
     #[test]

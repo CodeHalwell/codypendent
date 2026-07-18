@@ -520,6 +520,8 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Memory { source_open } => {
             render_memory(frame, area, state, theme, *source_open);
         }
+        Overlay::Docs => render_docs(frame, area, state, theme),
+        Overlay::Edges => render_edges(frame, area, state, theme),
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
@@ -792,6 +794,294 @@ fn render_memory(
             .wrap(Wrap { trim: false }),
         cols[1],
     );
+}
+
+/// The Docs Studio browser (Phase 4 client wiring): a document **tree** on the
+/// left; on the right, the focused document's **editor rail** (its blocks in
+/// order) over its **review rail** (pending suggestions). Read-only — the live
+/// CRDT edit transport is a separate follow-up. Colors are Theme tokens only
+/// (RULE 7).
+fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Docs Studio ({}) ", state.docs.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(inner);
+
+    // Left: the document tree (title + scope · status · mode).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.docs.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no documents in scope",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, doc) in state.docs.iter().enumerate() {
+        let selected = idx == state.selected_doc;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&doc.title, 28),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!("    {} · {} · {}", doc.scope, doc.status, doc.mode),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the editor rail (blocks) over the review rail (suggestions).
+    let rails = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[1]);
+
+    let editor_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut editor_lines: Vec<Line> = Vec::new();
+    if let Some(doc) = state.focused_doc() {
+        editor_lines.push(Line::styled(
+            format!("{} ({})", doc.title, doc.revision),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        editor_lines.push(section("Editor rail", theme));
+        if doc.blocks.is_empty() {
+            editor_lines.push(Line::styled(
+                "  (empty document)",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        for block in &doc.blocks {
+            editor_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<10}", block.kind),
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Span::styled(
+                    truncate(&block.text, 60),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+        }
+    } else {
+        editor_lines.push(Line::styled(
+            "  no document selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(editor_lines)
+            .block(editor_block)
+            .wrap(Wrap { trim: false }),
+        rails[0],
+    );
+
+    let review_block = Block::default()
+        .borders(Borders::LEFT | Borders::TOP)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut review_lines: Vec<Line> = Vec::new();
+    if let Some(doc) = state.focused_doc() {
+        review_lines.push(section("Review rail (suggestions)", theme));
+        if doc.suggestions.is_empty() {
+            review_lines.push(Line::styled(
+                "  no pending suggestions",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        for suggestion in &doc.suggestions {
+            review_lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(theme.status.info)),
+                Span::styled(
+                    format!("{} @ {} ", suggestion.author, suggestion.range),
+                    Style::default().fg(theme.text.muted),
+                ),
+                Span::styled(
+                    format!("→ {}", truncate(&suggestion.replacement, 40)),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+            if let Some(rationale) = &suggestion.rationale {
+                review_lines.push(Line::styled(
+                    format!("      {rationale}"),
+                    Style::default().fg(theme.text.secondary),
+                ));
+            }
+        }
+    }
+    review_lines.push(Line::raw(""));
+    review_lines.push(Line::styled(
+        "  ↑/↓ select · G edges · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(review_lines)
+            .block(review_block)
+            .wrap(Wrap { trim: false }),
+        rails[1],
+    );
+}
+
+/// The code-graph edge inspector (Phase 4 exit criterion 4): the repository's
+/// edges on the left, and for the focused edge its relation, confidence,
+/// evidence kind + source, and revision on the right — the evidence-and-revision
+/// payload the criterion calls for. Colors are Theme tokens only (RULE 7).
+fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Code-graph edges ({}) ", state.edges.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(inner);
+
+    // Left: the edge list (relation, then from → to).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.edges.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no edges in this repository",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, edge) in state.edges.iter().enumerate() {
+        let selected = idx == state.selected_edge;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&edge.relation, 14),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {} → {}",
+                truncate(&edge.from, 16),
+                truncate(&edge.to, 16)
+            ),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail for the focused edge — relation, confidence, and the
+    // exit-criterion payload: evidence kind + source + revision.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(edge) = state.focused_edge() {
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(section("Edge", theme));
+        lines.push(field("from", &edge.from, theme.text.primary));
+        lines.push(field("to", &edge.to, theme.text.primary));
+        lines.push(field("relation", &edge.relation, theme.text.secondary));
+        lines.push(field(
+            "confidence",
+            &format!("{:.2}", edge.confidence),
+            edge_confidence_color(edge.confidence, theme),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(section("Evidence", theme));
+        lines.push(field("kind", &edge.evidence_kind, theme.status.info));
+        lines.push(field("source", &edge.evidence, theme.text.secondary));
+        lines.push(field("revision", &edge.revision, theme.text.secondary));
+    } else {
+        lines.push(Line::styled(
+            "  no edge selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · D docs · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// Color an edge's confidence by tier (Chapter 07): a syntax-inferred call
+/// (~0.45) reads as tentative; an LSP/compiler-resolved edge (≥0.90) as trusted.
+fn edge_confidence_color(confidence: f32, theme: &Theme) -> Color {
+    if confidence >= 0.90 {
+        theme.status.success
+    } else if confidence >= 0.60 {
+        theme.status.warning
+    } else {
+        theme.text.muted
+    }
 }
 
 /// Color for a skill's coarse risk label (`safe` / `low` / `medium` / `high`).
@@ -1544,5 +1834,98 @@ mod tests {
             text.contains("events 3..7 of session 51ee"),
             "revealed source missing:\n{text}"
         );
+    }
+
+    #[test]
+    fn docs_studio_snapshot_shows_tree_editor_and_review_rails() {
+        use crate::state::{DocBlockView, DocCard, DocSuggestionView};
+        let mut state = running_build_state();
+        state.docs = vec![DocCard {
+            title: "Payments runbook".to_owned(),
+            scope: "organization".to_owned(),
+            status: "draft".to_owned(),
+            mode: "suggest".to_owned(),
+            revision: "r7".to_owned(),
+            blocks: vec![
+                DocBlockView {
+                    kind: "heading".to_owned(),
+                    text: "Charging a customer".to_owned(),
+                },
+                DocBlockView {
+                    kind: "paragraph".to_owned(),
+                    text: "Call charge_customer with an idempotency key.".to_owned(),
+                },
+            ],
+            suggestions: vec![DocSuggestionView {
+                status: "pending".to_owned(),
+                author: "agent".to_owned(),
+                range: "0..8".to_owned(),
+                replacement: "Charging a customer safely".to_owned(),
+                rationale: Some("match the code path".to_owned()),
+            }],
+        }];
+        reduce(&mut state, Action::OpenDocs);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Docs Studio"), "title missing:\n{text}");
+        // Tree rail: the document title + its scope/status/mode.
+        assert!(
+            text.contains("Payments runbook"),
+            "tree title missing:\n{text}"
+        );
+        assert!(text.contains("organization"), "tree scope missing:\n{text}");
+        // Editor rail: block kinds and the revision badge.
+        assert!(text.contains("Editor rail"), "editor rail missing:\n{text}");
+        assert!(text.contains("heading"), "block kind missing:\n{text}");
+        assert!(text.contains("r7"), "revision badge missing:\n{text}");
+        // Review rail: the pending suggestion with its author and rationale.
+        assert!(text.contains("Review rail"), "review rail missing:\n{text}");
+        assert!(text.contains("agent"), "suggestion author missing:\n{text}");
+        assert!(
+            text.contains("match the code path"),
+            "suggestion rationale missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn edge_inspector_snapshot_shows_evidence_and_revision() {
+        use crate::state::GraphEdgeCard;
+        let mut state = running_build_state();
+        state.edges = vec![GraphEdgeCard {
+            from: "billing::charge".to_owned(),
+            to: "gateway::submit".to_owned(),
+            relation: "calls".to_owned(),
+            confidence: 0.45,
+            evidence_kind: "syntax_inferred".to_owned(),
+            evidence: "artifact 3f2a (src/billing.rs)".to_owned(),
+            revision: "79acbf1".to_owned(),
+        }];
+        reduce(&mut state, Action::OpenEdges);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Code-graph edges"), "title missing:\n{text}");
+        assert!(
+            text.contains("billing::charge"),
+            "from symbol missing:\n{text}"
+        );
+        assert!(
+            text.contains("gateway::submit"),
+            "to symbol missing:\n{text}"
+        );
+        assert!(text.contains("calls"), "relation missing:\n{text}");
+        // The exit-criterion payload: evidence kind + source + revision on show.
+        assert!(
+            text.contains("Evidence"),
+            "evidence section missing:\n{text}"
+        );
+        assert!(
+            text.contains("syntax_inferred"),
+            "evidence kind missing:\n{text}"
+        );
+        assert!(
+            text.contains("src/billing.rs"),
+            "evidence source missing:\n{text}"
+        );
+        assert!(text.contains("79acbf1"), "revision missing:\n{text}");
     }
 }

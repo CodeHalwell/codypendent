@@ -494,6 +494,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
 ]

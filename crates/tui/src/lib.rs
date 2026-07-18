@@ -39,8 +39,9 @@ pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use reduce::reduce;
 pub use render::render;
 pub use state::{
-    AppState, InputMode, MemoryCard, Overlay, Pane, PatchSummary, PendingApproval, RunView,
-    SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    AppState, DocBlockView, DocCard, DocSuggestionView, GraphEdgeCard, InputMode, MemoryCard,
+    Overlay, Pane, PatchSummary, PendingApproval, RunView, SkillCard, StatusProjection, ToolCard,
+    ToolStatus, TranscriptEntry,
 };
 pub use terminal::TerminalGuard;
 pub use theme::Theme;

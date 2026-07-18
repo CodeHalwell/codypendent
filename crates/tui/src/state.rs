@@ -71,6 +71,15 @@ pub enum Overlay {
     /// opening surfaces the full source string in place; a real file-open is the
     /// CLI's job later ("every retrieved memory opens its source").
     Memory { source_open: bool },
+    /// The Docs Studio browser (Phase 4 client wiring): the [`AppState::docs`]
+    /// tree on the left, and the focused document's editor rail (its blocks) +
+    /// review rail (its pending suggestions) on the right. Read-only — the live
+    /// CRDT edit transport is a separate follow-up.
+    Docs,
+    /// The code-graph edge inspector (Phase 4 exit criterion 4): the
+    /// [`AppState::edges`] list on the left and, for the focused edge, its
+    /// relation, confidence, evidence kind + source, and revision on the right.
+    Edges,
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -254,6 +263,82 @@ pub struct MemoryCard {
     pub source: String,
 }
 
+/// A Docs Studio card (STEP 4.x client wiring): one [`KnowledgeDocument`]
+/// projected for the Docs browser's tree/editor/review rails. Self-contained —
+/// the TUI never depends on `codypendent-knowledge`; the CLI maps a document
+/// snapshot (plus its pending suggestions) into this shape. Every field is a
+/// pre-rendered human string so the renderer stays a pure projection.
+///
+/// [`KnowledgeDocument`]: (mapped by the CLI from `codypendent-knowledge`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocCard {
+    /// The document title (its heading in the tree).
+    pub title: String,
+    /// The scope the document lives in (e.g. `system`, `workspace …`).
+    pub scope: String,
+    /// The lifecycle status (`draft` / `in_review` / `published` / `archived`).
+    pub status: String,
+    /// The collaboration mode governing agent edits (`ask` / `suggest` / `edit`
+    /// / `co_author` / `review` / `maintain`) — org docs default to `suggest`.
+    pub mode: String,
+    /// The document's monotonic revision, pre-rendered (e.g. `"r7"`).
+    pub revision: String,
+    /// The rendered blocks (the editor rail), in document order.
+    pub blocks: Vec<DocBlockView>,
+    /// The pending suggestions on the document (the review rail).
+    pub suggestions: Vec<DocSuggestionView>,
+}
+
+/// One rendered document block (the editor rail). `text` is the block's primary
+/// text or a structured-block label — never the raw serialized content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocBlockView {
+    /// The block kind label (`heading` / `paragraph` / `code` / …).
+    pub kind: String,
+    /// A one-line human rendering of the block's content.
+    pub text: String,
+}
+
+/// One pending suggestion on a document (the review rail): a proposed
+/// replacement over a character range, with its author and rationale. Rendered
+/// read-only — accept/reject is a later live-transport concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSuggestionView {
+    /// The suggestion status (`pending` for the review rail).
+    pub status: String,
+    /// Who proposed it, pre-rendered (e.g. `"agent"` / `"human"`).
+    pub author: String,
+    /// The character range it targets, pre-rendered (e.g. `"12..40"`).
+    pub range: String,
+    /// The proposed replacement text.
+    pub replacement: String,
+    /// The proposer's rationale, when given.
+    pub rationale: Option<String>,
+}
+
+/// A code-graph edge projected for the graph-edge inspector (Phase 4 exit
+/// criterion 4: "graph edges expose evidence + revision"). Self-contained — the
+/// CLI maps a `CodeEdge` (resolving its endpoint node ids to qualified names)
+/// into this shape. Every field is a pre-rendered human string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphEdgeCard {
+    /// The source symbol's qualified name (or a fallback id when unresolved).
+    pub from: String,
+    /// The target symbol's qualified name (or a fallback id when unresolved).
+    pub to: String,
+    /// The relation label (`calls` / `defines` / `imports` / …).
+    pub relation: String,
+    /// The edge confidence in `[0, 1]` — the tier its evidence earns.
+    pub confidence: f32,
+    /// The evidence layer that produced it (`syntax_inferred` / `lsp_resolved`
+    /// / `compiler_resolved` / `runtime_observed`).
+    pub evidence_kind: String,
+    /// A human rendering of the descriptive evidence ref, or `"(none)"`.
+    pub evidence: String,
+    /// The git revision the edge was recorded at.
+    pub revision: String,
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -302,6 +387,18 @@ pub struct AppState {
     pub memories: Vec<MemoryCard>,
     /// Index into `memories` of the focused memory.
     pub selected_memory: usize,
+    /// The Docs Studio projection (Phase 4 client wiring): the visible-scope
+    /// documents, mapped to self-contained [`DocCard`]s by the CLI. May be
+    /// empty. The [`Overlay::Docs`] browser reads it.
+    pub docs: Vec<DocCard>,
+    /// Index into `docs` of the focused document.
+    pub selected_doc: usize,
+    /// The code-graph edge projection (Phase 4 exit criterion 4): this
+    /// repository's edges, mapped to self-contained [`GraphEdgeCard`]s by the
+    /// CLI. May be empty. The [`Overlay::Edges`] inspector reads it.
+    pub edges: Vec<GraphEdgeCard>,
+    /// Index into `edges` of the focused edge.
+    pub selected_edge: usize,
     /// The focused pane.
     pub focus: Pane,
     /// The top-most overlay / modal.
@@ -341,6 +438,10 @@ impl AppState {
             selected_skill: 0,
             memories: Vec::new(),
             selected_memory: 0,
+            docs: Vec::new(),
+            selected_doc: 0,
+            edges: Vec::new(),
+            selected_edge: 0,
             focus: Pane::Sessions,
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
@@ -357,12 +458,15 @@ impl AppState {
         match self.overlay {
             Overlay::NewRun(_) | Overlay::Steering(_) => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The Skills / Memory browsers are navigable with the normal key
-            // table (arrows, `S`/`M` to toggle, `o` to open a source, Esc to
+            // The Skills / Memory / Docs / Edges browsers are navigable with the
+            // normal key table (arrows to select, a letter to toggle, Esc to
             // dismiss), so they stay in `Normal` mode.
-            Overlay::None | Overlay::Help | Overlay::Skills | Overlay::Memory { .. } => {
-                InputMode::Normal
-            }
+            Overlay::None
+            | Overlay::Help
+            | Overlay::Skills
+            | Overlay::Memory { .. }
+            | Overlay::Docs
+            | Overlay::Edges => InputMode::Normal,
         }
     }
 
@@ -395,6 +499,18 @@ impl AppState {
     #[must_use]
     pub fn focused_memory(&self) -> Option<&MemoryCard> {
         self.memories.get(self.selected_memory)
+    }
+
+    /// The focused Docs Studio card, if any.
+    #[must_use]
+    pub fn focused_doc(&self) -> Option<&DocCard> {
+        self.docs.get(self.selected_doc)
+    }
+
+    /// The focused code-graph edge card, if any.
+    #[must_use]
+    pub fn focused_edge(&self) -> Option<&GraphEdgeCard> {
+        self.edges.get(self.selected_edge)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.

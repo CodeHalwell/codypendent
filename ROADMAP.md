@@ -33,10 +33,13 @@ the release gate is the
 > suggest-by-default for org docs, deterministic Markdown publication, a semantic
 > `LanguageAdapter` layer with LSP-edge supersession and revision-aware graph
 > queries (callers/blast-radius/tests-covering/changed-between), and a
-> documentation staleness engine (`/update-docs`). What remains for Phase 4 is
-> **client-surface wiring** — the TUI Docs view + edge inspector, live daemon CRDT
-> transport and edit-lease enforcement, executing publication through the
-> approval-gated write path, and spawning a live language server — tracked below.
+> documentation staleness engine (`/update-docs`). The first slice of
+> **client-surface wiring** has now landed: a read-only TUI Docs view
+> (tree / editor / review rail) and a code-graph edge inspector, fed by the CLI
+> projection seam (`D` / `G`). What remains for Phase 4 is the rest of that
+> wiring — live daemon CRDT transport and edit-lease enforcement, executing
+> publication through the approval-gated write path, and spawning a live language
+> server — tracked below.
 
 ---
 
@@ -154,14 +157,14 @@ client-surface wiring is the remaining slice.
 
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
-- [ ] TUI Docs view (tree/editor/review rail) and the graph-edge inspector (edges already carry relation + confidence + evidence + revision; exit criterion 4 is a render)
+- [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
 - [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
 **Exit:** concurrent edits merge ✅; document snapshot reproducible ✅; symbol
 changes flag affected docs with evidence ✅; graph edges expose evidence +
-revision ✅ (data model; TUI inspector render pending). ADR-016 recorded ✅;
+revision ✅ (data model + read-only TUI inspector render). ADR-016 recorded ✅;
 suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 
 ## Phase 5 — Workflow & multi-agent orchestration ⬜

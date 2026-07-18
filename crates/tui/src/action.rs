@@ -92,6 +92,12 @@ pub enum Action {
     /// than opening a file.
     OpenSource,
 
+    // --- Docs Studio & code intelligence (Phase 4 client wiring) ---
+    /// Toggle the Docs Studio browser (`D`): tree / editor rail / review rail.
+    OpenDocs,
+    /// Toggle the code-graph edge inspector (`G`).
+    OpenEdges,
+
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).
     Help,

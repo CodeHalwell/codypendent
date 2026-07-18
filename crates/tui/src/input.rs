@@ -103,6 +103,16 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "D",
+        description: "open Docs Studio (tree / editor / review rails)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "G",
+        description: "open the code-graph edge inspector",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "q",
         description: "detach (the run keeps going)",
         mouse: None,
@@ -183,6 +193,8 @@ fn map_normal_char(c: char) -> Action {
         'S' => Action::OpenSkills,
         'M' => Action::OpenMemory,
         'o' => Action::OpenSource,
+        'D' => Action::OpenDocs,
+        'G' => Action::OpenEdges,
         _ => Action::NoOp,
     }
 }
@@ -296,6 +308,8 @@ mod tests {
             map_event(&ch('o'), InputMode::Normal, W),
             Action::OpenSource
         );
+        assert_eq!(map_event(&ch('D'), InputMode::Normal, W), Action::OpenDocs);
+        assert_eq!(map_event(&ch('G'), InputMode::Normal, W), Action::OpenEdges);
     }
 
     #[test]
