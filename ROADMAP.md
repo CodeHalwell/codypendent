@@ -42,7 +42,9 @@ the release gate is the
 > server — all daemon-internal or external-tool work tracked below. With those
 > deferred, **Phase 5 has begun**: the `codypendent-workflow` crate now compiles
 > declarative `workflow.yaml` manifests into a validated node graph (STEP 5.1
-> compiler core), the foundation for durable multi-agent orchestration.
+> compiler core), the foundation for durable multi-agent orchestration. In
+> parallel, a **Codex-informed TUI backlog** is tracked near the end of this file:
+> the command palette (`/`) has shipped; a contextual footer is next.
 
 ---
 
@@ -204,6 +206,58 @@ update requires approval; original audio/image artifacts linked; setup assistant
 **Exit:** routing meets quality threshold at lower cost than static
 strongest-model; no learned artifact self-promotes; regressions covered; every
 promotion attributable and reversible.
+
+---
+
+## Client & TUI experience — Codex-informed backlog
+
+A design review of the Codex TUI surfaced patterns worth adopting. The rule:
+borrow the **principles** (progressive disclosure, a contextual footer, a
+universal composer, rich approvals), not the chat-first **shape** — Codypendent's
+multi-pane workspace over an event-sourced transcript is the point of difference,
+and it already embodies several of these. (Visualized in a TUI mock + borrow
+review produced alongside this work.)
+
+- [x] **Command palette** (`/`) — one searchable surface for every command, so
+      the feature set grows without exhausting single-key bindings (the Docs/Edges
+      `D`/`G` additions had nearly filled the keymap). Pure-reducer; 52 TUI tests.
+- [x] **Rich approval cards** — action + risk + requested capabilities verbatim,
+      at the point of decision (already shipped in the approval modal).
+- [x] **Narrative transcript** — typed, event-sourced cells (model prose, tool
+      cards, diffs, markers) in one attributable stream (already the model).
+- [ ] 🟡 **Contextual footer** — a width-adaptive status line that separates
+      instructional from ambient state and shifts by mode (idle / working + queue /
+      plan / history-search). The `StatusProjection` already carries the fields —
+      **next up**, pure-reducer.
+- [ ] **Universal composer** — the input as an action surface: multiline, history
+      + reverse-search, `/` commands and `@` mentions, large-paste placeholders,
+      and queue/steer-while-working (steering already queues mid-run).
+- [ ] **Side conversations & forks** — inspect or branch without derailing the
+      main run; converges with Phase 5 STEP 5.6 `ForkSession{checkpoint}`.
+- [ ] **Terminal-native polish** — resize reflow, paste-burst detection, IME
+      input, terminal hyperlinks, copy-friendly output (folds into Phase 6 themes).
+
+## Cross-cutting, Codex-informed priorities
+
+From the broader Codex comparison, sequencing notes that touch several phases:
+
+- [ ] **OS sandbox enforcement gates Phase 6.** The policy engine *decides*
+      (deny / allow / approve); it does not yet *enforce*. Native isolation
+      (bubblewrap + seccomp / Seatbelt / AppContainer) should land as a
+      prerequisite for the plugin host and untrusted content, not after it — treat
+      the policy engine as the compiler that emits a sandbox profile.
+- [ ] **Finish the Phase 4 document vertical before deepening Phase 5.** One
+      end-to-end slice (open → concurrent-edit → review suggestions → inspect graph
+      evidence → publish through approval → reconnect) demonstrates the thesis
+      better than breadth. The mutation engine + `DocumentSync` payload exist; the
+      daemon transport + edit-leases remain.
+- [ ] **Trust boundary as plumbing, not new design.** Retrieved memories, skill
+      descriptions, and CI/PR text must render as *evidence*, not instructions —
+      the fabric already carries `EvidenceRef` / `TrustTier` / `DataClassification`
+      / `Scope`, so this is finishing the wiring, not inventing it.
+- [ ] **Generate the protocol SDK.** The VS Code extension hand-duplicates the
+      Rust wire codec; a generated TypeScript + JSON-Schema pipeline from the
+      protocol crate removes that drift risk as the protocol grows.
 
 ---
 
