@@ -9,6 +9,7 @@
 //!
 //! [`RunExecutor`]: codypendent_daemon::executor::RunExecutor
 
+mod documents;
 mod executor;
 mod scan;
 

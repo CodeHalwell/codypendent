@@ -205,6 +205,27 @@ impl DocumentStore {
         }))
     }
 
+    /// Read just a document's [`Scope`] by id, without reconstructing its CRDT.
+    /// `None` if absent. The daemon's mutation-transport seam uses this to derive
+    /// the document's default [`CollaborationMode`](super::collab::CollaborationMode)
+    /// before applying an edit — deserializing the full Loro snapshot only to pick
+    /// a mode would be wasteful.
+    pub async fn scope(
+        &self,
+        pool: &SqlitePool,
+        id: DocumentId,
+    ) -> Result<Option<Scope>, DocStoreError> {
+        let Some(row) = sqlx::query("SELECT scope_json FROM documents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let scope: Scope = serde_json::from_str(row.get::<String, _>("scope_json").as_str())?;
+        Ok(Some(scope))
+    }
+
     /// Persist the current CRDT state of `doc`, bumping the revision and recording
     /// one authorship entry for `(mutation, block_id)` attributed to `author`.
     /// Snapshot write, authorship, and the `DocumentChanged` outbox row land in

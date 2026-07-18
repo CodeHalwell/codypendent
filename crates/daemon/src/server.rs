@@ -33,6 +33,7 @@ use tracing::{error, info, warn};
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
 use crate::commands::{ApplyContext, CommandProcessor};
+use crate::documents::{DocumentHub, DocumentMutationRequest, DocumentMutator};
 use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
@@ -72,6 +73,16 @@ pub struct ServerState {
     /// stays `Queued`); the assembly binary injects an implementation that wraps
     /// the runtime agent loop (dependency inversion — see [`crate::executor`]).
     pub executor: Option<Arc<dyn RunExecutor>>,
+    /// Per-document CRDT-sync fan-out: a `MutateDocument` that applies publishes
+    /// its sync here, and a client's `Subscription::Document` forwarder delivers
+    /// from it (Phase 4 STEP 4.3).
+    pub documents: DocumentHub,
+    /// Applies an accepted `MutateDocument` onto the authoritative collaborative
+    /// document. `None` in a lib-only / test embedding (the command is then
+    /// rejected `document.transport-unavailable`); the assembly injects a
+    /// knowledge-backed implementation (dependency inversion — see
+    /// [`crate::documents`]).
+    pub mutator: Option<Arc<dyn DocumentMutator>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -142,14 +153,22 @@ pub async fn run_with_executor_on(
         .and_then(|e| e.collaborators())
         .unwrap_or_else(|| (SubscriptionHub::new(), ApprovalBroker::new()));
 
+    // The document-transport seam, bundled with the executor by the assembly (as
+    // its `collaborators` are). The per-document fan-out is created fresh here —
+    // the server owns publishing (after a mutation applies) and subscribing (a
+    // client's `Document` forwarder), and the mutator only computes the sync.
+    let mutator = executor.as_ref().and_then(|e| e.document_mutator());
+    let documents = DocumentHub::new();
+
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
-    // expire at runtime. The same tick prunes session fan-out channels whose
-    // last subscriber detached, so the hub does not grow for the daemon's
-    // lifetime. Aborted when the server stops.
+    // expire at runtime. The same tick prunes session and document fan-out
+    // channels whose last subscriber detached, so neither hub grows for the
+    // daemon's lifetime. Aborted when the server stops.
     let expiry_task = {
         let broker = approvals.clone();
         let hub = subscriptions.clone();
+        let doc_hub = documents.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -162,6 +181,7 @@ pub async fn run_with_executor_on(
                     Err(error) => warn!(%error, "approval expiry sweep failed"),
                 }
                 hub.prune_idle();
+                doc_hub.prune_idle();
             }
         })
     };
@@ -181,6 +201,8 @@ pub async fn run_with_executor_on(
         artifacts,
         secret,
         executor,
+        documents,
+        mutator,
     });
 
     #[cfg(unix)]
@@ -301,6 +323,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     // that would double-deliver every live event.
     let mut forwarders: std::collections::HashMap<SessionId, JoinHandle<()>> =
         std::collections::HashMap::new();
+    // Keyed by document: a re-subscribe to the same document replaces its
+    // forwarder, so a client that re-attaches never gets a document's syncs twice.
+    let mut doc_forwarders: std::collections::HashMap<
+        codypendent_protocol::DocumentId,
+        JoinHandle<()>,
+    > = std::collections::HashMap::new();
 
     // The read loop stamps this on every frame; the heartbeat task reads it to
     // decide when the client has gone silent. Locked only for the instant swap,
@@ -330,7 +358,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
                 *last_activity
                     .lock()
                     .expect("last-activity mutex poisoned") = tokio::time::Instant::now();
-                match handle_request(&state, &writer, &mut conn, &mut forwarders, request).await {
+                match handle_request(
+                    &state,
+                    &writer,
+                    &mut conn,
+                    &mut forwarders,
+                    &mut doc_forwarders,
+                    request,
+                )
+                .await
+                {
                     Ok(true) => break Ok(()), // shutdown handled
                     Ok(false) => {}
                     Err(e) => break Err(e),
@@ -343,8 +380,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     };
 
     heartbeat.abort();
-    // A slow or vanished client must never wedge a forwarder; drop them all.
+    // A slow or vanished client must never wedge a forwarder; drop them all —
+    // both the session event forwarders and the document sync forwarders.
     for forwarder in forwarders.values() {
+        forwarder.abort();
+    }
+    for forwarder in doc_forwarders.values() {
         forwarder.abort();
     }
     // Announce this client's departure from every session it was attached to, so
@@ -399,6 +440,10 @@ async fn handle_request(
     writer: &SharedWriter,
     conn: &mut ConnState,
     forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
+    doc_forwarders: &mut std::collections::HashMap<
+        codypendent_protocol::DocumentId,
+        JoinHandle<()>,
+    >,
     request: Envelope,
 ) -> anyhow::Result<bool> {
     // Major-version incompatibility is refused structurally; the connection
@@ -502,6 +547,7 @@ async fn handle_request(
                         writer,
                         conn,
                         forwarders,
+                        doc_forwarders,
                         &request,
                         *session_id,
                         last_seen_sequence.unwrap_or(0),
@@ -558,6 +604,74 @@ async fn handle_request(
                                 true,
                             )),
                         ),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // A collaborative-document mutation is applied to the
+                // authoritative Loro document (in `codypendent-knowledge`, reached
+                // through the assembly's `DocumentMutator` seam), not the session
+                // ledger — so, like `AttachSession`/`UpdateIdeContext`, it is
+                // intercepted here rather than flowing through the event write
+                // path (Phase 4 STEP 4.3).
+                CommandBody::MutateDocument {
+                    document_id,
+                    mutation,
+                } => {
+                    // Read-only clients may not edit documents. (The seam also
+                    // enforces the document's collaboration mode and edit leases;
+                    // this is the coarse role gate the daemon owns.)
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not mutate documents".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    // With no mutator injected (lib-only server / daemon tests)
+                    // document transport is not enabled; reject structurally so the
+                    // connection survives, mirroring the executor-less run path.
+                    let Some(mutator) = state.mutator.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let mutate = DocumentMutationRequest {
+                        document_id: *document_id,
+                        mutation: mutation.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match mutator.apply_mutation(mutate).await {
+                        Ok(sync) => {
+                            // The mutation committed inside the seam; only now does
+                            // its sync fan out to the document's subscribers
+                            // (persist-before-publish, RULE 2). A subscriber's CRDT
+                            // merge is idempotent, so a lost or duplicated sync
+                            // self-heals — no watermark is needed here.
+                            state.documents.publish(*document_id, sync);
+                            Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            )
+                        }
+                        Err(error) => {
+                            Envelope::reply_to(&request, Payload::CommandRejected(error))
+                        }
                     };
                     send(writer, &reply).await?;
                 }
@@ -687,6 +801,10 @@ async fn handle_attach(
     writer: &SharedWriter,
     conn: &ConnState,
     forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
+    doc_forwarders: &mut std::collections::HashMap<
+        codypendent_protocol::DocumentId,
+        JoinHandle<()>,
+    >,
     request: &Envelope,
     session_id: SessionId,
     last_seen: u64,
@@ -734,8 +852,26 @@ async fn handle_attach(
     )
     .await?;
 
-    let writer = Arc::clone(writer);
     let client_id = conn.client_id_or(request.client_id);
+
+    // Spawn a per-document forwarder for each `Document` subscription in this
+    // attach. Document syncs ride a separate, document-keyed fan-out (not the
+    // session hub), so they get their own forwarders — delivered as
+    // `Payload::DocumentSync`. A subscriber's baseline comes from the document
+    // read path; this stream carries the post-subscribe updates it merges. Done
+    // before the session forwarder below consumes `writer`/`subscriptions`.
+    for subscription in &subscriptions {
+        if let Subscription::Document { document_id } = subscription {
+            let receiver = state.documents.subscribe(*document_id);
+            let handle =
+                tokio::spawn(forward_document_syncs(Arc::clone(writer), receiver, client_id));
+            if let Some(previous) = doc_forwarders.insert(*document_id, handle) {
+                previous.abort();
+            }
+        }
+    }
+
+    let writer = Arc::clone(writer);
     let handle = tokio::spawn(forward_events(
         writer,
         receiver,
@@ -747,6 +883,7 @@ async fn handle_attach(
     if let Some(previous) = forwarders.insert(session_id, handle) {
         previous.abort();
     }
+
     // Announce this client's arrival so other attached clients (e.g. the TUI
     // during a handoff to VS Code) see it join. Emitted after the forwarder is
     // live so the arriving client also receives its own presence event.
@@ -816,6 +953,32 @@ async fn forward_events(
                 }
             }
             // Slow consumer: skip the dropped span rather than stall the writer.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Forward a document's live CRDT syncs to one subscribed client, framing each
+/// as a [`Payload::DocumentSync`]. Never blocks the publisher: a lagging receiver
+/// skips the dropped span (its next merge reconverges — CRDT updates are
+/// idempotent snapshots) and a vanished client ends the task. Document syncs are
+/// not session-scoped, so the frame carries no `session_id`; the client routes by
+/// the sync's own `document_id`.
+async fn forward_document_syncs(
+    writer: SharedWriter,
+    mut receiver: broadcast::Receiver<codypendent_protocol::DocumentSync>,
+    client_id: ClientId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(sync) => {
+                let envelope = Envelope::request(client_id, Payload::DocumentSync(sync));
+                if send(&writer, &envelope).await.is_err() {
+                    break; // client gone
+                }
+            }
+            // Slow consumer: skip the dropped span; the next sync reconverges.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }

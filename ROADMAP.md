@@ -33,13 +33,17 @@ the release gate is the
 > suggest-by-default for org docs, deterministic Markdown publication, a semantic
 > `LanguageAdapter` layer with LSP-edge supersession and revision-aware graph
 > queries (callers/blast-radius/tests-covering/changed-between), and a
-> documentation staleness engine (`/update-docs`). The first slice of
-> **client-surface wiring** has now landed: a read-only TUI Docs view
+> documentation staleness engine (`/update-docs`). Two slices of
+> **client-surface wiring** have now landed. First, a read-only TUI Docs view
 > (tree / editor / review rail) and a code-graph edge inspector, fed by the CLI
-> projection seam (`D` / `G`). What remains for Phase 4 is the rest of that
-> wiring — live daemon CRDT transport and edit-lease enforcement, executing
-> publication through the approval-gated write path, and spawning a live language
-> server — all daemon-internal or external-tool work tracked below. With those
+> projection seam (`D` / `G`). Second, **live daemon CRDT transport**: the
+> `MutateDocument` command now applies onto the authoritative Loro document
+> through a `DocumentMutator` assembly seam (mode-gated by the document's scope,
+> single-writer via edit-lease `require`), and the resulting `DocumentSync` fans
+> out to `Subscription::Document` subscribers over a per-document `DocumentHub`.
+> What remains for Phase 4 is executing publication through the approval-gated
+> write path, spawning a live language server, and the client-side CRDT replica
+> that consumes the sync stream — external-tool / client work tracked below. With those
 > deferred, **Phase 5 is underway**: the `codypendent-workflow` crate compiles
 > declarative `workflow.yaml` manifests into a validated node graph (5.1 compiler
 > core), persists runs / node records / checkpoints with resume-guarding in a
@@ -168,7 +172,7 @@ client-surface wiring is the remaining slice.
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
 - [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
-- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines landed:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the daemon's pre-mutation guard. *Remaining:* routing `MutateDocument` through the `codypendentd` seam, a per-document subscription/broadcast channel, and calling `acquire`/`require` from that path
+- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Remaining:* a `CommandBody::AcquireDocumentLease` so a client can take a lease before editing (today `require` is a correctly-placed pass-through until a lease is held), and the client-side CRDT replica that consumes the sync stream
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
@@ -291,8 +295,12 @@ From the broader Codex comparison, sequencing notes that touch several phases:
 - [ ] **Finish the Phase 4 document vertical before deepening Phase 5.** One
       end-to-end slice (open → concurrent-edit → review suggestions → inspect graph
       evidence → publish through approval → reconnect) demonstrates the thesis
-      better than breadth. The mutation engine + `DocumentSync` payload exist; the
-      daemon transport + edit-leases remain.
+      better than breadth. The mutation engine, `DocumentSync` payload, edit-lease
+      store, **and the daemon transport** now exist (`MutateDocument` applies
+      through the assembly `DocumentMutator` seam and fans out to `Document`
+      subscribers). What still closes the loop: a lease-acquire command, a
+      client-side CRDT replica that consumes the sync stream, and publishing a
+      `PublishPlan` through the approval-gated write path.
 - [ ] **Trust boundary as plumbing, not new design.** Retrieved memories, skill
       descriptions, and CI/PR text must render as *evidence*, not instructions —
       the fabric already carries `EvidenceRef` / `TrustTier` / `DataClassification`

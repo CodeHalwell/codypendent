@@ -568,6 +568,16 @@ impl RunExecutor for RuntimeExecutor {
     fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker)> {
         Some((self.subscriptions.clone(), self.approvals.clone()))
     }
+
+    fn document_mutator(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::documents::DocumentMutator>> {
+        // Apply `MutateDocument` over the knowledge document engine (mode-gated by
+        // scope, single-writer via edit leases). Shares the daemon's pool.
+        Some(Arc::new(crate::documents::KnowledgeDocumentMutator::new(
+            self.pool.clone(),
+        )))
+    }
 }
 
 /// The `repository` recorded on the StartRun command that created a queued run,

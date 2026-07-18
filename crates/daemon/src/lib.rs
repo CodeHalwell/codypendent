@@ -14,6 +14,7 @@ pub mod server;
 pub mod approvals;
 pub mod artifacts;
 pub mod commands;
+pub mod documents;
 pub mod executor;
 pub mod policy;
 pub mod projections;

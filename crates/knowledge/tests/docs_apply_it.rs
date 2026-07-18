@@ -87,6 +87,26 @@ async fn edit_mode_applies_text_directly_and_advances_the_revision() {
 }
 
 #[tokio::test]
+async fn scope_reads_the_scope_without_loading_the_crdt() {
+    // The daemon's mutation-transport seam reads a document's scope to derive its
+    // default collaboration mode before applying an edit; `scope` is that reader.
+    let (_tmp, pool) = temp_pool().await;
+    let id = seed_paragraph(&pool, "hi").await;
+    let store = DocumentStore::new();
+
+    let scope = store.scope(&pool, id).await.unwrap();
+    assert_eq!(scope, Some(Scope::System));
+    // A System-scope document defaults to direct editing (the seam's mode gate).
+    assert_eq!(
+        CollaborationMode::default_for_scope(&scope.unwrap()),
+        CollaborationMode::Edit
+    );
+
+    // An absent document reads `None` (the seam then rejects `document.not-found`).
+    assert_eq!(store.scope(&pool, DocumentId::new()).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn edit_mode_inserts_and_deletes_blocks() {
     let (_tmp, pool) = temp_pool().await;
     let id = seed_paragraph(&pool, "keep").await;
