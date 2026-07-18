@@ -58,6 +58,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "F2",
+        description: "toggle layout: chat ⇄ workspace panes",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "a / A",
         description: "approve once / for the run (when prompted)",
         mouse: None,
@@ -213,6 +218,7 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Up if ctrl(key) => Action::PrevRun,
         KeyCode::Down if ctrl(key) => Action::NextRun,
+        KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::Char('c') if ctrl(key) => Action::Detach,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         _ => Action::NoOp,
@@ -220,7 +226,8 @@ fn map_composer_key(key: &KeyEvent) -> Action {
 }
 
 /// A pending approval owns the input: the decision keys, plus arrows to move
-/// between stacked approvals. Ctrl-C still detaches (the run keeps going).
+/// between stacked approvals. Ctrl-C still detaches (the run keeps going); `F2`
+/// still flips the layout underneath.
 fn map_approval_key(key: &KeyEvent) -> Action {
     if ctrl(key) && key.code == KeyCode::Char('c') {
         return Action::Detach;
@@ -231,6 +238,7 @@ fn map_approval_key(key: &KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Reject,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        KeyCode::F(2) => Action::ToggleLayout,
         _ => Action::NoOp,
     }
 }
@@ -475,6 +483,11 @@ mod tests {
         assert_eq!(
             map_event(&ctrl(KeyCode::Down), InputMode::Composer, W),
             Action::NextRun
+        );
+        // F2 flips the layout from the base view.
+        assert_eq!(
+            map_event(&key(KeyCode::F(2)), InputMode::Composer, W),
+            Action::ToggleLayout
         );
     }
 

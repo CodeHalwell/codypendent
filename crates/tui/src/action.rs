@@ -104,6 +104,8 @@ pub enum Action {
 
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
+    /// Flip between the chat single-column and the workspace panes (`F2`).
+    ToggleLayout,
 
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).

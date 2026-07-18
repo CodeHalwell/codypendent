@@ -35,6 +35,30 @@ impl Pane {
     }
 }
 
+/// Which base layout the shell renders. Toggled at runtime (`F2` or the palette);
+/// the composer and status footer are identical in both — only the region above
+/// them changes, and the input model (composer / palette / approval modal) is the
+/// same in each, so the panes are at-a-glance context, not a separate mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    /// The single-column conversation (the Claude Code / Codex feel). Default.
+    #[default]
+    Chat,
+    /// Runs │ conversation │ approvals panes, for at-a-glance workspace state.
+    Workspace,
+}
+
+impl LayoutMode {
+    /// The other layout.
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            LayoutMode::Chat => LayoutMode::Workspace,
+            LayoutMode::Workspace => LayoutMode::Chat,
+        }
+    }
+}
+
 /// How the input layer should interpret the next key (see
 /// [`crate::input::map_event`]). Derived from the active overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +446,9 @@ pub struct AppState {
     /// text lands here; Enter sends it (starting a run, or steering the active
     /// one). Empty by default.
     pub composer: String,
+    /// Which base layout is rendered (chat single-column vs. workspace panes).
+    /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
+    pub layout: LayoutMode,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -465,6 +492,7 @@ impl AppState {
             selected_edge: 0,
             focus: Pane::Sessions,
             composer: String::new(),
+            layout: LayoutMode::Chat,
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,

@@ -111,6 +111,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 },
             }
         }
+        Action::ToggleLayout => state.layout = state.layout.toggled(),
 
         Action::Help => {
             state.overlay = match state.overlay {
@@ -696,6 +697,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Memory => state.overlay = Overlay::Memory { source_open: false },
         PaletteCommand::Docs => state.overlay = Overlay::Docs,
         PaletteCommand::Edges => state.overlay = Overlay::Edges,
+        PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
         PaletteCommand::Help => state.overlay = Overlay::Help,
         PaletteCommand::Detach => state.should_detach = true,
     }
@@ -1637,6 +1639,24 @@ mod tests {
         assert_eq!(s.selected_run, 0);
         reduce(&mut s, Action::NextRun);
         assert_eq!(s.selected_run, 1);
+    }
+
+    #[test]
+    fn f2_toggles_between_chat_and_workspace_layouts() {
+        use crate::state::LayoutMode;
+        let mut s = AppState::new();
+        assert_eq!(s.layout, LayoutMode::Chat);
+        reduce(&mut s, Action::ToggleLayout);
+        assert_eq!(s.layout, LayoutMode::Workspace);
+        reduce(&mut s, Action::ToggleLayout);
+        assert_eq!(s.layout, LayoutMode::Chat);
+        // The palette command reaches the same toggle.
+        reduce(&mut s, Action::OpenPalette);
+        for c in "layout".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.layout, LayoutMode::Workspace);
     }
 
     #[test]

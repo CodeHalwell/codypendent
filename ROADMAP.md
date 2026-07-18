@@ -219,12 +219,15 @@ overlays reachable from the palette. The feel is chat-first; the capability set
 is deliberately broader. (Visualized in a TUI mock + borrow review produced
 alongside this work.)
 
-- [x] **Conversation-centred shell** — the base view is now a full-width
-      transcript + a persistent bottom composer + a one-row status footer; the old
-      three-pane layout is retired. Type to send (a message starts a run, or
-      steers the live one); `/` on an empty composer opens the palette; PgUp/PgDn
-      scroll; Ctrl-↑/↓ switch runs; a pending approval owns the input until
-      resolved. Pure-reducer; 62 TUI tests green.
+- [x] **Conversation-centred shell + layout toggle** — the base view is a
+      full-width transcript + a persistent bottom composer + a one-row status
+      footer. Type to send (a message starts a run, or steers the live one); `/`
+      on an empty composer opens the palette; PgUp/PgDn scroll; Ctrl-↑/↓ switch
+      runs; a pending approval owns the input until resolved. **`F2` (or the
+      palette) toggles to a workspace layout** — Runs │ conversation │ approvals
+      panes for at-a-glance state — sharing the same composer, footer, and input
+      model, so the panes are context, not a separate mode. Pure-reducer; 64 TUI
+      tests green.
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key
       actions.

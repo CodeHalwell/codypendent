@@ -22,7 +22,7 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    AppState, Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    AppState, LayoutMode, Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -47,11 +47,162 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         ])
         .split(area);
 
-    render_conversation(frame, rows[0], state, theme);
+    // The region above the composer depends on the layout; the composer and
+    // status footer are identical in both.
+    match state.layout {
+        LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
+        LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
+    }
     render_composer(frame, rows[1], state, theme);
     render_status_line(frame, rows[2], state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+/// The workspace layout: a runs pane, the conversation, and an approvals + run
+/// detail pane. The panes are at-a-glance context — interaction stays the same
+/// (composer, palette, approval modal), so no pane needs its own input focus.
+fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(26),
+            Constraint::Percentage(48),
+            Constraint::Percentage(26),
+        ])
+        .split(area);
+    render_runs_pane(frame, cols[0], state, theme);
+    render_conversation(frame, cols[1], state, theme);
+    render_context_pane(frame, cols[2], state, theme);
+}
+
+/// The runs pane (workspace layout): every run with its state and objective, the
+/// selected one marked. Read-only — switch runs with Ctrl-↑/↓.
+fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let block = pane_block(&format!("Runs ({})", state.runs.len()), false, theme);
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.runs.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no runs yet",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, run) in state.runs.iter().enumerate() {
+        let selected = idx == state.selected_run;
+        let marker = if selected { "› " } else { "  " };
+        let line = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                run_state_dot(run.state),
+                Style::default().fg(run_state_color(run.state, theme)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&run.objective, 18),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let item = ListItem::new(line);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+/// The context pane (workspace layout): pending approvals over the selected run's
+/// details. Read-only — approvals are resolved through the modal that pops when
+/// one is pending.
+fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let block = pane_block(
+        &format!("Approvals ({})", state.pending_approvals.len()),
+        false,
+        theme,
+    );
+    let mut lines: Vec<Line> = Vec::new();
+
+    if state.pending_approvals.is_empty() {
+        lines.push(Line::styled(
+            "  none pending",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    for (idx, approval) in state.pending_approvals.iter().enumerate() {
+        let selected = idx == state.selected_approval;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                risk_label(approval.risk.level).to_owned(),
+                Style::default().fg(risk_color(approval.risk.level, theme)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                action_kind(&approval.action).to_owned(),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(section("Run", theme));
+    if let Some(run) = state.selected_run() {
+        let field = |k: &str, v: String, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v, Style::default().fg(color)),
+            ])
+        };
+        lines.push(field(
+            "state",
+            run_state_label(run.state).to_owned(),
+            run_state_color(run.state, theme),
+        ));
+        lines.push(field(
+            "mode",
+            mode_label(run.mode).to_owned(),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "model",
+            run.model
+                .as_ref()
+                .map_or("—".to_owned(), ToString::to_string),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "ctx",
+            run.context_percent
+                .map_or("—".to_owned(), |p| format!("{p}%")),
+            theme.status.info,
+        ));
+        lines.push(field(
+            "cost",
+            format_cost(run.cost_minor),
+            theme.status.warning,
+        ));
+        lines.push(field(
+            "wt",
+            run.worktree.clone().unwrap_or_else(|| "—".to_owned()),
+            theme.text.secondary,
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  no run selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The composer's height in rows (a bordered box holding one input line).
@@ -1409,6 +1560,17 @@ fn run_state_label(state: RunState) -> &'static str {
     }
 }
 
+fn run_state_dot(state: RunState) -> &'static str {
+    match state {
+        RunState::Completed => "✓",
+        RunState::Failed => "✗",
+        RunState::Cancelled => "⊘",
+        RunState::WaitingForApproval | RunState::WaitingForUserInput => "◆",
+        RunState::Paused => "⏸",
+        _ => "●",
+    }
+}
+
 fn run_state_color(state: RunState, theme: &Theme) -> Color {
     match state {
         RunState::Running | RunState::Preparing => theme.status.running,
@@ -1766,6 +1928,31 @@ mod tests {
             text.contains("add a boundary check"),
             "draft not shown:\n{text}"
         );
+    }
+
+    #[test]
+    fn workspace_layout_adds_runs_and_approvals_panes() {
+        // Toggling to the workspace layout flanks the conversation with a runs
+        // pane and an approvals + detail pane — the composer/footer are unchanged.
+        let mut state = running_build_state();
+        reduce(&mut state, Action::ToggleLayout);
+        let text = render_to_string(&state, 120, 30);
+
+        assert!(text.contains("Runs"), "runs pane missing:\n{text}");
+        assert!(
+            text.contains("Approvals"),
+            "approvals pane missing:\n{text}"
+        );
+        // The conversation is still the centre surface.
+        assert!(text.contains("fix-tests"), "conversation title:\n{text}");
+        // The composer and status footer persist across the toggle.
+        assert!(text.contains("›"), "composer:\n{text}");
+        assert!(text.contains("mode"), "status footer:\n{text}");
+
+        // Toggling back returns to the single-column chat (no Runs pane title).
+        reduce(&mut state, Action::ToggleLayout);
+        let chat = render_to_string(&state, 120, 30);
+        assert!(!chat.contains("Runs ("), "should be single-column:\n{chat}");
     }
 
     #[test]

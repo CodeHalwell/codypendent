@@ -29,6 +29,8 @@ pub enum PaletteCommand {
     Docs,
     /// Open the code-graph edge inspector.
     Edges,
+    /// Flip between the chat and workspace layouts.
+    ToggleLayout,
     /// Toggle the help overlay.
     Help,
     /// Detach this client (the run keeps going).
@@ -99,6 +101,12 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Memory",
         description: "browse curated memories and their provenance",
         key: "M",
+    },
+    PaletteEntry {
+        command: PaletteCommand::ToggleLayout,
+        title: "Toggle layout",
+        description: "switch between chat and workspace panes",
+        key: "F2",
     },
     PaletteEntry {
         command: PaletteCommand::Help,
