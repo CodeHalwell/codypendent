@@ -358,6 +358,39 @@ impl WorkflowStore {
         }))
     }
 
+    /// Every run **not** in a terminal state — `pending`, `running`, or `paused` —
+    /// oldest first. These are the runs a daemon must reconcile on startup after a
+    /// crash: for each, recompile its workflow and [`resume`](WorkflowStore::resume)
+    /// from the first incomplete node (the signature guard refuses one whose graph
+    /// changed). Node records are not loaded here — call
+    /// [`snapshot`](WorkflowStore::snapshot) or [`resume`](WorkflowStore::resume)
+    /// per run when reconciling.
+    pub async fn list_incomplete_runs(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+        let rows = sqlx::query(
+            "SELECT id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state \
+             FROM workflow_runs WHERE state IN ('pending', 'running', 'paused') \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkflowRunRecord {
+                    id: row.get("id"),
+                    workflow_id: row.get("workflow_id"),
+                    workflow_version: row.get::<i64, _>("workflow_version") as u32,
+                    graph_signature: row.get("graph_signature"),
+                    run_id: row.get("run_id"),
+                    inputs: serde_json::from_str(&row.get::<String, _>("inputs_json"))?,
+                    state: WorkflowRunState::parse(&row.get::<String, _>("state"))?,
+                })
+            })
+            .collect()
+    }
+
     /// The full run + node snapshot, or `None` if the run does not exist.
     pub async fn snapshot(
         &self,

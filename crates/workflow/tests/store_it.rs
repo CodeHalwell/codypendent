@@ -259,6 +259,44 @@ async fn retry_from_node_refuses_a_changed_graph_or_unknown_node() {
 }
 
 #[tokio::test]
+async fn list_incomplete_runs_returns_only_non_terminal_runs() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+
+    // Three runs: leave one pending, drive one to running, finish one.
+    let pending = store
+        .create_run(&pool, &compiled, Some("pending"), &json!({}))
+        .await
+        .unwrap();
+    let running = store
+        .create_run(&pool, &compiled, Some("running"), &json!({}))
+        .await
+        .unwrap();
+    let completed = store
+        .create_run(&pool, &compiled, Some("done"), &json!({}))
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &running, WorkflowRunState::Running)
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &completed, WorkflowRunState::Completed)
+        .await
+        .unwrap();
+
+    // Startup recovery sees the pending + running runs (oldest first), not the
+    // completed one.
+    let incomplete = store.list_incomplete_runs(&pool).await.unwrap();
+    let ids: Vec<&str> = incomplete.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec![pending.as_str(), running.as_str()]);
+    // The records carry enough to recompile + resume (run_id, signature preserved).
+    assert_eq!(incomplete[1].run_id.as_deref(), Some("running"));
+    assert_eq!(incomplete[1].graph_signature, compiled.signature());
+}
+
+#[tokio::test]
 async fn run_state_transitions_persist() {
     let (_tmp, pool) = temp_pool().await;
     let compiled = compile_yaml(MANIFEST).unwrap();

@@ -212,8 +212,11 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         transitively downstream of it — resetting them to a clean `Pending`
         (attempt / timings / cost / agent-run id cleared) and the run to
         `Running`, under the same signature guard — so a `resume` then picks up
-        from that node (the durable-store half of retry-from-node). *Remaining
-        for 5.2:* daemon startup recovery wiring, node-lifecycle ledger events,
+        from that node (the durable-store half of retry-from-node).
+        `list_incomplete_runs` enumerates the non-terminal runs
+        (pending/running/paused) a daemon must reconcile on startup, so recovery
+        is a recompile-and-`resume` per run. *Remaining for 5.2:* the daemon
+        startup-recovery **wiring** over that list, node-lifecycle ledger events,
         the pause/resume/retry-from-node **commands** that drive these store ops,
         and the TUI workflow-graph view.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
