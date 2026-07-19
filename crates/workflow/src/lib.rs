@@ -13,19 +13,23 @@
 //! topologically ordered node graph the executor drives.
 //!
 //! The definition + compiler layer holds **no** daemon or agent-framework code,
-//! so the format and its validation can be exercised on their own. Durable
-//! execution storage (STEP 5.2) — workflow runs, node records, and checkpoints —
-//! lives in [`store`] over a SQLite pool ([`db`]), still daemon-free so recovery
-//! and idempotency are testable in isolation. Lowering the compiled graph onto
-//! framework orchestration builders, cross-checking tool/skill/agent references
-//! against the live registry, and wiring recovery into the daemon are the
-//! remaining steps, tracked in the roadmap.
+//! so the format and its validation can be exercised on their own. Reference
+//! cross-checking is supplied by a [`registry::WorkflowRegistry`] snapshot the
+//! daemon builds from the live registry + loaded agent profiles, so
+//! [`compile::compile_with_registry`] can reject an unknown tool/skill/role while
+//! the crate itself stays daemon-free. Durable execution storage (STEP 5.2) —
+//! workflow runs, node records, and checkpoints — lives in [`store`] over a
+//! SQLite pool ([`db`]), still daemon-free so recovery and idempotency are
+//! testable in isolation. Lowering the compiled graph onto framework
+//! orchestration builders and wiring recovery into the daemon are the remaining
+//! steps, tracked in the roadmap.
 
 pub mod agent;
 pub mod blackboard;
 pub mod compile;
 pub mod db;
 pub mod model;
+pub mod registry;
 pub mod store;
 
 pub use agent::{
@@ -36,12 +40,14 @@ pub use blackboard::{
     BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
 };
 pub use compile::{
-    compile, compile_yaml, CompileError, CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
+    compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
+    CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,
 };
+pub use registry::{SetRegistry, WorkflowRegistry};
 pub use store::{
     Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord, WorkflowRunRecord, WorkflowRunSnapshot,
     WorkflowRunState, WorkflowStore, WorkflowStoreError,
