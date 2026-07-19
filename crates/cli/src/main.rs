@@ -20,6 +20,12 @@
 //! ```text
 //! codypendent            # opens the TUI for the current repository's session
 //! ```
+//!
+//! Phase 5 STEP 5.1 adds workflow-manifest validation:
+//!
+//! ```text
+//! codypendent workflow validate path/to/workflow.yaml
+//! ```
 
 use std::path::PathBuf;
 
@@ -84,6 +90,11 @@ enum TopCommand {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Work with declarative workflow manifests (Phase 5).
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
     /// `agent_servers` config points at this; it is not meant to be run by hand.
     Acp {
@@ -130,6 +141,25 @@ impl IdeArg {
 enum IndexCommand {
     /// Delete the derived indexes and rebuild them from the authoritative rows.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    /// Parse and compile a `workflow.yaml`, reporting the validated graph or the
+    /// precise error. Structural validation only; it does not run the workflow.
+    Validate {
+        /// Path to the workflow manifest to validate.
+        file: PathBuf,
+    },
+    /// Compile a `workflow.yaml` and print its full graph (nodes, actions, edges,
+    /// approvals, outputs) as a human tree, or the JSON projection with `--json`.
+    Show {
+        /// Path to the workflow manifest to show.
+        file: PathBuf,
+        /// Emit the compiled graph as JSON instead of a human tree.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +250,10 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Workflow { command } => match command {
+            WorkflowCommand::Validate { file } => commands::workflow_validate(&file),
+            WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
+        },
         TopCommand::Acp { repo } => {
             let repo = match repo {
                 Some(repo) => repo,

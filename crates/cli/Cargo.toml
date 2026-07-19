@@ -20,6 +20,9 @@ codypendent-protocol = { workspace = true }
 codypendent-tui = { workspace = true }
 codypendent-knowledge = { workspace = true }
 codypendent-integrations = { workspace = true }
+# The declarative workflow compiler, exposed via `codypendent workflow validate`
+# (Phase 5 STEP 5.1) so authors can check a manifest before it ever runs.
+codypendent-workflow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

@@ -425,6 +425,101 @@ pub async fn open(
     Ok(())
 }
 
+/// `codypendent workflow validate <FILE>` (Phase 5 STEP 5.1): parse and compile a
+/// declarative `workflow.yaml`, reporting either a one-line summary of the
+/// validated graph or the precise error (naming the offending step). Self-contained
+/// — it never touches the daemon; a manifest is just text on disk.
+///
+/// This is **structural** validation: schema version, unique/non-empty ids,
+/// exactly one action per step, resolvable + acyclic dependencies, budget sanity,
+/// and the multi-agent `orchestration_reason` rule. Whether a named tool/skill/role
+/// actually *exists* is a separate registry cross-check that needs a configured
+/// runtime (the compiler exposes it via `compile_with_registry`).
+pub fn workflow_validate(file: &std::path::Path) -> anyhow::Result<()> {
+    let yaml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading workflow manifest {}", file.display()))?;
+    match codypendent_workflow::compile_yaml(&yaml) {
+        Ok(compiled) => {
+            println!("{}", workflow_summary(&compiled));
+            Ok(())
+        }
+        // A structural error is the user's to fix — surface it verbatim, tagged with
+        // the file, and exit non-zero (via `?` in `main`).
+        Err(error) => anyhow::bail!("{}: {error}", file.display()),
+    }
+}
+
+/// `codypendent workflow show <FILE> [--json]` (Phase 5 STEP 5.2): compile a
+/// manifest and print its full graph — every node's action, dependencies,
+/// workspace, approval, retry, and declared outputs — as a human tree or, with
+/// `--json`, the serialized [`CompiledWorkflow`] projection a graph-view client
+/// consumes. Structural compilation only, like [`workflow_validate`]; a compile
+/// error is surfaced verbatim and exits non-zero.
+pub fn workflow_show(file: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let yaml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading workflow manifest {}", file.display()))?;
+    let compiled = codypendent_workflow::compile_yaml(&yaml)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&compiled)?);
+    } else {
+        print!("{}", workflow_tree(&compiled));
+    }
+    Ok(())
+}
+
+/// A human, indented rendering of a compiled workflow graph. Pure, so it is tested
+/// directly. Nodes are listed in topological order; each shows its action and the
+/// execution-affecting settings that are set.
+fn workflow_tree(compiled: &codypendent_workflow::CompiledWorkflow) -> String {
+    use codypendent_workflow::NodeAction;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} v{} ({} step(s), {} agent step(s))",
+        compiled.id,
+        compiled.version,
+        compiled.nodes.len(),
+        compiled.agent_node_count()
+    );
+    for node in &compiled.nodes {
+        let action = match &node.action {
+            NodeAction::Agent { role, skill, .. } => match skill {
+                Some(skill) => format!("agent {role} · skill {skill}"),
+                None => format!("agent {role}"),
+            },
+            NodeAction::Tool { name } => format!("tool {name}"),
+        };
+        let _ = writeln!(out, "  - {} [{action}]", node.id);
+        if !node.depends_on.is_empty() {
+            let _ = writeln!(out, "      depends_on: {}", node.depends_on.join(", "));
+        }
+        if let Some(approval) = &node.approval {
+            let _ = writeln!(out, "      approval: {approval:?}");
+        }
+        if !node.outputs.is_empty() {
+            let _ = writeln!(out, "      outputs: {}", node.outputs.join(", "));
+        }
+    }
+    out
+}
+
+/// A one-line human summary of a validated workflow graph. Pure, so it is tested
+/// directly.
+fn workflow_summary(compiled: &codypendent_workflow::CompiledWorkflow) -> String {
+    let order: Vec<&str> = compiled.nodes.iter().map(|node| node.id.as_str()).collect();
+    format!(
+        "\u{2713} {} v{} valid — {} step(s), {} agent step(s); order: {}",
+        compiled.id,
+        compiled.version,
+        compiled.nodes.len(),
+        compiled.agent_node_count(),
+        order.join(" \u{2192} "),
+    )
+}
+
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
 fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) -> String {
     format!(
@@ -450,5 +545,116 @@ mod open_tests {
         assert!(message.contains("VS Code"));
         assert!(message.contains("does not restart"));
         assert!(message.contains(&paths.socket_path.display().to_string()));
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+
+    const VALID: &str = "\
+schema_version: 1
+id: pipeline
+version: 2
+budget:
+  maximum_cost_usd: 5.0
+steps:
+  - id: build
+    tool: repository.test
+  - id: check
+    depends_on: [build]
+    tool: repository.test
+";
+
+    #[test]
+    fn summary_reports_id_version_counts_and_order() {
+        let compiled = codypendent_workflow::compile_yaml(VALID).unwrap();
+        let summary = workflow_summary(&compiled);
+        assert!(summary.contains("pipeline v2 valid"));
+        assert!(summary.contains("2 step(s)"));
+        assert!(summary.contains("0 agent step(s)"));
+        // Topological order is shown, dependency first.
+        assert!(summary.contains("build \u{2192} check"), "got: {summary}");
+    }
+
+    #[test]
+    fn validate_accepts_a_good_manifest_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wf.yaml");
+        std::fs::write(&path, VALID).unwrap();
+        workflow_validate(&path).expect("a valid manifest validates");
+    }
+
+    #[test]
+    fn validate_reports_a_compile_error_tagged_with_the_file() {
+        // A step depending on a missing step fails to compile; the error names the
+        // file and the offending dependency.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broken.yaml");
+        std::fs::write(
+            &path,
+            "schema_version: 1\nid: wf\nversion: 1\nsteps:\n  - id: a\n    depends_on: [ghost]\n    tool: repository.test\n",
+        )
+        .unwrap();
+        let err = workflow_validate(&path).unwrap_err().to_string();
+        assert!(err.contains("broken.yaml"), "error names the file: {err}");
+        assert!(err.contains("ghost"), "error names the bad dep: {err}");
+    }
+
+    #[test]
+    fn validate_reports_a_missing_file() {
+        let err = workflow_validate(std::path::Path::new("/no/such/manifest.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading workflow manifest"));
+    }
+
+    const AGENT_MANIFEST: &str = "\
+schema_version: 1
+id: review-flow
+version: 1
+budget:
+  maximum_cost_usd: 5.0
+  maximum_agents: 1
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+    skill: github.inspect-failed-check
+    outputs: [finding]
+  - id: publish
+    depends_on: [inspect]
+    tool: github.update-pull-request
+    approval: always
+";
+
+    #[test]
+    fn tree_shows_each_node_action_edge_and_settings() {
+        let compiled = codypendent_workflow::compile_yaml(AGENT_MANIFEST).unwrap();
+        let tree = workflow_tree(&compiled);
+        assert!(tree.contains("review-flow v1"));
+        assert!(tree.contains("inspect [agent investigator · skill github.inspect-failed-check]"));
+        assert!(tree.contains("publish [tool github.update-pull-request]"));
+        assert!(tree.contains("depends_on: inspect"));
+        assert!(tree.contains("approval: Always"));
+        assert!(tree.contains("outputs: finding"));
+    }
+
+    #[test]
+    fn show_json_emits_a_parseable_graph_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wf.yaml");
+        std::fs::write(&path, AGENT_MANIFEST).unwrap();
+        // The command runs; and the same compiled graph serializes to the JSON
+        // shape a graph-view client parses (tagged actions, edges).
+        workflow_show(&path, true).expect("show --json succeeds");
+        let compiled = codypendent_workflow::compile_yaml(AGENT_MANIFEST).unwrap();
+        let value = serde_json::to_value(&compiled).unwrap();
+        assert_eq!(value["id"], "review-flow");
+        assert_eq!(value["nodes"][0]["action"]["kind"], "agent");
+        assert_eq!(
+            value["nodes"][1]["action"]["name"],
+            "github.update-pull-request"
+        );
     }
 }

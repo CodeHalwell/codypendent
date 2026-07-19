@@ -473,6 +473,123 @@ async fn observer_start_run_is_role_denied() {
 }
 
 #[tokio::test]
+async fn observer_cannot_acquire_a_document_lease() {
+    // A lease is a precursor to writing, so — like StartRun — an Observer is denied
+    // before the daemon even checks whether document transport is wired.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let _ = attach(
+        &mut stream,
+        client_id,
+        SessionId::new(),
+        None,
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "obs-lease-att",
+    )
+    .await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AcquireDocumentLease {
+                    lease: codypendent_protocol::DocumentEditLease {
+                        document_id: codypendent_protocol::DocumentId::new(),
+                        block_id: Some("p".to_string()),
+                    },
+                    ttl_seconds: None,
+                },
+                "lease-denied",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn lease_commands_are_rejected_when_transport_is_unwired() {
+    // The daemon's own test server injects no leaser (the executor-less path), so a
+    // Contributor's lease command is rejected structurally rather than crashing the
+    // connection — mirroring `MutateDocument` without a mutator.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let _ = attach(
+        &mut stream,
+        client_id,
+        SessionId::new(),
+        None,
+        ClientRole::Contributor,
+        vec![Subscription::SessionSummary],
+        "contrib-lease-att",
+    )
+    .await;
+
+    // Acquire → transport-unavailable.
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AcquireDocumentLease {
+                    lease: codypendent_protocol::DocumentEditLease {
+                        document_id: codypendent_protocol::DocumentId::new(),
+                        block_id: None,
+                    },
+                    ttl_seconds: Some(60),
+                },
+                "lease-acquire-unwired",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "document.transport-unavailable");
+        }
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    // Release → same structural rejection (and the connection survives both).
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReleaseDocumentLease {
+                    lease_id: "lease-x".to_string(),
+                },
+                "lease-release-unwired",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "document.transport-unavailable");
+        }
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn attaching_a_second_client_emits_presence() {
     // STEP 3.7: presence events let each attached client see who else is here.
     let tmp = tempfile::tempdir().unwrap();

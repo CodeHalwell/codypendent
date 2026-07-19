@@ -6,14 +6,18 @@
 //! dependent edges, ready for the executor to schedule. A definition that fails
 //! any check produces a precise [`CompileError`] naming the offending step.
 //!
-//! What is validated here: the schema version, that ids are present and unique,
-//! that every step has exactly one action (an agent — optionally with a skill —
-//! or a tool), that each `depends_on` names a real step and no step depends on
-//! itself, that the dependency graph is acyclic, that the budget is sane, and the
-//! multi-agent `orchestration_reason` rule (ADR-008). What is *not* validated
-//! here — because it needs the live registry — is whether a named tool, skill, or
-//! agent role actually exists; that check joins when the compiler is wired into
-//! the runtime (tracked in the roadmap).
+//! What [`compile`] validates on its own: the schema version, that ids are
+//! present and unique, that every step has exactly one action (an agent —
+//! optionally with a skill — or a tool), that each `depends_on` names a real step
+//! and no step depends on itself, that the dependency graph is acyclic, that the
+//! budget is sane, and the multi-agent `orchestration_reason` rule (ADR-008).
+//!
+//! Whether a named tool, skill, or agent role actually *exists* needs the live
+//! registry, which the workflow crate cannot name. That check is
+//! [`compile_with_registry`] (equivalently [`CompiledWorkflow::validate_references`]):
+//! given a [`WorkflowRegistry`] snapshot it rejects any step referencing an
+//! unknown tool, skill, or role. The daemon supplies the registry when it wires
+//! the compiler into the runtime.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,6 +25,7 @@ use crate::model::{
     parse_definition, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy, WorkflowBudget,
     WorkflowDefinition, WorkflowInput, WorkspaceMode, SUPPORTED_SCHEMA_VERSION,
 };
+use crate::registry::WorkflowRegistry;
 
 /// A failure to compile a workflow definition. Each variant names the offending
 /// step (or the whole-workflow property) so a caller can report it precisely.
@@ -71,6 +76,17 @@ pub enum CompileError {
         "a multi-agent workflow ({agent_steps} agent steps) must declare an `orchestration_reason`"
     )]
     MissingOrchestrationReason { agent_steps: usize },
+    /// A step names a tool the registry does not know (STEP 5.1 cross-check).
+    #[error("step {step} references unknown tool {tool}")]
+    UnknownTool { step: String, tool: String },
+    /// An agent step names a skill the registry does not know (STEP 5.1
+    /// cross-check).
+    #[error("step {step} references unknown skill {skill}")]
+    UnknownSkill { step: String, skill: String },
+    /// An agent step names a role with no known agent profile (STEP 5.1
+    /// cross-check).
+    #[error("step {step} references unknown agent role {role}")]
+    UnknownAgentRole { step: String, role: String },
 }
 
 /// A parse-or-compile failure, for the [`compile_yaml`] convenience path.
@@ -87,7 +103,12 @@ pub enum WorkflowError {
 /// A validated, executable workflow: its metadata plus a topologically ordered
 /// node graph. Producing this is proof the definition passed every check in
 /// [`compile`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// It is [`Serialize`](serde::Serialize) so the graph can be projected as JSON —
+/// the shape a `workflow show --json`, a graph-view client, or a stored plan
+/// consumes. (Deserialize is deliberately *not* derived: a graph is *produced* by
+/// [`compile`] from a validated definition, never trusted from the wire.)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompiledWorkflow {
     /// The workflow id.
     pub id: String,
@@ -118,6 +139,52 @@ impl CompiledWorkflow {
             .iter()
             .filter(|node| matches!(node.action, NodeAction::Agent { .. }))
             .count()
+    }
+
+    /// Cross-check every node's references against `registry` (STEP 5.1): a tool
+    /// step's tool name, an agent step's role, and an agent step's skill (when it
+    /// applies one) must each resolve. Returns the first unresolved reference in
+    /// topological order — nodes are already ordered, so the earliest failing step
+    /// is the one a run would hit first — as an [`CompileError::UnknownTool`] /
+    /// [`CompileError::UnknownSkill`] / [`CompileError::UnknownAgentRole`].
+    ///
+    /// This is the resolution half of [`compile_with_registry`]; a caller holding
+    /// an already-compiled workflow (e.g. one loaded from a durable run) can call
+    /// it directly. Within a node the role is checked before the skill, so an agent
+    /// with both a bad role and a bad skill reports the role first.
+    pub fn validate_references(
+        &self,
+        registry: &impl WorkflowRegistry,
+    ) -> Result<(), CompileError> {
+        for node in &self.nodes {
+            match &node.action {
+                NodeAction::Tool { name } => {
+                    if !registry.has_tool(name) {
+                        return Err(CompileError::UnknownTool {
+                            step: node.id.clone(),
+                            tool: name.clone(),
+                        });
+                    }
+                }
+                NodeAction::Agent { role, skill, .. } => {
+                    if !registry.has_agent_role(role) {
+                        return Err(CompileError::UnknownAgentRole {
+                            step: node.id.clone(),
+                            role: role.clone(),
+                        });
+                    }
+                    if let Some(skill) = skill {
+                        if !registry.has_skill(skill) {
+                            return Err(CompileError::UnknownSkill {
+                                step: node.id.clone(),
+                                skill: skill.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A stable hash of the graph's *shape and execution semantics*: the workflow
@@ -198,7 +265,7 @@ fn hash_opt(hasher: &mut impl sha2::Digest, value: Option<&str>) {
 }
 
 /// A validated workflow node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompiledNode {
     /// The node's id.
     pub id: String,
@@ -221,7 +288,8 @@ pub struct CompiledNode {
 }
 
 /// The single action a node performs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeAction {
     /// An agent step, optionally applying a skill.
     Agent {
@@ -237,6 +305,28 @@ pub enum NodeAction {
 pub fn compile_yaml(yaml: &str) -> Result<CompiledWorkflow, WorkflowError> {
     let definition = parse_definition(yaml)?;
     Ok(compile(&definition)?)
+}
+
+/// Compile `definition` and then cross-check every tool/skill/role reference
+/// against `registry` (STEP 5.1). Structural validation runs first, so a
+/// malformed graph fails with its structural error before any name is looked up.
+pub fn compile_with_registry(
+    definition: &WorkflowDefinition,
+    registry: &impl WorkflowRegistry,
+) -> Result<CompiledWorkflow, CompileError> {
+    let compiled = compile(definition)?;
+    compiled.validate_references(registry)?;
+    Ok(compiled)
+}
+
+/// Parse a YAML manifest, compile it, and cross-check its references against
+/// `registry`, in one call.
+pub fn compile_yaml_with_registry(
+    yaml: &str,
+    registry: &impl WorkflowRegistry,
+) -> Result<CompiledWorkflow, WorkflowError> {
+    let definition = parse_definition(yaml)?;
+    Ok(compile_with_registry(&definition, registry)?)
 }
 
 /// Validate `definition` and lower it into a [`CompiledWorkflow`]. See the module
@@ -468,6 +558,7 @@ fn dependents_of<'a>(
 mod tests {
     use super::*;
     use crate::model::{AgentRef, WorkflowStep, WorkspaceSpec};
+    use crate::registry::SetRegistry;
 
     /// A minimal agent step.
     fn agent_step(id: &str, depends_on: &[&str]) -> WorkflowStep {
@@ -701,6 +792,108 @@ mod tests {
         // But recompiling the identical definition is stable.
         let base_again = compile(&definition(vec![tool_step("a", &[])])).unwrap();
         assert_eq!(base.signature(), base_again.signature());
+    }
+
+    #[test]
+    fn compile_with_registry_accepts_resolvable_references() {
+        // `worker` agent + `repository.test` tool from the shared fixtures.
+        let def = definition(vec![agent_step("a", &[]), tool_step("b", &["a"])]);
+        let registry = SetRegistry::new()
+            .with_agent_role("worker")
+            .with_tool("repository.test");
+        assert!(compile_with_registry(&def, &registry).is_ok());
+    }
+
+    #[test]
+    fn compile_with_registry_rejects_an_unknown_tool() {
+        let def = definition(vec![tool_step("verify", &[])]);
+        // A registry that knows nothing — the tool cannot resolve.
+        let registry = SetRegistry::new();
+        assert_eq!(
+            compile_with_registry(&def, &registry).unwrap_err(),
+            CompileError::UnknownTool {
+                step: "verify".to_owned(),
+                tool: "repository.test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn compile_with_registry_rejects_an_unknown_agent_role() {
+        let def = definition(vec![agent_step("inspect", &[])]);
+        let registry = SetRegistry::new().with_tool("repository.test");
+        assert_eq!(
+            compile_with_registry(&def, &registry).unwrap_err(),
+            CompileError::UnknownAgentRole {
+                step: "inspect".to_owned(),
+                role: "worker".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn compile_with_registry_rejects_an_unknown_skill() {
+        let mut step = agent_step("inspect", &[]);
+        step.skill = Some("code.repair".to_owned());
+        // The role resolves, but the skill does not.
+        let registry = SetRegistry::new().with_agent_role("worker");
+        assert_eq!(
+            compile_with_registry(&definition(vec![step]), &registry).unwrap_err(),
+            CompileError::UnknownSkill {
+                step: "inspect".to_owned(),
+                skill: "code.repair".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn reference_check_reports_the_role_before_the_skill() {
+        // An agent with both a bad role and a bad skill surfaces the role first —
+        // the role is what selects the agent that would apply the skill.
+        let mut step = agent_step("inspect", &[]);
+        step.skill = Some("code.repair".to_owned());
+        let registry = SetRegistry::new();
+        assert!(matches!(
+            compile_with_registry(&definition(vec![step]), &registry).unwrap_err(),
+            CompileError::UnknownAgentRole { .. }
+        ));
+    }
+
+    #[test]
+    fn reference_check_runs_only_after_structural_validation() {
+        // A cyclic graph fails structurally even against an empty registry — the
+        // reference pass never runs on a graph that could not compile.
+        let def = definition(vec![tool_step("a", &["b"]), tool_step("b", &["a"])]);
+        assert!(matches!(
+            compile_with_registry(&def, &SetRegistry::new()).unwrap_err(),
+            CompileError::Cycle(_)
+        ));
+    }
+
+    #[test]
+    fn compiled_graph_serializes_to_a_stable_json_projection() {
+        // The graph JSON shape a `workflow show --json` / graph-view client reads:
+        // top-level id/version/nodes, each node carrying a tagged action.
+        let def = definition(vec![
+            agent_step("inspect", &[]),
+            tool_step("verify", &["inspect"]),
+        ]);
+        let compiled = compile(&def).unwrap();
+        let value = serde_json::to_value(&compiled).unwrap();
+
+        assert_eq!(value["id"], "wf");
+        assert_eq!(value["version"], 1);
+        let nodes = value["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        // The agent node's action is tagged `agent` with its role.
+        assert_eq!(nodes[0]["id"], "inspect");
+        assert_eq!(nodes[0]["action"]["kind"], "agent");
+        assert_eq!(nodes[0]["action"]["role"], "worker");
+        // The tool node's action is tagged `tool` with its name, and its edge back
+        // to the agent node is present.
+        assert_eq!(nodes[1]["action"]["kind"], "tool");
+        assert_eq!(nodes[1]["action"]["name"], "repository.test");
+        assert_eq!(nodes[1]["depends_on"][0], "inspect");
     }
 
     #[test]

@@ -156,6 +156,281 @@ async fn resume_refuses_a_changed_graph_signature() {
 }
 
 #[tokio::test]
+async fn retry_from_node_resets_the_node_and_everything_downstream() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}))
+        .await
+        .unwrap();
+
+    // Drive the whole pipeline to completion (a → b → c), recording cost + an
+    // agent-run id along the way.
+    for node in ["a", "b", "c"] {
+        store
+            .transition_node(
+                &pool,
+                &id,
+                node,
+                NodeState::Running,
+                1,
+                Some("agent-x"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_node(
+                &pool,
+                &id,
+                node,
+                NodeState::Completed,
+                1,
+                None,
+                Some(&json!({ "usd": 0.2 })),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Completed)
+        .await
+        .unwrap();
+
+    // Retry from `b`: `b` and its downstream `c` reset; `a` (upstream) is untouched.
+    let reset = store
+        .retry_from_node(&pool, &id, "b", &compiled)
+        .await
+        .unwrap();
+    assert_eq!(reset, vec!["b".to_string(), "c".to_string()]);
+
+    let snap = store.snapshot(&pool, &id).await.unwrap().unwrap();
+    // The run is Running again so the executor picks it back up.
+    assert_eq!(snap.run.state, WorkflowRunState::Running);
+
+    let node = |n: &str| snap.nodes.iter().find(|x| x.node_id == n).unwrap().clone();
+    // `a` kept its terminal state and provenance.
+    assert_eq!(node("a").state, NodeState::Completed);
+    assert_eq!(node("a").cost, Some(json!({ "usd": 0.2 })));
+    // `b` and `c` are fresh Pending: state, attempt, cost, and agent-run id cleared.
+    for n in ["b", "c"] {
+        let r = node(n);
+        assert_eq!(r.state, NodeState::Pending, "{n} reset to pending");
+        assert_eq!(r.attempt, 0, "{n} attempt cleared");
+        assert_eq!(r.cost, None, "{n} cost cleared");
+        assert_eq!(r.agent_run_id, None, "{n} agent-run id cleared");
+    }
+
+    // Composes with resume: the first incomplete node is now `b`.
+    let plan = store.resume(&pool, &id, &compiled).await.unwrap();
+    assert_eq!(plan.next_node.as_deref(), Some("b"));
+}
+
+#[tokio::test]
+async fn retry_from_node_refuses_a_changed_graph_or_unknown_node() {
+    let (_tmp, pool) = temp_pool().await;
+    let original = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &original, None, &json!({}))
+        .await
+        .unwrap();
+
+    // A changed graph is refused, exactly like `resume`.
+    let changed_manifest =
+        format!("{MANIFEST}  - id: d\n    depends_on: [c]\n    tool: repository.test\n");
+    let changed = compile_yaml(&changed_manifest).unwrap();
+    let err = store
+        .retry_from_node(&pool, &id, "b", &changed)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        WorkflowStoreError::GraphSignatureChanged { .. }
+    ));
+
+    // A node absent from the graph is NotFound (not a silent no-op).
+    let err = store
+        .retry_from_node(&pool, &id, "ghost", &original)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkflowStoreError::NotFound(_)));
+}
+
+/// A diamond: `a` fans out to `b` and `c`, which both feed `d`.
+const DIAMOND: &str = "\
+schema_version: 1
+id: diamond
+version: 1
+budget:
+  maximum_cost_usd: 5.0
+steps:
+  - id: a
+    tool: repository.test
+  - id: b
+    depends_on: [a]
+    tool: repository.test
+  - id: c
+    depends_on: [a]
+    tool: repository.test
+  - id: d
+    depends_on: [b, c]
+    tool: repository.test
+";
+
+#[tokio::test]
+async fn ready_nodes_is_the_parallel_frontier() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(DIAMOND).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}))
+        .await
+        .unwrap();
+
+    let complete = |node: &'static str| {
+        let store = &store;
+        let pool = &pool;
+        let id = &id;
+        async move {
+            store
+                .transition_node(pool, id, node, NodeState::Completed, 1, None, None)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Fresh: only the source `a` is ready.
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["a"]
+    );
+
+    // After `a`, both `b` and `c` are ready at once — the parallel frontier `resume`
+    // (which returns a single node) cannot express.
+    complete("a").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["b", "c"]
+    );
+
+    // Completing only `b` leaves `c` ready; `d` still waits on `c`.
+    complete("b").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["c"]
+    );
+
+    // Once both `b` and `c` are done, `d` becomes ready.
+    complete("c").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["d"]
+    );
+
+    // With everything terminal, the frontier is empty.
+    complete("d").await;
+    assert!(store
+        .ready_nodes(&pool, &id, &compiled)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_dependency_blocks_the_dependent() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(DIAMOND).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}))
+        .await
+        .unwrap();
+
+    // `a` completes; `b` fails; `c` completes. `d` depends on both `b` and `c`, so
+    // a failed `b` keeps `d` off the frontier — it is not ready and never blocks a
+    // sibling.
+    store
+        .transition_node(&pool, &id, "a", NodeState::Completed, 1, None, None)
+        .await
+        .unwrap();
+    store
+        .transition_node(&pool, &id, "b", NodeState::Failed, 1, None, None)
+        .await
+        .unwrap();
+    store
+        .transition_node(&pool, &id, "c", NodeState::Completed, 1, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .ready_nodes(&pool, &id, &compiled)
+            .await
+            .unwrap()
+            .is_empty(),
+        "d must stay blocked while its dependency b is failed"
+    );
+}
+
+#[tokio::test]
+async fn ready_nodes_refuses_a_changed_graph_signature() {
+    let (_tmp, pool) = temp_pool().await;
+    let original = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &original, None, &json!({}))
+        .await
+        .unwrap();
+
+    let changed = compile_yaml(DIAMOND).unwrap();
+    let err = store.ready_nodes(&pool, &id, &changed).await.unwrap_err();
+    assert!(matches!(
+        err,
+        WorkflowStoreError::GraphSignatureChanged { .. }
+    ));
+}
+
+#[tokio::test]
+async fn list_incomplete_runs_returns_only_non_terminal_runs() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+
+    // Three runs: leave one pending, drive one to running, finish one.
+    let pending = store
+        .create_run(&pool, &compiled, Some("pending"), &json!({}))
+        .await
+        .unwrap();
+    let running = store
+        .create_run(&pool, &compiled, Some("running"), &json!({}))
+        .await
+        .unwrap();
+    let completed = store
+        .create_run(&pool, &compiled, Some("done"), &json!({}))
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &running, WorkflowRunState::Running)
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &completed, WorkflowRunState::Completed)
+        .await
+        .unwrap();
+
+    // Startup recovery sees the pending + running runs (oldest first), not the
+    // completed one.
+    let incomplete = store.list_incomplete_runs(&pool).await.unwrap();
+    let ids: Vec<&str> = incomplete.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec![pending.as_str(), running.as_str()]);
+    // The records carry enough to recompile + resume (run_id, signature preserved).
+    assert_eq!(incomplete[1].run_id.as_deref(), Some("running"));
+    assert_eq!(incomplete[1].graph_signature, compiled.signature());
+}
+
+#[tokio::test]
 async fn run_state_transitions_persist() {
     let (_tmp, pool) = temp_pool().await;
     let compiled = compile_yaml(MANIFEST).unwrap();

@@ -8,6 +8,7 @@
 //! round), so a block's content rides as opaque JSON rather than a typed block —
 //! the protocol never needs to know the block schema.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::DocumentId;
@@ -90,6 +91,23 @@ pub struct DocumentEditLease {
     pub block_id: Option<String>,
 }
 
+/// A granted document lease — the daemon's reply to an accepted
+/// `AcquireDocumentLease` (STEP 4.3 client transport). The client holds the
+/// `lease_id` as the capability to renew (a re-acquire of the same range) and to
+/// `ReleaseDocumentLease` when it stops editing; `expires_at` is when the lease
+/// lapses if neither happens, so a crashed holder never blocks the range forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentLeaseGrant {
+    /// The server-minted lease id, returned only to the acquirer.
+    pub lease_id: String,
+    pub document_id: DocumentId,
+    /// The leased block, or `None` for a whole-document (structural) lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    /// When the lease lapses unless renewed.
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Serialize `Vec<u8>` as a JSON array of numbers (portable, no extra deps). The
 /// framing layer already bounds frame size, so document snapshots that would be
 /// large are exchanged as incremental updates, not full snapshots.
@@ -166,5 +184,36 @@ mod tests {
         let json = serde_json::to_string(&sync).expect("serialize");
         let parsed: DocumentSync = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(sync, parsed);
+    }
+
+    #[test]
+    fn document_lease_grant_round_trips() {
+        let grant = DocumentLeaseGrant {
+            lease_id: "lease-1".into(),
+            document_id: DocumentId::new(),
+            block_id: Some("b1".into()),
+            expires_at: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&grant).expect("serialize");
+        let parsed: DocumentLeaseGrant = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(grant, parsed);
+    }
+
+    #[test]
+    fn a_whole_document_grant_omits_the_block() {
+        // A structural lease carries no block; the field is skipped on the wire and
+        // reparses to `None`.
+        let grant = DocumentLeaseGrant {
+            lease_id: "lease-2".into(),
+            document_id: DocumentId::new(),
+            block_id: None,
+            expires_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&grant).expect("serialize");
+        assert!(!json.contains("block_id"));
+        let parsed: DocumentLeaseGrant = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.block_id, None);
     }
 }

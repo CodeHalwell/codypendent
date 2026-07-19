@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::DocumentMutation;
+use crate::document::{DocumentEditLease, DocumentMutation};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, DocumentId, RunId, SessionId, WorkspaceId};
@@ -101,6 +101,28 @@ pub enum CommandBody {
     MutateDocument {
         document_id: DocumentId,
         mutation: DocumentMutation,
+    },
+    /// Acquire (or renew) an edit lease over a document block-range before editing
+    /// it (Phase 4 STEP 4.3 client transport). One writer per block-range: a
+    /// whole-document lease (`block_id = None`) covers structural edits and
+    /// conflicts with any block lease. The daemon replies
+    /// [`DocumentLeaseGranted`](crate::envelope::Payload::DocumentLeaseGranted)
+    /// with the minted lease id + expiry, or `CommandRejected` `document.range-leased`
+    /// when a different writer holds an overlapping range. Like `MutateDocument`
+    /// this is intercepted at the connection level (documents live outside the
+    /// session ledger) rather than flowing through the event write path.
+    AcquireDocumentLease {
+        lease: DocumentEditLease,
+        /// How long the lease is valid, in seconds; the daemon applies a default
+        /// when absent. A re-acquire by the same holder renews the expiry in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_seconds: Option<u64>,
+    },
+    /// Release a previously acquired document lease by its id (Phase 4 STEP 4.3).
+    /// Idempotent — releasing an already-released or unknown lease is accepted as a
+    /// no-op — so a client that loses the acknowledgement can retry safely.
+    ReleaseDocumentLease {
+        lease_id: String,
     },
     #[serde(other)]
     Unknown,
@@ -205,6 +227,35 @@ mod tests {
                 insert: "hello".to_string(),
             },
         });
+        round_trip(CommandBody::AcquireDocumentLease {
+            lease: DocumentEditLease {
+                document_id: DocumentId::new(),
+                block_id: Some("b1".to_string()),
+            },
+            ttl_seconds: Some(300),
+        });
+        round_trip(CommandBody::ReleaseDocumentLease {
+            lease_id: "lease-1".to_string(),
+        });
+    }
+
+    #[test]
+    fn acquire_document_lease_omits_absent_ttl_and_block() {
+        // A whole-document lease with the default TTL sends neither optional key,
+        // and such a payload (also what an older client would emit) reparses with
+        // both defaulted.
+        let body = CommandBody::AcquireDocumentLease {
+            lease: DocumentEditLease {
+                document_id: DocumentId::new(),
+                block_id: None,
+            },
+            ttl_seconds: None,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("ttl_seconds"));
+        assert!(!json.contains("block_id"));
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]

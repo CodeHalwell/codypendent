@@ -4,11 +4,25 @@
 //! breaks.
 
 use codypendent_workflow::{
-    compile_yaml, ApprovalPolicy, NodeAction, OrchestrationReason, WorkspaceMode,
+    compile_yaml, compile_yaml_with_registry, ApprovalPolicy, CompileError, NodeAction,
+    OrchestrationReason, SetRegistry, WorkflowError, WorkspaceMode,
 };
 
 /// The canonical manifest, embedded so the test travels with the crate.
 const REPAIR_GITHUB_CHECK: &str = include_str!("../../../docs/specs/workflow.yaml");
+
+/// A registry that knows exactly the tools, skills, and roles the canonical
+/// manifest references — the set a correctly configured daemon would present.
+fn repair_github_check_registry() -> SetRegistry {
+    SetRegistry::new()
+        .with_agent_role("investigator")
+        .with_agent_role("implementer")
+        .with_agent_role("reviewer")
+        .with_skill("github.inspect-failed-check")
+        .with_skill("code.repair")
+        .with_tool("repository.test")
+        .with_tool("github.update-pull-request")
+}
 
 #[test]
 fn the_canonical_manifest_compiles() {
@@ -64,4 +78,56 @@ fn the_canonical_manifest_compiles() {
     let publish = workflow.node("publish").unwrap();
     assert_eq!(publish.approval, Some(ApprovalPolicy::Always));
     assert!(publish.dependents.is_empty());
+}
+
+#[test]
+fn the_canonical_manifest_cross_checks_against_a_matching_registry() {
+    // Every tool/skill/role the manifest names resolves against a registry that
+    // knows them — the STEP 5.1 cross-check passes end to end.
+    let registry = repair_github_check_registry();
+    let workflow = compile_yaml_with_registry(REPAIR_GITHUB_CHECK, &registry)
+        .expect("the canonical manifest must cross-check against its registry");
+    assert_eq!(workflow.id, "repair-github-check");
+}
+
+#[test]
+fn a_missing_skill_fails_the_cross_check() {
+    // Drop `code.repair` from the registry; the `patch` step can no longer resolve
+    // its skill, so the cross-check rejects the otherwise-valid manifest.
+    let registry = SetRegistry::new()
+        .with_agent_role("investigator")
+        .with_agent_role("implementer")
+        .with_agent_role("reviewer")
+        .with_skill("github.inspect-failed-check")
+        .with_tool("repository.test")
+        .with_tool("github.update-pull-request");
+
+    let err = compile_yaml_with_registry(REPAIR_GITHUB_CHECK, &registry).unwrap_err();
+    match err {
+        WorkflowError::Compile(CompileError::UnknownSkill { step, skill }) => {
+            assert_eq!(step, "patch");
+            assert_eq!(skill, "code.repair");
+        }
+        other => panic!("expected an UnknownSkill compile error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_tool_fails_the_cross_check() {
+    // A registry with the agents/skills but neither tool: the first tool step in
+    // topological order (`verify` → `repository.test`) is the one reported.
+    let registry = SetRegistry::new()
+        .with_agent_role("investigator")
+        .with_agent_role("implementer")
+        .with_agent_role("reviewer")
+        .with_skill("github.inspect-failed-check")
+        .with_skill("code.repair");
+    let err = compile_yaml_with_registry(REPAIR_GITHUB_CHECK, &registry).unwrap_err();
+    match err {
+        WorkflowError::Compile(CompileError::UnknownTool { step, tool }) => {
+            assert_eq!(step, "verify");
+            assert_eq!(tool, "repository.test");
+        }
+        other => panic!("expected an UnknownTool compile error, got {other:?}"),
+    }
 }

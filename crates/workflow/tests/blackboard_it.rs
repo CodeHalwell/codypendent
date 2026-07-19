@@ -174,6 +174,84 @@ async fn superseding_an_already_superseded_item_is_refused() {
 }
 
 #[tokio::test]
+async fn get_returns_an_item_scoped_to_its_run() {
+    let (_tmp, pool) = temp_pool().await;
+    let run_a = seed_run(&pool).await;
+    let run_b = seed_run(&pool).await;
+    let board = BlackboardStore::new();
+
+    let posted = board
+        .post(&pool, &run_a, finding("in A", vec![json!({ "e": 1 })]))
+        .await
+        .unwrap();
+
+    // Fetchable within its own run…
+    let got = board.get(&pool, &run_a, &posted.id).await.unwrap();
+    assert_eq!(got.map(|i| i.id), Some(posted.id.clone()));
+    // …never visible from another run's board, and an unknown id is None.
+    assert!(board
+        .get(&pool, &run_b, &posted.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(board.get(&pool, &run_a, "ghost").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn history_walks_the_full_supersession_chain() {
+    let (_tmp, pool) = temp_pool().await;
+    let run = seed_run(&pool).await;
+    let board = BlackboardStore::new();
+
+    // v1 → v2 → v3, a three-link correction chain.
+    let v1 = board
+        .post(&pool, &run, finding("v1", vec![json!({ "artifact": "a" })]))
+        .await
+        .unwrap();
+    let v2 = board
+        .supersede(
+            &pool,
+            &run,
+            &v1.id,
+            finding("v2", vec![json!({ "artifact": "b" })]),
+        )
+        .await
+        .unwrap();
+    let v3 = board
+        .supersede(
+            &pool,
+            &run,
+            &v2.id,
+            finding("v3", vec![json!({ "artifact": "c" })]),
+        )
+        .await
+        .unwrap();
+
+    let expected = [v1.id.as_str(), v2.id.as_str(), v3.id.as_str()];
+
+    // The chain is identical whichever link is used as the anchor, always oldest
+    // → newest, and the live head's `superseded_by` is None.
+    for anchor in [&v1.id, &v2.id, &v3.id] {
+        let chain = board.history(&pool, &run, anchor).await.unwrap();
+        let ids: Vec<&str> = chain.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids, expected,
+            "chain from {anchor} must be the full lineage"
+        );
+        let revisions: Vec<u32> = chain.iter().map(|i| i.revision).collect();
+        assert_eq!(revisions, vec![1, 2, 3]);
+        assert_eq!(chain.last().unwrap().superseded_by, None);
+    }
+
+    // An id not on this board has no history.
+    assert!(board
+        .history(&pool, &run, "ghost")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn blackboards_are_isolated_per_workflow_run() {
     let (_tmp, pool) = temp_pool().await;
     let run_a = seed_run(&pool).await;
