@@ -102,4 +102,14 @@ pub trait RunExecutor: Send + Sync {
     fn document_mutator(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentMutator>> {
         None
     }
+
+    /// The assembly-provided [`DocumentLeaser`](crate::documents::DocumentLeaser)
+    /// that acquires/releases the block-range edit leases gating `MutateDocument`
+    /// (Phase 4 STEP 4.3 client transport). Bundled with
+    /// [`document_mutator`](RunExecutor::document_mutator) for the same reason —
+    /// both name `codypendent-knowledge`, which only the assembly can. The default
+    /// `None` leaves lease commands unwired (rejected `document.transport-unavailable`).
+    fn document_leaser(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentLeaser>> {
+        None
+    }
 }

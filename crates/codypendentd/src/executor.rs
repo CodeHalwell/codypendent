@@ -576,6 +576,14 @@ impl RunExecutor for RuntimeExecutor {
             self.pool.clone(),
         )))
     }
+
+    fn document_leaser(&self) -> Option<Arc<dyn codypendent_daemon::documents::DocumentLeaser>> {
+        // Acquire/release the block-range edit leases that gate `MutateDocument`,
+        // over the same knowledge lease store the mutator's `require` enforces.
+        Some(Arc::new(crate::documents::KnowledgeDocumentMutator::new(
+            self.pool.clone(),
+        )))
+    }
 }
 
 /// The `repository` recorded on the StartRun command that created a queued run,

@@ -27,9 +27,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use codypendent_protocol::{
-    ClientId, CodypendentError, DocumentId, DocumentMutation, DocumentSync,
+    ClientId, CodypendentError, DocumentId, DocumentLeaseGrant, DocumentMutation, DocumentSync,
 };
 use tokio::sync::broadcast;
 
@@ -131,6 +132,62 @@ pub trait DocumentMutator: Send + Sync {
     /// are transactional and revision-guarded) and are surfaced verbatim to the
     /// requesting client as a `CommandRejected`.
     fn apply_mutation(&self, request: DocumentMutationRequest) -> DocumentMutationFuture<'_>;
+}
+
+/// A client's request to acquire (or renew) an edit lease before mutating a
+/// document. The [`ClientId`] is the lease-holder identity, so the same client is
+/// later recognised as the writer that may mutate the leased range (the
+/// [`DocumentMutator`] seam derives the same identity from the mutating client).
+#[derive(Debug, Clone)]
+pub struct DocumentLeaseRequest {
+    pub document_id: DocumentId,
+    /// The block to lease, or `None` for a whole-document (structural) lease.
+    pub block_id: Option<String>,
+    /// The lease lifetime; `None` lets the seam apply its default.
+    pub ttl: Option<Duration>,
+    /// The identity of the acquiring client.
+    pub client_id: ClientId,
+}
+
+/// A client's request to release a lease it holds, by the id the grant returned.
+#[derive(Debug, Clone)]
+pub struct DocumentLeaseReleaseRequest {
+    pub lease_id: String,
+    /// The identity of the releasing client (for attribution / audit).
+    pub client_id: ClientId,
+}
+
+/// The future a [`DocumentLeaser`] acquire returns: the granted lease to reply
+/// with, or a structured error. Boxed so the trait stays object-safe without an
+/// `async-trait` dependency, matching [`DocumentMutationFuture`].
+pub type DocumentLeaseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DocumentLeaseGrant, CodypendentError>> + Send + 'a>>;
+
+/// The future a [`DocumentLeaser`] release returns: unit on success (release is
+/// idempotent) or a structured error.
+pub type DocumentReleaseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for *edit-lease* orchestration — acquiring and releasing the
+/// block-range leases that gate `MutateDocument` (Phase 4 STEP 4.3).
+///
+/// Bundled with [`DocumentMutator`] and injected together by the `codypendentd`
+/// assembly (the only layer that can name `codypendent-knowledge`'s
+/// `DocumentLeaseStore`). The daemon calls [`acquire`](DocumentLeaser::acquire) on
+/// an `AcquireDocumentLease` command and [`release`](DocumentLeaser::release) on a
+/// `ReleaseDocumentLease` command; the mutator's own pre-mutation `require` then
+/// enforces the lease a writer took here. With no leaser injected (lib-only /
+/// test server) both commands are rejected `document.transport-unavailable`,
+/// exactly as `MutateDocument` is without a mutator.
+pub trait DocumentLeaser: Send + Sync {
+    /// Acquire (or renew) the requested lease and return the grant to reply with.
+    /// A different writer holding an overlapping range is a
+    /// `document.range-leased` rejection.
+    fn acquire(&self, request: DocumentLeaseRequest) -> DocumentLeaseFuture<'_>;
+
+    /// Release the identified lease. Idempotent: releasing an already-released or
+    /// unknown lease succeeds.
+    fn release(&self, request: DocumentLeaseReleaseRequest) -> DocumentReleaseFuture<'_>;
 }
 
 #[cfg(test)]

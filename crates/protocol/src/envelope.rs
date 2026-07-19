@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catchup::Catchup;
 use crate::command::Command;
-use crate::document::DocumentSync;
+use crate::document::{DocumentLeaseGrant, DocumentSync};
 use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
@@ -100,6 +100,14 @@ pub enum Payload {
     },
     /// The command was rejected; carries the full structured error.
     CommandRejected(CodypendentError),
+    /// An `AcquireDocumentLease` command was accepted; carries the minted lease id
+    /// and expiry the client holds to renew and release (Phase 4 STEP 4.3). A
+    /// distinct reply from `CommandAccepted` because the client needs the granted
+    /// lease back, not just an acknowledgement.
+    DocumentLeaseGranted {
+        command_id: CommandId,
+        grant: DocumentLeaseGrant,
+    },
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
     /// A collaborative document's CRDT sync update, delivered to the clients
@@ -261,6 +269,36 @@ mod tests {
                 assert!(matches!(catchup, Catchup::Events { from: 1, .. }));
             }
             other => panic!("expected Catchup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_lease_granted_payload_round_trips() {
+        use crate::document::DocumentLeaseGrant;
+        use crate::ids::DocumentId;
+
+        let command_id = CommandId::new();
+        let document_id = DocumentId::new();
+        let granted = Payload::DocumentLeaseGranted {
+            command_id,
+            grant: DocumentLeaseGrant {
+                lease_id: "lease-9".to_string(),
+                document_id,
+                block_id: Some("b3".to_string()),
+                expires_at: Utc::now(),
+            },
+        };
+        match round_trip_payload(granted) {
+            Payload::DocumentLeaseGranted {
+                command_id: id,
+                grant,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(grant.lease_id, "lease-9");
+                assert_eq!(grant.document_id, document_id);
+                assert_eq!(grant.block_id.as_deref(), Some("b3"));
+            }
+            other => panic!("expected DocumentLeaseGranted, got {other:?}"),
         }
     }
 

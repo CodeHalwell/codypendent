@@ -33,7 +33,10 @@ use tracing::{error, info, warn};
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
 use crate::commands::{ApplyContext, CommandProcessor};
-use crate::documents::{DocumentHub, DocumentMutationRequest, DocumentMutator};
+use crate::documents::{
+    DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
+    DocumentMutationRequest, DocumentMutator,
+};
 use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
@@ -83,6 +86,11 @@ pub struct ServerState {
     /// knowledge-backed implementation (dependency inversion — see
     /// [`crate::documents`]).
     pub mutator: Option<Arc<dyn DocumentMutator>>,
+    /// Acquires/releases the block-range edit leases gating `MutateDocument`.
+    /// `None` in a lib-only / test embedding (lease commands are then rejected
+    /// `document.transport-unavailable`); injected together with `mutator` by the
+    /// assembly.
+    pub leaser: Option<Arc<dyn DocumentLeaser>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -158,6 +166,7 @@ pub async fn run_with_executor_on(
     // the server owns publishing (after a mutation applies) and subscribing (a
     // client's `Document` forwarder), and the mutator only computes the sync.
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
+    let leaser = executor.as_ref().and_then(|e| e.document_leaser());
     let documents = DocumentHub::new();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
@@ -203,6 +212,7 @@ pub async fn run_with_executor_on(
         executor,
         documents,
         mutator,
+        leaser,
     });
 
     #[cfg(unix)]
@@ -689,6 +699,95 @@ async fn handle_request(
                                 },
                             )
                         }
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Edit-lease acquire/release, intercepted at the connection level
+                // like `MutateDocument` (leases live outside the session ledger).
+                // A lease is a precursor to writing, so — as with a non-resolving
+                // `MutateDocument` — an Observer may not take one.
+                CommandBody::AcquireDocumentLease { lease, ttl_seconds } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not acquire a document lease".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(leaser) = state.leaser.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let acquire = DocumentLeaseRequest {
+                        document_id: lease.document_id,
+                        block_id: lease.block_id.clone(),
+                        ttl: ttl_seconds.map(std::time::Duration::from_secs),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match leaser.acquire(acquire).await {
+                        Ok(grant) => Envelope::reply_to(
+                            &request,
+                            Payload::DocumentLeaseGranted {
+                                command_id: command.command_id,
+                                grant,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ReleaseDocumentLease { lease_id } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not release a document lease".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(leaser) = state.leaser.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let release = DocumentLeaseReleaseRequest {
+                        lease_id: lease_id.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match leaser.release(release).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;

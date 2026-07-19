@@ -29,7 +29,9 @@ pub use artifact::{ArtifactRef, DataClassification};
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, SessionProjection};
 pub use command::{Command, CommandBody};
-pub use document::{DocumentEditLease, DocumentMutation, DocumentSync, SuggestionInput};
+pub use document::{
+    DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, SuggestionInput,
+};
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};
 pub use events::{Actor, EventBody, SessionEvent};
