@@ -22,7 +22,7 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    AppState, Overlay, Pane, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    AppState, LayoutMode, Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -34,26 +34,295 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         area,
     );
 
+    // A conversation-centred shell: the transcript is the workspace, a
+    // persistent composer sits beneath it, and a one-row status footer spans the
+    // bottom. Every other surface (runs, approvals, docs, skills, memory, edges)
+    // is a centered overlay or the approval modal — minimal permanent chrome.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),                  // conversation transcript
+            Constraint::Length(COMPOSER_HEIGHT), // persistent composer
+            Constraint::Length(1),               // status footer
+        ])
         .split(area);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
-        ])
-        .split(rows[0]);
-
-    render_sessions(frame, panes[0], state, theme);
-    render_transcript(frame, panes[1], state, theme);
-    render_right(frame, panes[2], state, theme);
-    render_status_line(frame, rows[1], state, theme);
+    // The region above the composer depends on the layout; the composer and
+    // status footer are identical in both.
+    match state.layout {
+        LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
+        LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
+    }
+    render_composer(frame, rows[1], state, theme);
+    render_status_line(frame, rows[2], state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+/// The workspace layout: a runs pane, the conversation, and an approvals + run
+/// detail pane. The panes are at-a-glance context — interaction stays the same
+/// (composer, palette, approval modal), so no pane needs its own input focus.
+fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(26),
+            Constraint::Percentage(48),
+            Constraint::Percentage(26),
+        ])
+        .split(area);
+    render_runs_pane(frame, cols[0], state, theme);
+    render_conversation(frame, cols[1], state, theme);
+    render_context_pane(frame, cols[2], state, theme);
+}
+
+/// The runs pane (workspace layout): every run with its state and objective, the
+/// selected one marked. Read-only — switch runs with Ctrl-↑/↓.
+fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let block = pane_block(&format!("Runs ({})", state.runs.len()), false, theme);
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.runs.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no runs yet",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, run) in state.runs.iter().enumerate() {
+        let selected = idx == state.selected_run;
+        let marker = if selected { "› " } else { "  " };
+        let line = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                run_state_dot(run.state),
+                Style::default().fg(run_state_color(run.state, theme)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&run.objective, 18),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let item = ListItem::new(line);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+/// The context pane (workspace layout): pending approvals over the selected run's
+/// details. Read-only — approvals are resolved through the modal that pops when
+/// one is pending.
+fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let block = pane_block(
+        &format!("Approvals ({})", state.pending_approvals.len()),
+        false,
+        theme,
+    );
+    let mut lines: Vec<Line> = Vec::new();
+
+    if state.pending_approvals.is_empty() {
+        lines.push(Line::styled(
+            "  none pending",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    for (idx, approval) in state.pending_approvals.iter().enumerate() {
+        let selected = idx == state.selected_approval;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                risk_label(approval.risk.level).to_owned(),
+                Style::default().fg(risk_color(approval.risk.level, theme)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                action_kind(&approval.action).to_owned(),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(section("Run", theme));
+    if let Some(run) = state.selected_run() {
+        let field = |k: &str, v: String, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v, Style::default().fg(color)),
+            ])
+        };
+        lines.push(field(
+            "state",
+            run_state_label(run.state).to_owned(),
+            run_state_color(run.state, theme),
+        ));
+        lines.push(field(
+            "mode",
+            mode_label(run.mode).to_owned(),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "model",
+            run.model
+                .as_ref()
+                .map_or("—".to_owned(), ToString::to_string),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "ctx",
+            run.context_percent
+                .map_or("—".to_owned(), |p| format!("{p}%")),
+            theme.status.info,
+        ));
+        lines.push(field(
+            "cost",
+            format_cost(run.cost_minor),
+            theme.status.warning,
+        ));
+        lines.push(field(
+            "wt",
+            run.worktree.clone().unwrap_or_else(|| "—".to_owned()),
+            theme.text.secondary,
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  no run selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The composer's height in rows (a bordered box holding one input line).
+const COMPOSER_HEIGHT: u16 = 3;
+
+/// The conversation: the selected run's transcript, full width, as the primary
+/// surface. Its title names the session + active run (and a run counter when
+/// several are live, switchable with Ctrl-↑/↓).
+fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let session = state.session_title.as_deref().unwrap_or("Codypendent");
+    let title = match state.selected_run() {
+        Some(run) if state.runs.len() > 1 => format!(
+            "{session} — {} [{}/{}]",
+            truncate(&run.objective, 36),
+            state.selected_run + 1,
+            state.runs.len()
+        ),
+        Some(run) => format!("{session} — {}", truncate(&run.objective, 44)),
+        None => session.to_owned(),
+    };
+    let block = pane_block(&title, true, theme);
+    let inner = block.inner(area);
+
+    let Some(run) = state.selected_run() else {
+        let hint = Paragraph::new(vec![
+            Line::styled("No runs yet.", Style::default().fg(theme.text.secondary)),
+            Line::styled(
+                "Type a message below and press Enter to start one.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ])
+        .block(block);
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    // `focused = false`: the conversation shows no per-entry selection highlight
+    // (there is no in-transcript cursor in the composer-driven shell).
+    let lines = transcript_lines(run, theme, false);
+
+    // Auto-scroll: measure the wrapped height, cache the bottom offset (so the
+    // reducer's paging can leave/enter follow mode precisely), and pin the view to
+    // the tail while following; otherwise honor the manual offset.
+    let max_scroll = max_scroll_offset(&lines, inner.width, inner.height);
+    state.transcript_max_scroll.set(max_scroll);
+    let offset = if run.follow {
+        max_scroll
+    } else {
+        run.scroll.min(max_scroll)
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((offset, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// The largest useful scroll offset: total wrapped rows minus the viewport
+/// height (0 when everything fits). Wrapped rows are estimated as
+/// `ceil(line_width / inner_width)` per line — close enough for scrolling; the
+/// exact word-wrap boundary differs by at most a row.
+fn max_scroll_offset(lines: &[Line], width: u16, height: u16) -> u16 {
+    let inner_width = width.max(1) as usize;
+    let total: usize = lines
+        .iter()
+        .map(|line| {
+            let w = line.width();
+            if w == 0 {
+                1
+            } else {
+                w.div_ceil(inner_width)
+            }
+        })
+        .sum();
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    total.saturating_sub(height)
+}
+
+/// The persistent composer: an always-present input line. Empty, it shows a
+/// context-aware placeholder (start a run vs. steer the live one); with a draft,
+/// it shows the text and a cursor.
+fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let steering = state.selected_run_is_active();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            if steering { " Steer " } else { " Message " },
+            Style::default().fg(theme.text.muted),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(Style::default().bg(theme.surface.panel));
+
+    let mut spans = vec![Span::styled(
+        "› ",
+        Style::default()
+            .fg(theme.focus.active)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if state.composer.is_empty() {
+        let hint = if steering {
+            "steer the run · Enter sends · / for commands"
+        } else {
+            "message the agent to start a run · Enter sends · / for commands"
+        };
+        spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
+    } else {
+        spans.push(Span::styled(
+            state.composer.as_str(),
+            Style::default().fg(theme.text.primary),
+        ));
+        spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
@@ -67,81 +336,6 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
         ))
         .border_style(Style::default().fg(theme.border_color(focused)))
         .style(theme.panel_style())
-}
-
-fn render_sessions(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Sessions;
-    let block = pane_block("Sessions & runs", focused, theme);
-
-    let mut items: Vec<ListItem> = Vec::new();
-    let title = state
-        .session_title
-        .clone()
-        .unwrap_or_else(|| "(no session)".to_owned());
-    items.push(ListItem::new(Line::styled(
-        title,
-        Style::default()
-            .fg(theme.text.secondary)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if state.runs.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no runs yet — press n",
-            Style::default().fg(theme.text.muted),
-        )));
-    }
-
-    for (idx, run) in state.runs.iter().enumerate() {
-        let selected = idx == state.selected_run;
-        let marker = if selected { "› " } else { "  " };
-        let line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
-            Span::styled(
-                run_state_dot(run.state),
-                Style::default().fg(run_state_color(run.state, theme)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                truncate(&run.objective, 22),
-                Style::default().fg(theme.text.primary),
-            ),
-        ]);
-        let item = ListItem::new(line);
-        items.push(if selected && focused {
-            item.style(theme.selection_style())
-        } else {
-            item
-        });
-    }
-
-    frame.render_widget(List::new(items).block(block), area);
-}
-
-fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Transcript;
-    let title = match state.selected_run() {
-        Some(run) => format!("Transcript — {}", truncate(&run.objective, 24)),
-        None => "Transcript".to_owned(),
-    };
-    let block = pane_block(&title, focused, theme);
-
-    let Some(run) = state.selected_run() else {
-        let hint = Paragraph::new(Line::styled(
-            "Nothing to show. Press n to start a run.",
-            Style::default().fg(theme.text.muted),
-        ))
-        .block(block);
-        frame.render_widget(hint, area);
-        return;
-    };
-
-    let lines = transcript_lines(run, theme, focused);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((run.scroll, 0));
-    frame.render_widget(paragraph, area);
 }
 
 fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
@@ -312,109 +506,8 @@ fn patch_lines<'a>(
     }
 }
 
-fn render_right(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let focused = state.focus == Pane::Approvals;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    // Approvals list.
-    let block = pane_block(
-        &format!("Approvals ({})", state.pending_approvals.len()),
-        focused,
-        theme,
-    );
-    let mut items: Vec<ListItem> = Vec::new();
-    if state.pending_approvals.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  none pending",
-            Style::default().fg(theme.text.muted),
-        )));
-    }
-    for (idx, approval) in state.pending_approvals.iter().enumerate() {
-        let selected = idx == state.selected_approval;
-        let line = Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
-            ),
-            Span::styled(
-                risk_label(approval.risk.level).to_owned(),
-                Style::default().fg(risk_color(approval.risk.level, theme)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                action_kind(&approval.action).to_owned(),
-                Style::default().fg(theme.text.primary),
-            ),
-        ]);
-        let item = ListItem::new(line);
-        items.push(if selected && focused {
-            item.style(theme.selection_style())
-        } else {
-            item
-        });
-    }
-    frame.render_widget(List::new(items).block(block), rows[0]);
-
-    // Run details.
-    render_details(frame, rows[1], state, theme);
-}
-
-fn render_details(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = pane_block("Run details", false, theme);
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(run) = state.selected_run() {
-        let field = |k: &str, v: String| -> Line {
-            Line::from(vec![
-                Span::styled(format!("{k}: "), Style::default().fg(theme.text.muted)),
-                Span::styled(v, Style::default().fg(theme.text.primary)),
-            ])
-        };
-        lines.push(field("objective", run.objective.clone()));
-        lines.push(field("mode", mode_label(run.mode).to_owned()));
-        lines.push(Line::from(vec![
-            Span::styled("state: ", Style::default().fg(theme.text.muted)),
-            Span::styled(
-                run_state_label(run.state).to_owned(),
-                Style::default().fg(run_state_color(run.state, theme)),
-            ),
-        ]));
-        lines.push(field(
-            "model",
-            run.model
-                .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
-        ));
-        lines.push(field(
-            "worktree",
-            run.worktree.clone().unwrap_or_else(|| "—".to_owned()),
-        ));
-        lines.push(field(
-            "context",
-            run.context_percent
-                .map_or("—".to_owned(), |p| format!("{p}%")),
-        ));
-        lines.push(field("cost", format_cost(run.cost_minor)));
-    } else {
-        lines.push(Line::styled(
-            "no run selected",
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let status = state.status();
-    let sep = Span::styled("  ", Style::default().fg(theme.text.muted));
-    let mut spans: Vec<Span> = Vec::new();
+    let bg = Style::default().bg(theme.surface.overlay);
 
     // A transient notice (rejected command, presence change) takes the line:
     // it is the only channel for "the daemon said no", so it must not compete
@@ -431,23 +524,33 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         return;
     }
 
-    let field = |label: &str, value: String, color: Color| -> Vec<Span> {
+    let status = state.status();
+    let width = area.width;
+    // Two tiers: full fields on a wide terminal, then progressively fewer as the
+    // width shrinks, so mode/state/attention always survive.
+    let full = width >= 96;
+    let mid = width >= 64;
+
+    let field = |label: &str, value: String, color: Color| -> Vec<Span<'static>> {
         vec![
             Span::styled(format!("{label} "), Style::default().fg(theme.text.muted)),
             Span::styled(value, Style::default().fg(color)),
         ]
     };
+    let sep = || Span::styled("  ", Style::default().fg(theme.text.muted));
 
-    spans.push(Span::raw(" "));
-    spans.extend(field(
-        "mode",
-        status
-            .mode
-            .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
-        theme.status.info,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
+    // --- ambient state (left) ---
+    let mut ambient: Vec<Vec<Span>> = Vec::new();
+    if mid {
+        ambient.push(field(
+            "mode",
+            status
+                .mode
+                .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
+            theme.status.info,
+        ));
+    }
+    ambient.push(field(
         "state",
         status
             .run_state
@@ -456,37 +559,38 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             .run_state
             .map_or(theme.text.muted, |s| run_state_color(s, theme)),
     ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "model",
-        status
-            .model
-            .as_ref()
-            .map_or("—".to_owned(), ToString::to_string),
-        theme.text.secondary,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "ctx",
-        status
-            .context_percent
-            .map_or("—".to_owned(), |p| format!("{p}%")),
-        theme.status.info,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "cost",
-        format_cost(status.cost_minor),
-        theme.status.warning,
-    ));
-    spans.push(sep.clone());
-    spans.extend(field(
-        "wt",
-        status.worktree.clone().unwrap_or_else(|| "—".to_owned()),
-        theme.text.secondary,
-    ));
-    spans.push(sep);
-    spans.extend(field(
+    if full {
+        ambient.push(field(
+            "model",
+            status
+                .model
+                .as_ref()
+                .map_or("—".to_owned(), ToString::to_string),
+            theme.text.secondary,
+        ));
+    }
+    if mid {
+        ambient.push(field(
+            "ctx",
+            status
+                .context_percent
+                .map_or("—".to_owned(), |p| format!("{p}%")),
+            theme.status.info,
+        ));
+    }
+    if full {
+        ambient.push(field(
+            "cost",
+            format_cost(status.cost_minor),
+            theme.status.warning,
+        ));
+        ambient.push(field(
+            "wt",
+            status.worktree.clone().unwrap_or_else(|| "—".to_owned()),
+            theme.text.secondary,
+        ));
+    }
+    ambient.push(field(
         "approvals",
         status.pending_approvals.to_string(),
         if status.pending_approvals > 0 {
@@ -496,7 +600,45 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         },
     ));
 
-    let bg = Style::default().bg(theme.surface.overlay);
+    let mut left: Vec<Span> = vec![Span::raw(" ")];
+    for (i, group) in ambient.into_iter().enumerate() {
+        if i > 0 {
+            left.push(sep());
+        }
+        left.extend(group);
+    }
+
+    // --- instructional hint (right), by what the user should do next ---
+    let key = |k: &str| Span::styled(k.to_owned(), Style::default().fg(theme.focus.active));
+    let word = |w: &str| Span::styled(w.to_owned(), Style::default().fg(theme.text.muted));
+    let scrolled_up = state.selected_run().is_some_and(|r| !r.follow);
+    let hint: Vec<Span> = if status.pending_approvals > 0 {
+        vec![
+            key("a"),
+            word(" approve  "),
+            key("A"),
+            word(" run  "),
+            key("r"),
+            word(" reject"),
+        ]
+    } else if scrolled_up {
+        vec![key("PgDn"), word(" ↧ latest")]
+    } else if !state.composer.is_empty() {
+        vec![key("⏎"), word(" send  "), key("Esc"), word(" clear")]
+    } else {
+        vec![key("/"), word(" cmds  "), key("F2"), word(" layout")]
+    };
+    // Right-align the hint by padding between it and the ambient fields. This
+    // renders every frame, so measure widths from the spans directly rather than
+    // cloning `left` and wrapping `hint` in a `Line` just to call `.width()`.
+    let left_width: usize = left.iter().map(|span| span.width()).sum();
+    let hint_width: usize = hint.iter().map(|span| span.width()).sum();
+    let pad = (width as usize).saturating_sub(left_width + hint_width + 1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(hint);
+    spans.push(Span::raw(" "));
+
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
@@ -519,6 +661,11 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Skills => render_skills(frame, area, state, theme),
         Overlay::Memory { source_open } => {
             render_memory(frame, area, state, theme, *source_open);
+        }
+        Overlay::Docs => render_docs(frame, area, state, theme),
+        Overlay::Edges => render_edges(frame, area, state, theme),
+        Overlay::Palette { query, selected } => {
+            render_palette(frame, area, theme, query, *selected);
         }
         Overlay::None => {
             if state.show_approval_modal() {
@@ -792,6 +939,381 @@ fn render_memory(
             .wrap(Wrap { trim: false }),
         cols[1],
     );
+}
+
+/// The Docs Studio browser (Phase 4 client wiring): a document **tree** on the
+/// left; on the right, the focused document's **editor rail** (its blocks in
+/// order) over its **review rail** (pending suggestions). Read-only — the live
+/// CRDT edit transport is a separate follow-up. Colors are Theme tokens only
+/// (RULE 7).
+fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Docs Studio ({}) ", state.docs.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(inner);
+
+    // Left: the document tree (title + scope · status · mode).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.docs.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no documents in scope",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, doc) in state.docs.iter().enumerate() {
+        let selected = idx == state.selected_doc;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&doc.title, 28),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!("    {} · {} · {}", doc.scope, doc.status, doc.mode),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the editor rail (blocks) over the review rail (suggestions).
+    let rails = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[1]);
+
+    let editor_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut editor_lines: Vec<Line> = Vec::new();
+    if let Some(doc) = state.focused_doc() {
+        editor_lines.push(Line::styled(
+            format!("{} ({})", doc.title, doc.revision),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        editor_lines.push(section("Editor rail", theme));
+        if doc.blocks.is_empty() {
+            editor_lines.push(Line::styled(
+                "  (empty document)",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        for block in &doc.blocks {
+            editor_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<10}", block.kind),
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Span::styled(
+                    truncate(&block.text, 60),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+        }
+    } else {
+        editor_lines.push(Line::styled(
+            "  no document selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(editor_lines)
+            .block(editor_block)
+            .wrap(Wrap { trim: false }),
+        rails[0],
+    );
+
+    let review_block = Block::default()
+        .borders(Borders::LEFT | Borders::TOP)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut review_lines: Vec<Line> = Vec::new();
+    if let Some(doc) = state.focused_doc() {
+        review_lines.push(section("Review rail (suggestions)", theme));
+        if doc.suggestions.is_empty() {
+            review_lines.push(Line::styled(
+                "  no pending suggestions",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        for suggestion in &doc.suggestions {
+            review_lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(theme.status.info)),
+                Span::styled(
+                    format!("{} @ {} ", suggestion.author, suggestion.range),
+                    Style::default().fg(theme.text.muted),
+                ),
+                Span::styled(
+                    format!("→ {}", truncate(&suggestion.replacement, 40)),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+            if let Some(rationale) = &suggestion.rationale {
+                review_lines.push(Line::styled(
+                    format!("      {rationale}"),
+                    Style::default().fg(theme.text.secondary),
+                ));
+            }
+        }
+    }
+    review_lines.push(Line::raw(""));
+    review_lines.push(Line::styled(
+        "  ↑/↓ select · G edges · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(review_lines)
+            .block(review_block)
+            .wrap(Wrap { trim: false }),
+        rails[1],
+    );
+}
+
+/// The code-graph edge inspector (Phase 4 exit criterion 4): the repository's
+/// edges on the left, and for the focused edge its relation, confidence,
+/// evidence kind + source, and revision on the right — the evidence-and-revision
+/// payload the criterion calls for. Colors are Theme tokens only (RULE 7).
+fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Code-graph edges ({}) ", state.edges.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(inner);
+
+    // Left: the edge list (relation, then from → to).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.edges.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no edges in this repository",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, edge) in state.edges.iter().enumerate() {
+        let selected = idx == state.selected_edge;
+        let marker = if selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&edge.relation, 14),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {} → {}",
+                truncate(&edge.from, 16),
+                truncate(&edge.to, 16)
+            ),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail for the focused edge — relation, confidence, and the
+    // exit-criterion payload: evidence kind + source + revision.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(edge) = state.focused_edge() {
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(section("Edge", theme));
+        lines.push(field("from", &edge.from, theme.text.primary));
+        lines.push(field("to", &edge.to, theme.text.primary));
+        lines.push(field("relation", &edge.relation, theme.text.secondary));
+        lines.push(field(
+            "confidence",
+            &format!("{:.2}", edge.confidence),
+            edge_confidence_color(edge.confidence, theme),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(section("Evidence", theme));
+        lines.push(field("kind", &edge.evidence_kind, theme.status.info));
+        lines.push(field("source", &edge.evidence, theme.text.secondary));
+        lines.push(field("revision", &edge.revision, theme.text.secondary));
+    } else {
+        lines.push(Line::styled(
+            "  no edge selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · D docs · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// The command palette: a filter line over a searchable list of every command,
+/// so the growing feature set is reachable without a permanent pane or a
+/// single-key binding each. Colors are Theme tokens only (RULE 7).
+fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, selected: usize) {
+    let rect = centered_rect(72, 70, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Command palette ",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input.
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            filter,
+            Line::styled(
+                "  ↑/↓ select · Enter run · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+        ])
+        .style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    // The filtered command list.
+    let matches = crate::palette::filtered(query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching command",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (idx, entry) in matches.iter().enumerate() {
+        let is_selected = idx == selected;
+        let marker = if is_selected { "› " } else { "  " };
+        let head = Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                format!("{:<20}", entry.title),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::styled(
+                entry.description.to_owned(),
+                Style::default().fg(theme.text.muted),
+            ),
+            Span::styled(
+                format!("  [{}]", entry.key),
+                Style::default().fg(theme.status.info),
+            ),
+        ]);
+        let item = ListItem::new(head);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
+    );
+}
+
+/// Color an edge's confidence by tier (Chapter 07): a syntax-inferred call
+/// (~0.45) reads as tentative; an LSP/compiler-resolved edge (≥0.90) as trusted.
+fn edge_confidence_color(confidence: f32, theme: &Theme) -> Color {
+    if confidence >= 0.90 {
+        theme.status.success
+    } else if confidence >= 0.60 {
+        theme.status.warning
+    } else {
+        theme.text.muted
+    }
 }
 
 /// Color for a skill's coarse risk label (`safe` / `low` / `medium` / `high`).
@@ -1218,7 +1740,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::reduce::reduce;
-    use crate::state::{MemoryCard, SkillCard};
+    use crate::state::{MemoryCard, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
         Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
@@ -1401,7 +1923,7 @@ mod tests {
         reduce(&mut state, Action::Help);
         let text = render_to_string(&state, 110, 34);
         assert!(text.contains("Help"));
-        assert!(text.contains("cycle panes"));
+        assert!(text.contains("command palette"));
         assert!(text.contains("detach"));
     }
 
@@ -1450,7 +1972,103 @@ mod tests {
     fn renders_empty_state_without_panicking() {
         let state = AppState::new();
         let text = render_to_string(&state, 80, 24);
-        assert!(text.contains("no runs yet"));
+        // The empty conversation invites the first message.
+        assert!(text.contains("No runs yet"));
+        assert!(text.contains("start one"));
+    }
+
+    #[test]
+    fn conversation_shell_shows_transcript_composer_and_footer() {
+        // A live run: the transcript is the main surface, the composer offers to
+        // steer it, and the status footer spans the bottom.
+        let state = running_build_state();
+        let text = render_to_string(&state, 100, 30);
+
+        // Conversation title names the session + active run objective.
+        assert!(text.contains("fix-tests"), "session in title:\n{text}");
+        assert!(
+            text.contains("diagnose the failing test"),
+            "run objective:\n{text}"
+        );
+        // The persistent composer + its steering placeholder (the run is live).
+        assert!(text.contains("›"), "composer prompt:\n{text}");
+        assert!(text.contains("Enter sends"), "composer hint:\n{text}");
+        assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
+        // The status footer is still present.
+        assert!(text.contains("mode"), "status footer:\n{text}");
+    }
+
+    #[test]
+    fn composer_shows_a_typed_draft() {
+        let mut state = running_build_state();
+        for c in "add a boundary check".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("add a boundary check"),
+            "draft not shown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn workspace_layout_adds_runs_and_approvals_panes() {
+        // Toggling to the workspace layout flanks the conversation with a runs
+        // pane and an approvals + detail pane — the composer/footer are unchanged.
+        let mut state = running_build_state();
+        reduce(&mut state, Action::ToggleLayout);
+        let text = render_to_string(&state, 120, 30);
+
+        assert!(text.contains("Runs"), "runs pane missing:\n{text}");
+        assert!(
+            text.contains("Approvals"),
+            "approvals pane missing:\n{text}"
+        );
+        // The conversation is still the centre surface.
+        assert!(text.contains("fix-tests"), "conversation title:\n{text}");
+        // The composer and status footer persist across the toggle.
+        assert!(text.contains("›"), "composer:\n{text}");
+        assert!(text.contains("mode"), "status footer:\n{text}");
+
+        // Toggling back returns to the single-column chat (no Runs pane title).
+        reduce(&mut state, Action::ToggleLayout);
+        let chat = render_to_string(&state, 120, 30);
+        assert!(!chat.contains("Runs ("), "should be single-column:\n{chat}");
+    }
+
+    #[test]
+    fn contextual_footer_switches_hint_by_context() {
+        // Idle: full ambient fields + a command hint.
+        let mut state = running_build_state();
+        let idle = render_to_string(&state, 120, 30);
+        assert!(idle.contains("mode"), "ambient fields:\n{idle}");
+        assert!(idle.contains("model"), "model field at full width:\n{idle}");
+        assert!(
+            idle.contains("cmds") || idle.contains("F2"),
+            "command hint:\n{idle}"
+        );
+
+        // Drafting: the hint invites sending.
+        for c in "hello".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let drafting = render_to_string(&state, 120, 30);
+        assert!(
+            drafting.contains("send"),
+            "send hint while drafting:\n{drafting}"
+        );
+    }
+
+    #[test]
+    fn contextual_footer_narrows_by_dropping_low_priority_fields() {
+        let state = running_build_state();
+        let narrow = render_to_string(&state, 50, 30);
+        // State survives; the model field is dropped at a narrow width.
+        assert!(narrow.contains("state"), "state kept:\n{narrow}");
+        assert!(
+            !narrow.contains("model"),
+            "model dropped when narrow:\n{narrow}"
+        );
     }
 
     #[test]
@@ -1544,5 +2162,124 @@ mod tests {
             text.contains("events 3..7 of session 51ee"),
             "revealed source missing:\n{text}"
         );
+    }
+
+    #[test]
+    fn docs_studio_snapshot_shows_tree_editor_and_review_rails() {
+        use crate::state::{DocBlockView, DocCard, DocSuggestionView};
+        let mut state = running_build_state();
+        state.docs = vec![DocCard {
+            title: "Payments runbook".to_owned(),
+            scope: "organization".to_owned(),
+            status: "draft".to_owned(),
+            mode: "suggest".to_owned(),
+            revision: "r7".to_owned(),
+            blocks: vec![
+                DocBlockView {
+                    kind: "heading".to_owned(),
+                    text: "Charging a customer".to_owned(),
+                },
+                DocBlockView {
+                    kind: "paragraph".to_owned(),
+                    text: "Call charge_customer with an idempotency key.".to_owned(),
+                },
+            ],
+            suggestions: vec![DocSuggestionView {
+                status: "pending".to_owned(),
+                author: "agent".to_owned(),
+                range: "0..8".to_owned(),
+                replacement: "Charging a customer safely".to_owned(),
+                rationale: Some("match the code path".to_owned()),
+            }],
+        }];
+        reduce(&mut state, Action::OpenDocs);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Docs Studio"), "title missing:\n{text}");
+        // Tree rail: the document title + its scope/status/mode.
+        assert!(
+            text.contains("Payments runbook"),
+            "tree title missing:\n{text}"
+        );
+        assert!(text.contains("organization"), "tree scope missing:\n{text}");
+        // Editor rail: block kinds and the revision badge.
+        assert!(text.contains("Editor rail"), "editor rail missing:\n{text}");
+        assert!(text.contains("heading"), "block kind missing:\n{text}");
+        assert!(text.contains("r7"), "revision badge missing:\n{text}");
+        // Review rail: the pending suggestion with its author and rationale.
+        assert!(text.contains("Review rail"), "review rail missing:\n{text}");
+        assert!(text.contains("agent"), "suggestion author missing:\n{text}");
+        assert!(
+            text.contains("match the code path"),
+            "suggestion rationale missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn command_palette_snapshot_lists_and_filters_commands() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let all = render_to_string(&state, 120, 40);
+        assert!(all.contains("Command palette"), "title missing:\n{all}");
+        // Unfiltered, it lists commands with their key hints.
+        assert!(all.contains("New run"), "command missing:\n{all}");
+        assert!(all.contains("Docs Studio"), "command missing:\n{all}");
+        assert!(all.contains("[n]"), "key hint missing:\n{all}");
+
+        // Typing filters the list down.
+        for c in "docs".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let filtered = render_to_string(&state, 120, 40);
+        assert!(
+            filtered.contains("Docs Studio"),
+            "match missing:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("New run"),
+            "non-match should be filtered out:\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn edge_inspector_snapshot_shows_evidence_and_revision() {
+        use crate::state::GraphEdgeCard;
+        let mut state = running_build_state();
+        state.edges = vec![GraphEdgeCard {
+            from: "billing::charge".to_owned(),
+            to: "gateway::submit".to_owned(),
+            relation: "calls".to_owned(),
+            confidence: 0.45,
+            evidence_kind: "syntax_inferred".to_owned(),
+            evidence: "artifact 3f2a (src/billing.rs)".to_owned(),
+            revision: "79acbf1".to_owned(),
+        }];
+        reduce(&mut state, Action::OpenEdges);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Code-graph edges"), "title missing:\n{text}");
+        assert!(
+            text.contains("billing::charge"),
+            "from symbol missing:\n{text}"
+        );
+        assert!(
+            text.contains("gateway::submit"),
+            "to symbol missing:\n{text}"
+        );
+        assert!(text.contains("calls"), "relation missing:\n{text}");
+        // The exit-criterion payload: evidence kind + source + revision on show.
+        assert!(
+            text.contains("Evidence"),
+            "evidence section missing:\n{text}"
+        );
+        assert!(
+            text.contains("syntax_inferred"),
+            "evidence kind missing:\n{text}"
+        );
+        assert!(
+            text.contains("src/billing.rs"),
+            "evidence source missing:\n{text}"
+        );
+        assert!(text.contains("79acbf1"), "revision missing:\n{text}");
     }
 }

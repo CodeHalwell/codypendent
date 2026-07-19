@@ -28,6 +28,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+# Names the `SqlitePool` type the knowledge-fabric read helpers pass around (the
+# TUI projection seam). Already a transitive dependency via `codypendent-knowledge`.
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -22,7 +22,7 @@ the release gate is the
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | 🟡 |
-| **5** | Workflows & multi-agent orchestration | ⬜ |
+| **5** | Workflows & multi-agent orchestration | 🟡 |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
 | **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
 
@@ -33,10 +33,27 @@ the release gate is the
 > suggest-by-default for org docs, deterministic Markdown publication, a semantic
 > `LanguageAdapter` layer with LSP-edge supersession and revision-aware graph
 > queries (callers/blast-radius/tests-covering/changed-between), and a
-> documentation staleness engine (`/update-docs`). What remains for Phase 4 is
-> **client-surface wiring** — the TUI Docs view + edge inspector, live daemon CRDT
-> transport and edit-lease enforcement, executing publication through the
-> approval-gated write path, and spawning a live language server — tracked below.
+> documentation staleness engine (`/update-docs`). Two slices of
+> **client-surface wiring** have now landed. First, a read-only TUI Docs view
+> (tree / editor / review rail) and a code-graph edge inspector, fed by the CLI
+> projection seam (`D` / `G`). Second, **live daemon CRDT transport**: the
+> `MutateDocument` command now applies onto the authoritative Loro document
+> through a `DocumentMutator` assembly seam (mode-gated by the document's scope,
+> single-writer via edit-lease `require`), and the resulting `DocumentSync` fans
+> out to `Subscription::Document` subscribers over a per-document `DocumentHub`.
+> What remains for Phase 4 is executing publication through the approval-gated
+> write path, spawning a live language server, and the client-side CRDT replica
+> that consumes the sync stream — external-tool / client work tracked below. With those
+> deferred, **Phase 5 is underway**: the `codypendent-workflow` crate compiles
+> declarative `workflow.yaml` manifests into a validated node graph (5.1 compiler
+> core), persists runs / node records / checkpoints with resume-guarding in a
+> `WorkflowStore` (5.2 durable store), carries agent-profile (`agent.toml`)
+> parsing, and holds a per-run `BlackboardStore` for the typed, evidence-gated
+> artifact channel agents share (5.3) — the daemon-free foundation for durable
+> multi-agent orchestration. In parallel, a **Codex-informed TUI backlog** is
+> tracked near the end of this file: the conversation-centred shell, command
+> palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
+> have all shipped.
 
 ---
 
@@ -154,19 +171,51 @@ client-surface wiring is the remaining slice.
 
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
-- [ ] TUI Docs view (tree/editor/review rail) and the graph-edge inspector (edges already carry relation + confidence + evidence + revision; exit criterion 4 is a render)
-- [ ] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement
+- [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
+- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Remaining:* a `CommandBody::AcquireDocumentLease` so a client can take a lease before editing (today `require` is a correctly-placed pass-through until a lease is held), and the client-side CRDT replica that consumes the sync stream
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
 **Exit:** concurrent edits merge ✅; document snapshot reproducible ✅; symbol
 changes flag affected docs with evidence ✅; graph edges expose evidence +
-revision ✅ (data model; TUI inspector render pending). ADR-016 recorded ✅;
+revision ✅ (data model + read-only TUI inspector render). ADR-016 recorded ✅;
 suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 
-## Phase 5 — Workflow & multi-agent orchestration ⬜
+## Phase 5 — Workflow & multi-agent orchestration 🟡
 
 - [ ] Declarative workflows; durable checkpoint storage; supervisor/specialist delegation; blackboard
+  - [x] **5.1 (compiler core)** `codypendent-workflow` crate: the declarative
+        `workflow.yaml` model + a compiler that validates a definition (schema
+        version, unique/non-empty step ids, exactly one action per step,
+        skill⇒agent, resolvable `depends_on`, acyclic graph via topological sort,
+        budget sanity, and the ADR-008 multi-agent `orchestration_reason` rule)
+        and lowers it into a topologically ordered node graph. The canonical
+        `repair-github-check` manifest compiles (regression test). *Remaining for
+        5.1:* registry cross-checks (unknown tool/skill/agent = error), lowering
+        onto framework graphs, and replacing the hard-coded `/fix-ci` flow with
+        this definition. Agent-profile (`agent.toml`) parsing has landed —
+        `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
+        permissions/budget/completion (the canonical profile parses in a test).
+  - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
+        durable workflow runs, a per-node record (state / attempt / cost /
+        start+end times — the node-level provenance the graph view needs), and
+        checkpoints. `resume` reports the first incomplete node and **refuses a
+        changed graph signature** (`CompiledWorkflow::signature()` hashes the
+        graph shape). *Remaining for 5.2:* daemon startup recovery wiring,
+        node-lifecycle ledger events, pause/resume/retry-from-node commands, and
+        the TUI workflow-graph view.
+  - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
+        `blackboard_items` table): the typed, attributed artifact channel agents
+        share *within* a workflow run — findings, hypotheses, decisions, code
+        locations, proposed patches, test results, document drafts, open
+        questions (Chapter 04's "communicate only via blackboard artifacts and
+        declared outputs, never raw transcripts"). Claim-like kinds (finding /
+        decision / test-result / proposed-patch / code-location) are **refused
+        without evidence**; a corrected item **supersedes** rather than deletes
+        (the chain is stamped in one transaction); boards are **isolated per
+        run**. Payload/author/evidence ride as opaque JSON so the crate stays
+        daemon-decoupled. *Remaining for 5.3:* daemon read/write commands +
+        subscription delivery, and the TUI blackboard surface.
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
@@ -188,6 +237,77 @@ update requires approval; original audio/image artifacts linked; setup assistant
 **Exit:** routing meets quality threshold at lower cost than static
 strongest-model; no learned artifact self-promotes; regressions covered; every
 promotion attributable and reversible.
+
+---
+
+## Client & TUI experience — Codex-informed backlog
+
+Direction: adopt the **conversation-centred shell** — the Claude Code / Codex
+CLI look and feel (a transcript-dominant surface, a persistent composer, `/`
+slash commands, minimal permanent chrome) — as the base, and keep Codypendent's
+richer surfaces (runs, approvals, docs, knowledge, code graph, workflows) as
+overlays reachable from the palette. The feel is chat-first; the capability set
+is deliberately broader. (Visualized in a TUI mock + borrow review produced
+alongside this work.)
+
+- [x] **Conversation-centred shell + layout toggle** — the base view is a
+      full-width transcript + a persistent bottom composer + a one-row status
+      footer. Type to send (a message starts a run, or steers the live one); `/`
+      on an empty composer opens the palette; PgUp/PgDn scroll; Ctrl-↑/↓ switch
+      runs; a pending approval owns the input until resolved. **`F2` (or the
+      palette) toggles to a workspace layout** — Runs │ conversation │ approvals
+      panes for at-a-glance state — sharing the same composer, footer, and input
+      model, so the panes are context, not a separate mode. Pure-reducer; 64 TUI
+      tests green.
+- [x] **Command palette** (`/`) — one searchable surface for every command, the
+      command hub now that typing composes a message rather than firing single-key
+      actions.
+- [x] **Rich approval cards** — action + risk + requested capabilities verbatim,
+      at the point of decision (the approval modal owns input when pending).
+- [x] **Narrative transcript** — typed, event-sourced cells (model prose, tool
+      cards, diffs, markers) in one attributable stream — the shell's main surface.
+- [x] **Contextual footer** — the status line drops fields by priority as the
+      terminal narrows (mode/model/cost/worktree fall away first; state +
+      attention always survive) and carries a right-aligned instructional hint
+      that shifts by context: approve/reject when an approval is pending, `↧ latest`
+      when scrolled up, send/clear while drafting, else `/ cmds · F2 layout`.
+- [x] **Auto-scroll** — the conversation follows the latest by default (streaming
+      stays pinned to the bottom); PgUp leaves follow to read history, PgDn (or
+      sending a message) snaps back. The renderer measures the wrapped height and
+      caches the bottom so paging is exact.
+- [ ] **Composer polish** — the persistent composer exists; the rich editor
+      remains: multiline, input history + reverse-search, `@` file/symbol mentions,
+      large-paste placeholders, queue-while-working.
+- [ ] **Side conversations & forks** — inspect or branch without derailing the
+      main run; converges with Phase 5 STEP 5.6 `ForkSession{checkpoint}`.
+- [ ] **Terminal-native polish** — resize reflow, paste-burst detection, IME
+      input, terminal hyperlinks, copy-friendly output (folds into Phase 6 themes).
+
+## Cross-cutting, Codex-informed priorities
+
+From the broader Codex comparison, sequencing notes that touch several phases:
+
+- [ ] **OS sandbox enforcement gates Phase 6.** The policy engine *decides*
+      (deny / allow / approve); it does not yet *enforce*. Native isolation
+      (bubblewrap + seccomp / Seatbelt / AppContainer) should land as a
+      prerequisite for the plugin host and untrusted content, not after it — treat
+      the policy engine as the compiler that emits a sandbox profile.
+- [ ] **Finish the Phase 4 document vertical before deepening Phase 5.** One
+      end-to-end slice (open → concurrent-edit → review suggestions → inspect graph
+      evidence → publish through approval → reconnect) demonstrates the thesis
+      better than breadth. The mutation engine, `DocumentSync` payload, edit-lease
+      store, **and the daemon transport** now exist (`MutateDocument` applies
+      through the assembly `DocumentMutator` seam and fans out to `Document`
+      subscribers). What still closes the loop: a lease-acquire command, a
+      client-side CRDT replica that consumes the sync stream, and publishing a
+      `PublishPlan` through the approval-gated write path.
+- [ ] **Trust boundary as plumbing, not new design.** Retrieved memories, skill
+      descriptions, and CI/PR text must render as *evidence*, not instructions —
+      the fabric already carries `EvidenceRef` / `TrustTier` / `DataClassification`
+      / `Scope`, so this is finishing the wiring, not inventing it.
+- [ ] **Generate the protocol SDK.** The VS Code extension hand-duplicates the
+      Rust wire codec; a generated TypeScript + JSON-Schema pipeline from the
+      protocol crate removes that drift risk as the protocol grows.
 
 ---
 

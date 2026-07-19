@@ -70,11 +70,13 @@ pub use observer::extract_candidates;
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
 
+pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use docs::collab::{
     CollaborationMode, EditDisposition, NewSuggestion, Suggestion, SuggestionStatus,
     SuggestionStore,
 };
 pub use docs::crdt::{DocCrdtError, DocumentCrdt};
+pub use docs::leases::{DocumentLease, DocumentLeaseStore, LeaseError};
 pub use docs::model::{
     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
     DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,

@@ -52,6 +52,10 @@ pub enum Action {
     Expand,
 
     // --- run control ---
+    /// Switch the conversation to the previous run (`Ctrl-↑`).
+    PrevRun,
+    /// Switch the conversation to the next run (`Ctrl-↓`).
+    NextRun,
     /// Open the new-run prompt (`n`).
     NewRun,
     /// Pause the selected run, or resume it if already paused (`p`).
@@ -91,6 +95,17 @@ pub enum Action {
     /// browser). The TUI does no I/O, so this surfaces the source string rather
     /// than opening a file.
     OpenSource,
+
+    // --- Docs Studio & code intelligence (Phase 4 client wiring) ---
+    /// Toggle the Docs Studio browser (`D`): tree / editor rail / review rail.
+    OpenDocs,
+    /// Toggle the code-graph edge inspector (`G`).
+    OpenEdges,
+
+    /// Toggle the command palette (`/`): a searchable list of every command.
+    OpenPalette,
+    /// Flip between the chat single-column and the workspace panes (`F2`).
+    ToggleLayout,
 
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).

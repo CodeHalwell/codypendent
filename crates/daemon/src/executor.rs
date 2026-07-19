@@ -87,4 +87,19 @@ pub trait RunExecutor: Send + Sync {
     )> {
         None
     }
+
+    /// The assembly-provided [`DocumentMutator`](crate::documents::DocumentMutator)
+    /// that applies an accepted `MutateDocument` command onto the authoritative
+    /// collaborative document (Phase 4 STEP 4.3 client transport).
+    ///
+    /// Bundled with the executor for the same reason as
+    /// [`collaborators`](RunExecutor::collaborators): both are seams the daemon
+    /// declares and the `codypendentd` assembly (which alone can name the
+    /// knowledge crate) implements and injects together. The default `None`
+    /// leaves document transport unwired — the executor-less server and the
+    /// daemon's own tests then reject `MutateDocument` structurally rather than
+    /// applying it.
+    fn document_mutator(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentMutator>> {
+        None
+    }
 }

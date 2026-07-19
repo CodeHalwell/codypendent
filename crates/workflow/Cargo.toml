@@ -1,0 +1,33 @@
+[package]
+name = "codypendent-workflow"
+description = "codypendent-workflow: declarative workflow definitions and the compiler that validates them into an executable node graph (Phase 5, STEP 5.1). Deliberately daemon- and framework-free — pure parsing and validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+# Agent profiles are TOML (the shape of `docs/specs/agent.toml`, STEP 5.1).
+toml = { workspace = true }
+thiserror = { workspace = true }
+# Durable workflow runs / node records / checkpoints (STEP 5.2). SQLite via the
+# shared migrations, mirroring the knowledge crate's own `db` helper so this crate
+# never has to depend on the daemon.
+sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+# Stable graph signature for the resume guard (STEP 5.2).
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

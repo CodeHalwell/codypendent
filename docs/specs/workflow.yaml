@@ -3,6 +3,11 @@ id: repair-github-check
 version: 1
 description: Investigate and repair a failed GitHub check in an isolated worktree.
 
+# Multi-agent (investigator → implementer → independent reviewer): the reviewer
+# is a separate agent so its judgement is structurally independent of the
+# implementer (ADR-008 router justification).
+orchestration_reason: independent-review
+
 inputs:
   pull_request:
     type: github_pull_request

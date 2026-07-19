@@ -33,17 +33,19 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use codypendent_knowledge::{
-    db as knowledge_db, CapabilityRequest, EvidenceRef, MemoryClass, MemoryRecord, MemoryStore,
-    Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope, TrustTier,
+    db as knowledge_db, BlockContent, CapabilityRequest, CodeEdge, CodeRelation, CollaborationMode,
+    DocumentAuthor, DocumentBlock, DocumentStore, EvidenceKind, EvidenceRef, KnowledgeDocument,
+    MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem, RegistryItemKind,
+    RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Catchup, ClientId, ClientRole, Command, CommandBody, CommandId,
-    Envelope, Payload, SessionEvent, SessionId, Subscription, WorkspaceId,
+    read_envelope, write_envelope, Catchup, ClientId, ClientRole, CodeNodeId, Command, CommandBody,
+    CommandId, Envelope, Payload, RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, Action, AppState, Intent, MemoryCard, SkillCard, TerminalGuard,
-    Theme,
+    map_event, reduce, render, Action, AppState, DocBlockView, DocCard, DocSuggestionView,
+    GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -110,16 +112,19 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    // STEP 2.6: seed the Skill Studio + memory browser projections. This reads the
+    // STEP 2.6 + Phase 4 client wiring: seed the Skill Studio, memory browser,
+    // Docs Studio, and code-graph edge-inspector projections. This reads the
     // knowledge fabric's authoritative rows directly from SQLite (WAL allows
     // concurrent reads alongside the daemon) and maps them into the TUI's plain
     // projection structs — the one place the two worlds meet, done here (not in
     // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
     // failure logs and continues with empty lists; it never fails the TUI. Done
     // before entering the terminal so any diagnostic reaches a cooked screen.
-    let (skills, memories) = load_knowledge(paths, workspace_id, &repo).await;
-    state.skills = skills;
-    state.memories = memories;
+    let projections = load_knowledge(paths, workspace_id, &repo).await;
+    state.skills = projections.skills;
+    state.memories = projections.memories;
+    state.docs = projections.docs;
+    state.edges = projections.edges;
 
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
@@ -588,32 +593,55 @@ fn catchup_proves_session_exists(catchup: &Catchup) -> bool {
     }
 }
 
-/// Read the knowledge fabric's registry + memories directly from SQLite and map
-/// them into the TUI's plain projection structs (STEP 2.6). This is the CLI's
-/// job precisely because the TUI crate performs no I/O and never depends on
+/// The knowledge-fabric projections the TUI reads (STEP 2.6 + Phase 4 client
+/// wiring), all loaded in the one place the two worlds meet.
+struct KnowledgeProjections {
+    skills: Vec<SkillCard>,
+    memories: Vec<MemoryCard>,
+    docs: Vec<DocCard>,
+    edges: Vec<GraphEdgeCard>,
+}
+
+/// The cap on edges surfaced in the inspector. A large repository's graph can
+/// carry thousands of edges; the read-only inspector shows the first
+/// [`MAX_INSPECTOR_EDGES`] (oldest first) and logs when it truncates — never a
+/// silent cut.
+const MAX_INSPECTOR_EDGES: usize = 500;
+
+/// Read the knowledge fabric's registry, memories, documents, and code-graph
+/// edges directly from SQLite and map them into the TUI's plain projection
+/// structs (STEP 2.6 + Phase 4 client wiring). This is the CLI's job precisely
+/// because the TUI crate performs no I/O and never depends on
 /// `codypendent-knowledge`; the mapping from the knowledge domain types to the
 /// projection structs happens here and nowhere else.
 ///
 /// The database is opened via the same helper the `index rebuild` path uses; WAL
 /// mode lets this read concurrently with the running daemon. Every failure path
 /// (open, list, query) is swallowed into an empty list with a stderr note, so a
-/// missing or busy database only means empty Skills / Memory browsers — never a
-/// TUI that refuses to start.
+/// missing or busy database only means empty browsers — never a TUI that refuses
+/// to start.
 async fn load_knowledge(
     paths: &RuntimePaths,
     workspace_id: WorkspaceId,
     repo: &Path,
-) -> (Vec<SkillCard>, Vec<MemoryCard>) {
+) -> KnowledgeProjections {
+    let empty = || KnowledgeProjections {
+        skills: Vec::new(),
+        memories: Vec::new(),
+        docs: Vec::new(),
+        edges: Vec::new(),
+    };
+
     let database_path = paths.data_dir.join("codypendent.db");
     let pool = match knowledge_db::open(&database_path).await {
         Ok(pool) => pool,
         Err(error) => {
             eprintln!(
-                "codypendent: Skill Studio / memory views unavailable \
+                "codypendent: knowledge views unavailable \
                  (opening {}: {error})",
                 database_path.display()
             );
-            return (Vec::new(), Vec::new());
+            return empty();
         }
     };
 
@@ -625,15 +653,15 @@ async fn load_knowledge(
         }
     };
 
-    // Visible memory scopes: the System tier, this session's workspace, and THIS
-    // repository — where a run's harvested procedural/semantic memories are
-    // stored (the primary memory path), derived from the same canonical path the
-    // daemon uses. The store enforces cross-repository isolation in SQL; an empty
-    // result is fine.
+    // Visible scopes: the System tier, this session's workspace, and THIS
+    // repository — where a run's harvested memories and documents live, derived
+    // from the same canonical path the daemon uses. The stores enforce
+    // cross-scope isolation in SQL; an empty result is fine.
+    let repository = codypendent_knowledge::stable_repository_id(repo);
     let scopes = vec![
         Scope::System,
         Scope::Workspace(workspace_id),
-        Scope::Repository(codypendent_knowledge::stable_repository_id(repo)),
+        Scope::Repository(repository),
     ];
     let memories = match MemoryStore::new().query(&pool, &scopes, None).await {
         Ok(records) => records.iter().map(memory_card).collect(),
@@ -643,8 +671,92 @@ async fn load_knowledge(
         }
     };
 
+    let docs = load_docs(&pool, &scopes).await;
+    let edges = load_edges(&pool, repository).await;
+
     pool.close().await;
-    (skills, memories)
+    KnowledgeProjections {
+        skills,
+        memories,
+        docs,
+        edges,
+    }
+}
+
+/// Project each visible-scope document (snapshot + pending suggestions) into a
+/// [`DocCard`]. A per-document read failure logs and skips that document; the
+/// browser degrades to what it could load rather than failing.
+async fn load_docs(pool: &sqlx::SqlitePool, scopes: &[Scope]) -> Vec<DocCard> {
+    let doc_store = DocumentStore::new();
+    let suggestion_store = SuggestionStore::new();
+    let summaries = match doc_store.list(pool, scopes).await {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            eprintln!("codypendent: could not list documents: {error}");
+            return Vec::new();
+        }
+    };
+
+    let mut docs = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let document = match doc_store.snapshot_document(pool, summary.id).await {
+            Ok(Some(document)) => document,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!(
+                    "codypendent: could not load document {}: {error}",
+                    summary.id
+                );
+                continue;
+            }
+        };
+        let suggestions = suggestion_store
+            .pending(pool, summary.id)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "codypendent: could not load suggestions for {}: {error}",
+                    summary.id
+                );
+                Vec::new()
+            });
+        docs.push(doc_card(&document, &suggestions));
+    }
+    docs
+}
+
+/// Project this repository's code-graph edges into [`GraphEdgeCard`]s, resolving
+/// each endpoint node id to its qualified name. Bounded by
+/// [`MAX_INSPECTOR_EDGES`] with a note when it truncates.
+async fn load_edges(pool: &sqlx::SqlitePool, repository: RepositoryId) -> Vec<GraphEdgeCard> {
+    use codypendent_knowledge::codegraph;
+
+    let names: HashMap<CodeNodeId, String> = match codegraph::nodes(pool, repository).await {
+        Ok(nodes) => nodes
+            .into_iter()
+            .map(|node| (node.id, node.key.qualified_name))
+            .collect(),
+        Err(error) => {
+            eprintln!("codypendent: could not load code-graph nodes: {error}");
+            HashMap::new()
+        }
+    };
+
+    let mut edges = match codegraph::edges(pool, repository).await {
+        Ok(edges) => edges,
+        Err(error) => {
+            eprintln!("codypendent: could not load code-graph edges: {error}");
+            return Vec::new();
+        }
+    };
+    if edges.len() > MAX_INSPECTOR_EDGES {
+        eprintln!(
+            "codypendent: code graph has {} edges; the inspector shows the first {MAX_INSPECTOR_EDGES}",
+            edges.len()
+        );
+        edges.truncate(MAX_INSPECTOR_EDGES);
+    }
+    edges.iter().map(|edge| edge_card(edge, &names)).collect()
 }
 
 /// Map a governed [`RegistryItem`] into the TUI's [`SkillCard`] projection,
@@ -779,6 +891,155 @@ fn memory_class_label(class: MemoryClass) -> &'static str {
         MemoryClass::Failure => "failure",
         MemoryClass::Artifact => "artifact",
         MemoryClass::Code => "code",
+    }
+}
+
+/// Map a [`KnowledgeDocument`] (plus its pending suggestions) into the TUI's
+/// [`DocCard`] projection. `mode` is the collaboration mode the document's scope
+/// defaults to — org-scope docs read `suggest`, the suggest-by-default the
+/// engine enforces (STEP 4.3).
+fn doc_card(document: &KnowledgeDocument, suggestions: &[Suggestion]) -> DocCard {
+    DocCard {
+        title: document.title.clone(),
+        scope: scope_label(&document.scope),
+        status: document.status.as_str().to_owned(),
+        mode: collab_mode_label(CollaborationMode::default_for_scope(&document.scope)).to_owned(),
+        revision: format!("r{}", document.revision),
+        blocks: document.blocks.iter().map(block_view).collect(),
+        suggestions: suggestions.iter().map(suggestion_view).collect(),
+    }
+}
+
+/// Render one [`DocumentBlock`] into the editor rail's [`DocBlockView`]: a kind
+/// label and a single-line human rendering of its content (never the raw
+/// serialized block). Structured/embed blocks get a compact stand-in.
+fn block_view(block: &DocumentBlock) -> DocBlockView {
+    let (kind, text) = match &block.content {
+        BlockContent::Heading { level, text } => (format!("heading h{level}"), text.clone()),
+        BlockContent::Paragraph { text } => ("paragraph".to_owned(), text.clone()),
+        BlockContent::Code { language, text } => (
+            match language {
+                Some(language) => format!("code {language}"),
+                None => "code".to_owned(),
+            },
+            text.clone(),
+        ),
+        BlockContent::Diagram { format, .. } => {
+            (format!("diagram {format}"), "(diagram)".to_owned())
+        }
+        BlockContent::Table { rows } => ("table".to_owned(), format!("({} rows)", rows.len())),
+        BlockContent::Callout { kind, text } => (format!("callout {kind}"), text.clone()),
+        BlockContent::Checklist { items } => {
+            ("checklist".to_owned(), format!("({} items)", items.len()))
+        }
+        BlockContent::Query { query } => ("query".to_owned(), query.clone()),
+        BlockContent::EmbeddedFile { path } => ("embed-file".to_owned(), path.clone()),
+        BlockContent::EmbeddedSymbol { symbol } => ("embed-symbol".to_owned(), symbol.clone()),
+        BlockContent::EmbeddedWorkflow { workflow } => {
+            ("embed-workflow".to_owned(), workflow.clone())
+        }
+        BlockContent::EmbeddedSkill { skill } => ("embed-skill".to_owned(), skill.clone()),
+    };
+    // Collapse to one line — the editor rail renders a block per row.
+    DocBlockView {
+        kind,
+        text: text.replace('\n', " "),
+    }
+}
+
+/// Map a [`Suggestion`] into the review rail's [`DocSuggestionView`].
+fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
+    DocSuggestionView {
+        status: suggestion_status_label(suggestion.status).to_owned(),
+        author: document_author_label(&suggestion.author),
+        range: format!("{}..{}", suggestion.range_start, suggestion.range_end),
+        replacement: suggestion.replacement.clone(),
+        rationale: suggestion.rationale.clone(),
+    }
+}
+
+/// Map a [`CodeEdge`] into the inspector's [`GraphEdgeCard`], resolving each
+/// endpoint node id to its qualified name via `names` (falling back to the id
+/// when a node is not in the map). Carries the evidence + revision the Phase 4
+/// exit criterion requires the inspector to expose.
+fn edge_card(edge: &CodeEdge, names: &HashMap<CodeNodeId, String>) -> GraphEdgeCard {
+    let name = |id: &CodeNodeId| {
+        names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| format!("node {id}"))
+    };
+    GraphEdgeCard {
+        from: name(&edge.from),
+        to: name(&edge.to),
+        relation: code_relation_label(edge.relation).to_owned(),
+        confidence: edge.confidence,
+        evidence_kind: evidence_kind_label(edge.evidence_kind).to_owned(),
+        evidence: edge
+            .evidence
+            .as_ref()
+            .map_or_else(|| "(none)".to_owned(), evidence_source),
+        revision: edge.revision.0.clone(),
+    }
+}
+
+fn collab_mode_label(mode: CollaborationMode) -> &'static str {
+    match mode {
+        CollaborationMode::Ask => "ask",
+        CollaborationMode::Suggest => "suggest",
+        CollaborationMode::Edit => "edit",
+        CollaborationMode::CoAuthor => "co-author",
+        CollaborationMode::Review => "review",
+        CollaborationMode::Maintain => "maintain",
+    }
+}
+
+fn suggestion_status_label(status: SuggestionStatus) -> &'static str {
+    match status {
+        SuggestionStatus::Pending => "pending",
+        SuggestionStatus::Accepted => "accepted",
+        SuggestionStatus::Rejected => "rejected",
+    }
+}
+
+/// A compact label for who authored a document mutation — an agent sentence
+/// names its serving model (the traceability triple's public face).
+fn document_author_label(author: &DocumentAuthor) -> String {
+    match author {
+        DocumentAuthor::Human { .. } => "human".to_owned(),
+        DocumentAuthor::Agent { model, .. } => format!("agent ({model})"),
+        DocumentAuthor::Integration { integration } => format!("integration ({integration})"),
+    }
+}
+
+fn code_relation_label(relation: CodeRelation) -> &'static str {
+    match relation {
+        CodeRelation::Contains => "contains",
+        CodeRelation::Defines => "defines",
+        CodeRelation::Imports => "imports",
+        CodeRelation::References => "references",
+        CodeRelation::Calls => "calls",
+        CodeRelation::Implements => "implements",
+        CodeRelation::Extends => "extends",
+        CodeRelation::Reads => "reads",
+        CodeRelation::Writes => "writes",
+        CodeRelation::Mutates => "mutates",
+        CodeRelation::Returns => "returns",
+        CodeRelation::Accepts => "accepts",
+        CodeRelation::Tests => "tests",
+        CodeRelation::Configures => "configures",
+        CodeRelation::Serializes => "serializes",
+        CodeRelation::DependsOn => "depends-on",
+        CodeRelation::GeneratedFrom => "generated-from",
+    }
+}
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::SyntaxInferred => "syntax_inferred",
+        EvidenceKind::LspResolved => "lsp_resolved",
+        EvidenceKind::CompilerResolved => "compiler_resolved",
+        EvidenceKind::RuntimeObserved => "runtime_observed",
     }
 }
 

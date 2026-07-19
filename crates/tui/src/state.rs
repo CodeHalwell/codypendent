@@ -5,6 +5,8 @@
 //! derived deterministically from the ordered [`SessionEvent`] stream plus local
 //! navigation, so replaying the same events yields the same state.
 
+use std::cell::Cell;
+
 use codypendent_protocol::{
     AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, ModelId, ProposedAction,
     Risk, RunDisposition, RunId, RunState, ToolOutcome,
@@ -35,16 +37,51 @@ impl Pane {
     }
 }
 
+/// Which base layout the shell renders. Toggled at runtime (`F2` or the palette);
+/// the composer and status footer are identical in both — only the region above
+/// them changes, and the input model (composer / palette / approval modal) is the
+/// same in each, so the panes are at-a-glance context, not a separate mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    /// The single-column conversation (the Claude Code / Codex feel). Default.
+    #[default]
+    Chat,
+    /// Runs │ conversation │ approvals panes, for at-a-glance workspace state.
+    Workspace,
+}
+
+impl LayoutMode {
+    /// The other layout.
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            LayoutMode::Chat => LayoutMode::Workspace,
+            LayoutMode::Workspace => LayoutMode::Chat,
+        }
+    }
+}
+
 /// How the input layer should interpret the next key (see
 /// [`crate::input::map_event`]). Derived from the active overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// The full navigation/command key table is live.
+    /// A navigable overlay (Skills / Memory / Docs / Edges / Help) is live: the
+    /// arrow/command key table drives it.
     Normal,
     /// A text prompt is capturing printable keys.
     Editing,
     /// A yes/no confirmation is awaiting a decision.
     Confirm,
+    /// The command palette is capturing a filter query while staying navigable
+    /// (printable keys filter; arrows move the selection; Enter runs it).
+    Palette,
+    /// The base conversation view: the persistent composer captures typed text;
+    /// `/` (on an empty composer) opens the palette; Enter sends; PgUp/PgDn
+    /// scroll the transcript; Ctrl-↑/↓ switch runs.
+    Composer,
+    /// A pending approval owns the screen: only the decision keys (`a`/`A`/`r`)
+    /// and selection arrows are live, so an approval is never typed past.
+    Approval,
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
@@ -71,6 +108,20 @@ pub enum Overlay {
     /// opening surfaces the full source string in place; a real file-open is the
     /// CLI's job later ("every retrieved memory opens its source").
     Memory { source_open: bool },
+    /// The Docs Studio browser (Phase 4 client wiring): the [`AppState::docs`]
+    /// tree on the left, and the focused document's editor rail (its blocks) +
+    /// review rail (its pending suggestions) on the right. Read-only — the live
+    /// CRDT edit transport is a separate follow-up.
+    Docs,
+    /// The code-graph edge inspector (Phase 4 exit criterion 4): the
+    /// [`AppState::edges`] list on the left and, for the focused edge, its
+    /// relation, confidence, evidence kind + source, and revision on the right.
+    Edges,
+    /// The command palette: a searchable list of every command the TUI exposes,
+    /// so the growing feature set stays reachable without consuming a single-key
+    /// binding each. `query` is the live filter; `selected` indexes the filtered
+    /// results (reset to 0 whenever the query changes). Opened with `/`.
+    Palette { query: String, selected: usize },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -174,8 +225,13 @@ pub struct RunView {
     pub transcript: Vec<TranscriptEntry>,
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
-    /// Transcript scroll offset in rows.
+    /// Transcript scroll offset in rows (used only when not following).
     pub scroll: u16,
+    /// Whether the conversation is pinned to the latest content. `true` by
+    /// default and after sending; scrolling up with PgUp leaves follow mode, and
+    /// paging back to the bottom re-enters it. When following, the renderer shows
+    /// the tail of the transcript regardless of `scroll`.
+    pub follow: bool,
 }
 
 impl RunView {
@@ -193,6 +249,7 @@ impl RunView {
             transcript: Vec::new(),
             transcript_selected: 0,
             scroll: 0,
+            follow: true,
         }
     }
 }
@@ -254,6 +311,82 @@ pub struct MemoryCard {
     pub source: String,
 }
 
+/// A Docs Studio card (STEP 4.x client wiring): one [`KnowledgeDocument`]
+/// projected for the Docs browser's tree/editor/review rails. Self-contained —
+/// the TUI never depends on `codypendent-knowledge`; the CLI maps a document
+/// snapshot (plus its pending suggestions) into this shape. Every field is a
+/// pre-rendered human string so the renderer stays a pure projection.
+///
+/// [`KnowledgeDocument`]: (mapped by the CLI from `codypendent-knowledge`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocCard {
+    /// The document title (its heading in the tree).
+    pub title: String,
+    /// The scope the document lives in (e.g. `system`, `workspace …`).
+    pub scope: String,
+    /// The lifecycle status (`draft` / `in_review` / `published` / `archived`).
+    pub status: String,
+    /// The collaboration mode governing agent edits (`ask` / `suggest` / `edit`
+    /// / `co_author` / `review` / `maintain`) — org docs default to `suggest`.
+    pub mode: String,
+    /// The document's monotonic revision, pre-rendered (e.g. `"r7"`).
+    pub revision: String,
+    /// The rendered blocks (the editor rail), in document order.
+    pub blocks: Vec<DocBlockView>,
+    /// The pending suggestions on the document (the review rail).
+    pub suggestions: Vec<DocSuggestionView>,
+}
+
+/// One rendered document block (the editor rail). `text` is the block's primary
+/// text or a structured-block label — never the raw serialized content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocBlockView {
+    /// The block kind label (`heading` / `paragraph` / `code` / …).
+    pub kind: String,
+    /// A one-line human rendering of the block's content.
+    pub text: String,
+}
+
+/// One pending suggestion on a document (the review rail): a proposed
+/// replacement over a character range, with its author and rationale. Rendered
+/// read-only — accept/reject is a later live-transport concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSuggestionView {
+    /// The suggestion status (`pending` for the review rail).
+    pub status: String,
+    /// Who proposed it, pre-rendered (e.g. `"agent"` / `"human"`).
+    pub author: String,
+    /// The character range it targets, pre-rendered (e.g. `"12..40"`).
+    pub range: String,
+    /// The proposed replacement text.
+    pub replacement: String,
+    /// The proposer's rationale, when given.
+    pub rationale: Option<String>,
+}
+
+/// A code-graph edge projected for the graph-edge inspector (Phase 4 exit
+/// criterion 4: "graph edges expose evidence + revision"). Self-contained — the
+/// CLI maps a `CodeEdge` (resolving its endpoint node ids to qualified names)
+/// into this shape. Every field is a pre-rendered human string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphEdgeCard {
+    /// The source symbol's qualified name (or a fallback id when unresolved).
+    pub from: String,
+    /// The target symbol's qualified name (or a fallback id when unresolved).
+    pub to: String,
+    /// The relation label (`calls` / `defines` / `imports` / …).
+    pub relation: String,
+    /// The edge confidence in `[0, 1]` — the tier its evidence earns.
+    pub confidence: f32,
+    /// The evidence layer that produced it (`syntax_inferred` / `lsp_resolved`
+    /// / `compiler_resolved` / `runtime_observed`).
+    pub evidence_kind: String,
+    /// A human rendering of the descriptive evidence ref, or `"(none)"`.
+    pub evidence: String,
+    /// The git revision the edge was recorded at.
+    pub revision: String,
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -302,8 +435,35 @@ pub struct AppState {
     pub memories: Vec<MemoryCard>,
     /// Index into `memories` of the focused memory.
     pub selected_memory: usize,
-    /// The focused pane.
+    /// The Docs Studio projection (Phase 4 client wiring): the visible-scope
+    /// documents, mapped to self-contained [`DocCard`]s by the CLI. May be
+    /// empty. The [`Overlay::Docs`] browser reads it.
+    pub docs: Vec<DocCard>,
+    /// Index into `docs` of the focused document.
+    pub selected_doc: usize,
+    /// The code-graph edge projection (Phase 4 exit criterion 4): this
+    /// repository's edges, mapped to self-contained [`GraphEdgeCard`]s by the
+    /// CLI. May be empty. The [`Overlay::Edges`] inspector reads it.
+    pub edges: Vec<GraphEdgeCard>,
+    /// Index into `edges` of the focused edge.
+    pub selected_edge: usize,
+    /// The focused pane. Vestigial in the conversation-centred shell (the
+    /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
+    /// The persistent composer buffer (the always-present bottom input). Typed
+    /// text lands here; Enter sends it (starting a run, or steering the active
+    /// one). Empty by default.
+    pub composer: String,
+    /// Which base layout is rendered (chat single-column vs. workspace panes).
+    /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
+    pub layout: LayoutMode,
+    /// The maximum transcript scroll offset (rows below the top that still fill
+    /// the viewport), cached by the renderer each frame. The renderer knows the
+    /// wrapped height and viewport; the reducer reads this cache so PgUp can leave
+    /// follow mode at the true bottom and PgDn can re-enter it. A one-frame-stale
+    /// layout metric — never domain state — which is why it is a [`Cell`] the
+    /// draw-only renderer may update through a shared reference.
+    pub transcript_max_scroll: Cell<u16>,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -341,7 +501,14 @@ impl AppState {
             selected_skill: 0,
             memories: Vec::new(),
             selected_memory: 0,
+            docs: Vec::new(),
+            selected_doc: 0,
+            edges: Vec::new(),
+            selected_edge: 0,
             focus: Pane::Sessions,
+            composer: String::new(),
+            layout: LayoutMode::Chat,
+            transcript_max_scroll: Cell::new(0),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
@@ -357,11 +524,24 @@ impl AppState {
         match self.overlay {
             Overlay::NewRun(_) | Overlay::Steering(_) => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The Skills / Memory browsers are navigable with the normal key
-            // table (arrows, `S`/`M` to toggle, `o` to open a source, Esc to
-            // dismiss), so they stay in `Normal` mode.
-            Overlay::None | Overlay::Help | Overlay::Skills | Overlay::Memory { .. } => {
-                InputMode::Normal
+            // The palette filters on printable keys but stays arrow-navigable, so
+            // it has its own input mode (see [`crate::input::map_palette_key`]).
+            Overlay::Palette { .. } => InputMode::Palette,
+            // The Skills / Memory / Docs / Edges / Help browsers are navigable with
+            // the arrow/command key table, so they stay in `Normal` mode.
+            Overlay::Help
+            | Overlay::Skills
+            | Overlay::Memory { .. }
+            | Overlay::Docs
+            | Overlay::Edges => InputMode::Normal,
+            // The base conversation view: an unresolved approval owns the screen
+            // (decision keys only); otherwise the composer captures typed text.
+            Overlay::None => {
+                if self.show_approval_modal() {
+                    InputMode::Approval
+                } else {
+                    InputMode::Composer
+                }
             }
         }
     }
@@ -370,6 +550,19 @@ impl AppState {
     #[must_use]
     pub fn selected_run(&self) -> Option<&RunView> {
         self.runs.get(self.selected_run)
+    }
+
+    /// Whether the selected run is still live — i.e. a composer message should
+    /// *steer* it rather than start a fresh run. `false` when no run is selected
+    /// or the selected run has reached a terminal state.
+    #[must_use]
+    pub fn selected_run_is_active(&self) -> bool {
+        self.selected_run().is_some_and(|run| {
+            !matches!(
+                run.state,
+                RunState::Completed | RunState::Failed | RunState::Cancelled
+            )
+        })
     }
 
     /// Whether the approval modal should be shown: there is at least one pending
@@ -395,6 +588,18 @@ impl AppState {
     #[must_use]
     pub fn focused_memory(&self) -> Option<&MemoryCard> {
         self.memories.get(self.selected_memory)
+    }
+
+    /// The focused Docs Studio card, if any.
+    #[must_use]
+    pub fn focused_doc(&self) -> Option<&DocCard> {
+        self.docs.get(self.selected_doc)
+    }
+
+    /// The focused code-graph edge card, if any.
+    #[must_use]
+    pub fn focused_edge(&self) -> Option<&GraphEdgeCard> {
+        self.edges.get(self.selected_edge)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.
