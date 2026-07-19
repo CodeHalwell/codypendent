@@ -172,7 +172,7 @@ client-surface wiring is the remaining slice.
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
 - [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached with `D` (docs) / `G` (edges); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
-- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Remaining:* a `CommandBody::AcquireDocumentLease` so a client can take a lease before editing (today `require` is a correctly-placed pass-through until a lease is held), and the client-side CRDT replica that consumes the sync stream
+- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Lease-acquire (now wired):* `CommandBody::AcquireDocumentLease`/`ReleaseDocumentLease` are intercepted at the connection level like `MutateDocument` and applied through a daemon `DocumentLeaser` seam (bundled onto the `RunExecutor`, implemented in the assembly over the same `DocumentLeaseStore`), so a client takes a real block-range lease before editing and is recognised as that writer when its mutation runs `require`; the reply is a `Payload::DocumentLeaseGranted` carrying the minted lease id + expiry, an Observer is role-denied, and a conflicting holder is `document.range-leased`. *Remaining:* the client-side CRDT replica that consumes the sync stream
 - [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
@@ -190,10 +190,17 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         skill⇒agent, resolvable `depends_on`, acyclic graph via topological sort,
         budget sanity, and the ADR-008 multi-agent `orchestration_reason` rule)
         and lowers it into a topologically ordered node graph. The canonical
-        `repair-github-check` manifest compiles (regression test). *Remaining for
-        5.1:* registry cross-checks (unknown tool/skill/agent = error), lowering
-        onto framework graphs, and replacing the hard-coded `/fix-ci` flow with
-        this definition. Agent-profile (`agent.toml`) parsing has landed —
+        `repair-github-check` manifest compiles (regression test).
+        **Registry cross-checks have landed:** a `WorkflowRegistry` lookup seam
+        plus `compile_with_registry` / `CompiledWorkflow::validate_references`
+        reject a step naming an unknown tool, an agent role with no profile, or a
+        skill the registry does not know (structural validation runs first, so a
+        malformed graph fails with its structural error before any name is looked
+        up). The workflow crate stays daemon-free — the trait is the seam the
+        daemon fills from the live registry + loaded agent profiles; `SetRegistry`
+        is the in-memory implementation the tests use. *Remaining for 5.1:*
+        lowering onto framework graphs, and replacing the hard-coded `/fix-ci`
+        flow with this definition. Agent-profile (`agent.toml`) parsing has landed —
         `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
         permissions/budget/completion (the canonical profile parses in a test).
   - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
@@ -296,11 +303,12 @@ From the broader Codex comparison, sequencing notes that touch several phases:
       end-to-end slice (open → concurrent-edit → review suggestions → inspect graph
       evidence → publish through approval → reconnect) demonstrates the thesis
       better than breadth. The mutation engine, `DocumentSync` payload, edit-lease
-      store, **and the daemon transport** now exist (`MutateDocument` applies
-      through the assembly `DocumentMutator` seam and fans out to `Document`
-      subscribers). What still closes the loop: a lease-acquire command, a
-      client-side CRDT replica that consumes the sync stream, and publishing a
-      `PublishPlan` through the approval-gated write path.
+      store, **the daemon transport, and lease acquire/release** now exist
+      (`MutateDocument` applies through the assembly `DocumentMutator` seam and
+      fans out to `Document` subscribers; `AcquireDocumentLease`/`ReleaseDocumentLease`
+      take a real block-range lease through the `DocumentLeaser` seam). What still
+      closes the loop: a client-side CRDT replica that consumes the sync stream,
+      and publishing a `PublishPlan` through the approval-gated write path.
 - [ ] **Trust boundary as plumbing, not new design.** Retrieved memories, skill
       descriptions, and CI/PR text must render as *evidence*, not instructions —
       the fabric already carries `EvidenceRef` / `TrustTier` / `DataClassification`
