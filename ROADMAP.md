@@ -208,9 +208,14 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         start+end times — the node-level provenance the graph view needs), and
         checkpoints. `resume` reports the first incomplete node and **refuses a
         changed graph signature** (`CompiledWorkflow::signature()` hashes the
-        graph shape). *Remaining for 5.2:* daemon startup recovery wiring,
-        node-lifecycle ledger events, pause/resume/retry-from-node commands, and
-        the TUI workflow-graph view.
+        graph shape). `retry_from_node` re-drives a chosen node and everything
+        transitively downstream of it — resetting them to a clean `Pending`
+        (attempt / timings / cost / agent-run id cleared) and the run to
+        `Running`, under the same signature guard — so a `resume` then picks up
+        from that node (the durable-store half of retry-from-node). *Remaining
+        for 5.2:* daemon startup recovery wiring, node-lifecycle ledger events,
+        the pause/resume/retry-from-node **commands** that drive these store ops,
+        and the TUI workflow-graph view.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code

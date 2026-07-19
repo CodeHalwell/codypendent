@@ -7,10 +7,14 @@
 //! graph view surfaces). [`WorkflowStore::resume`] rebuilds after a restart:
 //! it **refuses a changed graph signature** and otherwise reports the first
 //! incomplete node so execution continues exactly once from where it stopped.
+//! [`WorkflowStore::retry_from_node`] re-drives a chosen node and everything
+//! downstream of it, resetting them to `Pending` so a resume picks up from there.
 //!
 //! The store is daemon-agnostic — it operates on a SQLite pool (see
 //! [`crate::db`]) — so its recovery and idempotency semantics are testable
 //! without the daemon; the daemon wires it into workflow startup recovery.
+
+use std::collections::{BTreeSet, VecDeque};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -436,5 +440,84 @@ impl WorkflowStore {
             next_node,
             latest_checkpoint,
         })
+    }
+
+    /// Re-drive a run from `node_id`: reset that node and **every node transitively
+    /// downstream of it** to a fresh `Pending` state, and set the run `Running`
+    /// (STEP 5.2 retry-from-node). The downstream nodes are reset too because their
+    /// inputs came from the node being retried — leaving them `Completed` would
+    /// resume past stale work. Each reset clears the node's attempt, timings, cost,
+    /// and agent-run id so the next execution starts it clean; the returned ids are
+    /// the reset set, sorted.
+    ///
+    /// **Refuses a changed graph signature** (like [`resume`](WorkflowStore::resume)):
+    /// retrying a node only makes sense against the graph the run started on. A
+    /// `node_id` absent from that graph is [`WorkflowStoreError::NotFound`]. This
+    /// composes with [`resume`](WorkflowStore::resume) — after a retry-from-node the
+    /// first incomplete node is the one retried.
+    pub async fn retry_from_node(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+        compiled: &CompiledWorkflow,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let snapshot = self
+            .snapshot(pool, workflow_run_id)
+            .await?
+            .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+        let current = compiled.signature();
+        if snapshot.run.graph_signature != current {
+            return Err(WorkflowStoreError::GraphSignatureChanged {
+                expected: snapshot.run.graph_signature.clone(),
+                found: current,
+            });
+        }
+        if compiled.node(node_id).is_none() {
+            return Err(WorkflowStoreError::NotFound(format!(
+                "{workflow_run_id}/{node_id}"
+            )));
+        }
+
+        // The node plus its transitive dependents, walked over the compiled graph's
+        // dependent edges. A `BTreeSet` dedups (so the DAG walk terminates) and
+        // sorts the result for a stable return.
+        let mut to_reset: BTreeSet<String> = BTreeSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(node_id.to_owned());
+        while let Some(current) = queue.pop_front() {
+            if !to_reset.insert(current.clone()) {
+                continue;
+            }
+            if let Some(node) = compiled.node(&current) {
+                for dependent in &node.dependents {
+                    if !to_reset.contains(dependent) {
+                        queue.push_back(dependent.clone());
+                    }
+                }
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        for id in &to_reset {
+            sqlx::query(
+                "UPDATE workflow_nodes SET state = 'pending', attempt = 0, agent_run_id = NULL, \
+                 cost_json = NULL, started_at = NULL, ended_at = NULL \
+                 WHERE workflow_run_id = ? AND node_id = ?",
+            )
+            .bind(workflow_run_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE workflow_runs SET state = 'running', updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(workflow_run_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(to_reset.into_iter().collect())
     }
 }
