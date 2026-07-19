@@ -226,8 +226,11 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         without evidence**; a corrected item **supersedes** rather than deletes
         (the chain is stamped in one transaction); boards are **isolated per
         run**. Payload/author/evidence ride as opaque JSON so the crate stays
-        daemon-decoupled. *Remaining for 5.3:* daemon read/write commands +
-        subscription delivery, and the TUI blackboard surface.
+        daemon-decoupled. The read surface a projection needs is in place:
+        `query` (live or full board, kind-filtered), `get` (one item by id,
+        run-scoped), and `history` (an artifact's full supersession lineage,
+        oldest first). *Remaining for 5.3:* daemon read/write **commands** +
+        subscription delivery over that surface, and the TUI blackboard view.
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes

@@ -11,7 +11,11 @@
 //! Payload, author, and evidence ride as opaque JSON so this crate stays
 //! decoupled from the protocol/knowledge domain types (the daemon supplies typed
 //! values); what this store owns is the *discipline*: evidence-required kinds,
-//! per-run isolation, and supersession chains.
+//! per-run isolation, and supersession chains. Reads are
+//! [`query`](BlackboardStore::query) (the live or full board, filtered by kind),
+//! [`get`](BlackboardStore::get) (one item by id), and
+//! [`history`](BlackboardStore::history) (an artifact's full revision lineage,
+//! oldest first) — the surface the daemon's read command projects.
 
 use chrono::Utc;
 use serde_json::Value;
@@ -122,6 +126,11 @@ pub struct BlackboardItem {
     pub superseded_by: Option<String>,
 }
 
+/// Every column [`row_to_item`] decodes, in a fixed order shared by the SELECT
+/// statements.
+const ITEM_COLUMNS: &str =
+    "id, kind, payload_json, author_json, confidence, evidence_json, revision, superseded_by";
+
 /// The `blackboard_items` store, scoped to a workflow run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlackboardStore;
@@ -230,10 +239,8 @@ impl BlackboardStore {
         kind: Option<BlackboardKind>,
         include_superseded: bool,
     ) -> Result<Vec<BlackboardItem>, BlackboardError> {
-        let mut sql = String::from(
-            "SELECT id, kind, payload_json, author_json, confidence, evidence_json, revision, \
-             superseded_by FROM blackboard_items WHERE workflow_run_id = ?",
-        );
+        let mut sql =
+            format!("SELECT {ITEM_COLUMNS} FROM blackboard_items WHERE workflow_run_id = ?");
         if !include_superseded {
             sql.push_str(" AND superseded_by IS NULL");
         }
@@ -248,6 +255,77 @@ impl BlackboardStore {
         }
         let rows = q.fetch_all(pool).await?;
         rows.into_iter().map(row_to_item).collect()
+    }
+
+    /// Fetch one artifact by id within a run, or `None` if the run holds no such
+    /// item. (A run scope is required so an id from another run's board is never
+    /// returned.)
+    pub async fn get(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        id: &str,
+    ) -> Result<Option<BlackboardItem>, BlackboardError> {
+        let row = sqlx::query(&format!(
+            "SELECT {ITEM_COLUMNS} FROM blackboard_items WHERE id = ? AND workflow_run_id = ?"
+        ))
+        .bind(id)
+        .bind(workflow_run_id)
+        .fetch_optional(pool)
+        .await?;
+        row.map(row_to_item).transpose()
+    }
+
+    /// The full supersession chain the artifact `id` belongs to, oldest revision
+    /// first. A correction *supersedes* rather than deletes, so the lineage is
+    /// preserved; this walks it in both directions from `id` — back to the original
+    /// and forward to the current live item — and returns every revision in order.
+    /// The last element is the live item (its `superseded_by` is `None`) unless the
+    /// chain is mid-write. An `id` absent from the run yields an empty vector (the
+    /// chain always contains at least its anchor, so empty ⇒ not found).
+    pub async fn history(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        id: &str,
+    ) -> Result<Vec<BlackboardItem>, BlackboardError> {
+        let Some(anchor) = self.get(pool, workflow_run_id, id).await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut chain = vec![anchor.clone()];
+
+        // Walk backward: each step finds the single predecessor whose
+        // `superseded_by` points at the current item (supersede stamps exactly one
+        // old row, so the chain is linear and this terminates at the original).
+        let mut cursor = anchor.id.clone();
+        while let Some(row) = sqlx::query(&format!(
+            "SELECT {ITEM_COLUMNS} FROM blackboard_items \
+             WHERE workflow_run_id = ? AND superseded_by = ?"
+        ))
+        .bind(workflow_run_id)
+        .bind(&cursor)
+        .fetch_optional(pool)
+        .await?
+        {
+            let item = row_to_item(row)?;
+            cursor = item.id.clone();
+            chain.push(item);
+        }
+
+        // Walk forward: follow `superseded_by` to the live head.
+        let mut next = anchor.superseded_by.clone();
+        while let Some(next_id) = next {
+            let Some(item) = self.get(pool, workflow_run_id, &next_id).await? else {
+                break;
+            };
+            next = item.superseded_by.clone();
+            chain.push(item);
+        }
+
+        // Revisions are monotonic within a chain, so this yields oldest → newest.
+        chain.sort_by_key(|item| item.revision);
+        Ok(chain)
     }
 }
 
