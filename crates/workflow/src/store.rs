@@ -442,6 +442,34 @@ impl WorkflowStore {
         Ok(Some(WorkflowRunSnapshot { run, nodes }))
     }
 
+    /// The set of nodes ready to run **now**: every `Pending` node all of whose
+    /// dependencies are `Completed`, in topological order (STEP 5.2). Unlike
+    /// [`resume`](WorkflowStore::resume)'s single first-incomplete node, this is the
+    /// parallel scheduler's *frontier* — the full set an executor may launch
+    /// concurrently (into isolated worktrees, Phase 5's parallel-worktrees exit
+    /// criterion). **Refuses a changed graph signature.** A node with a failed,
+    /// skipped, or still-running dependency is not ready; it stays blocked until its
+    /// inputs complete.
+    pub async fn ready_nodes(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        compiled: &CompiledWorkflow,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let snapshot = self
+            .snapshot(pool, workflow_run_id)
+            .await?
+            .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+        let current = compiled.signature();
+        if snapshot.run.graph_signature != current {
+            return Err(WorkflowStoreError::GraphSignatureChanged {
+                expected: snapshot.run.graph_signature.clone(),
+                found: current,
+            });
+        }
+        Ok(ready_node_ids(compiled, &snapshot))
+    }
+
     /// Prepare to resume a run against a freshly compiled workflow. **Refuses a
     /// changed graph signature** (STEP 5.2); otherwise returns the snapshot, the
     /// first incomplete node to continue from, and the latest checkpoint.
@@ -553,4 +581,32 @@ impl WorkflowStore {
 
         Ok(to_reset.into_iter().collect())
     }
+}
+
+/// The pure scheduling core of [`WorkflowStore::ready_nodes`]: the ids of the
+/// nodes ready to run in `snapshot`, in the compiled graph's topological order. A
+/// node is ready when its own state is `Pending` and every dependency is
+/// `Completed`. Kept a free function (no pool) so the frontier logic is testable
+/// on its own and reusable by an in-memory executor.
+#[must_use]
+pub fn ready_node_ids(compiled: &CompiledWorkflow, snapshot: &WorkflowRunSnapshot) -> Vec<String> {
+    use std::collections::HashMap;
+    let states: HashMap<&str, NodeState> = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node.state))
+        .collect();
+    // `compiled.nodes` are already topologically ordered, so filtering in place
+    // yields a topologically ordered frontier.
+    compiled
+        .nodes
+        .iter()
+        .filter(|node| states.get(node.id.as_str()) == Some(&NodeState::Pending))
+        .filter(|node| {
+            node.depends_on
+                .iter()
+                .all(|dep| states.get(dep.as_str()) == Some(&NodeState::Completed))
+        })
+        .map(|node| node.id.clone())
+        .collect()
 }

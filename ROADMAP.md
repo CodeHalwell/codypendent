@@ -220,8 +220,13 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         from that node (the durable-store half of retry-from-node).
         `list_incomplete_runs` enumerates the non-terminal runs
         (pending/running/paused) a daemon must reconcile on startup, so recovery
-        is a recompile-and-`resume` per run. *Remaining for 5.2:* the daemon
-        startup-recovery **wiring** over that list, node-lifecycle ledger events,
+        is a recompile-and-`resume` per run. `ready_nodes` (pure core
+        `ready_node_ids`) returns the parallel scheduler's frontier — every
+        `Pending` node whose dependencies are all `Completed` — the full set an
+        executor may launch concurrently into isolated worktrees (Phase 5's
+        parallel-worktrees criterion), where `resume` gives only the single next
+        node. *Remaining for 5.2:* the daemon startup-recovery **wiring** over
+        that list, node-lifecycle ledger events,
         the pause/resume/retry-from-node **commands** that drive these store ops,
         and the TUI workflow-graph view.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's

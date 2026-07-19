@@ -258,6 +258,140 @@ async fn retry_from_node_refuses_a_changed_graph_or_unknown_node() {
     assert!(matches!(err, WorkflowStoreError::NotFound(_)));
 }
 
+/// A diamond: `a` fans out to `b` and `c`, which both feed `d`.
+const DIAMOND: &str = "\
+schema_version: 1
+id: diamond
+version: 1
+budget:
+  maximum_cost_usd: 5.0
+steps:
+  - id: a
+    tool: repository.test
+  - id: b
+    depends_on: [a]
+    tool: repository.test
+  - id: c
+    depends_on: [a]
+    tool: repository.test
+  - id: d
+    depends_on: [b, c]
+    tool: repository.test
+";
+
+#[tokio::test]
+async fn ready_nodes_is_the_parallel_frontier() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(DIAMOND).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}))
+        .await
+        .unwrap();
+
+    let complete = |node: &'static str| {
+        let store = &store;
+        let pool = &pool;
+        let id = &id;
+        async move {
+            store
+                .transition_node(pool, id, node, NodeState::Completed, 1, None, None)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Fresh: only the source `a` is ready.
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["a"]
+    );
+
+    // After `a`, both `b` and `c` are ready at once — the parallel frontier `resume`
+    // (which returns a single node) cannot express.
+    complete("a").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["b", "c"]
+    );
+
+    // Completing only `b` leaves `c` ready; `d` still waits on `c`.
+    complete("b").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["c"]
+    );
+
+    // Once both `b` and `c` are done, `d` becomes ready.
+    complete("c").await;
+    assert_eq!(
+        store.ready_nodes(&pool, &id, &compiled).await.unwrap(),
+        vec!["d"]
+    );
+
+    // With everything terminal, the frontier is empty.
+    complete("d").await;
+    assert!(store
+        .ready_nodes(&pool, &id, &compiled)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_dependency_blocks_the_dependent() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(DIAMOND).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}))
+        .await
+        .unwrap();
+
+    // `a` completes; `b` fails; `c` completes. `d` depends on both `b` and `c`, so
+    // a failed `b` keeps `d` off the frontier — it is not ready and never blocks a
+    // sibling.
+    store
+        .transition_node(&pool, &id, "a", NodeState::Completed, 1, None, None)
+        .await
+        .unwrap();
+    store
+        .transition_node(&pool, &id, "b", NodeState::Failed, 1, None, None)
+        .await
+        .unwrap();
+    store
+        .transition_node(&pool, &id, "c", NodeState::Completed, 1, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .ready_nodes(&pool, &id, &compiled)
+            .await
+            .unwrap()
+            .is_empty(),
+        "d must stay blocked while its dependency b is failed"
+    );
+}
+
+#[tokio::test]
+async fn ready_nodes_refuses_a_changed_graph_signature() {
+    let (_tmp, pool) = temp_pool().await;
+    let original = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &original, None, &json!({}))
+        .await
+        .unwrap();
+
+    let changed = compile_yaml(DIAMOND).unwrap();
+    let err = store.ready_nodes(&pool, &id, &changed).await.unwrap_err();
+    assert!(matches!(
+        err,
+        WorkflowStoreError::GraphSignatureChanged { .. }
+    ));
+}
+
 #[tokio::test]
 async fn list_incomplete_runs_returns_only_non_terminal_runs() {
     let (_tmp, pool) = temp_pool().await;
