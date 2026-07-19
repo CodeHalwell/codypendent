@@ -31,6 +31,10 @@ pub enum BlackboardError {
     /// The item to supersede does not exist in this workflow run.
     #[error("no such blackboard item: {0}")]
     NotFound(String),
+    /// The item to supersede has already been superseded — a concurrent supersede
+    /// won the race, so this one is refused rather than forking the chain.
+    #[error("blackboard item {0} has already been superseded")]
+    AlreadySuperseded(String),
 }
 
 /// The typed artifacts the blackboard holds (Chapter 04).
@@ -166,25 +170,43 @@ impl BlackboardStore {
         if new.kind.requires_evidence() && new.evidence.is_empty() {
             return Err(BlackboardError::EvidenceRequired(new.kind.as_str()));
         }
-        let old_revision: Option<i64> = sqlx::query_scalar(
-            "SELECT revision FROM blackboard_items WHERE id = ? AND workflow_run_id = ?",
+        // Read the old item's revision + supersession state, insert the
+        // replacement, and stamp the old row — all in ONE immediate (write-locked)
+        // transaction. A second concurrent supersede of the same item blocks at
+        // `begin`, then reads `superseded_by` already set and is refused, so the
+        // chain can never fork into two live replacements at the same revision.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let old: Option<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT revision, superseded_by FROM blackboard_items \
+             WHERE id = ? AND workflow_run_id = ?",
         )
         .bind(old_id)
         .bind(workflow_run_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        let old_revision =
-            old_revision.ok_or_else(|| BlackboardError::NotFound(old_id.to_owned()))?;
+        let (old_revision, superseded_by) =
+            old.ok_or_else(|| BlackboardError::NotFound(old_id.to_owned()))?;
+        if superseded_by.is_some() {
+            return Err(BlackboardError::AlreadySuperseded(old_id.to_owned()));
+        }
 
         let new_id = Uuid::now_v7().to_string();
         let revision = old_revision as u32 + 1;
-        let mut tx = pool.begin().await?;
         insert_item_tx(&mut *tx, workflow_run_id, &new_id, &new, revision).await?;
-        sqlx::query("UPDATE blackboard_items SET superseded_by = ? WHERE id = ?")
-            .bind(&new_id)
-            .bind(old_id)
-            .execute(&mut *tx)
-            .await?;
+        // Stamp only while still un-superseded; a 0-row result means another
+        // supersede slipped in, so abort rather than orphan our replacement.
+        let affected = sqlx::query(
+            "UPDATE blackboard_items SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL",
+        )
+        .bind(&new_id)
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            tx.rollback().await?;
+            return Err(BlackboardError::AlreadySuperseded(old_id.to_owned()));
+        }
         tx.commit().await?;
 
         Ok(BlackboardItem {

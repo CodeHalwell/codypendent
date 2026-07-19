@@ -323,12 +323,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     // that would double-deliver every live event.
     let mut forwarders: std::collections::HashMap<SessionId, JoinHandle<()>> =
         std::collections::HashMap::new();
-    // Keyed by document: a re-subscribe to the same document replaces its
-    // forwarder, so a client that re-attaches never gets a document's syncs twice.
-    let mut doc_forwarders: std::collections::HashMap<
-        codypendent_protocol::DocumentId,
-        JoinHandle<()>,
-    > = std::collections::HashMap::new();
+    // Document forwarders grouped by the session attach that spawned them, so a
+    // re-attach to a session replaces that session's whole document set: attaching
+    // with a reduced `Document` list aborts the forwarders for the documents it no
+    // longer names (mirrors the per-session replacement of `forwarders` above),
+    // while another session's document forwarders are left untouched.
+    let mut doc_forwarders: std::collections::HashMap<SessionId, Vec<JoinHandle<()>>> =
+        std::collections::HashMap::new();
 
     // The read loop stamps this on every frame; the heartbeat task reads it to
     // decide when the client has gone silent. Locked only for the instant swap,
@@ -385,8 +386,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     for forwarder in forwarders.values() {
         forwarder.abort();
     }
-    for forwarder in doc_forwarders.values() {
-        forwarder.abort();
+    for handles in doc_forwarders.values() {
+        for handle in handles {
+            handle.abort();
+        }
     }
     // Announce this client's departure from every session it was attached to, so
     // the remaining clients see it leave (STEP 3.7).
@@ -440,10 +443,7 @@ async fn handle_request(
     writer: &SharedWriter,
     conn: &mut ConnState,
     forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
-    doc_forwarders: &mut std::collections::HashMap<
-        codypendent_protocol::DocumentId,
-        JoinHandle<()>,
-    >,
+    doc_forwarders: &mut std::collections::HashMap<SessionId, Vec<JoinHandle<()>>>,
     request: Envelope,
 ) -> anyhow::Result<bool> {
     // Major-version incompatibility is refused structurally; the connection
@@ -617,15 +617,35 @@ async fn handle_request(
                     document_id,
                     mutation,
                 } => {
-                    // Read-only clients may not edit documents. (The seam also
-                    // enforces the document's collaboration mode and edit leases;
-                    // this is the coarse role gate the daemon owns.)
-                    if conn.role == ClientRole::Observer {
+                    // Role gate (the seam additionally enforces the document's
+                    // collaboration mode and edit leases; this is the coarse role
+                    // gate the daemon owns). An Observer may not mutate at all.
+                    // Accepting/rejecting a suggestion *resolves* proposed content
+                    // — it can apply an edit — so it mirrors `ResolveApproval`'s
+                    // split in `commands.rs`: only an Approver or Controller may
+                    // resolve. A Contributor may still propose (`Annotate`) and,
+                    // where the mode allows, edit directly.
+                    let resolves_suggestion = matches!(
+                        mutation,
+                        codypendent_protocol::DocumentMutation::AcceptSuggestion { .. }
+                            | codypendent_protocol::DocumentMutation::RejectSuggestion { .. }
+                    );
+                    let permitted = if resolves_suggestion {
+                        matches!(conn.role, ClientRole::Approver | ClientRole::Controller)
+                    } else {
+                        conn.role != ClientRole::Observer
+                    };
+                    if !permitted {
+                        let message = if resolves_suggestion {
+                            "only an Approver or Controller may resolve a document suggestion"
+                        } else {
+                            "an Observer may not mutate documents"
+                        };
                         let reply = Envelope::reply_to(
                             &request,
                             Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
                                 "protocol.role-denied",
-                                "an Observer may not mutate documents".to_string(),
+                                message.to_string(),
                                 false,
                             )),
                         );
@@ -669,9 +689,7 @@ async fn handle_request(
                                 },
                             )
                         }
-                        Err(error) => {
-                            Envelope::reply_to(&request, Payload::CommandRejected(error))
-                        }
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;
                 }
@@ -801,10 +819,7 @@ async fn handle_attach(
     writer: &SharedWriter,
     conn: &ConnState,
     forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
-    doc_forwarders: &mut std::collections::HashMap<
-        codypendent_protocol::DocumentId,
-        JoinHandle<()>,
-    >,
+    doc_forwarders: &mut std::collections::HashMap<SessionId, Vec<JoinHandle<()>>>,
     request: &Envelope,
     session_id: SessionId,
     last_seen: u64,
@@ -854,21 +869,35 @@ async fn handle_attach(
 
     let client_id = conn.client_id_or(request.client_id);
 
-    // Spawn a per-document forwarder for each `Document` subscription in this
-    // attach. Document syncs ride a separate, document-keyed fan-out (not the
-    // session hub), so they get their own forwarders — delivered as
-    // `Payload::DocumentSync`. A subscriber's baseline comes from the document
-    // read path; this stream carries the post-subscribe updates it merges. Done
-    // before the session forwarder below consumes `writer`/`subscriptions`.
-    for subscription in &subscriptions {
-        if let Subscription::Document { document_id } = subscription {
-            let receiver = state.documents.subscribe(*document_id);
-            let handle =
-                tokio::spawn(forward_document_syncs(Arc::clone(writer), receiver, client_id));
-            if let Some(previous) = doc_forwarders.insert(*document_id, handle) {
-                previous.abort();
-            }
+    // Reconcile this session's document forwarders. Abort the ones its *previous*
+    // attach spawned first, so a re-attach with a reduced (or empty) `Document`
+    // set stops delivering syncs for the documents it no longer names — then spawn
+    // the new set. Document syncs ride a separate, document-keyed fan-out (not the
+    // session hub) and are delivered as `Payload::DocumentSync`; a subscriber's
+    // baseline comes from the document read path, this stream carries the
+    // post-subscribe updates it merges. Done before the session forwarder below
+    // consumes `writer`/`subscriptions`.
+    if let Some(previous) = doc_forwarders.remove(&session_id) {
+        for handle in previous {
+            handle.abort();
         }
+    }
+    let new_doc_forwarders: Vec<JoinHandle<()>> = subscriptions
+        .iter()
+        .filter_map(|subscription| match subscription {
+            Subscription::Document { document_id } => {
+                let receiver = state.documents.subscribe(*document_id);
+                Some(tokio::spawn(forward_document_syncs(
+                    Arc::clone(writer),
+                    receiver,
+                    client_id,
+                )))
+            }
+            _ => None,
+        })
+        .collect();
+    if !new_doc_forwarders.is_empty() {
+        doc_forwarders.insert(session_id, new_doc_forwarders);
     }
 
     let writer = Arc::clone(writer);

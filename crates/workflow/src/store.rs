@@ -254,9 +254,10 @@ impl WorkflowStore {
     }
 
     /// Transition a node to `state` with the given `attempt`, stamping
-    /// `started_at` the first time it runs and `ended_at` once it reaches a
-    /// terminal state. `agent_run_id` and `cost` are recorded when provided (and
-    /// otherwise left as they were).
+    /// `started_at` the first time it runs and setting `ended_at` to the terminal
+    /// time — or **clearing it** when the node is not terminal, so a node retried
+    /// back to `Running` never carries a stale end timestamp. `agent_run_id` and
+    /// `cost` are recorded when provided (and otherwise left as they were).
     #[allow(clippy::too_many_arguments)]
     pub async fn transition_node(
         &self,
@@ -281,7 +282,7 @@ impl WorkflowStore {
              agent_run_id = COALESCE(?, agent_run_id), \
              cost_json = COALESCE(?, cost_json), \
              started_at = COALESCE(started_at, ?), \
-             ended_at = COALESCE(?, ended_at) \
+             ended_at = ? \
              WHERE workflow_run_id = ? AND node_id = ?",
         )
         .bind(state.as_str())

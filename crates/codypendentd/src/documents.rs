@@ -25,8 +25,8 @@ use codypendent_daemon::documents::{
     DocumentMutationFuture, DocumentMutationRequest, DocumentMutator,
 };
 use codypendent_knowledge::{
-    apply_mutation, ApplyError, CollaborationMode, DocStoreError, DocumentAuthor, DocumentLeaseStore,
-    DocumentStore, LeaseError,
+    apply_mutation, ApplyError, CollaborationMode, DocStoreError, DocumentAuthor,
+    DocumentLeaseStore, DocumentStore, LeaseError,
 };
 use codypendent_protocol::document::DocumentMutation;
 use codypendent_protocol::{CodypendentError, DocumentId, UserId};
@@ -81,7 +81,12 @@ impl DocumentMutator for KnowledgeDocumentMutator {
 
             // Enforce single-writer over the target range before applying.
             leases
-                .require(&pool, document_id, mutation_block_target(&mutation), &author)
+                .require(
+                    &pool,
+                    document_id,
+                    mutation_block_target(&mutation),
+                    &author,
+                )
                 .await
                 .map_err(map_lease_error)?;
 
@@ -171,16 +176,12 @@ fn map_store_error(error: DocStoreError) -> CodypendentError {
             format!("{error}; reload and retry"),
             true,
         ),
-        DocStoreError::SuggestionNotPending(_) => CodypendentError::new(
-            "document.suggestion-not-pending",
-            error.to_string(),
-            false,
-        ),
-        DocStoreError::SuggestionRangeDrifted(_) => CodypendentError::new(
-            "document.suggestion-drifted",
-            error.to_string(),
-            false,
-        ),
+        DocStoreError::SuggestionNotPending(_) => {
+            CodypendentError::new("document.suggestion-not-pending", error.to_string(), false)
+        }
+        DocStoreError::SuggestionRangeDrifted(_) => {
+            CodypendentError::new("document.suggestion-drifted", error.to_string(), false)
+        }
         // Database / serde / CRDT / corrupt-row: transient or internal — retryable.
         other => CodypendentError::new("document.apply-failed", other.to_string(), true),
     }

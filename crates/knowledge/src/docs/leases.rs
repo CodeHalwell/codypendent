@@ -98,11 +98,10 @@ impl DocumentLeaseStore {
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT id FROM document_leases \
              WHERE document_id = ? AND state = 'active' AND holder_key = ? \
-               AND ((block_id IS NULL AND ? IS NULL) OR block_id = ?) LIMIT 1",
+               AND block_id IS ? LIMIT 1",
         )
         .bind(document_id.to_string())
         .bind(&key)
-        .bind(block_id)
         .bind(block_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -195,12 +194,11 @@ impl DocumentLeaseStore {
         let holder: Option<String> = sqlx::query_scalar(
             "SELECT holder_json FROM document_leases \
              WHERE document_id = ? AND state = 'active' AND expires_at > ? \
-               AND ((block_id IS NULL AND ? IS NULL) OR block_id = ?) \
+               AND block_id IS ? \
              ORDER BY acquired_at DESC LIMIT 1",
         )
         .bind(document_id.to_string())
         .bind(Utc::now().to_rfc3339())
-        .bind(block_id)
         .bind(block_id)
         .fetch_optional(pool)
         .await?;

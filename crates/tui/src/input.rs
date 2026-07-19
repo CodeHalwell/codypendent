@@ -78,6 +78,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "?",
+        description: "show / hide this help overlay",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "↑ / ↓",
         description: "move selection in a browser or the palette",
         mouse: Some("wheel"),

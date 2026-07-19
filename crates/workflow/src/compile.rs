@@ -120,12 +120,17 @@ impl CompiledWorkflow {
             .count()
     }
 
-    /// A stable hash of the graph's *shape*: the workflow id + version, then each
-    /// node's id, action kind, and sorted dependencies, in topological order. Two
-    /// definitions with the same shape produce the same signature regardless of
-    /// incidental field ordering; any structural change (a node, an edge, an
-    /// action-kind flip) changes it. A durable run stores this so resume can
-    /// refuse a graph that has changed under it (STEP 5.2).
+    /// A stable hash of the graph's *shape and execution semantics*: the workflow
+    /// id + version, then each node's id, its **full action** (a tool's name; an
+    /// agent's role, model policy, and skill — not just the kind), its
+    /// execution-affecting settings (workspace mode, approval policy, retry
+    /// policy), and its sorted dependencies, in topological order. Two definitions
+    /// that run identically produce the same signature regardless of incidental
+    /// field ordering; any change that alters *what executes* — a node, an edge, a
+    /// node's tool or agent role, its workspace/approval/retry — changes it. A
+    /// durable run stores this so resume can refuse a graph that has changed under
+    /// it (STEP 5.2); hashing the action config (not just its kind) is what stops a
+    /// swapped tool or agent role from silently passing the resume guard.
     #[must_use]
     pub fn signature(&self) -> String {
         use sha2::{Digest, Sha256};
@@ -136,11 +141,32 @@ impl CompiledWorkflow {
         for node in &self.nodes {
             hasher.update(b"\xff");
             hasher.update(node.id.as_bytes());
-            let kind: &[u8] = match &node.action {
-                NodeAction::Agent { .. } => b"agent",
-                NodeAction::Tool { .. } => b"tool",
-            };
-            hasher.update(kind);
+            // The action, including the fields that determine what runs.
+            match &node.action {
+                NodeAction::Tool { name } => {
+                    hasher.update(b"\x02tool\x00");
+                    hasher.update(name.as_bytes());
+                }
+                NodeAction::Agent {
+                    role,
+                    model_policy,
+                    skill,
+                } => {
+                    hasher.update(b"\x02agent\x00");
+                    hash_field(&mut hasher, role.as_bytes());
+                    hash_opt(&mut hasher, model_policy.as_deref());
+                    hash_opt(&mut hasher, skill.as_deref());
+                }
+            }
+            // Execution-affecting node settings (serde-serialized for a stable,
+            // exhaustive encoding — a new field is included automatically).
+            hasher.update(b"\x03");
+            hasher.update(serde_json::to_vec(&node.workspace_mode).unwrap_or_default());
+            hasher.update(b"\x04");
+            hasher.update(serde_json::to_vec(&node.approval).unwrap_or_default());
+            hasher.update(b"\x05");
+            hasher.update(serde_json::to_vec(&node.retry).unwrap_or_default());
+            // Dependencies (order-independent).
             let mut deps = node.depends_on.clone();
             deps.sort();
             for dep in deps {
@@ -149,6 +175,25 @@ impl CompiledWorkflow {
             }
         }
         hex::encode(hasher.finalize())
+    }
+}
+
+/// Hash a length-prefixed byte field, so concatenated fields cannot alias (role
+/// `"ab"` + skill `"c"` must never hash like role `"a"` + skill `"bc"`).
+fn hash_field(hasher: &mut impl sha2::Digest, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// Hash an optional field: a presence byte then the length-prefixed value, so
+/// `None` and `Some("")` hash distinctly.
+fn hash_opt(hasher: &mut impl sha2::Digest, value: Option<&str>) {
+    match value {
+        None => hasher.update([0u8]),
+        Some(s) => {
+            hasher.update([1u8]);
+            hash_field(hasher, s.as_bytes());
+        }
     }
 }
 
@@ -625,6 +670,37 @@ mod tests {
         assert_eq!(compiled.node("b").unwrap().depends_on, vec!["a"]);
         let order: Vec<&str> = compiled.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(order, ["a", "b"]);
+    }
+
+    #[test]
+    fn signature_reflects_action_config_not_just_shape() {
+        // Same graph shape (one tool node, no edges), different tool name → the
+        // signature must change, so `resume` cannot accept a swapped tool.
+        let base = compile(&definition(vec![tool_step("a", &[])])).unwrap();
+        let mut swapped_step = tool_step("a", &[]);
+        swapped_step.tool = Some("workspace.apply_patch".to_owned());
+        let swapped = compile(&definition(vec![swapped_step])).unwrap();
+        assert_ne!(base.signature(), swapped.signature());
+
+        // Same graph shape (one agent node), different role → also a new signature.
+        let agent_a = compile(&definition(vec![agent_step("a", &[])])).unwrap();
+        let mut role_b = agent_step("a", &[]);
+        role_b.agent = Some(AgentRef {
+            role: "reviewer".to_owned(),
+            model_policy: None,
+        });
+        let agent_b = compile(&definition(vec![role_b])).unwrap();
+        assert_ne!(agent_a.signature(), agent_b.signature());
+
+        // Changing an execution-affecting setting (approval policy) also flips it.
+        let mut gated = tool_step("a", &[]);
+        gated.approval = Some(ApprovalPolicy::BeforeWrite);
+        let gated = compile(&definition(vec![gated])).unwrap();
+        assert_ne!(base.signature(), gated.signature());
+
+        // But recompiling the identical definition is stable.
+        let base_again = compile(&definition(vec![tool_step("a", &[])])).unwrap();
+        assert_eq!(base.signature(), base_again.signature());
     }
 
     #[test]

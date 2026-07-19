@@ -132,6 +132,48 @@ async fn supersede_replaces_and_keeps_the_chain() {
 }
 
 #[tokio::test]
+async fn superseding_an_already_superseded_item_is_refused() {
+    // Two supersedes of the same item must not both succeed — the loser would
+    // fork the chain into two live replacements. The second is rejected.
+    let (_tmp, pool) = temp_pool().await;
+    let run = seed_run(&pool).await;
+    let board = BlackboardStore::new();
+
+    let v1 = board
+        .post(&pool, &run, finding("v1", vec![json!({ "artifact": "a" })]))
+        .await
+        .unwrap();
+    board
+        .supersede(
+            &pool,
+            &run,
+            &v1.id,
+            finding("v2", vec![json!({ "artifact": "b" })]),
+        )
+        .await
+        .unwrap();
+
+    // A second supersede of v1 (now already superseded) is refused, and the
+    // live view still shows exactly one finding.
+    let err = board
+        .supersede(
+            &pool,
+            &run,
+            &v1.id,
+            finding("v2b", vec![json!({ "artifact": "c" })]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BlackboardError::AlreadySuperseded(_)));
+
+    let live = board
+        .query(&pool, &run, Some(BlackboardKind::Finding), false)
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1, "the chain never forked");
+}
+
+#[tokio::test]
 async fn blackboards_are_isolated_per_workflow_run() {
     let (_tmp, pool) = temp_pool().await;
     let run_a = seed_run(&pool).await;

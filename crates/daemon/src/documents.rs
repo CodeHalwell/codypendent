@@ -28,7 +28,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use codypendent_protocol::{ClientId, CodypendentError, DocumentId, DocumentMutation, DocumentSync};
+use codypendent_protocol::{
+    ClientId, CodypendentError, DocumentId, DocumentMutation, DocumentSync,
+};
 use tokio::sync::broadcast;
 
 /// Per-document channel depth. A document's sync stream is far lower-frequency
@@ -86,8 +88,9 @@ impl DocumentHub {
         self.lock().retain(|_, sender| sender.receiver_count() > 0);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<DocumentId, broadcast::Sender<DocumentSync>>>
-    {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<DocumentId, broadcast::Sender<DocumentSync>>> {
         // Held only for map lookups/inserts, never across an await, so poisoning
         // indicates a bug elsewhere; surface it loudly.
         self.channels.lock().expect("document hub mutex poisoned")

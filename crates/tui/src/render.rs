@@ -628,15 +628,15 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     } else {
         vec![key("/"), word(" cmds  "), key("F2"), word(" layout")]
     };
-    let hint = Line::from(hint);
-
-    // Right-align the hint by padding between it and the ambient fields.
-    let left_line = Line::from(left.clone());
-    let used = left_line.width() + hint.width();
-    let pad = (width as usize).saturating_sub(used + 1);
+    // Right-align the hint by padding between it and the ambient fields. This
+    // renders every frame, so measure widths from the spans directly rather than
+    // cloning `left` and wrapping `hint` in a `Line` just to call `.width()`.
+    let left_width: usize = left.iter().map(|span| span.width()).sum();
+    let hint_width: usize = hint.iter().map(|span| span.width()).sum();
+    let pad = (width as usize).saturating_sub(left_width + hint_width + 1);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(hint.spans);
+    spans.extend(hint);
     spans.push(Span::raw(" "));
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
