@@ -151,6 +151,15 @@ enum WorkflowCommand {
         /// Path to the workflow manifest to validate.
         file: PathBuf,
     },
+    /// Compile a `workflow.yaml` and print its full graph (nodes, actions, edges,
+    /// approvals, outputs) as a human tree, or the JSON projection with `--json`.
+    Show {
+        /// Path to the workflow manifest to show.
+        file: PathBuf,
+        /// Emit the compiled graph as JSON instead of a human tree.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,9 +250,10 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
-        TopCommand::Workflow {
-            command: WorkflowCommand::Validate { file },
-        } => commands::workflow_validate(&file),
+        TopCommand::Workflow { command } => match command {
+            WorkflowCommand::Validate { file } => commands::workflow_validate(&file),
+            WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
+        },
         TopCommand::Acp { repo } => {
             let repo = match repo {
                 Some(repo) => repo,

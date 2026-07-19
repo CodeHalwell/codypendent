@@ -225,10 +225,13 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         `Pending` node whose dependencies are all `Completed` — the full set an
         executor may launch concurrently into isolated worktrees (Phase 5's
         parallel-worktrees criterion), where `resume` gives only the single next
-        node. *Remaining for 5.2:* the daemon startup-recovery **wiring** over
-        that list, node-lifecycle ledger events,
-        the pause/resume/retry-from-node **commands** that drive these store ops,
-        and the TUI workflow-graph view.
+        node. The compiled graph is now a serializable projection
+        (`CompiledWorkflow: Serialize`, tagged node actions), surfaced by
+        `codypendent workflow show <file> [--json]` — the read model a graph view
+        renders. *Remaining for 5.2:* the daemon startup-recovery **wiring** over
+        the incomplete-runs list, node-lifecycle ledger events, the
+        pause/resume/retry-from-node **commands** that drive these store ops, and
+        the TUI workflow-graph view over the projection.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code

@@ -103,7 +103,12 @@ pub enum WorkflowError {
 /// A validated, executable workflow: its metadata plus a topologically ordered
 /// node graph. Producing this is proof the definition passed every check in
 /// [`compile`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// It is [`Serialize`](serde::Serialize) so the graph can be projected as JSON —
+/// the shape a `workflow show --json`, a graph-view client, or a stored plan
+/// consumes. (Deserialize is deliberately *not* derived: a graph is *produced* by
+/// [`compile`] from a validated definition, never trusted from the wire.)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompiledWorkflow {
     /// The workflow id.
     pub id: String,
@@ -260,7 +265,7 @@ fn hash_opt(hasher: &mut impl sha2::Digest, value: Option<&str>) {
 }
 
 /// A validated workflow node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompiledNode {
     /// The node's id.
     pub id: String,
@@ -283,7 +288,8 @@ pub struct CompiledNode {
 }
 
 /// The single action a node performs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeAction {
     /// An agent step, optionally applying a skill.
     Agent {
@@ -862,6 +868,32 @@ mod tests {
             compile_with_registry(&def, &SetRegistry::new()).unwrap_err(),
             CompileError::Cycle(_)
         ));
+    }
+
+    #[test]
+    fn compiled_graph_serializes_to_a_stable_json_projection() {
+        // The graph JSON shape a `workflow show --json` / graph-view client reads:
+        // top-level id/version/nodes, each node carrying a tagged action.
+        let def = definition(vec![
+            agent_step("inspect", &[]),
+            tool_step("verify", &["inspect"]),
+        ]);
+        let compiled = compile(&def).unwrap();
+        let value = serde_json::to_value(&compiled).unwrap();
+
+        assert_eq!(value["id"], "wf");
+        assert_eq!(value["version"], 1);
+        let nodes = value["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        // The agent node's action is tagged `agent` with its role.
+        assert_eq!(nodes[0]["id"], "inspect");
+        assert_eq!(nodes[0]["action"]["kind"], "agent");
+        assert_eq!(nodes[0]["action"]["role"], "worker");
+        // The tool node's action is tagged `tool` with its name, and its edge back
+        // to the agent node is present.
+        assert_eq!(nodes[1]["action"]["kind"], "tool");
+        assert_eq!(nodes[1]["action"]["name"], "repository.test");
+        assert_eq!(nodes[1]["depends_on"][0], "inspect");
     }
 
     #[test]

@@ -449,6 +449,63 @@ pub fn workflow_validate(file: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+/// `codypendent workflow show <FILE> [--json]` (Phase 5 STEP 5.2): compile a
+/// manifest and print its full graph — every node's action, dependencies,
+/// workspace, approval, retry, and declared outputs — as a human tree or, with
+/// `--json`, the serialized [`CompiledWorkflow`] projection a graph-view client
+/// consumes. Structural compilation only, like [`workflow_validate`]; a compile
+/// error is surfaced verbatim and exits non-zero.
+pub fn workflow_show(file: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let yaml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading workflow manifest {}", file.display()))?;
+    let compiled = codypendent_workflow::compile_yaml(&yaml)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&compiled)?);
+    } else {
+        print!("{}", workflow_tree(&compiled));
+    }
+    Ok(())
+}
+
+/// A human, indented rendering of a compiled workflow graph. Pure, so it is tested
+/// directly. Nodes are listed in topological order; each shows its action and the
+/// execution-affecting settings that are set.
+fn workflow_tree(compiled: &codypendent_workflow::CompiledWorkflow) -> String {
+    use codypendent_workflow::NodeAction;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} v{} ({} step(s), {} agent step(s))",
+        compiled.id,
+        compiled.version,
+        compiled.nodes.len(),
+        compiled.agent_node_count()
+    );
+    for node in &compiled.nodes {
+        let action = match &node.action {
+            NodeAction::Agent { role, skill, .. } => match skill {
+                Some(skill) => format!("agent {role} · skill {skill}"),
+                None => format!("agent {role}"),
+            },
+            NodeAction::Tool { name } => format!("tool {name}"),
+        };
+        let _ = writeln!(out, "  - {} [{action}]", node.id);
+        if !node.depends_on.is_empty() {
+            let _ = writeln!(out, "      depends_on: {}", node.depends_on.join(", "));
+        }
+        if let Some(approval) = &node.approval {
+            let _ = writeln!(out, "      approval: {approval:?}");
+        }
+        if !node.outputs.is_empty() {
+            let _ = writeln!(out, "      outputs: {}", node.outputs.join(", "));
+        }
+    }
+    out
+}
+
 /// A one-line human summary of a validated workflow graph. Pure, so it is tested
 /// directly.
 fn workflow_summary(compiled: &codypendent_workflow::CompiledWorkflow) -> String {
@@ -550,5 +607,54 @@ steps:
             .unwrap_err()
             .to_string();
         assert!(err.contains("reading workflow manifest"));
+    }
+
+    const AGENT_MANIFEST: &str = "\
+schema_version: 1
+id: review-flow
+version: 1
+budget:
+  maximum_cost_usd: 5.0
+  maximum_agents: 1
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+    skill: github.inspect-failed-check
+    outputs: [finding]
+  - id: publish
+    depends_on: [inspect]
+    tool: github.update-pull-request
+    approval: always
+";
+
+    #[test]
+    fn tree_shows_each_node_action_edge_and_settings() {
+        let compiled = codypendent_workflow::compile_yaml(AGENT_MANIFEST).unwrap();
+        let tree = workflow_tree(&compiled);
+        assert!(tree.contains("review-flow v1"));
+        assert!(tree.contains("inspect [agent investigator · skill github.inspect-failed-check]"));
+        assert!(tree.contains("publish [tool github.update-pull-request]"));
+        assert!(tree.contains("depends_on: inspect"));
+        assert!(tree.contains("approval: Always"));
+        assert!(tree.contains("outputs: finding"));
+    }
+
+    #[test]
+    fn show_json_emits_a_parseable_graph_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wf.yaml");
+        std::fs::write(&path, AGENT_MANIFEST).unwrap();
+        // The command runs; and the same compiled graph serializes to the JSON
+        // shape a graph-view client parses (tagged actions, edges).
+        workflow_show(&path, true).expect("show --json succeeds");
+        let compiled = codypendent_workflow::compile_yaml(AGENT_MANIFEST).unwrap();
+        let value = serde_json::to_value(&compiled).unwrap();
+        assert_eq!(value["id"], "review-flow");
+        assert_eq!(value["nodes"][0]["action"]["kind"], "agent");
+        assert_eq!(
+            value["nodes"][1]["action"]["name"],
+            "github.update-pull-request"
+        );
     }
 }
