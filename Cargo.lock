@@ -490,6 +490,7 @@ dependencies = [
  "codypendent-knowledge",
  "codypendent-protocol",
  "codypendent-tui",
+ "codypendent-workflow",
  "crossterm",
  "ratatui",
  "serde",

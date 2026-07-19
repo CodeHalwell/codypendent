@@ -425,6 +425,44 @@ pub async fn open(
     Ok(())
 }
 
+/// `codypendent workflow validate <FILE>` (Phase 5 STEP 5.1): parse and compile a
+/// declarative `workflow.yaml`, reporting either a one-line summary of the
+/// validated graph or the precise error (naming the offending step). Self-contained
+/// — it never touches the daemon; a manifest is just text on disk.
+///
+/// This is **structural** validation: schema version, unique/non-empty ids,
+/// exactly one action per step, resolvable + acyclic dependencies, budget sanity,
+/// and the multi-agent `orchestration_reason` rule. Whether a named tool/skill/role
+/// actually *exists* is a separate registry cross-check that needs a configured
+/// runtime (the compiler exposes it via `compile_with_registry`).
+pub fn workflow_validate(file: &std::path::Path) -> anyhow::Result<()> {
+    let yaml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading workflow manifest {}", file.display()))?;
+    match codypendent_workflow::compile_yaml(&yaml) {
+        Ok(compiled) => {
+            println!("{}", workflow_summary(&compiled));
+            Ok(())
+        }
+        // A structural error is the user's to fix — surface it verbatim, tagged with
+        // the file, and exit non-zero (via `?` in `main`).
+        Err(error) => anyhow::bail!("{}: {error}", file.display()),
+    }
+}
+
+/// A one-line human summary of a validated workflow graph. Pure, so it is tested
+/// directly.
+fn workflow_summary(compiled: &codypendent_workflow::CompiledWorkflow) -> String {
+    let order: Vec<&str> = compiled.nodes.iter().map(|node| node.id.as_str()).collect();
+    format!(
+        "\u{2713} {} v{} valid — {} step(s), {} agent step(s); order: {}",
+        compiled.id,
+        compiled.version,
+        compiled.nodes.len(),
+        compiled.agent_node_count(),
+        order.join(" \u{2192} "),
+    )
+}
+
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
 fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) -> String {
     format!(
@@ -450,5 +488,67 @@ mod open_tests {
         assert!(message.contains("VS Code"));
         assert!(message.contains("does not restart"));
         assert!(message.contains(&paths.socket_path.display().to_string()));
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+
+    const VALID: &str = "\
+schema_version: 1
+id: pipeline
+version: 2
+budget:
+  maximum_cost_usd: 5.0
+steps:
+  - id: build
+    tool: repository.test
+  - id: check
+    depends_on: [build]
+    tool: repository.test
+";
+
+    #[test]
+    fn summary_reports_id_version_counts_and_order() {
+        let compiled = codypendent_workflow::compile_yaml(VALID).unwrap();
+        let summary = workflow_summary(&compiled);
+        assert!(summary.contains("pipeline v2 valid"));
+        assert!(summary.contains("2 step(s)"));
+        assert!(summary.contains("0 agent step(s)"));
+        // Topological order is shown, dependency first.
+        assert!(summary.contains("build \u{2192} check"), "got: {summary}");
+    }
+
+    #[test]
+    fn validate_accepts_a_good_manifest_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wf.yaml");
+        std::fs::write(&path, VALID).unwrap();
+        workflow_validate(&path).expect("a valid manifest validates");
+    }
+
+    #[test]
+    fn validate_reports_a_compile_error_tagged_with_the_file() {
+        // A step depending on a missing step fails to compile; the error names the
+        // file and the offending dependency.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broken.yaml");
+        std::fs::write(
+            &path,
+            "schema_version: 1\nid: wf\nversion: 1\nsteps:\n  - id: a\n    depends_on: [ghost]\n    tool: repository.test\n",
+        )
+        .unwrap();
+        let err = workflow_validate(&path).unwrap_err().to_string();
+        assert!(err.contains("broken.yaml"), "error names the file: {err}");
+        assert!(err.contains("ghost"), "error names the bad dep: {err}");
+    }
+
+    #[test]
+    fn validate_reports_a_missing_file() {
+        let err = workflow_validate(std::path::Path::new("/no/such/manifest.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading workflow manifest"));
     }
 }

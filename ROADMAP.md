@@ -198,9 +198,14 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         malformed graph fails with its structural error before any name is looked
         up). The workflow crate stays daemon-free — the trait is the seam the
         daemon fills from the live registry + loaded agent profiles; `SetRegistry`
-        is the in-memory implementation the tests use. *Remaining for 5.1:*
-        lowering onto framework graphs, and replacing the hard-coded `/fix-ci`
-        flow with this definition. Agent-profile (`agent.toml`) parsing has landed —
+        is the in-memory implementation the tests use. The compiler also has a
+        user-facing entry point now: `codypendent workflow validate <file>`
+        parses + compiles a manifest and reports the validated graph (or the
+        precise error, tagged with the file), so an author checks a manifest
+        before it ever runs. *Remaining for 5.1:* lowering onto framework graphs,
+        and replacing the hard-coded `/fix-ci` flow with this definition (both
+        gated on the role→profile resolution the manifest's short roles imply but
+        that is not yet defined). Agent-profile (`agent.toml`) parsing has landed —
         `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
         permissions/budget/completion (the canonical profile parses in a test).
   - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
