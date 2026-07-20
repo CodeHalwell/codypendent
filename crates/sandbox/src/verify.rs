@@ -72,10 +72,12 @@ pub fn checksum_of(artifact: &[u8]) -> String {
 }
 
 /// The 32-byte digest a publisher signs: a SHA-256 over a canonical, versioned
-/// encoding of the artifact checksum plus the security-relevant manifest fields
-/// (id, version, kind, and the requested capabilities in sorted order). Binding
-/// the capabilities into the signed material is what stops a valid checksum
-/// signature from being reused against a manifest whose permissions were swapped.
+/// encoding of the artifact checksum plus the security-relevant manifest fields —
+/// id, version, kind, the runtime execution identity (command/protocol/working
+/// directory), the resource caps, and the requested capabilities in sorted order.
+/// Binding all of these into the signed material is what stops a valid checksum
+/// signature from being reused against a manifest whose permissions, command, or
+/// isolation limits were swapped.
 ///
 /// The encoding is **injective**: every field is length-prefixed (its byte length
 /// is committed before its bytes), and the capability list is count-prefixed with
@@ -130,6 +132,16 @@ pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
         b"working_directory",
         manifest.runtime.working_directory.trim().as_bytes(),
     );
+    // Resource caps are an isolation *control*, and `SandboxProfile::derive` copies
+    // them straight into the enforced profile — so bind them too, or a signed
+    // manifest could be replayed with weakened memory/CPU/wall/output limits. The
+    // four u64s are packed big-endian into one fixed-width, length-prefixed field.
+    let mut resources = Vec::with_capacity(32);
+    resources.extend_from_slice(&manifest.resources.memory_mb.to_be_bytes());
+    resources.extend_from_slice(&manifest.resources.cpu_seconds.to_be_bytes());
+    resources.extend_from_slice(&manifest.resources.wall_seconds.to_be_bytes());
+    resources.extend_from_slice(&manifest.resources.maximum_output_mb.to_be_bytes());
+    hash_field(&mut hasher, b"resources", &resources);
     // The full requested permission set: count-prefixed, then each capability's
     // class + value length-prefixed, so the set is bound unambiguously.
     let caps = CapabilitySet::from_spec(&manifest.capabilities);
@@ -406,6 +418,14 @@ signature = "unset"
             signing_digest(&different_command),
             d0,
             "runtime command is bound"
+        );
+
+        let mut weaker_limits = base.clone();
+        weaker_limits.resources.memory_mb += 100_000;
+        assert_ne!(
+            signing_digest(&weaker_limits),
+            d0,
+            "resource caps are bound"
         );
     }
 
