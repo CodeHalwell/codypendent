@@ -23,8 +23,8 @@ the release gate is the
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
 | **4** | Docs Studio & code intelligence — CRDT docs, semantic index | 🟡 |
 | **5** | Workflows & multi-agent orchestration | 🟡 |
-| **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | ⬜ |
-| **7** | Intelligent routing & learning — model router, graders, canary | ⬜ |
+| **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | 🟡 |
+| **7** | Intelligent routing & learning — model router, graders, canary | 🟡 |
 
 > **You are here:** Phases 0–3 are complete, and Phase 4's engine is in place.
 > The knowledge fabric now carries a Loro-backed collaborative document model
@@ -64,6 +64,29 @@ the release gate is the
 > tracked near the end of this file: the conversation-centred shell, command
 > palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
 > have all shipped.
+>
+> **Phases 6 and 7 have now begun as daemon-free engines.** Phase 6 landed the
+> `codypendent-sandbox` crate — the plugin **security boundary**: `plugin.toml`
+> parsing, sha256+ed25519 verification under a default-deny unsigned policy, the
+> capability **permission-diff** that gates a widening update on re-approval, a
+> **closed** `SandboxProfile` derived from the granted capabilities (the decision
+> layer the OS/WASM sandbox will enforce), the install→verify→enable→update→revoke
+> lifecycle, and untrusted-output sanitization — plus the Chapter 10 multimodal
+> `InputEnvelope`/`InputBlock` model (original media never replaced by a summary;
+> a remote-transcription classification gate) and six semantic-token theme
+> variants with a data-only theme-pack loader that refuses execution permissions.
+> Phase 7 landed the **router** (`codypendent-routing`): a version-stamped task
+> classifier, the Chapter 09 pipeline with **security hard-filters before utility**
+> (classified data never routes to a hosted provider), cheapest-above-threshold
+> selection, cascading escalation that preserves artifacts, and the five
+> eval-route arms + release gate — and the **learning loop** (`codypendent-eval`):
+> the `EvalCase`/`Assertion` harness, execution-grounded trace graders,
+> deterministic failure clustering, a growing regression suite, and the
+> shadow→canary→**human-approval**→rollback promotion pipeline that structurally
+> forbids self-promotion (only an `Actor::Human` can promote). What remains for
+> both phases is the daemon wiring, the persisted migrations/profiles, the OS/WASM
+> sandbox enforcement, and the live capture/measurement paths — the engines are in
+> place and unit-tested.
 
 ---
 
@@ -317,22 +340,115 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
 after restart; node-level cost/provenance visible; single-agent baseline selectable.
 
-## Phase 6 — Plugin & multimodal ecosystem ⬜
+## Phase 6 — Plugin & multimodal ecosystem 🟡
 
-- [ ] MCP plugin manager; WASM component SDK; native process sandbox; plugin permission UI
-- [ ] Voice input; image/screenshot input; themes + theme packs; agentic setup assistant
+The security-decision engines have landed as daemon-free crates; the OS/WASM
+*enforcement* that consumes their profiles, and the live client capture paths,
+are the remaining wiring.
 
-**Exit:** plugin cannot access undeclared path/network; permission-expansion on
-update requires approval; original audio/image artifacts linked; setup assistant proposes, never silently changes.
+- [x] **6.1 (plugin manifests, verification, lifecycle, permission-diff)** — the
+      new `codypendent-sandbox` crate (the manual's "crate justified by a
+      security boundary"). It parses `plugin.toml` (the `docs/specs/plugin.toml`
+      shape) with `deny_unknown_fields`; verifies the artifact by sha256 checksum
+      and an ed25519 publisher signature over that checksum, under a
+      default-**deny** unsigned policy; models capabilities as a comparable
+      `CapabilitySet` and computes the **permission diff** that blocks a
+      capability-expanding update until re-approved while auto-applying an
+      identical/narrowing one (exit criterion 2, rendered `+ network: host:443`);
+      derives a **closed** `SandboxProfile` from the *granted* set (env allowlist,
+      pre-opened paths, network allowlist, resource caps) so an executor honouring
+      it cannot reach an undeclared path/host (exit criterion 1, the decision layer
+      the OS/WASM sandbox enforces); drives the discover → verify →
+      install-disabled → smoke-test → enable → update → revoke lifecycle as a
+      guarded state machine carrying each plugin's trust record; and neutralizes
+      untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
+      before it enters context. 42 unit tests.
+- [x] **6.5 (multimodal input model)** — the Chapter 10 `InputEnvelope`/`InputBlock`
+      model in `codypendent-protocol`: a uniform envelope of typed blocks (Text,
+      Audio, Image, File, EditorSelection, CodeSymbol, GitHubReference, forward-
+      compatible `Unknown`). `ImageArtifact` keeps all four artifacts distinct
+      (original + extracted text + observations + crop/coordinate regions) and
+      `AudioArtifact` keeps the original audio linked to its reviewed transcript —
+      the original is never replaced by a summary (exit criterion 3). The
+      classification gate (`transcription_allowed`, media default `Confidential`)
+      permits local transcription always but blocks remote transcription when the
+      data exceeds an `OffDevicePolicy` ceiling. 10 round-trip/gate tests.
+- [x] **6.6 (themes + theme packs)** — six semantic-token variants beyond dark
+      (light, high-contrast, color-blind-safe Okabe–Ito, 256-color, 16-color,
+      monochrome); `ColorDepth::detect()` (NO_COLOR/COLORTERM/TERM) +
+      `Theme::select(depth, prefs)` with a manual override always winning; and a
+      **data-only** theme-pack loader that structurally rejects any pack declaring
+      capabilities/permissions (README: theme plugins get no execution
+      permissions). 17 tests (legibility invariants per variant).
+- [ ] **6.2/6.3/6.4 (enforcement + WASM + executable hooks)** — the native OS
+      sandbox (bubblewrap+seccomp / sandbox-exec / AppContainer), the `wasmtime`
+      component runtime + WASM SDK, the brokered-secrets host, and executing hooks
+      / skill `scripts/` through the sandbox. These *consume* the STEP 6.1
+      `SandboxProfile`; this is the "OS sandbox enforcement gates Phase 6"
+      cross-cutting item.
+- [ ] **6.5/6.7 (client capture + setup assistant)** — TUI clipboard/voice
+      capture and IDE drag-drop feeding the input model; the agentic `setup`
+      assistant under a restricted profile.
 
-## Phase 7 — Intelligent routing & learning ⬜
+**Exit:** plugin cannot access undeclared path/network (decision layer ✅,
+OS enforcement pending); permission-expansion on update requires approval ✅;
+original audio/image artifacts linked ✅ (model); setup assistant proposes,
+never silently changes (pending).
 
-- [ ] Task classifier; cost/quality router; local-model benchmark harness; route cascading
-- [ ] Trace graders; skill/prompt experiments; shadow + canary promotion; rollback UI
+## Phase 7 — Intelligent routing & learning 🟡
+
+The routing and learning **engines** have landed as two daemon-free crates
+(`codypendent-routing`, `codypendent-eval`); the daemon wiring, the persisted
+profiles/migrations, and the fixture task corpus are the remaining slice.
+
+- [x] **7.1 (eval harness core)** — `codypendent-eval`'s `case` module: the
+      Chapter 16 `EvalCase`/`Assertion` model (tests-pass, file changed/unchanged,
+      symbol-exists, command-not-executed, citation, no-forbidden-network,
+      approval-requested, patch-scope-limit) scored against an objective
+      `RunObservation`, with cost/duration budgets and a `SuiteReport` aggregate.
+      *Remaining:* the `codypendent eval run` CLI over the JSONL client and the
+      50–100 pinned fixture cases in `evals/tasks/`.
+- [x] **7.2 (capability + performance profiles)** — `codypendent-routing`'s
+      `ModelCapabilities` (the Chapter 09 shape) + `RequiredCapabilities` hard
+      filter, and a `ModelProfile` carrying **measured** performance (reliability,
+      per-task-class success, cost/latency), a `ModelExecutionProfile`, and the
+      `LocalBench` shape the harness fills. *Remaining:* migration `model_profiles`,
+      the `codypendent models bench` harness that measures a local model, and
+      first-use capability probes.
+- [x] **7.3 (the router)** — the Chapter 09 pipeline exactly, per task node: a
+      version-stamped rule-based task classifier; **security/privacy hard filters
+      first** (classified data can never be scored against — let alone routed to —
+      a hosted provider; it refuses rather than leaks); cheapest-model-above-the-
+      quality-threshold selection with a utility score; a versioned `RoutingPolicy`
+      (`router/<name>/<version>`); and **cascading escalation** that re-executes a
+      failed node on the next chain tier preserving artifacts and recording a
+      complete transition. The five eval-route arms + the release-gate report
+      (router+escalation ≥ quality at cost < static-strongest) land here too (exit
+      criterion 1). 37 tests. *Remaining:* daemon wiring behind the model-execution
+      seam and running the arms over a real suite.
+- [x] **7.4 (graders + clustering + regression suite)** — execution-grounded
+      `Signal`s (+patch-applies … −policy-violation) from a terminal-run `Trace`
+      (no model-vibes grading); deterministic `FailureCluster`ing by (task-class,
+      failing signal, tool, error-fingerprint) into the improvement queue; and a
+      `RegressionSuite` that grows with each fixed failure (a fixed cluster becomes
+      a guard case) and treats a missing observation as a regression. *Remaining:*
+      the OTLP exporter and daemon persistence.
+- [x] **7.5 (promotion pipeline — nothing promotes itself)** — the draft →
+      offline-regression → shadow → canary → **human approval** → promote →
+      rollback state machine for every learnable artifact. **No self-promotion
+      (ADR-010, exit criterion 2):** `approve()` requires an `Actor::Human` and is
+      the *only* path to `Promoted` — an agent/system/integration approver is
+      refused structurally; a canary regression auto-rolls-back without a human;
+      `ActiveVersions::rollback` restores the predecessor (attributable +
+      reversible, exit criterion 4); synthesized skill candidates must pass
+      permission review first. 12 tests incl. "an agent cannot promote itself".
+      *Remaining:* the daemon commands + persistence and the real shadow/canary
+      execution + eval-export privacy scrubbing.
 
 **Exit:** routing meets quality threshold at lower cost than static
-strongest-model; no learned artifact self-promotes; regressions covered; every
-promotion attributable and reversible.
+strongest-model ✅ (engine + gate; measured run pending); no learned artifact
+self-promotes ✅; regressions covered ✅ (suite engine); every promotion
+attributable and reversible ✅.
 
 ---
 
