@@ -42,7 +42,7 @@ pub use render::render;
 pub use state::{
     AppState, DocBlockView, DocCard, DocSuggestionView, GraphEdgeCard, InputMode, LayoutMode,
     MemoryCard, Overlay, Pane, PatchSummary, PendingApproval, RunView, SkillCard, StatusProjection,
-    ToolCard, ToolStatus, TranscriptEntry,
+    ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard,
 };
 pub use terminal::TerminalGuard;
 pub use theme::Theme;

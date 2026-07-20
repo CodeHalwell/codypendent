@@ -102,6 +102,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 _ => Overlay::Edges,
             }
         }
+        Action::OpenWorkflow => {
+            state.overlay = match state.overlay {
+                Overlay::Workflow => Overlay::None,
+                _ => Overlay::Workflow,
+            }
+        }
         Action::OpenPalette => {
             state.overlay = match state.overlay {
                 Overlay::Palette { .. } => Overlay::None,
@@ -454,6 +460,10 @@ fn nav(state: &mut AppState, delta: i32) {
             step(&mut state.selected_edge, state.edges.len(), delta);
             return;
         }
+        Overlay::Workflow => {
+            step(&mut state.selected_node, state.workflow.len(), delta);
+            return;
+        }
         Overlay::Palette {
             ref query,
             ref mut selected,
@@ -718,6 +728,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Memory => state.overlay = Overlay::Memory { source_open: false },
         PaletteCommand::Docs => state.overlay = Overlay::Docs,
         PaletteCommand::Edges => state.overlay = Overlay::Edges,
+        PaletteCommand::Workflow => state.overlay = Overlay::Workflow,
         PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
         PaletteCommand::Help => state.overlay = Overlay::Help,
         PaletteCommand::Detach => state.should_detach = true,
@@ -1544,6 +1555,64 @@ mod tests {
         assert_eq!(s.selected_edge, 1);
         reduce(&mut s, Action::SelectPrev);
         assert_eq!(s.selected_edge, 0);
+    }
+
+    fn node(id: &str) -> crate::state::WorkflowNodeCard {
+        crate::state::WorkflowNodeCard {
+            workflow: "repair-github-check v1".to_owned(),
+            id: id.to_owned(),
+            action: "tool repository.test".to_owned(),
+            kind: "tool".to_owned(),
+            state: "pending".to_owned(),
+            agent: "—".to_owned(),
+            model_policy: "—".to_owned(),
+            workspace: "shared worktree".to_owned(),
+            approval: "none".to_owned(),
+            retry: "1 attempt".to_owned(),
+            depends_on: "—".to_owned(),
+            outputs: "test_result".to_owned(),
+            cost: "—".to_owned(),
+        }
+    }
+
+    #[test]
+    fn open_workflow_toggles_the_workflow_view() {
+        let mut s = AppState::new();
+        s.workflow = vec![node("inspect")];
+        reduce(&mut s, Action::OpenWorkflow);
+        assert_eq!(s.overlay, Overlay::Workflow);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+        reduce(&mut s, Action::OpenWorkflow);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn workflow_navigation_moves_selection_within_the_graph() {
+        let mut s = AppState::new();
+        s.workflow = vec![node("inspect"), node("patch")];
+        reduce(&mut s, Action::OpenWorkflow);
+        assert_eq!(s.selected_node, 0);
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_node, 1);
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_node, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_node, 0);
+    }
+
+    #[test]
+    fn palette_opens_the_workflow_view() {
+        // "workflow" routes through the palette to the workflow-graph overlay,
+        // the discoverable front door in the conversation shell where a bare `W`
+        // composes text.
+        let mut s = AppState::new();
+        s.workflow = vec![node("inspect")];
+        reduce(&mut s, Action::OpenPalette);
+        for c in "workflow".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::Workflow);
     }
 
     #[test]

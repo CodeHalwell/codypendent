@@ -50,7 +50,11 @@ the release gate is the
 > `WorkflowStore` (5.2 durable store), carries agent-profile (`agent.toml`)
 > parsing, and holds a per-run `BlackboardStore` for the typed, evidence-gated
 > artifact channel agents share (5.3) — the daemon-free foundation for durable
-> multi-agent orchestration. In parallel, a **Codex-informed TUI backlog** is
+> multi-agent orchestration. The first Phase 5 **client surface** has now landed
+> too: a read-only TUI workflow-graph view over the compiled-graph projection
+> (per-node state / agent / worktree / approval / retry / outputs, grouped by
+> workflow), fed by a CLI seam that compiles `.codypendent/workflows/*.yaml`.
+> In parallel, a **Codex-informed TUI backlog** is
 > tracked near the end of this file: the conversation-centred shell, command
 > palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
 > have all shipped.
@@ -229,10 +233,22 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         node. The compiled graph is now a serializable projection
         (`CompiledWorkflow: Serialize`, tagged node actions), surfaced by
         `codypendent workflow show <file> [--json]` — the read model a graph view
-        renders. *Remaining for 5.2:* the daemon startup-recovery **wiring** over
-        the incomplete-runs list, node-lifecycle ledger events, the
-        pause/resume/retry-from-node **commands** that drive these store ops, and
-        the TUI workflow-graph view over the projection.
+        renders. **The TUI workflow-graph view over that projection has now
+        landed:** a read-only overlay (reached from the command palette, or the
+        bare `W` once a browser is open — like `D`/`G` in the conversation shell)
+        that lists a repository's compiled workflow nodes in topological order,
+        grouped by workflow, and — for the focused node — renders its action,
+        lifecycle state, agent, worktree, approval, retry, dependencies, and
+        declared outputs (exit criterion 3's per-node state / agent / worktree).
+        It is fed by a CLI seam that compiles `.codypendent/workflows/*.yaml`
+        into self-contained `WorkflowNodeCard`s (the one place the workflow crate
+        meets the pure TUI crate, mirroring the Docs/Edges wiring), skipping a
+        manifest that does not compile rather than failing the view. State/cost
+        are the pre-run values (`pending` / `—`); overlaying a durable run's live
+        per-node state and cost lands with the daemon executor. *Remaining for
+        5.2:* the daemon startup-recovery **wiring** over the incomplete-runs
+        list, node-lifecycle ledger events, and the pause/resume/retry-from-node
+        **commands** that drive these store ops.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code

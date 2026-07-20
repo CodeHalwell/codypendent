@@ -29,6 +29,8 @@ pub enum PaletteCommand {
     Docs,
     /// Open the code-graph edge inspector.
     Edges,
+    /// Open the workflow-graph view.
+    Workflow,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -89,6 +91,12 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Code-graph edges",
         description: "inspect graph edges (relation, evidence, revision)",
         key: "G",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Workflow,
+        title: "Workflow graph",
+        description: "view workflow nodes (state, agent, worktree, approval)",
+        key: "W",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,

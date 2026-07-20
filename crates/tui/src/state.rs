@@ -65,8 +65,8 @@ impl LayoutMode {
 /// [`crate::input::map_event`]). Derived from the active overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// A navigable overlay (Skills / Memory / Docs / Edges / Help) is live: the
-    /// arrow/command key table drives it.
+    /// A navigable overlay (Skills / Memory / Docs / Edges / Workflow / Help) is
+    /// live: the arrow/command key table drives it.
     Normal,
     /// A text prompt is capturing printable keys.
     Editing,
@@ -117,6 +117,13 @@ pub enum Overlay {
     /// [`AppState::edges`] list on the left and, for the focused edge, its
     /// relation, confidence, evidence kind + source, and revision on the right.
     Edges,
+    /// The workflow-graph view (Phase 5 STEP 5.2, exit criterion 3): the
+    /// [`AppState::workflow`] node list on the left and, for the focused node,
+    /// its action, state, agent, workspace, approval, retry, dependencies, and
+    /// declared outputs on the right. Read-only — a projection of the compiled
+    /// workflow graph (the daemon-side executor that fills live per-node
+    /// state/cost is a later wiring step).
+    Workflow,
     /// The command palette: a searchable list of every command the TUI exposes,
     /// so the growing feature set stays reachable without consuming a single-key
     /// binding each. `query` is the live filter; `selected` indexes the filtered
@@ -387,6 +394,52 @@ pub struct GraphEdgeCard {
     pub revision: String,
 }
 
+/// A workflow-graph node projected for the workflow view (Phase 5 STEP 5.2, exit
+/// criterion 3: "per-node state, cost, agent, worktree"). Self-contained — the
+/// TUI never depends on `codypendent-workflow`; the CLI compiles a
+/// `workflow.yaml` manifest and maps each `CompiledNode` (overlaid with the
+/// durable node record's state/cost when a run exists) into this shape. Every
+/// field is a pre-rendered human string so the renderer stays a pure projection.
+///
+/// Nodes are listed in the compiled topological order, grouped by their
+/// `workflow` label, so the view reads as an ordered graph rather than a flat
+/// pile when a repository declares more than one workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowNodeCard {
+    /// The owning workflow, pre-rendered (e.g. `"repair-github-check v1"`), so
+    /// several workflows can share the list under labeled groups.
+    pub workflow: String,
+    /// The node (step) id, unique within its workflow.
+    pub id: String,
+    /// The node's action, pre-rendered (e.g. `"agent implementer · skill
+    /// code.repair"` or `"tool repository.test"`).
+    pub action: String,
+    /// The action kind label (`agent` / `tool`) — drives the list glyph color.
+    pub kind: String,
+    /// The node's lifecycle state, pre-rendered (`pending` until a durable run
+    /// record overlays a live state such as `running` / `completed`).
+    pub state: String,
+    /// The agent role, when this is an agent node, else `"—"`.
+    pub agent: String,
+    /// The model-selection policy for an agent node, else `"—"`.
+    pub model_policy: String,
+    /// How the node's workspace is provisioned (`shared worktree` / `isolated
+    /// worktree`) — the exit-criterion "worktree" field.
+    pub workspace: String,
+    /// The approval policy gating the node (`before write` / `always` / `none`).
+    pub approval: String,
+    /// The retry policy, pre-rendered (e.g. `"1 attempt"` / `"2 attempts · 5s
+    /// backoff"`).
+    pub retry: String,
+    /// The nodes this one depends on, pre-rendered (comma-joined, or `"—"`).
+    pub depends_on: String,
+    /// The blackboard artifact kinds the node declares to produce, pre-rendered
+    /// (comma-joined, or `"—"`).
+    pub outputs: String,
+    /// The node's recorded cost, pre-rendered (`"—"` until a run records one).
+    pub cost: String,
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -447,6 +500,13 @@ pub struct AppState {
     pub edges: Vec<GraphEdgeCard>,
     /// Index into `edges` of the focused edge.
     pub selected_edge: usize,
+    /// The workflow-graph projection (Phase 5 STEP 5.2): the nodes of the
+    /// repository's compiled workflow manifests, mapped to self-contained
+    /// [`WorkflowNodeCard`]s by the CLI, in topological order. May be empty. The
+    /// [`Overlay::Workflow`] view reads it.
+    pub workflow: Vec<WorkflowNodeCard>,
+    /// Index into `workflow` of the focused node.
+    pub selected_node: usize,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -505,6 +565,8 @@ impl AppState {
             selected_doc: 0,
             edges: Vec::new(),
             selected_edge: 0,
+            workflow: Vec::new(),
+            selected_node: 0,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
@@ -527,13 +589,15 @@ impl AppState {
             // The palette filters on printable keys but stays arrow-navigable, so
             // it has its own input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. } => InputMode::Palette,
-            // The Skills / Memory / Docs / Edges / Help browsers are navigable with
-            // the arrow/command key table, so they stay in `Normal` mode.
+            // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
+            // navigable with the arrow/command key table, so they stay in `Normal`
+            // mode.
             Overlay::Help
             | Overlay::Skills
             | Overlay::Memory { .. }
             | Overlay::Docs
-            | Overlay::Edges => InputMode::Normal,
+            | Overlay::Edges
+            | Overlay::Workflow => InputMode::Normal,
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
             Overlay::None => {
@@ -600,6 +664,12 @@ impl AppState {
     #[must_use]
     pub fn focused_edge(&self) -> Option<&GraphEdgeCard> {
         self.edges.get(self.selected_edge)
+    }
+
+    /// The focused workflow node card, if any.
+    #[must_use]
+    pub fn focused_node(&self) -> Option<&WorkflowNodeCard> {
+        self.workflow.get(self.selected_node)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.

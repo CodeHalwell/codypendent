@@ -45,7 +45,7 @@ use codypendent_protocol::{
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
+    GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -125,6 +125,11 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     state.memories = projections.memories;
     state.docs = projections.docs;
     state.edges = projections.edges;
+    // Phase 5 STEP 5.2: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests. This reads files, not the
+    // knowledge db, so it is a standalone projection; a malformed manifest logs
+    // and is skipped rather than failing the TUI.
+    state.workflow = load_workflows(&repo);
 
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
@@ -1022,6 +1027,178 @@ fn edge_card(edge: &CodeEdge, names: &HashMap<CodeNodeId, String>) -> GraphEdgeC
     }
 }
 
+/// The cap on workflow nodes surfaced in the view. A pathological manifest set
+/// could declare a very large graph; the read-only view shows the first
+/// [`MAX_WORKFLOW_NODES`] (in discovery + topological order) and logs when it
+/// truncates — never a silent cut.
+const MAX_WORKFLOW_NODES: usize = 500;
+
+/// Compile the repository's declared workflow manifests
+/// (`.codypendent/workflows/*.{yaml,yml}`) and project each compiled node into a
+/// [`WorkflowNodeCard`] for the workflow-graph view (Phase 5 STEP 5.2). This is
+/// the CLI's job precisely because the TUI crate performs no I/O and never
+/// depends on `codypendent-workflow`; the mapping from the compiled graph to the
+/// projection happens here and nowhere else.
+///
+/// Manifests are compiled in sorted filename order for a deterministic view; an
+/// unreadable or non-compiling manifest logs to stderr and is skipped, so one
+/// broken file drops only its own workflow — never the others, and never the
+/// TUI. Nodes keep their compiled topological order. State/cost are the pre-run
+/// values (`pending` / `—`); overlaying a durable run's live per-node
+/// state/cost lands with the daemon-side workflow executor.
+fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
+    let dir = repo.join(".codypendent").join("workflows");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // A repository with no workflows directory is the common case — an empty
+        // view, not an error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            eprintln!(
+                "codypendent: workflow view unavailable (reading {}: {error})",
+                dir.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    // Collect and sort the manifest paths so the view order is deterministic.
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("yaml" | "yml")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut cards = Vec::new();
+    for path in files {
+        let yaml = match std::fs::read_to_string(&path) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                eprintln!(
+                    "codypendent: skipping workflow {} ({error})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match codypendent_workflow::compile_yaml(&yaml) {
+            Ok(compiled) => {
+                let label = format!("{} v{}", compiled.id, compiled.version);
+                cards.extend(
+                    compiled
+                        .nodes
+                        .iter()
+                        .map(|node| workflow_node_card(&label, node)),
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "codypendent: skipping workflow {} (does not compile: {error})",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if cards.len() > MAX_WORKFLOW_NODES {
+        eprintln!(
+            "codypendent: workflow view showing the first {MAX_WORKFLOW_NODES} of {} nodes",
+            cards.len()
+        );
+        cards.truncate(MAX_WORKFLOW_NODES);
+    }
+    cards
+}
+
+/// Map one [`CompiledNode`](codypendent_workflow::CompiledNode) into the view's
+/// [`WorkflowNodeCard`], pre-rendering every field to a human string. `workflow`
+/// is the owning workflow's `id vN` label the view groups by. State/cost are the
+/// pre-run values a compiled (not-yet-run) graph carries.
+fn workflow_node_card(
+    workflow: &str,
+    node: &codypendent_workflow::CompiledNode,
+) -> WorkflowNodeCard {
+    use codypendent_workflow::{ApprovalPolicy, NodeAction, WorkspaceMode};
+
+    let dash = || "\u{2014}".to_owned(); // "—"
+    let (kind, action, agent, model_policy) = match &node.action {
+        NodeAction::Agent {
+            role,
+            model_policy,
+            skill,
+        } => {
+            let action = match skill {
+                Some(skill) => format!("agent {role} \u{b7} skill {skill}"),
+                None => format!("agent {role}"),
+            };
+            (
+                "agent".to_owned(),
+                action,
+                role.clone(),
+                model_policy.clone().unwrap_or_else(dash),
+            )
+        }
+        NodeAction::Tool { name } => ("tool".to_owned(), format!("tool {name}"), dash(), dash()),
+    };
+
+    let workspace = match node.workspace_mode {
+        WorkspaceMode::SharedWorktree => "shared worktree",
+        WorkspaceMode::IsolatedWorktree => "isolated worktree",
+    }
+    .to_owned();
+
+    let approval = match node.approval {
+        Some(ApprovalPolicy::BeforeWrite) => "before write".to_owned(),
+        Some(ApprovalPolicy::Always) => "always".to_owned(),
+        None => "none".to_owned(),
+    };
+
+    let retry = {
+        let attempts = node.retry.attempts;
+        let unit = if attempts == 1 { "attempt" } else { "attempts" };
+        if node.retry.backoff_seconds == 0 {
+            format!("{attempts} {unit}")
+        } else {
+            format!(
+                "{attempts} {unit} \u{b7} {}s backoff",
+                node.retry.backoff_seconds
+            )
+        }
+    };
+
+    let join = |items: &[String]| {
+        if items.is_empty() {
+            dash()
+        } else {
+            items.join(", ")
+        }
+    };
+
+    WorkflowNodeCard {
+        workflow: workflow.to_owned(),
+        id: node.id.clone(),
+        action,
+        kind,
+        // A compiled-but-not-yet-run node is pending; a durable run record
+        // overlays a live state here once the executor lands.
+        state: "pending".to_owned(),
+        agent,
+        model_policy,
+        workspace,
+        approval,
+        retry,
+        depends_on: join(&node.depends_on),
+        outputs: join(&node.outputs),
+        // No run has recorded a cost against a compiled-only node.
+        cost: dash(),
+    }
+}
+
 fn collab_mode_label(mode: CollaborationMode) -> &'static str {
     match mode {
         CollaborationMode::Ask => "ask",
@@ -1262,5 +1439,110 @@ mod tests {
         // A forward-compat variant we can't inspect is accepted rather than
         // discarding a possibly-resumable session against a newer daemon.
         assert!(catchup_proves_session_exists(&Catchup::Unknown));
+    }
+
+    /// A manifest exercising both action kinds and every rendered node field: an
+    /// agent step with a skill, an isolated worktree, and a before-write
+    /// approval; a tool step with a multi-attempt retry and a dependency.
+    const TEST_MANIFEST: &str = "\
+schema_version: 1
+id: repair-github-check
+version: 1
+orchestration_reason: independent-review
+budget:
+  maximum_cost_usd: 5.0
+  maximum_agents: 2
+steps:
+  - id: patch
+    agent:
+      role: implementer
+      model_policy: coding
+    skill: code.repair
+    workspace:
+      mode: isolated-worktree
+    approval: before-write
+    outputs: [proposed_patch]
+  - id: verify
+    depends_on: [patch]
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+";
+
+    #[test]
+    fn workflow_node_card_renders_agent_and_tool_nodes() {
+        let compiled = codypendent_workflow::compile_yaml(TEST_MANIFEST).expect("compiles");
+        let label = format!("{} v{}", compiled.id, compiled.version);
+        let cards: Vec<_> = compiled
+            .nodes
+            .iter()
+            .map(|node| workflow_node_card(&label, node))
+            .collect();
+
+        let patch = cards.iter().find(|c| c.id == "patch").expect("patch node");
+        assert_eq!(patch.workflow, "repair-github-check v1");
+        assert_eq!(patch.kind, "agent");
+        assert_eq!(patch.agent, "implementer");
+        assert_eq!(patch.model_policy, "coding");
+        assert!(
+            patch.action.contains("skill code.repair"),
+            "{}",
+            patch.action
+        );
+        assert_eq!(patch.workspace, "isolated worktree");
+        assert_eq!(patch.approval, "before write");
+        // A compiled-but-not-yet-run node is pending with no recorded cost.
+        assert_eq!(patch.state, "pending");
+        assert_eq!(patch.cost, "\u{2014}");
+        assert_eq!(patch.depends_on, "\u{2014}"); // no dependencies
+        assert_eq!(patch.outputs, "proposed_patch");
+
+        let verify = cards
+            .iter()
+            .find(|c| c.id == "verify")
+            .expect("verify node");
+        assert_eq!(verify.kind, "tool");
+        assert_eq!(verify.agent, "\u{2014}");
+        assert_eq!(verify.model_policy, "\u{2014}");
+        assert_eq!(verify.action, "tool repository.test");
+        assert_eq!(verify.workspace, "shared worktree");
+        assert_eq!(verify.approval, "none");
+        assert_eq!(verify.retry, "2 attempts \u{b7} 5s backoff");
+        assert_eq!(verify.depends_on, "patch");
+    }
+
+    #[test]
+    fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        // No workflows directory → an empty view, not an error.
+        assert!(load_workflows(repo).is_empty());
+
+        let dir = repo.join(".codypendent").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("repair.yaml"), TEST_MANIFEST).unwrap();
+        // A manifest that parses but fails to compile (no steps) is skipped, not
+        // fatal — the good workflow still loads.
+        std::fs::write(
+            dir.join("broken.yaml"),
+            "schema_version: 1\nid: broken\nversion: 1\nsteps: []\n",
+        )
+        .unwrap();
+        // A non-manifest file is ignored by extension.
+        std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let cards = load_workflows(repo);
+        assert_eq!(
+            cards.len(),
+            2,
+            "both nodes of the good manifest, none of the broken"
+        );
+        assert!(cards.iter().all(|c| c.workflow == "repair-github-check v1"));
+        // Nodes keep their compiled topological order.
+        assert_eq!(cards[0].id, "patch");
+        assert_eq!(cards[1].id, "verify");
     }
 }

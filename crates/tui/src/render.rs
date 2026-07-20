@@ -664,6 +664,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::Docs => render_docs(frame, area, state, theme),
         Overlay::Edges => render_edges(frame, area, state, theme),
+        Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, theme, query, *selected);
         }
@@ -1215,6 +1216,162 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
             .wrap(Wrap { trim: false }),
         cols[1],
     );
+}
+
+/// The workflow-graph view (Phase 5 STEP 5.2, exit criterion 3): a list of the
+/// compiled workflow's nodes on the left — grouped by workflow, in topological
+/// order — and, for the focused node, its action, state, agent, workspace,
+/// approval, retry, dependencies, and declared outputs on the right. Read-only:
+/// a projection of the compiled graph, with per-node state/cost overlaid from a
+/// durable run when one exists (`pending` / `—` otherwise). Colors are Theme
+/// tokens only (RULE 7).
+fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Workflow ({} node(s)) ", state.workflow.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(inner);
+
+    // Left: the node list, in topological order. A workflow-label header is
+    // folded into the first node of each group so item↔card stays 1:1 (the
+    // selection indexes `state.workflow` directly) while the graph still reads
+    // as grouped when a repository declares more than one workflow.
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.workflow.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no workflow manifests in this repository",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    let mut previous_workflow: Option<&str> = None;
+    for (idx, node) in state.workflow.iter().enumerate() {
+        let selected = idx == state.selected_node;
+        let marker = if selected { "› " } else { "  " };
+        let mut lines: Vec<Line> = Vec::new();
+        if previous_workflow != Some(node.workflow.as_str()) {
+            lines.push(Line::styled(
+                node.workflow.clone(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            previous_workflow = Some(node.workflow.as_str());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                truncate(&node.id, 20),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                node.state.clone(),
+                Style::default().fg(node_state_color(&node.state, theme)),
+            ),
+        ]));
+        lines.push(Line::styled(
+            format!("    {}", truncate(&node.action, 34)),
+            Style::default().fg(theme.text.muted),
+        ));
+        let item = ListItem::new(lines);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail for the focused node — the exit-criterion payload
+    // (state, agent, worktree, cost) plus the graph edges and declared outputs.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(node) = state.focused_node() {
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(section("Node", theme));
+        lines.push(field("workflow", &node.workflow, theme.text.secondary));
+        lines.push(field("id", &node.id, theme.text.primary));
+        lines.push(field(
+            "state",
+            &node.state,
+            node_state_color(&node.state, theme),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(section("Action", theme));
+        lines.push(field("action", &node.action, theme.text.secondary));
+        lines.push(field("agent", &node.agent, theme.text.primary));
+        lines.push(field("model policy", &node.model_policy, theme.text.muted));
+        lines.push(Line::raw(""));
+        lines.push(section("Execution", theme));
+        lines.push(field("worktree", &node.workspace, theme.status.info));
+        lines.push(field("approval", &node.approval, theme.text.secondary));
+        lines.push(field("retry", &node.retry, theme.text.secondary));
+        lines.push(field("cost", &node.cost, theme.text.secondary));
+        lines.push(Line::raw(""));
+        lines.push(section("Graph", theme));
+        lines.push(field("depends on", &node.depends_on, theme.text.secondary));
+        lines.push(field("outputs", &node.outputs, theme.text.secondary));
+    } else {
+        lines.push(Line::styled(
+            "  no node selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// Color for a workflow node's lifecycle state. Terminal-success reads calm;
+/// active states draw the eye; failure/blocked read as error; not-yet-run
+/// (`pending`) and `skipped` stay quiet.
+fn node_state_color(state: &str, theme: &Theme) -> Color {
+    match state {
+        "completed" => theme.status.success,
+        "running" => theme.status.running,
+        "waiting_approval" => theme.status.warning,
+        "failed" | "blocked" => theme.status.error,
+        "pending" => theme.status.info,
+        _ => theme.text.muted,
+    }
 }
 
 /// The command palette: a filter line over a searchable list of every command,
@@ -2281,5 +2438,63 @@ mod tests {
             "evidence source missing:\n{text}"
         );
         assert!(text.contains("79acbf1"), "revision missing:\n{text}");
+    }
+
+    #[test]
+    fn workflow_view_snapshot_shows_node_state_agent_and_worktree() {
+        use crate::state::WorkflowNodeCard;
+        let mut state = running_build_state();
+        state.workflow = vec![
+            WorkflowNodeCard {
+                workflow: "repair-github-check v1".to_owned(),
+                id: "patch".to_owned(),
+                action: "agent implementer \u{b7} skill code.repair".to_owned(),
+                kind: "agent".to_owned(),
+                state: "pending".to_owned(),
+                agent: "implementer".to_owned(),
+                model_policy: "coding".to_owned(),
+                workspace: "isolated worktree".to_owned(),
+                approval: "before write".to_owned(),
+                retry: "1 attempt".to_owned(),
+                depends_on: "\u{2014}".to_owned(),
+                outputs: "proposed_patch".to_owned(),
+                cost: "\u{2014}".to_owned(),
+            },
+            WorkflowNodeCard {
+                workflow: "repair-github-check v1".to_owned(),
+                id: "verify".to_owned(),
+                action: "tool repository.test".to_owned(),
+                kind: "tool".to_owned(),
+                state: "pending".to_owned(),
+                agent: "\u{2014}".to_owned(),
+                model_policy: "\u{2014}".to_owned(),
+                workspace: "shared worktree".to_owned(),
+                approval: "none".to_owned(),
+                retry: "2 attempts \u{b7} 5s backoff".to_owned(),
+                depends_on: "patch".to_owned(),
+                outputs: "test_result".to_owned(),
+                cost: "\u{2014}".to_owned(),
+            },
+        ];
+        reduce(&mut state, Action::OpenWorkflow);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Workflow"), "title missing:\n{text}");
+        // The workflow group header and the node ids in the list.
+        assert!(
+            text.contains("repair-github-check v1"),
+            "group header missing:\n{text}"
+        );
+        assert!(text.contains("patch"), "node id missing:\n{text}");
+        // The focused (first) node's detail — the exit-criterion payload: state,
+        // agent, worktree, approval, and declared outputs.
+        assert!(text.contains("pending"), "state missing:\n{text}");
+        assert!(text.contains("implementer"), "agent missing:\n{text}");
+        assert!(
+            text.contains("isolated worktree"),
+            "worktree missing:\n{text}"
+        );
+        assert!(text.contains("before write"), "approval missing:\n{text}");
+        assert!(text.contains("proposed_patch"), "outputs missing:\n{text}");
     }
 }
