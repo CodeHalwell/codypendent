@@ -10,6 +10,7 @@ members = [
     "crates/knowledge",
     "crates/integrations",
     "crates/workflow",
+    "crates/sandbox",
     "crates/test-support",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
@@ -34,6 +35,7 @@ codypendent-runtime = { path = "crates/runtime" }
 codypendent-knowledge = { path = "crates/knowledge" }
 codypendent-integrations = { path = "crates/integrations" }
 codypendent-workflow = { path = "crates/workflow" }
+codypendent-sandbox = { path = "crates/sandbox" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
@@ -50,6 +52,13 @@ crossterm = "0.28"
 # Hashing (content-addressed artifact store)
 sha2 = "0.10"
 hex = "0.4"
+
+# Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
+# publisher signature over the artifact checksum; `base64` decodes the signature
+# and publisher key carried as text in `plugin.toml`'s `[security]`. Pinned to a
+# version that builds on the workspace's rust-version (1.82).
+ed25519-dalek = "=2.2.0"
+base64 = "0.22"
 
 # GitHub & IDE integrations (Phase 3). `reqwest` is the typed GitHub client's
 # HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook

@@ -1,0 +1,254 @@
+//! Capability grants and the permission diff (STEP 6.1).
+//!
+//! The capabilities a plugin *declares* in its manifest become a [`CapabilitySet`]
+//! — the flat, comparable statement of everything it may touch. When a plugin
+//! updates, the new manifest's set is compared against the *installed* set: any
+//! capability present in the new set but not the old is an **expansion**, and an
+//! expansion blocks the update until the user re-approves it (exit criterion 2).
+//! Removed capabilities narrow the grant and never require approval.
+//!
+//! The diff is rendered exactly as the TUI shows it (`+ network: uploads.github.com:443`)
+//! so the user decides against the real delta, not a summary.
+
+use std::collections::BTreeSet;
+use std::fmt;
+
+use crate::manifest::CapabilitiesSpec;
+
+/// A single, comparable capability a plugin holds. Each variant carries the
+/// concrete grant (a path, a `host:port`, a secret name) so two sets diff at the
+/// granularity the user reasons about — adding one host to a network allowlist
+/// is a distinct, visible expansion.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    /// Read access to a filesystem path.
+    FilesystemRead(String),
+    /// Write access to a filesystem path.
+    FilesystemWrite(String),
+    /// Network access to a `host:port` destination.
+    Network(String),
+    /// Access to a named secret (brokered per call, never via env).
+    Secret(String),
+    /// Permission to spawn subprocesses.
+    Subprocess,
+}
+
+impl Capability {
+    /// The capability class, used to group a diff line (`network`, `secret`, …).
+    #[must_use]
+    pub fn class(&self) -> &'static str {
+        match self {
+            Capability::FilesystemRead(_) => "filesystem_read",
+            Capability::FilesystemWrite(_) => "filesystem_write",
+            Capability::Network(_) => "network",
+            Capability::Secret(_) => "secret",
+            Capability::Subprocess => "subprocess",
+        }
+    }
+
+    /// The concrete grant value (the path / host:port / secret name).
+    #[must_use]
+    pub fn value(&self) -> &str {
+        match self {
+            Capability::FilesystemRead(v)
+            | Capability::FilesystemWrite(v)
+            | Capability::Network(v)
+            | Capability::Secret(v) => v,
+            Capability::Subprocess => "true",
+        }
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.class(), self.value())
+    }
+}
+
+/// The complete set of capabilities a plugin holds. Order-independent and
+/// deduplicated, so two manifests compare by *content*, not declaration order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    caps: BTreeSet<Capability>,
+}
+
+impl CapabilitySet {
+    /// The set derived from a manifest's `[capabilities]` table.
+    #[must_use]
+    pub fn from_spec(spec: &CapabilitiesSpec) -> Self {
+        let mut caps = BTreeSet::new();
+        for p in &spec.filesystem_read {
+            caps.insert(Capability::FilesystemRead(p.clone()));
+        }
+        for p in &spec.filesystem_write {
+            caps.insert(Capability::FilesystemWrite(p.clone()));
+        }
+        for n in &spec.network {
+            caps.insert(Capability::Network(n.clone()));
+        }
+        for s in &spec.secrets {
+            caps.insert(Capability::Secret(s.clone()));
+        }
+        if spec.subprocess {
+            caps.insert(Capability::Subprocess);
+        }
+        Self { caps }
+    }
+
+    /// Whether the set is empty — a plugin (e.g. a theme pack) that touches
+    /// nothing. Used to enforce "data-only plugins carry zero capabilities".
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.caps.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.caps.len()
+    }
+
+    /// Whether the set holds a specific capability — the run-time gate: a call
+    /// requesting a capability not in the set is denied (exit criterion 1).
+    #[must_use]
+    pub fn grants(&self, cap: &Capability) -> bool {
+        self.caps.contains(cap)
+    }
+
+    /// Iterate the capabilities in stable (sorted) order.
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.caps.iter()
+    }
+
+    /// Compute the diff from `self` (the installed set) to `next` (the update's
+    /// requested set).
+    #[must_use]
+    pub fn diff_to(&self, next: &CapabilitySet) -> PermissionDiff {
+        let added = next.caps.difference(&self.caps).cloned().collect();
+        let removed = self.caps.difference(&next.caps).cloned().collect();
+        PermissionDiff { added, removed }
+    }
+}
+
+/// The change in capabilities between an installed manifest and an update.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionDiff {
+    /// Capabilities the update requests that the install did not hold — the
+    /// **expansion** that gates re-approval.
+    pub added: Vec<Capability>,
+    /// Capabilities the install held that the update drops — a narrowing.
+    pub removed: Vec<Capability>,
+}
+
+impl PermissionDiff {
+    /// Whether the update expands permissions. `true` ⇒ the update is blocked
+    /// until the user re-approves (STEP 6.1 exit criterion 2).
+    #[must_use]
+    pub fn expands_permissions(&self) -> bool {
+        !self.added.is_empty()
+    }
+
+    /// Whether the two manifests declare identical capabilities.
+    #[must_use]
+    pub fn is_identical(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// Render the diff the way the TUI displays it — one `+`/`-` line per
+    /// capability, additions first, each grouped by class then value:
+    ///
+    /// ```text
+    /// + network: uploads.github.com:443
+    /// - secret: legacy-token
+    /// ```
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut lines = Vec::with_capacity(self.added.len() + self.removed.len());
+        for cap in &self.added {
+            lines.push(format!("+ {cap}"));
+        }
+        for cap in &self.removed {
+            lines.push(format!("- {cap}"));
+        }
+        lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(network: &[&str], secrets: &[&str], subprocess: bool) -> CapabilitiesSpec {
+        CapabilitiesSpec {
+            filesystem_read: vec![],
+            filesystem_write: vec![],
+            network: network.iter().map(|s| s.to_string()).collect(),
+            secrets: secrets.iter().map(|s| s.to_string()).collect(),
+            subprocess,
+        }
+    }
+
+    #[test]
+    fn set_is_order_independent() {
+        let a = CapabilitySet::from_spec(&spec(&["a:1", "b:2"], &[], false));
+        let b = CapabilitySet::from_spec(&spec(&["b:2", "a:1"], &[], false));
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn identical_manifests_need_no_reapproval() {
+        let installed =
+            CapabilitySet::from_spec(&spec(&["api.github.com:443"], &["github-token"], false));
+        let update =
+            CapabilitySet::from_spec(&spec(&["api.github.com:443"], &["github-token"], false));
+        let diff = installed.diff_to(&update);
+        assert!(diff.is_identical());
+        assert!(!diff.expands_permissions());
+    }
+
+    #[test]
+    fn added_network_host_is_an_expansion() {
+        let installed = CapabilitySet::from_spec(&spec(&["api.github.com:443"], &[], false));
+        let update = CapabilitySet::from_spec(&spec(
+            &["api.github.com:443", "uploads.github.com:443"],
+            &[],
+            false,
+        ));
+        let diff = installed.diff_to(&update);
+        assert!(diff.expands_permissions());
+        assert_eq!(
+            diff.added,
+            vec![Capability::Network("uploads.github.com:443".into())]
+        );
+        assert_eq!(diff.render(), "+ network: uploads.github.com:443");
+    }
+
+    #[test]
+    fn adding_subprocess_is_an_expansion() {
+        let installed = CapabilitySet::from_spec(&spec(&[], &[], false));
+        let update = CapabilitySet::from_spec(&spec(&[], &[], true));
+        let diff = installed.diff_to(&update);
+        assert!(diff.expands_permissions());
+        assert_eq!(diff.added, vec![Capability::Subprocess]);
+    }
+
+    #[test]
+    fn removing_a_capability_narrows_and_needs_no_approval() {
+        let installed = CapabilitySet::from_spec(&spec(&["a:1", "b:2"], &["s"], false));
+        let update = CapabilitySet::from_spec(&spec(&["a:1"], &[], false));
+        let diff = installed.diff_to(&update);
+        assert!(!diff.expands_permissions());
+        assert_eq!(diff.removed.len(), 2);
+        // Removals render with a leading '-'.
+        assert!(diff.render().lines().all(|l| l.starts_with('-')));
+    }
+
+    #[test]
+    fn grants_gates_a_runtime_request() {
+        let set = CapabilitySet::from_spec(&spec(&["api.github.com:443"], &[], false));
+        assert!(set.grants(&Capability::Network("api.github.com:443".into())));
+        // An undeclared host is not granted (exit criterion 1 at the decision layer).
+        assert!(!set.grants(&Capability::Network("evil.example.com:443".into())));
+        assert!(!set.grants(&Capability::FilesystemRead("/home/user/.ssh/id_rsa".into())));
+    }
+}

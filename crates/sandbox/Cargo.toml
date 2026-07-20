@@ -1,0 +1,25 @@
+[package]
+name = "codypendent-sandbox"
+description = "codypendent-sandbox: the plugin security boundary (Phase 6). Parses plugin.toml, verifies checksum/signature, evaluates capability permissions, computes permission diffs for updates, drives the install→verify→enable lifecycle, and derives a sandbox profile from the granted capabilities. Pure decision logic — OS-level process/WASM isolation wires onto these grants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Plugin manifests are TOML — the exact shape of `docs/specs/plugin.toml`.
+toml = { workspace = true }
+thiserror = { workspace = true }
+# Artifact checksum (sha256) + hex encoding of digests.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Publisher signature over the checksum (ed25519), key + signature carried as
+# base64 text in the manifest's `[security]` table.
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true
