@@ -3,6 +3,20 @@
 Reviewed at commit `dc02967` (merge of PR #12), branch `main`. All file:line
 references are as of that commit.
 
+> **Fix-pass addendum (same day, this branch).** A defect-fix pass landed after
+> this review; see the commits following it on this branch. **Fixed:** S1–S6,
+> C1–C10 and C12–C15 (C2 = wire-safe tool replay + unit pin, though a live
+> provider test still does not exist; C3 = schema + `external_id` idempotency,
+> while the personal-token 403 is documented, not worked around; C12 = absolute
+> timeout ceiling, search/git bounds, bounded drain — the `kill`-binary
+> dependency remains), plus the Phase-4 suggestion-lease scope, manifest
+> `outputs` validation (and the canonical manifest's invalid kinds), the stale
+> protocol doc comments, and the ROADMAP under-claims. **Still open:** C11
+> (lexicographic revision comparison — needs a schema-level decision), S7 (OS
+> sandbox enforcement + trust-tier rendering — tracked roadmap work), the §4
+> performance cluster, the §5 dead-code inventory, cross-language golden
+> vectors / the generated protocol SDK, and `cargo deny`/`audit` in CI.
+
 **Method.** Every phase marked ✅/🟡 in [`ROADMAP.md`](../../ROADMAP.md) was
 audited claim-by-claim against the code by six parallel reviewers (daemon +
 protocol, knowledge, runtime + integrations, workflow, TUI + CLI, VS Code

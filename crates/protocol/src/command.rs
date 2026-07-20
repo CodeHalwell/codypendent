@@ -90,14 +90,16 @@ pub enum CommandBody {
         update: IdeContextUpdate,
     },
     /// Apply a semantic mutation to a collaborative document (Phase 4 STEP 4.3).
-    /// The intended handling is to map this onto the authoritative Loro document
-    /// (`codypendent-knowledge`) and, in a non-`Edit` collaboration mode, record
-    /// content edits as suggestions rather than applying them directly.
     ///
-    /// **Not yet handled by the daemon.** This is the wire contract; routing it to
-    /// `DocumentStore`/`SuggestionStore` (with a role-permission arm) is part of
-    /// the Phase 4 *client-transport* slice tracked in the roadmap. Until then the
-    /// daemon's command processor rejects it, like any command it does not model.
+    /// Handled at the connection level (documents live outside the session
+    /// ledger, so this never flows through the event write path): the daemon
+    /// applies it onto the authoritative Loro document through its
+    /// `DocumentMutator` seam — mode-gated by the document's scope (content
+    /// edits become suggestions outside `Edit` mode), single-writer enforced
+    /// via the edit-lease `require` pre-check — and fans the resulting
+    /// `DocumentSync` out to the document's subscribers. An Observer is
+    /// role-denied; a daemon assembled without a mutator rejects it
+    /// `document.transport-unavailable`.
     MutateDocument {
         document_id: DocumentId,
         mutation: DocumentMutation,
