@@ -251,9 +251,12 @@ impl WorktreeManager {
             .bind(worktree_path.to_string_lossy().as_ref())
             .execute(pool)
             .await?;
-        if run_git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
-            .await
-            .is_ok()
+        if run_git(
+            &repo,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .await
+        .is_ok()
         {
             match run_git(&repo, &["merge-base", "--is-ancestor", &branch, "HEAD"]).await {
                 Ok(_) => {

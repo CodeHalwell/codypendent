@@ -495,9 +495,9 @@ enum GitOp {
 /// fallback (`directories`), so the poison only triggers when the home
 /// directory is genuinely unknowable.
 fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> PathScope {
-    let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
-        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
-    });
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
 
     let canonical = |expanded: String| scope::canonicalize_lenient(Path::new(&expanded));
 

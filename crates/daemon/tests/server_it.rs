@@ -493,7 +493,13 @@ async fn observer_cannot_acquire_a_document_lease() {
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
-    bind_role(&mut stream, client_id, ClientRole::Observer, "obs-lease-att").await;
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Observer,
+        "obs-lease-att",
+    )
+    .await;
 
     let reply = send_recv(
         &mut stream,
@@ -531,7 +537,13 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
-    bind_role(&mut stream, client_id, ClientRole::Contributor, "contrib-lease-att").await;
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Contributor,
+        "contrib-lease-att",
+    )
+    .await;
 
     // Acquire → transport-unavailable.
     let reply = send_recv(

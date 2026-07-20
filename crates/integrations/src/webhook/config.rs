@@ -35,10 +35,7 @@ impl std::fmt::Debug for WebhooksConfig {
         f.debug_struct("WebhooksConfig")
             .field("enabled", &self.enabled)
             .field("listen_addr", &self.listen_addr)
-            .field(
-                "secret",
-                &self.secret.as_ref().map(|_| "<redacted>"),
-            )
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }

@@ -337,7 +337,10 @@ async fn pagination_refuses_lookalike_origin_next_links() {
     // leak a second request (which would fail to resolve anyway).
     let server = MockServer::start().await;
     let repo = RepoId::new("o", "r");
-    let evil_next = format!("{}.evil.test/repos/o/r/issues/1/comments?page=2", server.uri());
+    let evil_next = format!(
+        "{}.evil.test/repos/o/r/issues/1/comments?page=2",
+        server.uri()
+    );
 
     Mock::given(method("GET"))
         .and(path("/repos/o/r/issues/1/comments"))
@@ -355,5 +358,9 @@ async fn pagination_refuses_lookalike_origin_next_links() {
         .list_review_comments(&repo, 1)
         .await
         .expect("list first page");
-    assert_eq!(comments.len(), 1, "the lookalike next link must not be followed");
+    assert_eq!(
+        comments.len(),
+        1,
+        "the lookalike next link must not be followed"
+    );
 }
