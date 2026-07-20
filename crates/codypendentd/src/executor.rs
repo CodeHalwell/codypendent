@@ -584,6 +584,14 @@ impl RunExecutor for RuntimeExecutor {
             self.pool.clone(),
         )))
     }
+
+    fn workflow_starter(&self) -> Option<Arc<dyn codypendent_daemon::workflows::WorkflowStarter>> {
+        // Compile a `StartWorkflow` manifest and create a durable run over the
+        // daemon's pool (Phase 5 STEP 5.2). Driving the run is a later step.
+        Some(Arc::new(crate::workflows::WorkflowRunStarter::new(
+            self.pool.clone(),
+        )))
+    }
 }
 
 /// The `repository` recorded on the StartRun command that created a queued run,

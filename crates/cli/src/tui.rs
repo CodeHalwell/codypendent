@@ -44,8 +44,9 @@ use codypendent_protocol::{
     CommandId, Envelope, Payload, RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, Action, AppState, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
+    map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
+    WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     state.memories = projections.memories;
     state.docs = projections.docs;
     state.edges = projections.edges;
+    state.blackboard = projections.blackboard;
     // Phase 5 STEP 5.2: seed the workflow-graph view by compiling the
     // repository's declared workflow manifests. This reads files, not the
     // knowledge db, so it is a standalone projection; a malformed manifest logs
@@ -644,6 +646,7 @@ struct KnowledgeProjections {
     memories: Vec<MemoryCard>,
     docs: Vec<DocCard>,
     edges: Vec<GraphEdgeCard>,
+    blackboard: Vec<BlackboardItemCard>,
 }
 
 /// The cap on edges surfaced in the inspector. A large repository's graph can
@@ -674,6 +677,7 @@ async fn load_knowledge(
         memories: Vec::new(),
         docs: Vec::new(),
         edges: Vec::new(),
+        blackboard: Vec::new(),
     };
 
     let database_path = paths.data_dir.join("codypendent.db");
@@ -717,6 +721,10 @@ async fn load_knowledge(
 
     let docs = load_docs(&pool, &scopes).await;
     let edges = load_edges(&pool, repository).await;
+    // Phase 5 STEP 5.3: the blackboard artifacts on the active workflow runs. The
+    // workflow tables share this database (the migrations are workspace-wide), so
+    // the same pool serves them; empty until a run posts artifacts.
+    let blackboard = load_blackboard(&pool).await;
 
     pool.close().await;
     KnowledgeProjections {
@@ -724,6 +732,7 @@ async fn load_knowledge(
         memories,
         docs,
         edges,
+        blackboard,
     }
 }
 
@@ -1199,6 +1208,146 @@ fn workflow_node_card(
     }
 }
 
+/// The cap on blackboard artifacts surfaced in the view — a long-running board
+/// can accumulate many; the read-only view shows the first [`MAX_BLACKBOARD_ITEMS`]
+/// (newest first, across the active runs) and logs when it truncates.
+const MAX_BLACKBOARD_ITEMS: usize = 500;
+
+/// Project the blackboard artifacts on the active workflow runs into
+/// [`BlackboardItemCard`]s (Phase 5 STEP 5.3). The workflow tables share the
+/// knowledge database (the migrations are workspace-wide), so the same pool
+/// serves them. Runs are the daemon's non-terminal set (the boards worth
+/// watching); each run's full board — live and superseded — is queried so the
+/// view can dim corrected artifacts. Empty until the executor posts artifacts; a
+/// query failure logs and skips that run rather than failing the view.
+async fn load_blackboard(pool: &sqlx::SqlitePool) -> Vec<BlackboardItemCard> {
+    use codypendent_workflow::{BlackboardStore, WorkflowStore};
+
+    let runs = match WorkflowStore::new().list_incomplete_runs(pool).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!("codypendent: could not list workflow runs: {error}");
+            return Vec::new();
+        }
+    };
+
+    let board = BlackboardStore::new();
+    let mut cards = Vec::new();
+    for run in runs {
+        let run_label = format!("{} \u{b7} run {}", run.workflow_id, short_run_id(&run.id));
+        match board.query(pool, &run.id, None, true).await {
+            Ok(items) => cards.extend(
+                items
+                    .iter()
+                    .map(|item| blackboard_item_card(&run_label, item)),
+            ),
+            Err(error) => {
+                eprintln!(
+                    "codypendent: could not query the blackboard for run {}: {error}",
+                    run.id
+                );
+            }
+        }
+        if cards.len() >= MAX_BLACKBOARD_ITEMS {
+            eprintln!(
+                "codypendent: blackboard view showing the first {MAX_BLACKBOARD_ITEMS} artifacts"
+            );
+            cards.truncate(MAX_BLACKBOARD_ITEMS);
+            break;
+        }
+    }
+    cards
+}
+
+/// Map a [`BlackboardItem`](codypendent_workflow::BlackboardItem) into the view's
+/// [`BlackboardItemCard`], rendering its opaque JSON payload/author/evidence to
+/// human strings. `run` is the owning run's label the view groups by.
+fn blackboard_item_card(
+    run: &str,
+    item: &codypendent_workflow::BlackboardItem,
+) -> BlackboardItemCard {
+    BlackboardItemCard {
+        run: run.to_owned(),
+        kind: item.kind.as_str().to_owned(),
+        summary: summarize_json(&item.payload),
+        author: summarize_author(&item.author),
+        confidence: item
+            .confidence
+            .map_or_else(|| "\u{2014}".to_owned(), |c| format!("{c:.2}")),
+        evidence: if item.evidence.is_empty() {
+            "\u{2014}".to_owned()
+        } else {
+            format!("{} ref(s)", item.evidence.len())
+        },
+        revision: format!("r{}", item.revision),
+        superseded: item.superseded_by.is_some(),
+    }
+}
+
+/// The first 8 characters of a run id, for a compact run label.
+fn short_run_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// A one-line human summary of an opaque artifact payload: a string payload as-is;
+/// an object's first human-text field (`summary`/`title`/`statement`/…) when one
+/// is present; otherwise its compact JSON. Capped so a large payload cannot blow
+/// out the card.
+fn summarize_json(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => {
+            let field = [
+                "summary",
+                "title",
+                "statement",
+                "text",
+                "description",
+                "message",
+            ]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str));
+            match field {
+                Some(text) => text.to_owned(),
+                None => value.to_string(),
+            }
+        }
+        other => other.to_string(),
+    };
+    truncate_chars(&raw, 200)
+}
+
+/// A compact rendering of an opaque author record: a string as-is; an object's
+/// `role`/`agent` as `"agent <role>"`; otherwise its compact JSON.
+fn summarize_author(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => match map
+            .get("role")
+            .or_else(|| map.get("agent"))
+            .and_then(Value::as_str)
+        {
+            Some(role) => format!("agent {role}"),
+            None => value.to_string(),
+        },
+        other => other.to_string(),
+    };
+    truncate_chars(&raw, 80)
+}
+
+/// Truncate to at most `max` characters, appending an ellipsis when cut (char-safe
+/// so a multi-byte boundary is never split).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}\u{2026}")
+    }
+}
+
 fn collab_mode_label(mode: CollaborationMode) -> &'static str {
     match mode {
         CollaborationMode::Ask => "ask",
@@ -1544,5 +1693,61 @@ steps:
         // Nodes keep their compiled topological order.
         assert_eq!(cards[0].id, "patch");
         assert_eq!(cards[1].id, "verify");
+    }
+
+    #[test]
+    fn blackboard_item_card_renders_opaque_payload_and_provenance() {
+        use codypendent_workflow::{BlackboardItem, BlackboardKind};
+        use serde_json::json;
+
+        let item = BlackboardItem {
+            id: "0192-abc".to_owned(),
+            kind: BlackboardKind::Finding,
+            payload: json!({ "summary": "off-by-one in paginate()", "detail": "…" }),
+            author: json!({ "role": "investigator", "run": "r1" }),
+            confidence: Some(0.85),
+            evidence: vec![json!({ "artifact": "a1" }), json!({ "artifact": "a2" })],
+            revision: 1,
+            superseded_by: None,
+        };
+        let card = blackboard_item_card("repair-github-check \u{b7} run 0192abcd", &item);
+        assert_eq!(card.kind, "finding");
+        assert_eq!(card.summary, "off-by-one in paginate()");
+        assert_eq!(card.author, "agent investigator");
+        assert_eq!(card.confidence, "0.85");
+        assert_eq!(card.evidence, "2 ref(s)");
+        assert_eq!(card.revision, "r1");
+        assert!(!card.superseded);
+    }
+
+    #[test]
+    fn json_summaries_fall_back_gracefully() {
+        use codypendent_workflow::{BlackboardItem, BlackboardKind};
+        use serde_json::json;
+
+        // A string payload is used verbatim; an object without a known text field
+        // falls back to compact JSON rather than panicking.
+        assert_eq!(summarize_json(&json!("plain text")), "plain text");
+        assert!(summarize_json(&json!({ "x": 1 })).contains("\"x\""));
+        assert!(summarize_author(&json!({ "who": "?" })).contains("who"));
+
+        // A superseded hypothesis with no confidence or evidence renders em dashes.
+        let item = BlackboardItem {
+            id: "1".to_owned(),
+            kind: BlackboardKind::Hypothesis,
+            payload: json!("a guess"),
+            author: json!("someone"),
+            confidence: None,
+            evidence: vec![],
+            revision: 3,
+            superseded_by: Some("2".to_owned()),
+        };
+        let card = blackboard_item_card("run", &item);
+        assert_eq!(card.summary, "a guess");
+        assert_eq!(card.author, "someone");
+        assert_eq!(card.confidence, "\u{2014}");
+        assert_eq!(card.evidence, "\u{2014}");
+        assert_eq!(card.revision, "r3");
+        assert!(card.superseded);
     }
 }

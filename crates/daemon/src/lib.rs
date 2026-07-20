@@ -20,4 +20,5 @@ pub mod policy;
 pub mod projections;
 pub mod recovery;
 pub mod subscriptions;
+pub mod workflows;
 pub mod worktrees;

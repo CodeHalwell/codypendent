@@ -65,8 +65,8 @@ impl LayoutMode {
 /// [`crate::input::map_event`]). Derived from the active overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// A navigable overlay (Skills / Memory / Docs / Edges / Workflow / Help) is
-    /// live: the arrow/command key table drives it.
+    /// A navigable overlay (Skills / Memory / Docs / Edges / Workflow /
+    /// Blackboard / Help) is live: the arrow/command key table drives it.
     Normal,
     /// A text prompt is capturing printable keys.
     Editing,
@@ -124,6 +124,13 @@ pub enum Overlay {
     /// workflow graph (the daemon-side executor that fills live per-node
     /// state/cost is a later wiring step).
     Workflow,
+    /// The blackboard view (Phase 5 STEP 5.3): the [`AppState::blackboard`] item
+    /// list (the typed, attributed artifacts agents share within a workflow run —
+    /// findings, decisions, patches, …) grouped by run, and — for the focused
+    /// item — its kind, author, confidence, evidence, revision, and payload
+    /// summary. Read-only — a projection of the per-run board (populated once the
+    /// executor posts artifacts).
+    Blackboard,
     /// The command palette: a searchable list of every command the TUI exposes,
     /// so the growing feature set stays reachable without consuming a single-key
     /// binding each. `query` is the live filter; `selected` indexes the filtered
@@ -440,6 +447,36 @@ pub struct WorkflowNodeCard {
     pub cost: String,
 }
 
+/// A blackboard artifact projected for the blackboard view (Phase 5 STEP 5.3).
+/// Self-contained — the TUI never depends on `codypendent-workflow`; the CLI maps
+/// a `BlackboardItem` (its opaque JSON payload/author/evidence rendered to human
+/// strings) into this shape. Items are grouped by their `run` label, so several
+/// workflow runs' boards read as labeled groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlackboardItemCard {
+    /// The owning workflow run, pre-rendered (e.g. `"repair-github-check · run
+    /// 0f2a"`), so several runs' boards share the list under labeled groups.
+    pub run: String,
+    /// The artifact kind, pre-rendered (`finding` / `decision` / `proposed_patch`
+    /// / …).
+    pub kind: String,
+    /// A one-line human summary of the artifact's payload.
+    pub summary: String,
+    /// Who produced it, pre-rendered from the author record (e.g. `"agent
+    /// investigator"`).
+    pub author: String,
+    /// The producer's confidence, pre-rendered (`"0.85"` or `"—"`).
+    pub confidence: String,
+    /// The evidence backing the artifact, pre-rendered (e.g. `"2 ref(s)"` or
+    /// `"—"`) — claim-like kinds always carry it.
+    pub evidence: String,
+    /// The artifact's revision, pre-rendered (e.g. `"r1"`).
+    pub revision: String,
+    /// Whether this item has been superseded by a later revision (the review
+    /// rail shows the live item; a superseded one is dimmed).
+    pub superseded: bool,
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -507,6 +544,13 @@ pub struct AppState {
     pub workflow: Vec<WorkflowNodeCard>,
     /// Index into `workflow` of the focused node.
     pub selected_node: usize,
+    /// The blackboard projection (Phase 5 STEP 5.3): the artifacts on the active
+    /// workflow runs' boards, mapped to self-contained [`BlackboardItemCard`]s by
+    /// the CLI, grouped by run. May be empty (until the executor posts artifacts).
+    /// The [`Overlay::Blackboard`] view reads it.
+    pub blackboard: Vec<BlackboardItemCard>,
+    /// Index into `blackboard` of the focused item.
+    pub selected_item: usize,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -567,6 +611,8 @@ impl AppState {
             selected_edge: 0,
             workflow: Vec::new(),
             selected_node: 0,
+            blackboard: Vec::new(),
+            selected_item: 0,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
@@ -597,7 +643,8 @@ impl AppState {
             | Overlay::Memory { .. }
             | Overlay::Docs
             | Overlay::Edges
-            | Overlay::Workflow => InputMode::Normal,
+            | Overlay::Workflow
+            | Overlay::Blackboard => InputMode::Normal,
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
             Overlay::None => {
@@ -670,6 +717,12 @@ impl AppState {
     #[must_use]
     pub fn focused_node(&self) -> Option<&WorkflowNodeCard> {
         self.workflow.get(self.selected_node)
+    }
+
+    /// The focused blackboard item card, if any.
+    #[must_use]
+    pub fn focused_item(&self) -> Option<&BlackboardItemCard> {
+        self.blackboard.get(self.selected_item)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.

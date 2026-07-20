@@ -665,6 +665,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Docs => render_docs(frame, area, state, theme),
         Overlay::Edges => render_edges(frame, area, state, theme),
         Overlay::Workflow => render_workflow(frame, area, state, theme),
+        Overlay::Blackboard => render_blackboard(frame, area, state, theme),
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, theme, query, *selected);
         }
@@ -1372,6 +1373,169 @@ fn node_state_color(state: &str, theme: &Theme) -> Color {
         "pending" => theme.status.info,
         _ => theme.text.muted,
     }
+}
+
+/// The blackboard view (Phase 5 STEP 5.3): the typed artifacts agents share
+/// within a workflow run — a list on the left, grouped by run, and, for the
+/// focused item, its kind, author, confidence, evidence, revision, and payload
+/// summary on the right. Read-only. Colors are Theme tokens only (RULE 7).
+fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(86, 86, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Blackboard ({} item(s)) ", state.blackboard.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(inner);
+
+    // Left: the artifact list, grouped by run (the run header is folded into the
+    // first item of each group so item↔card stays 1:1 with the selection index).
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.blackboard.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no blackboard artifacts on the active runs",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    let mut previous_run: Option<&str> = None;
+    for (idx, card) in state.blackboard.iter().enumerate() {
+        let selected = idx == state.selected_item;
+        let marker = if selected { "› " } else { "  " };
+        let mut lines: Vec<Line> = Vec::new();
+        if previous_run != Some(card.run.as_str()) {
+            lines.push(Line::styled(
+                card.run.clone(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            previous_run = Some(card.run.as_str());
+        }
+        // A superseded artifact is dimmed; the live one reads normally.
+        let kind_color = if card.superseded {
+            theme.text.muted
+        } else {
+            theme.status.info
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(truncate(&card.kind, 16), Style::default().fg(kind_color)),
+            if card.superseded {
+                Span::styled(" (superseded)", Style::default().fg(theme.text.muted))
+            } else {
+                Span::raw("")
+            },
+        ]));
+        lines.push(Line::styled(
+            format!("    {}", truncate(&card.summary, 34)),
+            Style::default().fg(theme.text.muted),
+        ));
+        let item = ListItem::new(lines);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail for the focused artifact — kind, author, confidence, the
+    // evidence that grounds it (claim-like kinds always carry it), revision, and a
+    // payload summary.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(card) = state.focused_item() {
+        let field = |k: &str, v: &str, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v.to_owned(), Style::default().fg(color)),
+            ])
+        };
+        lines.push(section("Artifact", theme));
+        lines.push(field("run", &card.run, theme.text.secondary));
+        lines.push(field("kind", &card.kind, theme.status.info));
+        lines.push(field("revision", &card.revision, theme.text.secondary));
+        if card.superseded {
+            lines.push(field("status", "superseded", theme.text.muted));
+        }
+        lines.push(Line::raw(""));
+        lines.push(section("Provenance", theme));
+        lines.push(field("author", &card.author, theme.text.primary));
+        lines.push(field("confidence", &card.confidence, theme.text.secondary));
+        lines.push(field("evidence", &card.evidence, theme.text.secondary));
+        lines.push(Line::raw(""));
+        lines.push(section("Payload", theme));
+        for line in textwrap_summary(&card.summary) {
+            lines.push(Line::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
+    } else {
+        lines.push(Line::styled(
+            "  no artifact selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// Split a one-line summary into wrapped display lines for the payload panel. A
+/// plain char-count wrap (the summary is already a single pre-rendered line, so a
+/// word-aware wrap is unnecessary here) keeping each chunk within the panel.
+fn textwrap_summary(summary: &str) -> Vec<String> {
+    const WIDTH: usize = 48;
+    if summary.is_empty() {
+        return vec!["(empty)".to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in summary.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > WIDTH {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// The command palette: a filter line over a searchable list of every command,
@@ -2496,5 +2660,42 @@ mod tests {
         );
         assert!(text.contains("before write"), "approval missing:\n{text}");
         assert!(text.contains("proposed_patch"), "outputs missing:\n{text}");
+    }
+
+    #[test]
+    fn blackboard_view_snapshot_shows_artifact_provenance() {
+        use crate::state::BlackboardItemCard;
+        let mut state = running_build_state();
+        state.blackboard = vec![BlackboardItemCard {
+            run: "repair-github-check \u{b7} run 0f2a".to_owned(),
+            kind: "finding".to_owned(),
+            summary: "the failing test asserts an off-by-one in paginate()".to_owned(),
+            author: "agent investigator".to_owned(),
+            confidence: "0.85".to_owned(),
+            evidence: "2 ref(s)".to_owned(),
+            revision: "r1".to_owned(),
+            superseded: false,
+        }];
+        reduce(&mut state, Action::OpenBlackboard);
+        let text = render_to_string(&state, 120, 40);
+
+        assert!(text.contains("Blackboard"), "title missing:\n{text}");
+        // Run group header + the artifact kind.
+        assert!(
+            text.contains("repair-github-check"),
+            "run header missing:\n{text}"
+        );
+        assert!(text.contains("finding"), "kind missing:\n{text}");
+        // The provenance payload the exit criterion wants visible.
+        assert!(
+            text.contains("agent investigator"),
+            "author missing:\n{text}"
+        );
+        assert!(text.contains("0.85"), "confidence missing:\n{text}");
+        assert!(text.contains("2 ref(s)"), "evidence missing:\n{text}");
+        assert!(
+            text.contains("off-by-one"),
+            "payload summary missing:\n{text}"
+        );
     }
 }

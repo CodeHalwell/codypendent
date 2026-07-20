@@ -178,6 +178,7 @@ fn map_normal_char(c: char) -> Action {
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
+        'B' => Action::OpenBlackboard,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }
@@ -361,6 +362,10 @@ mod tests {
         assert_eq!(
             map_event(&ch('W'), InputMode::Normal, W),
             Action::OpenWorkflow
+        );
+        assert_eq!(
+            map_event(&ch('B'), InputMode::Normal, W),
+            Action::OpenBlackboard
         );
         assert_eq!(
             map_event(&ch('/'), InputMode::Normal, W),

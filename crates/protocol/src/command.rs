@@ -126,6 +126,27 @@ pub enum CommandBody {
     ReleaseDocumentLease {
         lease_id: String,
     },
+    /// Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).
+    ///
+    /// Carries the workflow **manifest YAML** (its content, not a path — the daemon
+    /// never reads an arbitrary client-named file) and the typed `inputs` the
+    /// manifest declares. Handled at the connection level like `MutateDocument` (a
+    /// workflow run lives in its own durable store outside the session ledger): the
+    /// daemon compiles the manifest, creates the run through its `WorkflowStarter`
+    /// seam, and replies
+    /// [`WorkflowRunStarted`](crate::envelope::Payload::WorkflowRunStarted) with the
+    /// new run id — or `CommandRejected` when the manifest does not compile. A
+    /// daemon assembled without a starter rejects it `workflow.transport-unavailable`.
+    /// (Driving the created run is a later step; this command only makes runs
+    /// durably creatable.)
+    StartWorkflow {
+        /// The workflow manifest YAML (the content of a `workflow.yaml`).
+        manifest: String,
+        /// The typed inputs the manifest declares, as JSON. Defaults to null when
+        /// omitted (a workflow with no required inputs).
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        inputs: serde_json::Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -239,6 +260,25 @@ mod tests {
         round_trip(CommandBody::ReleaseDocumentLease {
             lease_id: "lease-1".to_string(),
         });
+        round_trip(CommandBody::StartWorkflow {
+            manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            inputs: serde_json::json!({ "pull_request": 42 }),
+        });
+    }
+
+    #[test]
+    fn start_workflow_omits_null_inputs_and_reparses() {
+        // A workflow with no inputs sends no `inputs` key, and such a payload
+        // (also what an older client emits) reparses with `inputs` defaulted to
+        // null.
+        let body = CommandBody::StartWorkflow {
+            manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            inputs: serde_json::Value::Null,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("inputs"), "null inputs are skipped: {json}");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]

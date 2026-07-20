@@ -112,4 +112,15 @@ pub trait RunExecutor: Send + Sync {
     fn document_leaser(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentLeaser>> {
         None
     }
+
+    /// The assembly-provided [`WorkflowStarter`](crate::workflows::WorkflowStarter)
+    /// that creates a durable run from an accepted `StartWorkflow` command (Phase 5
+    /// STEP 5.2). Bundled with the executor like the document seams — it names
+    /// `codypendent-workflow` and the pool, which only the assembly can. The default
+    /// `None` leaves workflow-start unwired: the executor-less server and the
+    /// daemon's own tests then reject `StartWorkflow` with
+    /// `workflow.transport-unavailable`, exactly as they leave a run `Queued`.
+    fn workflow_starter(&self) -> Option<std::sync::Arc<dyn crate::workflows::WorkflowStarter>> {
+        None
+    }
 }

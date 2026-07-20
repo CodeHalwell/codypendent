@@ -42,6 +42,7 @@ use crate::instance::InstanceRecord;
 use crate::ledger;
 use crate::projections;
 use crate::subscriptions::SubscriptionHub;
+use crate::workflows::{StartWorkflowRequest, WorkflowStarter};
 
 /// Heartbeat cadence advertised in `ServerHello` and used to probe idle clients.
 const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
@@ -91,6 +92,11 @@ pub struct ServerState {
     /// `document.transport-unavailable`); injected together with `mutator` by the
     /// assembly.
     pub leaser: Option<Arc<dyn DocumentLeaser>>,
+    /// Creates a durable run from an accepted `StartWorkflow` (Phase 5 STEP 5.2).
+    /// `None` in a lib-only / test embedding (the command is then rejected
+    /// `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub starter: Option<Arc<dyn WorkflowStarter>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -167,6 +173,7 @@ pub async fn run_with_executor_on(
     // client's `Document` forwarder), and the mutator only computes the sync.
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
+    let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let documents = DocumentHub::new();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
@@ -213,6 +220,7 @@ pub async fn run_with_executor_on(
         documents,
         mutator,
         leaser,
+        starter,
     });
 
     #[cfg(unix)]
@@ -791,6 +799,57 @@ async fn handle_request(
                                 command_id: command.command_id,
                                 sequence: None,
                                 created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // A `StartWorkflow` creates a durable run in the workflow store,
+                // which lives outside the session ledger — so, like `MutateDocument`,
+                // it is intercepted here and applied through the assembly's
+                // `WorkflowStarter` seam rather than the event write path (Phase 5
+                // STEP 5.2). Driving the created run is a later step.
+                CommandBody::StartWorkflow { manifest, inputs } => {
+                    // An Observer may not start a run.
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not start a workflow".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    // With no starter injected (lib-only server / daemon tests)
+                    // workflow transport is not enabled; reject structurally so the
+                    // connection survives, mirroring the executor-less run path.
+                    let Some(starter) = state.starter.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "workflow.transport-unavailable",
+                                "workflow transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let start = StartWorkflowRequest {
+                        manifest: manifest.clone(),
+                        inputs: inputs.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match starter.start(start).await {
+                        Ok(workflow_run_id) => Envelope::reply_to(
+                            &request,
+                            Payload::WorkflowRunStarted {
+                                command_id: command.command_id,
+                                workflow_run_id,
                             },
                         ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),

@@ -31,6 +31,8 @@ pub enum PaletteCommand {
     Edges,
     /// Open the workflow-graph view.
     Workflow,
+    /// Open the blackboard view.
+    Blackboard,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -97,6 +99,12 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Workflow graph",
         description: "view workflow nodes (state, agent, worktree, approval)",
         key: "W",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Blackboard,
+        title: "Blackboard",
+        description: "view workflow artifacts (findings, decisions, evidence)",
+        key: "B",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
