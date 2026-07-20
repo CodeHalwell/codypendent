@@ -163,6 +163,11 @@ pub enum WorktreeError {
     /// error so callers can branch on it.
     #[error("worktree {worktree_path} already has an active lease")]
     LeaseConflict { worktree_path: PathBuf },
+    /// Re-allocation found a leftover run branch holding commits not reachable
+    /// from HEAD. Deleting it would lose work, so the allocation refuses; the
+    /// branch must be merged or removed deliberately.
+    #[error("branch {branch} holds unmerged work; refusing to reuse it")]
+    BranchHoldsWork { branch: String },
     /// No lease row exists for the given id.
     #[error("no workspace lease with id {lease_id}")]
     LeaseNotFound { lease_id: Uuid },
@@ -234,6 +239,32 @@ impl WorktreeManager {
             return Err(WorktreeError::LeaseConflict { worktree_path });
         }
 
+        // A prior lease on this path that is no longer active (released or
+        // orphaned) blocks re-allocation twice over: its row trips the
+        // UNIQUE(worktree_path) index, and its surviving branch makes
+        // `worktree add -b` refuse. Clear both, but only where provably
+        // lossless: the row's terminal disposition was already acted on (patch
+        // exported / orphan adopted / directory retained), and the branch is
+        // deleted only when every commit on it is reachable from HEAD — a
+        // branch holding unmerged work refuses the allocation instead.
+        sqlx::query("DELETE FROM workspace_leases WHERE worktree_path = ? AND state != 'active'")
+            .bind(worktree_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await?;
+        if run_git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .await
+            .is_ok()
+        {
+            match run_git(&repo, &["merge-base", "--is-ancestor", &branch, "HEAD"]).await {
+                Ok(_) => {
+                    run_git(&repo, &["branch", "-D", &branch]).await?;
+                }
+                Err(_) => {
+                    return Err(WorktreeError::BranchHoldsWork { branch });
+                }
+            }
+        }
+
         // Record the base commit, then create branch + worktree atomically. Using
         // `add -b <branch> <path> <base>` creates the branch at HEAD (== base) and
         // checks it out into the new worktree in one step, leaving no dangling
@@ -271,6 +302,23 @@ impl WorktreeManager {
         };
 
         if let Err(e) = insert_lease(pool, &lease).await {
+            // Losing the insert race must not leak the just-created worktree
+            // on disk until a next-boot orphan sweep: it was created moments
+            // ago at base == HEAD with no work in it, so tearing it down is
+            // lossless. Best-effort — a failure here only re-creates the
+            // pre-existing leak, it cannot lose work.
+            let _ = run_git(
+                &lease.repository_path,
+                &[
+                    OsString::from("worktree"),
+                    OsString::from("remove"),
+                    OsString::from("--force"),
+                    worktree_path.clone().into_os_string(),
+                ],
+            )
+            .await;
+            let _ = run_git(&lease.repository_path, &["branch", "-D", &lease.branch]).await;
+
             // Backstop for a lost race on the UNIQUE(worktree_path) index.
             if let WorktreeError::Database(sqlx::Error::Database(db)) = &e {
                 if db.is_unique_violation() {
@@ -1137,5 +1185,58 @@ mod tests {
         );
         assert_eq!(records[2].path, PathBuf::from("/wt/detached"));
         assert_eq!(records[2].branch, None);
+    }
+
+    #[tokio::test]
+    async fn reallocate_after_clean_release_succeeds() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let run_id = seed_run(&pool).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let first = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let outcome = mgr.release(&pool, &store, first.id, false).await.unwrap();
+        assert!(outcome.worktree_removed);
+
+        // The same run re-allocates the same path: the released lease row and
+        // the workless leftover branch must not block it.
+        let second = mgr
+            .allocate(&pool, &repo, run_id)
+            .await
+            .expect("re-allocation after a clean release must succeed");
+        assert_eq!(second.worktree_path, first.worktree_path);
+        assert!(second.worktree_path.exists());
+    }
+
+    #[tokio::test]
+    async fn reallocate_refuses_when_leftover_branch_holds_work() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let run_id = seed_run(&pool).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+
+        // Commit unmerged work on the run branch, then release (dir retained).
+        let wt = &lease.worktree_path;
+        std::fs::write(wt.join("feature.txt"), "unmerged\n").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-q", "-m", "unmerged feature"]);
+        let outcome = mgr.release(&pool, &store, lease.id, false).await.unwrap();
+        assert!(outcome.preserved);
+
+        // Re-allocation must refuse rather than delete the branch's work.
+        let err = mgr
+            .allocate(&pool, &repo, run_id)
+            .await
+            .expect_err("a leftover branch with unmerged work must refuse re-allocation");
+        assert!(
+            matches!(err, WorktreeError::BranchHoldsWork { .. }),
+            "unexpected error: {err:?}"
+        );
     }
 }

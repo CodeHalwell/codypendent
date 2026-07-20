@@ -363,8 +363,14 @@ impl CommandProcessor {
             }
             CommandBody::CancelRun { run_id }
             | CommandBody::PauseRun { run_id }
-            | CommandBody::ResumeRun { run_id }
-            | CommandBody::QueueSteering { run_id, .. } => {
+            | CommandBody::ResumeRun { run_id } => {
+                let state = projections::load_run_state(pool, *run_id)
+                    .await
+                    .map_err(internal_error)?
+                    .ok_or_else(|| run_not_found(*run_id))?;
+                validate_run_transition(&command.body, *run_id, state)?;
+            }
+            CommandBody::QueueSteering { run_id, .. } => {
                 if projections::run_session(pool, *run_id)
                     .await
                     .map_err(internal_error)?
@@ -1085,6 +1091,44 @@ fn run_not_found(run_id: RunId) -> CodypendentError {
     CodypendentError::new("protocol.run-not-found", format!("no run {run_id}"), false)
 }
 
+/// Whether a lifecycle command is legal from the run's current state.
+///
+/// Without this guard `ResumeRun` on a `Completed` run flipped the projection
+/// back to `Running` with no executor attached — a zombie polluting
+/// `active_runs` until the next boot's recovery force-failed it and appended
+/// contradictory terminal events onto an already-finished run.
+fn validate_run_transition(
+    body: &CommandBody,
+    run_id: RunId,
+    state: RunState,
+) -> Result<(), CodypendentError> {
+    let terminal = matches!(
+        state,
+        RunState::Completed | RunState::Failed | RunState::Cancelled
+    );
+    let (verb, legal) = match body {
+        // Cancelling is legal from any live state.
+        CommandBody::CancelRun { .. } => ("cancel", !terminal && state != RunState::Unknown),
+        // Pausing is legal from any live, not-already-paused state.
+        CommandBody::PauseRun { .. } => (
+            "pause",
+            !terminal && !matches!(state, RunState::Paused | RunState::Unknown),
+        ),
+        // Resuming means "leave Paused" — anything else is already live or done.
+        CommandBody::ResumeRun { .. } => ("resume", state == RunState::Paused),
+        _ => ("transition", true),
+    };
+    if legal {
+        Ok(())
+    } else {
+        Err(CodypendentError::new(
+            "run.invalid-transition",
+            format!("cannot {verb} run {run_id} in state {state:?}"),
+            false,
+        ))
+    }
+}
+
 fn approval_not_found(approval_id: codypendent_protocol::ApprovalId) -> CodypendentError {
     CodypendentError::new(
         "approval.not-found",
@@ -1612,6 +1656,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(effect_rows, 1, "no second effect row appeared");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_commands_validate_run_state() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+
+        let session = create_session(&processor, &pool, "create").await;
+        let run = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                    },
+                    "start",
+                ),
+            )
+            .await
+            .unwrap()
+            .created_run
+            .unwrap();
+
+        // Resuming a run that is not paused is refused.
+        let err = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(CommandBody::ResumeRun { run_id: run }, "resume-live"),
+            )
+            .await
+            .expect_err("resuming a non-paused run must be rejected");
+        assert_eq!(err.code, "run.invalid-transition");
+
+        // Cancel is legal from a live state…
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(CommandBody::CancelRun { run_id: run }, "cancel-1"),
+            )
+            .await
+            .unwrap();
+
+        // …but resuming (or re-cancelling) a terminal run must be refused: the
+        // old behavior flipped a Completed/Cancelled run back to `Running` with
+        // no executor attached — a zombie in `active_runs` until next boot.
+        let err = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(CommandBody::ResumeRun { run_id: run }, "resume-done"),
+            )
+            .await
+            .expect_err("resuming a cancelled run must be rejected");
+        assert_eq!(err.code, "run.invalid-transition");
+        let err = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(CommandBody::CancelRun { run_id: run }, "cancel-2"),
+            )
+            .await
+            .expect_err("cancelling an already-cancelled run must be rejected");
+        assert_eq!(err.code, "run.invalid-transition");
     }
 
     #[tokio::test]

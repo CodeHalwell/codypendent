@@ -27,6 +27,13 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 toml = { workspace = true }
+# Robust home resolution for policy path expansion: `$HOME` with an OS
+# fallback, so a stripped environment cannot silently drop `$HOME/...` DENY
+# entries (they fail closed instead — see `policy::build_path_scope`).
+directories = { workspace = true }
+# Webhook-style HMAC is already a workspace dep (Phase 3); here it signs resume
+# tokens (`server::mint_resume_token`) instead of the ad-hoc sha2 sandwich.
+hmac = { workspace = true }
 
 [dev-dependencies]
 codypendent-test-support = { workspace = true }
