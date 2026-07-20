@@ -489,6 +489,7 @@ dependencies = [
  "codypendent-integrations",
  "codypendent-knowledge",
  "codypendent-protocol",
+ "codypendent-sandbox",
  "codypendent-tui",
  "codypendent-workflow",
  "crossterm",
