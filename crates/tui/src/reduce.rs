@@ -213,9 +213,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         card.args_digest = Some(args_digest);
                         card.status = ToolStatus::Running;
                     }
-                    None => run
-                        .transcript
-                        .push(TranscriptEntry::Tool(Box::new(ToolCard {
+                    None => AppState::push_entry(
+                        run,
+                        TranscriptEntry::Tool(Box::new(ToolCard {
                             tool,
                             status: ToolStatus::Running,
                             action: None,
@@ -224,7 +224,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             artifact: None,
                             approval_id: None,
                             expanded: false,
-                        }))),
+                        })),
+                    ),
                 }
             }
         }
@@ -244,9 +245,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         card.outcome = Some(outcome);
                         card.artifact = artifact;
                     }
-                    None => run
-                        .transcript
-                        .push(TranscriptEntry::Tool(Box::new(ToolCard {
+                    None => AppState::push_entry(
+                        run,
+                        TranscriptEntry::Tool(Box::new(ToolCard {
                             tool,
                             status: ToolStatus::Completed,
                             action: None,
@@ -255,7 +256,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             artifact,
                             approval_id: None,
                             expanded: false,
-                        }))),
+                        })),
+                    ),
                 }
             }
         }
@@ -296,8 +298,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
-                run.transcript
-                    .push(TranscriptEntry::Steering { applied: false });
+                AppState::push_entry(run, TranscriptEntry::Steering { applied: false });
             }
         }
         EventBody::SteeringApplied { run_id } => {
@@ -308,9 +309,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 });
                 match marked {
                     Some(applied) => *applied = true,
-                    None => run
-                        .transcript
-                        .push(TranscriptEntry::Steering { applied: true }),
+                    None => AppState::push_entry(run, TranscriptEntry::Steering { applied: true }),
                 }
             }
         }
@@ -591,6 +590,13 @@ fn begin_steering(state: &mut AppState) {
 }
 
 fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: ApprovalScope) {
+    // A decision must only be possible while its card is on screen. The
+    // approval modal renders only when no overlay is open — with a browser or
+    // Help overlay covering it, `a`/`r` are live Normal-mode keys and would
+    // otherwise resolve an action the user cannot see.
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
     if let Some(pending) = state.focused_approval() {
         let approval_id = pending.approval_id;
         state.outbox.push(Intent::ResolveApproval {
@@ -994,6 +1000,97 @@ mod tests {
         );
         assert!(s.pending_approvals.is_empty());
         assert!(!s.show_approval_modal());
+    }
+
+    #[test]
+    fn approval_keys_are_inert_while_an_overlay_hides_the_card() {
+        let mut s = AppState::new();
+        // A browser overlay is open when the approval arrives: the modal is
+        // covered (it renders only with no overlay), yet `a`/`r` are live
+        // Normal-mode keys — they must not resolve a card the user cannot see.
+        reduce(&mut s, Action::OpenSkills);
+        let approval_id = ApprovalId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id,
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                risk: Risk {
+                    level: RiskLevel::Medium,
+                    reasons: vec!["runs a command".to_owned()],
+                },
+            }),
+        );
+        assert!(!s.show_approval_modal(), "overlay covers the modal");
+
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        reduce(&mut s, Action::Reject);
+        assert!(
+            s.drain_outbox().is_empty(),
+            "no decision may fire while the card is hidden"
+        );
+        assert_eq!(s.pending_approvals.len(), 1);
+
+        // Dismissing the overlay reveals the card and re-arms the keys.
+        reduce(&mut s, Action::Dismiss);
+        assert!(s.show_approval_modal());
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        let intents = s.drain_outbox();
+        assert!(
+            matches!(intents.as_slice(), [Intent::ResolveApproval { .. }]),
+            "the visible card resolves normally, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn run_started_does_not_steal_selection_mid_draft() {
+        let mut s = AppState::new();
+        let mine = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: mine,
+                objective: "mine".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        assert_eq!(s.selected_run, 0);
+
+        // A draft is in progress: another client's RunStarted (shared session)
+        // must not move the selection — Enter submits against `selected_run`,
+        // so a steal here would retarget the message being composed.
+        reduce(&mut s, Action::InputChar('h'));
+        let theirs = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: theirs,
+                objective: "theirs".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        assert_eq!(s.runs.len(), 2);
+        assert_eq!(s.selected_run, 0, "a mid-draft selection must not move");
+
+        // With an empty composer a new run takes focus (follow the action) —
+        // this is also what keeps our own submits selected, since submitting
+        // clears the composer before its RunStarted folds back.
+        s.composer.clear();
+        let third = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: third,
+                objective: "next".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        assert_eq!(s.selected_run, 2);
     }
 
     #[test]

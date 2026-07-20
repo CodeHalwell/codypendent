@@ -636,12 +636,21 @@ impl AppState {
         mode: AgentMode,
     ) -> &mut RunView {
         if let Some(idx) = self.runs.iter().position(|r| r.run_id == run_id) {
-            self.selected_run = idx;
+            // An already-known run re-announcing itself (catch-up overlap,
+            // another client's activity) must not steal the selection.
             return &mut self.runs[idx];
         }
         self.runs.push(RunView::new(run_id, objective, mode));
-        self.selected_run = self.runs.len() - 1;
         let last = self.runs.len() - 1;
+        // Focus the new run unless the user is mid-draft. Our own submit
+        // clears the composer before its RunStarted folds back, so this still
+        // follows the action for runs this client starts — while another
+        // client's RunStarted in a shared session cannot retarget a message
+        // being composed (Enter submits against `selected_run` at that
+        // moment).
+        if self.composer.is_empty() {
+            self.selected_run = last;
+        }
         &mut self.runs[last]
     }
 
