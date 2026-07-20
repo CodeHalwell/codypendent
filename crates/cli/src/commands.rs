@@ -425,28 +425,58 @@ pub async fn open(
     Ok(())
 }
 
-/// `codypendent workflow validate <FILE>` (Phase 5 STEP 5.1): parse and compile a
-/// declarative `workflow.yaml`, reporting either a one-line summary of the
-/// validated graph or the precise error (naming the offending step). Self-contained
-/// — it never touches the daemon; a manifest is just text on disk.
+/// `codypendent workflow validate <FILE> [--agents <DIR>]` (Phase 5 STEP 5.1):
+/// parse and compile a declarative `workflow.yaml`, reporting either a one-line
+/// summary of the validated graph or the precise error (naming the offending
+/// step). Self-contained — it never touches the daemon; a manifest and its agent
+/// profiles are just text on disk.
 ///
-/// This is **structural** validation: schema version, unique/non-empty ids,
-/// exactly one action per step, resolvable + acyclic dependencies, budget sanity,
-/// and the multi-agent `orchestration_reason` rule. Whether a named tool/skill/role
-/// actually *exists* is a separate registry cross-check that needs a configured
-/// runtime (the compiler exposes it via `compile_with_registry`).
-pub fn workflow_validate(file: &std::path::Path) -> anyhow::Result<()> {
+/// Without `--agents` this is **structural** validation: schema version,
+/// unique/non-empty ids, exactly one action per step, resolvable + acyclic
+/// dependencies, budget sanity, and the multi-agent `orchestration_reason` rule.
+/// With `--agents <DIR>` it additionally **resolves agent roles**: every agent
+/// step's short role must be fulfilled by a profile in that directory, so an
+/// author catches a role with no profile before a run reaches it. (Whether a
+/// named *tool* or *skill* exists still needs the live registry — a daemon-side
+/// cross-check via `compile_with_registry`.)
+pub fn workflow_validate(
+    file: &std::path::Path,
+    agents: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(file)
         .with_context(|| format!("reading workflow manifest {}", file.display()))?;
-    match codypendent_workflow::compile_yaml(&yaml) {
-        Ok(compiled) => {
-            println!("{}", workflow_summary(&compiled));
-            Ok(())
+    // A structural error is the user's to fix — surface it verbatim, tagged with
+    // the file, and exit non-zero (via `?` in `main`).
+    let compiled = codypendent_workflow::compile_yaml(&yaml)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+    println!("{}", workflow_summary(&compiled));
+
+    if let Some(agents_dir) = agents {
+        let profiles = codypendent_workflow::AgentProfileSet::load_dir(agents_dir)
+            .with_context(|| format!("loading agent profiles from {}", agents_dir.display()))?;
+        let unresolved = profiles.unresolved_roles(&compiled);
+        if unresolved.is_empty() {
+            println!(
+                "\u{2713} agent roles: all resolved against {} ({} profile(s))",
+                agents_dir.display(),
+                profiles.len(),
+            );
+        } else {
+            // Report every unresolved role so an author fixes them in one pass.
+            let detail = unresolved
+                .iter()
+                .map(|r| format!("step `{}` \u{2192} role `{}`", r.step, r.role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "{}: {} agent role(s) unresolved against {}: {detail}",
+                file.display(),
+                unresolved.len(),
+                agents_dir.display(),
+            );
         }
-        // A structural error is the user's to fix — surface it verbatim, tagged with
-        // the file, and exit non-zero (via `?` in `main`).
-        Err(error) => anyhow::bail!("{}: {error}", file.display()),
     }
+    Ok(())
 }
 
 /// `codypendent workflow show <FILE> [--json]` (Phase 5 STEP 5.2): compile a
@@ -582,7 +612,7 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("wf.yaml");
         std::fs::write(&path, VALID).unwrap();
-        workflow_validate(&path).expect("a valid manifest validates");
+        workflow_validate(&path, None).expect("a valid manifest validates");
     }
 
     #[test]
@@ -596,17 +626,44 @@ steps:
             "schema_version: 1\nid: wf\nversion: 1\nsteps:\n  - id: a\n    depends_on: [ghost]\n    tool: repository.test\n",
         )
         .unwrap();
-        let err = workflow_validate(&path).unwrap_err().to_string();
+        let err = workflow_validate(&path, None).unwrap_err().to_string();
         assert!(err.contains("broken.yaml"), "error names the file: {err}");
         assert!(err.contains("ghost"), "error names the bad dep: {err}");
     }
 
     #[test]
     fn validate_reports_a_missing_file() {
-        let err = workflow_validate(std::path::Path::new("/no/such/manifest.yaml"))
+        let err = workflow_validate(std::path::Path::new("/no/such/manifest.yaml"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("reading workflow manifest"));
+    }
+
+    #[test]
+    fn validate_with_agents_resolves_or_reports_roles() {
+        // `AGENT_MANIFEST` has one agent step (`inspect`, role `investigator`).
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("wf.yaml");
+        std::fs::write(&manifest, AGENT_MANIFEST).unwrap();
+        let agents = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+
+        // No profile fulfils `investigator` yet → the cross-check fails, naming
+        // the manifest, the step, and the unresolved role.
+        let err = workflow_validate(&manifest, Some(&agents))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wf.yaml"), "names the manifest: {err}");
+        assert!(err.contains("investigator"), "names the role: {err}");
+        assert!(err.contains("inspect"), "names the step: {err}");
+
+        // Add a profile fulfilling the role (via the id suffix) → it resolves.
+        std::fs::write(
+            agents.join("scout.toml"),
+            "schema_version = 1\nid = \"agents.investigator\"\nname = \"Scout\"\n",
+        )
+        .unwrap();
+        workflow_validate(&manifest, Some(&agents)).expect("every agent role now resolves");
     }
 
     const AGENT_MANIFEST: &str = "\

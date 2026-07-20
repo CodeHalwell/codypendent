@@ -207,12 +207,22 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         user-facing entry point now: `codypendent workflow validate <file>`
         parses + compiles a manifest and reports the validated graph (or the
         precise error, tagged with the file), so an author checks a manifest
-        before it ever runs. *Remaining for 5.1:* lowering onto framework graphs,
-        and replacing the hard-coded `/fix-ci` flow with this definition (both
-        gated on the role→profile resolution the manifest's short roles imply but
-        that is not yet defined). Agent-profile (`agent.toml`) parsing has landed —
-        `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
-        permissions/budget/completion (the canonical profile parses in a test).
+        before it ever runs. **Role→profile resolution is now defined** — the gate
+        the rest of 5.1 waited on. An `AgentProfileSet` loads a directory of
+        `agent.toml` profiles and indexes them by the role each *fulfils*:
+        `AgentProfile::fulfilled_role` is the profile's explicit `role` field, else
+        the last dotted segment of its id — so the canonical `code.implementer`
+        binds a manifest's short `role: implementer` — and the set refuses a
+        directory where two profiles claim one role (a role resolves to exactly one
+        profile). `codypendent workflow validate <file> --agents <dir>` uses it to
+        cross-check that every agent step's role resolves, reporting each
+        unresolved `step → role` before a run reaches it (the tool/skill half still
+        needs the live registry). Agent-profile (`agent.toml`) parsing had already
+        landed — `parse_agent_profile` reads
+        role/mode/autonomy/model_policy/skills/tools/permissions/budget/completion.
+        *Remaining for 5.1:* lowering the compiled graph onto framework
+        orchestration builders, and replacing the hard-coded `/fix-ci` flow with
+        the declarative `repair-github-check` definition.
   - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
         durable workflow runs, a per-node record (state / attempt / cost /
         start+end times — the node-level provenance the graph view needs), and

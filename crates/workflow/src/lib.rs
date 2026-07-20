@@ -30,6 +30,7 @@ pub mod compile;
 pub mod db;
 pub mod model;
 pub mod registry;
+pub mod resolve;
 pub mod store;
 
 pub use agent::{
@@ -48,6 +49,7 @@ pub use model::{
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,
 };
 pub use registry::{SetRegistry, WorkflowRegistry};
+pub use resolve::{AgentProfileSet, AgentProfileSetError, UnresolvedRole};
 pub use store::{
     blocked_node_ids, ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord,
     WorkflowRunRecord, WorkflowRunSnapshot, WorkflowRunState, WorkflowStore, WorkflowStoreError,
