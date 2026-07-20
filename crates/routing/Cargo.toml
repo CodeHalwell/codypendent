@@ -1,0 +1,19 @@
+[package]
+name = "codypendent-routing"
+description = "codypendent-routing: per-task-node model routing (Phase 7, STEP 7.2/7.3). Measured capability/performance profiles, a rule-based task classifier, and the Chapter 09 utility router — hard filters, cheapest-above-threshold selection, and cascading escalation that preserves artifacts. Pure decision logic; the daemon fills the model-execution seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+# ModelId + DataClassification are shared wire types; reusing them keeps routing
+# decisions expressed in the same vocabulary as the rest of the system.
+codypendent-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
