@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use codypendent_eval::{
     cluster_failures, grade, rank_by_frequency, ActiveVersions, ArtifactKind, ArtifactVersion,
-    CanaryOutcome, Candidate, PromotionError, PromotionStage, RegressionSuite, RunObservation,
-    Signal, Trace,
+    CanaryOutcome, Candidate, PromotionError, PromotionRecord, PromotionStage, RegressionSuite,
+    RunObservation, Signal, Trace,
 };
 use codypendent_protocol::events::Actor;
 use codypendent_protocol::ids::{AgentId, ModelId, RunId, UserId};
@@ -126,15 +126,23 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
         "still not promoted"
     );
 
-    // 6. A human approves → promoted, and the version activates.
+    // 6. A human approves → promoted, and the version activates. Activation
+    //    requires this promotion receipt — there is no way to activate v5 without
+    //    the human-approved record `approve` returned.
     let record = candidate.approve(&human()).unwrap();
     assert_eq!(candidate.stage, PromotionStage::Promoted);
     assert_eq!(record.actor_kind, "human");
     assert_eq!(record.artifact.to_string(), "skill/rust-ci/5");
 
     let mut active = ActiveVersions::new();
-    active.activate(&ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4)); // the predecessor
-    active.activate(&artifact);
+    // The predecessor v4 was itself activated by its own prior human promotion.
+    let predecessor = PromotionRecord {
+        artifact: ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4),
+        actor_kind: "human".into(),
+        stage: PromotionStage::Promoted,
+    };
+    active.activate(&predecessor).unwrap();
+    active.activate(&record).unwrap();
     assert_eq!(active.active("skill/rust-ci"), Some(5));
 
     // 7. Rollback is one operation and restores the predecessor (reversible).

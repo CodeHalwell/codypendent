@@ -7,16 +7,21 @@
 //! **deny**: a plugin with no signature is refused unless the operator has
 //! explicitly opted into allowing unsigned plugins.
 //!
-//! The checksum binds the manifest to a specific artifact; the signature binds
-//! that checksum to a publisher. Verifying the signature over the checksum (not
-//! re-hashing the artifact under the key) keeps the two concerns separable and
-//! matches how the manifest stores them.
+//! The checksum binds the manifest to a specific artifact. The signature binds a
+//! **canonical digest** that covers the checksum *and the security-relevant
+//! manifest fields* — id, version, kind, and the requested capabilities — to a
+//! publisher (see [`signing_digest`]). Signing that digest (raw bytes, not a hex
+//! string) means a valid publisher signature cannot be replayed against a
+//! manifest whose `[capabilities]` (or kind/runtime identity) has been altered:
+//! change any signed field and the digest — and so the required signature —
+//! changes with it.
 
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::PluginManifest;
+use crate::permission::CapabilitySet;
 
 /// Policy for plugins whose manifest carries no signature (`[plugins].unsigned`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -66,12 +71,49 @@ pub fn checksum_of(artifact: &[u8]) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
+/// The 32-byte digest a publisher signs: a SHA-256 over a canonical, versioned
+/// encoding of the artifact checksum plus the security-relevant manifest fields
+/// (id, version, kind, and the requested capabilities in sorted order). Binding
+/// the capabilities into the signed material is what stops a valid checksum
+/// signature from being reused against a manifest whose permissions were swapped.
+///
+/// The encoding is deterministic — capabilities come from a [`CapabilitySet`],
+/// which is sorted and deduplicated, and the checksum is lower-cased — so the
+/// signer and verifier always agree regardless of declaration order or hex
+/// casing. This is the signing contract a packaging tool implements.
+#[must_use]
+pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
+    let mut payload = String::new();
+    payload.push_str("codypendent-plugin-signature-v1\n");
+    payload.push_str("checksum=");
+    payload.push_str(&manifest.security.checksum.trim().to_ascii_lowercase());
+    payload.push('\n');
+    payload.push_str("id=");
+    payload.push_str(manifest.id.trim());
+    payload.push('\n');
+    payload.push_str("version=");
+    payload.push_str(manifest.version.trim());
+    payload.push('\n');
+    payload.push_str("kind=");
+    payload.push_str(manifest.kind.as_str());
+    payload.push('\n');
+    // Sorted, deduplicated capability lines — the full requested permission set.
+    for cap in CapabilitySet::from_spec(&manifest.capabilities).iter() {
+        payload.push_str("cap=");
+        payload.push_str(&cap.to_string());
+        payload.push('\n');
+    }
+    Sha256::digest(payload.as_bytes()).into()
+}
+
 /// Verify a plugin artifact against its manifest under the given unsigned policy
 /// and optional publisher key.
 ///
 /// * The artifact must hash to the manifest's checksum.
 /// * If the manifest is signed, `publisher_key` (32 raw ed25519 public-key bytes)
-///   must verify the signature over the **checksum string**.
+///   must verify the signature over the [`signing_digest`] — which binds the
+///   checksum *and* the security-relevant manifest fields (id/version/kind/
+///   capabilities), so a signature cannot be replayed against altered permissions.
 /// * If the manifest is unsigned, [`UnsignedPolicy`] decides.
 ///
 /// The publisher key is supplied by the caller (the daemon resolves it from the
@@ -126,9 +168,11 @@ pub fn verify_artifact(
     })?;
     let signature = Signature::from_bytes(&sig_arr);
 
-    // The signed message is the canonical checksum string — publishing a plugin
-    // signs the artifact identity, and the checksum is that identity.
-    key.verify_strict(actual.as_bytes(), &signature)
+    // The signed message is the canonical digest binding the artifact identity AND
+    // the security-relevant manifest fields (id/version/kind/capabilities), so a
+    // valid signature can't be replayed against a manifest whose permissions,
+    // runtime kind, or identity were swapped.
+    key.verify_strict(&signing_digest(manifest), &signature)
         .map_err(|_| VerifyError::SignatureMismatch)?;
     Ok(Verified { signed: true })
 }
@@ -156,6 +200,43 @@ signature = "{signature}"
 "#
         );
         parse_manifest(&toml).expect("manifest parses")
+    }
+
+    /// A manifest with a `[capabilities]` table, so a signature binds real
+    /// permissions. `network` lists the requested hosts.
+    fn manifest_with_caps(checksum: &str, network: &[&str]) -> PluginManifest {
+        let net = network
+            .iter()
+            .map(|h| format!("\"{h}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = format!(
+            r#"
+schema_version = 1
+id = "wc"
+name = "Word Count"
+version = "0.1.0"
+kind = "wasm-component"
+publisher = "me"
+[runtime]
+command = "word_count.wasm"
+[capabilities]
+network = [{net}]
+[security]
+checksum = "{checksum}"
+signature = "unset"
+"#
+        );
+        parse_manifest(&toml).expect("manifest parses")
+    }
+
+    /// Sign a manifest's [`signing_digest`] with `key` and set its signature field
+    /// — the packaging step, so the signature covers the manifest's real
+    /// checksum + identity + capabilities.
+    fn sign(manifest: &mut PluginManifest, key: &SigningKey) {
+        let sig = key.sign(&signing_digest(manifest));
+        manifest.security.signature =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
     }
 
     #[test]
@@ -191,11 +272,9 @@ signature = "{signature}"
     #[test]
     fn valid_signature_verifies() {
         let artifact = b"signed plugin bytes";
-        let checksum = checksum_of(artifact);
         let signing = SigningKey::from_bytes(&[7u8; 32]);
-        let sig = signing.sign(checksum.as_bytes());
-        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        let m = manifest_with(&checksum, &sig_b64);
+        let mut m = manifest_with_caps(&checksum_of(artifact), &["api.github.com:443"]);
+        sign(&mut m, &signing);
         let key = signing.verifying_key();
         let v = verify_artifact(&m, artifact, Some(key.as_bytes()), UnsignedPolicy::Deny)
             .expect("signature verifies");
@@ -205,11 +284,9 @@ signature = "{signature}"
     #[test]
     fn signature_from_the_wrong_key_is_rejected() {
         let artifact = b"signed plugin bytes";
-        let checksum = checksum_of(artifact);
         let signing = SigningKey::from_bytes(&[7u8; 32]);
-        let sig = signing.sign(checksum.as_bytes());
-        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        let m = manifest_with(&checksum, &sig_b64);
+        let mut m = manifest_with_caps(&checksum_of(artifact), &["api.github.com:443"]);
+        sign(&mut m, &signing);
         // A different key must not verify this signature.
         let attacker = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
         let err = verify_artifact(
@@ -224,16 +301,56 @@ signature = "{signature}"
 
     #[test]
     fn signature_over_a_tampered_artifact_is_rejected_at_checksum() {
-        // A signed checksum for the real bytes, but the artifact shipped is
+        // A signed manifest for the real bytes, but the artifact shipped is
         // different: checksum fails before signature is even considered.
-        let checksum = checksum_of(b"the real bytes");
         let signing = SigningKey::from_bytes(&[7u8; 32]);
-        let sig = signing.sign(checksum.as_bytes());
-        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        let m = manifest_with(&checksum, &sig_b64);
+        let mut m = manifest_with_caps(&checksum_of(b"the real bytes"), &["api.github.com:443"]);
+        sign(&mut m, &signing);
         let key = signing.verifying_key();
         let err = verify_artifact(&m, b"tampered", Some(key.as_bytes()), UnsignedPolicy::Deny)
             .unwrap_err();
         assert!(matches!(err, VerifyError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn swapping_capabilities_after_signing_breaks_the_signature() {
+        // The exit-criterion-2 attack the review flagged: a publisher signs a
+        // narrow manifest; an attacker keeps the valid checksum + signature but
+        // widens `[capabilities]`. The signature must no longer verify, because it
+        // binds the capabilities, not just the checksum.
+        let artifact = b"signed plugin bytes";
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut m = manifest_with_caps(&checksum_of(artifact), &["api.github.com:443"]);
+        sign(&mut m, &signing);
+        let key = signing.verifying_key();
+        // The honest manifest verifies.
+        assert!(verify_artifact(&m, artifact, Some(key.as_bytes()), UnsignedPolicy::Deny).is_ok());
+
+        // Attacker widens the network allowlist, keeping the same signature.
+        m.capabilities
+            .network
+            .push("exfiltrate.example.com:443".to_string());
+        let err =
+            verify_artifact(&m, artifact, Some(key.as_bytes()), UnsignedPolicy::Deny).unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::SignatureMismatch,
+            "widened capabilities break the signature"
+        );
+    }
+
+    #[test]
+    fn signing_digest_changes_with_the_security_relevant_fields() {
+        // Sanity: the digest binds checksum + id/version/kind + capabilities.
+        let base = manifest_with_caps(&checksum_of(b"x"), &["a:1"]);
+        let d0 = signing_digest(&base);
+
+        let mut widened = base.clone();
+        widened.capabilities.network.push("b:2".into());
+        assert_ne!(signing_digest(&widened), d0, "capabilities are bound");
+
+        let mut different_version = base.clone();
+        different_version.version = "9.9.9".into();
+        assert_ne!(signing_digest(&different_version), d0, "version is bound");
     }
 }

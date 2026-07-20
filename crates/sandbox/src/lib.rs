@@ -45,4 +45,6 @@ pub use manifest::{
 pub use permission::{Capability, CapabilitySet, PermissionDiff};
 pub use profile::{SandboxProfile, ENV_ALLOWLIST};
 pub use sanitize::{sanitize_untrusted, Sanitized};
-pub use verify::{checksum_of, verify_artifact, UnsignedPolicy, Verified, VerifyError};
+pub use verify::{
+    checksum_of, signing_digest, verify_artifact, UnsignedPolicy, Verified, VerifyError,
+};

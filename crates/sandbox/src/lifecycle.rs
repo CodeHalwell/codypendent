@@ -60,6 +60,12 @@ pub enum LifecycleError {
     UpdateExpandsPermissions { diff: String },
     #[error("plugin id/kind changed on update (was {old}, now {new}); reinstall required")]
     IdentityChanged { old: String, new: String },
+    /// A granted capability is not one the manifest requested. A grant may only
+    /// *narrow* the manifest's request, never widen it — otherwise a caller could
+    /// smuggle an undeclared capability past the manifest into the sandbox profile
+    /// (exit criterion 1).
+    #[error("granted capability not requested by the manifest: {capability}")]
+    GrantExceedsManifest { capability: String },
 }
 
 /// An installed plugin and its trust record. The `state` is the lifecycle
@@ -96,6 +102,17 @@ impl InstalledPlugin {
         granted: CapabilitySet,
     ) -> Result<Self, LifecycleError> {
         let Verified { signed } = verify_artifact(&manifest, artifact, publisher_key, unsigned)?;
+        // A grant may only narrow the manifest — reject any granted capability the
+        // manifest did not request, so an undeclared capability can never reach the
+        // sandbox profile through an over-broad grant.
+        let requested = CapabilitySet::from_spec(&manifest.capabilities);
+        for cap in granted.iter() {
+            if !requested.grants(cap) {
+                return Err(LifecycleError::GrantExceedsManifest {
+                    capability: cap.to_string(),
+                });
+            }
+        }
         let trust = if signed {
             TrustTier::Trusted
         } else {
@@ -300,6 +317,38 @@ signature = "set-during-packaging"
         assert_eq!(p.state, LifecycleState::InstalledDisabled);
         assert!(!p.is_active(), "a freshly installed plugin does nothing");
         assert_eq!(p.trust, TrustTier::Unsigned);
+    }
+
+    #[test]
+    fn a_narrowing_grant_is_accepted() {
+        // The manifest requests api.github.com; the user withholds it (grants
+        // nothing). A narrowing grant is fine.
+        let (m, artifact) = manifest("0.1.0", &["api.github.com:443"]);
+        let narrowed = CapabilitySet::default();
+        let p =
+            InstalledPlugin::install_disabled(m, &artifact, None, UnsignedPolicy::Allow, narrowed)
+                .expect("a narrowing grant installs");
+        assert!(p.granted.is_empty());
+    }
+
+    #[test]
+    fn a_grant_the_manifest_did_not_request_is_rejected() {
+        // The manifest requests only api.github.com; a caller tries to grant a
+        // filesystem read the manifest never declared. It must be refused so an
+        // undeclared capability can't reach the sandbox profile (exit criterion 1).
+        let (m, artifact) = manifest("0.1.0", &["api.github.com:443"]);
+        let smuggled = CapabilitySet::from_spec(&crate::manifest::CapabilitiesSpec {
+            filesystem_read: vec!["/home/user/.ssh".into()],
+            network: vec!["api.github.com:443".into()],
+            ..Default::default()
+        });
+        let err =
+            InstalledPlugin::install_disabled(m, &artifact, None, UnsignedPolicy::Allow, smuggled)
+                .unwrap_err();
+        assert!(
+            matches!(err, LifecycleError::GrantExceedsManifest { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

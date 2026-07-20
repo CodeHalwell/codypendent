@@ -135,6 +135,12 @@ pub enum PromotionError {
     /// A synthesized artifact needs permission review before it can be evaluated.
     #[error("candidate needs permission review before evaluation")]
     PermissionReviewRequired,
+    /// A version was submitted for activation without a human-approved promotion
+    /// receipt — the activation-bypass guard (exit criterion 2).
+    #[error(
+        "cannot activate a version without a completed promotion (record stage was {stage:?})"
+    )]
+    NotPromoted { stage: PromotionStage },
 }
 
 /// A record of a promotion or rollback, for the audit trail.
@@ -302,12 +308,23 @@ impl ActiveVersions {
         Self::default()
     }
 
-    /// Activate a version (on promotion), pushing it onto the artifact's stack.
-    pub fn activate(&mut self, artifact: &ArtifactVersion) {
+    /// Activate a version, pushing it onto the artifact's stack. Activation
+    /// **requires a promotion receipt** — a [`PromotionRecord`] whose stage is
+    /// [`PromotionStage::Promoted`], which only [`Candidate::approve`] (an
+    /// `Actor::Human`) produces. There is no way to make a bare version active
+    /// without such a record, so an agent/system caller cannot activate its own
+    /// draft and bypass the human-approval gate (ADR-010, exit criterion 2).
+    pub fn activate(&mut self, record: &PromotionRecord) -> Result<(), PromotionError> {
+        if record.stage != PromotionStage::Promoted {
+            return Err(PromotionError::NotPromoted {
+                stage: record.stage,
+            });
+        }
         self.history
-            .entry(artifact.stem())
+            .entry(record.artifact.stem())
             .or_default()
-            .push(artifact.version);
+            .push(record.artifact.version);
+        Ok(())
     }
 
     /// The currently active version of an artifact stem, if any.
@@ -361,6 +378,16 @@ mod tests {
 
     fn artifact() -> ArtifactVersion {
         ArtifactVersion::new(ArtifactKind::Router, "tool-selection", 12)
+    }
+
+    /// A promotion receipt for a version — as `approve()` would produce for a
+    /// human-approved candidate. Used to activate a version in tests.
+    fn promoted(version: u32) -> PromotionRecord {
+        PromotionRecord {
+            artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", version),
+            actor_kind: "human".into(),
+            stage: PromotionStage::Promoted,
+        }
     }
 
     fn drive_to_comparison(c: &mut Candidate) {
@@ -479,16 +506,8 @@ mod tests {
     #[test]
     fn rollback_restores_the_predecessor_version() {
         let mut active = ActiveVersions::new();
-        active.activate(&ArtifactVersion::new(
-            ArtifactKind::Router,
-            "tool-selection",
-            11,
-        ));
-        active.activate(&ArtifactVersion::new(
-            ArtifactKind::Router,
-            "tool-selection",
-            12,
-        ));
+        active.activate(&promoted(11)).unwrap();
+        active.activate(&promoted(12)).unwrap();
         assert_eq!(active.active("router/tool-selection"), Some(12));
         // One command restores the predecessor.
         let restored = active.rollback("router/tool-selection");
@@ -499,8 +518,40 @@ mod tests {
     #[test]
     fn rollback_without_a_predecessor_is_a_noop() {
         let mut active = ActiveVersions::new();
-        active.activate(&artifact());
+        active.activate(&promoted(12)).unwrap();
         assert_eq!(active.rollback("router/tool-selection"), None);
+        assert_eq!(active.active("router/tool-selection"), Some(12));
+    }
+
+    #[test]
+    fn activation_requires_a_promoted_record() {
+        // The exit-criterion-2 activation-bypass guard: a record that is NOT a
+        // completed human promotion (e.g. a rollback receipt, or a fabricated
+        // non-promoted record) cannot make a version active.
+        let mut active = ActiveVersions::new();
+        let not_promoted = PromotionRecord {
+            artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", 99),
+            actor_kind: "agent".into(),
+            stage: PromotionStage::ComparisonReady,
+        };
+        let err = active.activate(&not_promoted).unwrap_err();
+        assert!(matches!(err, PromotionError::NotPromoted { .. }));
+        assert_eq!(
+            active.active("router/tool-selection"),
+            None,
+            "nothing was activated"
+        );
+    }
+
+    #[test]
+    fn a_human_approval_record_activates() {
+        // The genuine path: approve() (a human) produces a Promoted record, which
+        // is exactly what activate() accepts.
+        let mut c = Candidate::draft(artifact(), &human());
+        drive_to_comparison(&mut c);
+        let record = c.approve(&human()).unwrap();
+        let mut active = ActiveVersions::new();
+        active.activate(&record).unwrap();
         assert_eq!(active.active("router/tool-selection"), Some(12));
     }
 
