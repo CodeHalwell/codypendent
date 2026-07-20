@@ -362,7 +362,13 @@ are the remaining wiring.
       install-disabled → smoke-test → enable → update → revoke lifecycle as a
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
-      before it enters context. 42 unit tests.
+      before it enters context. 42 unit tests. **Surfaced to users** via
+      `codypendent plugin inspect <file>` (renders identity + the requested
+      capability list + resource caps + trust posture — the "evaluate permissions"
+      step) and `codypendent plugin diff <installed> <update>` (prints the
+      permission diff and exits non-zero on an expansion, so CI can gate on
+      re-approval) — the CLI seam mirroring `workflow validate`, with example
+      manifests under `examples/plugins/word-count/`.
 - [x] **6.5 (multimodal input model)** — the Chapter 10 `InputEnvelope`/`InputBlock`
       model in `codypendent-protocol`: a uniform envelope of typed blocks (Text,
       Audio, Image, File, EditorSelection, CodeSymbol, GitHubReference, forward-
