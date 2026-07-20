@@ -20,14 +20,20 @@
 //! the crate itself stays daemon-free. Durable execution storage (STEP 5.2) —
 //! workflow runs, node records, and checkpoints — lives in [`store`] over a
 //! SQLite pool ([`db`]), still daemon-free so recovery and idempotency are
-//! testable in isolation. Lowering the compiled graph onto framework
-//! orchestration builders and wiring recovery into the daemon are the remaining
-//! steps, tracked in the roadmap.
+//! testable in isolation. [`drive`] closes the loop over that store: a
+//! [`WorkflowDriver`](drive::WorkflowDriver) advances a run through the ready
+//! frontier, executing each node via a [`NodeExecutor`](drive::NodeExecutor)
+//! seam and recording every transition — resumable and model-free, so the whole
+//! lifecycle is tested with a fake executor. Role resolution ([`resolve`]) binds
+//! a manifest's short role to an `agent.toml` profile. Lowering node execution
+//! onto the real agent loop and wiring the driver + recovery into the daemon are
+//! the remaining steps, tracked in the roadmap.
 
 pub mod agent;
 pub mod blackboard;
 pub mod compile;
 pub mod db;
+pub mod drive;
 pub mod model;
 pub mod registry;
 pub mod resolve;
@@ -44,6 +50,7 @@ pub use compile::{
     compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
     CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };
+pub use drive::{NodeContext, NodeExecutor, NodeObserver, NodeOutcome, WorkflowDriver};
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,

@@ -255,10 +255,24 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         meets the pure TUI crate, mirroring the Docs/Edges wiring), skipping a
         manifest that does not compile rather than failing the view. State/cost
         are the pre-run values (`pending` / `—`); overlaying a durable run's live
-        per-node state and cost lands with the daemon executor. *Remaining for
-        5.2:* the daemon startup-recovery **wiring** over the incomplete-runs
-        list, node-lifecycle ledger events, and the pause/resume/retry-from-node
-        **commands** that drive these store ops.
+        per-node state and cost lands with the daemon executor. **The engine loop
+        over the store — the `WorkflowDriver` — has now landed:** it advances a
+        run through the `ready_nodes` frontier, executing each node via a
+        `NodeExecutor` seam and recording the transition (attempt / cost /
+        agent-run id) through `transition_node`, until the run reaches a terminal
+        `Completed`/`Failed`. It is **resumable** (a `Completed` node is never in
+        the frontier; a node left `Running` by an interrupted drive is reset to
+        `Pending` and re-driven exactly once) and **model-free** — the daemon
+        fills `NodeExecutor` with the agent loop / tool layer, while the crate's
+        tests fill it with a fake executor, so linear completion, failure blocking
+        only its dependents, retry-to-success, resume-skips-completed, and a
+        diamond frontier are all proven without a model call. A `NodeObserver`
+        sees every transition (the seam the daemon fills to emit
+        `WorkflowNodeTransitioned` events). *Remaining for 5.2:* wiring the driver
+        into the daemon behind a real `NodeExecutor`, the startup-recovery pass
+        over the incomplete-runs list, node-lifecycle ledger events over the
+        observer, and the pause/resume/retry-from-node **commands** that drive
+        these store ops.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code

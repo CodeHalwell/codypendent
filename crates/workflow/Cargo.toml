@@ -11,6 +11,8 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# The node-execution seam the driver (STEP 5.2) calls is an async trait.
+async-trait = { workspace = true }
 # Agent profiles are TOML (the shape of `docs/specs/agent.toml`, STEP 5.1).
 toml = { workspace = true }
 thiserror = { workspace = true }
