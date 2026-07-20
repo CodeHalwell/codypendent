@@ -20,6 +20,30 @@
 //! method on a [`Candidate`] that reaches [`PromotionStage::Promoted`] without
 //! one. A grader, an agent, or the canary itself can drive a candidate all the
 //! way to `ComparisonReady`, but the last step is a human's alone.
+//!
+//! # Trust boundary: mechanism here, authentication in the daemon
+//!
+//! This crate is **daemon-free by design**, and a pure library has no trust
+//! anchor with which to *authenticate* that a caller-supplied [`Actor::Human`] is
+//! a real human — `Actor::Human` is an ordinary, constructible value. So what this
+//! module provides is the **mechanism**, enforced structurally:
+//!
+//! * the only path to [`PromotionStage::Promoted`] is [`Candidate::approve`], and
+//!   it refuses any non-human actor;
+//! * a [`Candidate`] can only be advanced through its state machine (its fields are
+//!   private — you cannot fabricate one already at `ComparisonReady`);
+//! * the promotion receipt ([`PromotionRecord`]) is unforgeable (private fields,
+//!   `Serialize`-only) and is the sole key [`ActiveVersions::activate`] accepts.
+//!
+//! **Authenticating the human is the daemon's responsibility**, exactly where
+//! ADR-010 places it: the daemon constructs an [`Actor::Human`] *only* from an
+//! authenticated client session, is the sole holder of the [`ActiveVersions`]
+//! authority, and gates `approve` behind an authenticated approval command. A
+//! caller able to fabricate an `Actor::Human` and drive the machine already runs
+//! inside the daemon's trust domain — at which point no library guard (here or
+//! anywhere) can help. The library makes self-promotion *structurally* impossible
+//! for honest code and leaves *authentication* to the layer that can actually do
+//! it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -135,32 +159,74 @@ pub enum PromotionError {
     /// A synthesized artifact needs permission review before it can be evaluated.
     #[error("candidate needs permission review before evaluation")]
     PermissionReviewRequired,
+    /// A version was submitted for activation without a human-approved promotion
+    /// receipt — the activation-bypass guard (exit criterion 2).
+    #[error(
+        "cannot activate a version without a completed promotion (record stage was {stage:?})"
+    )]
+    NotPromoted { stage: PromotionStage },
 }
 
 /// A record of a promotion or rollback, for the audit trail.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// **Unforgeable by construction.** The fields are private and there is no public
+/// constructor — a `PromotionRecord` is minted only by [`Candidate::approve`] (an
+/// `Actor::Human`) or [`Candidate::rollback`]. It derives `Serialize` so a receipt
+/// can be written to the audit log, but **not** `Deserialize`, so a caller cannot
+/// rehydrate a forged receipt from JSON and hand it to
+/// [`ActiveVersions::activate`]. Together with the private fields, that makes the
+/// no-self-promotion gate unbypassable in safe Rust (the workspace denies
+/// `unsafe_code`): the only way to obtain a `Promoted` receipt is a real human
+/// approval.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PromotionRecord {
-    pub artifact: ArtifactVersion,
+    artifact: ArtifactVersion,
     /// Who performed the action (a human for a promotion).
-    pub actor_kind: String,
+    actor_kind: String,
     /// The stage transitioned into.
-    pub stage: PromotionStage,
+    stage: PromotionStage,
+}
+
+impl PromotionRecord {
+    /// The artifact version this receipt promotes (or rolled back).
+    #[must_use]
+    pub fn artifact(&self) -> &ArtifactVersion {
+        &self.artifact
+    }
+
+    /// The kind of actor that performed the action (`human` for a promotion).
+    #[must_use]
+    pub fn actor_kind(&self) -> &str {
+        &self.actor_kind
+    }
+
+    /// The stage this receipt records.
+    #[must_use]
+    pub fn stage(&self) -> PromotionStage {
+        self.stage
+    }
 }
 
 /// A candidate moving through the pipeline.
+///
+/// Its fields are **private**: a candidate can only be created by
+/// [`Candidate::draft`] and advanced through its state machine, so honest code
+/// cannot fabricate one already at [`PromotionStage::ComparisonReady`] to shortcut
+/// to approval. (Reconstruction via `Deserialize` is a deliberate, daemon-owned
+/// persistence path — see the module-level trust-boundary note.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
-    pub artifact: ArtifactVersion,
+    artifact: ArtifactVersion,
     /// Who authored the candidate (attribution). Non-human authors are fine — a
     /// grader/agent may *draft* a candidate; it just cannot *promote* one.
-    pub author_kind: String,
-    pub stage: PromotionStage,
+    author_kind: String,
+    stage: PromotionStage,
     /// Synthesized artifacts (e.g. skills from trace clusters) must pass a
     /// permission review before entering evaluation.
     #[serde(default)]
-    pub requires_permission_review: bool,
+    requires_permission_review: bool,
     #[serde(default)]
-    pub permission_reviewed: bool,
+    permission_reviewed: bool,
 }
 
 impl Candidate {
@@ -175,6 +241,24 @@ impl Candidate {
             requires_permission_review: false,
             permission_reviewed: false,
         }
+    }
+
+    /// The artifact version this candidate promotes.
+    #[must_use]
+    pub fn artifact(&self) -> &ArtifactVersion {
+        &self.artifact
+    }
+
+    /// The kind of actor that authored the candidate (`human`/`agent`/…).
+    #[must_use]
+    pub fn author_kind(&self) -> &str {
+        &self.author_kind
+    }
+
+    /// Where the candidate currently sits in the pipeline.
+    #[must_use]
+    pub fn stage(&self) -> PromotionStage {
+        self.stage
     }
 
     /// Mark that this candidate was synthesized and needs permission review.
@@ -302,12 +386,27 @@ impl ActiveVersions {
         Self::default()
     }
 
-    /// Activate a version (on promotion), pushing it onto the artifact's stack.
-    pub fn activate(&mut self, artifact: &ArtifactVersion) {
-        self.history
-            .entry(artifact.stem())
-            .or_default()
-            .push(artifact.version);
+    /// Activate a version, pushing it onto the artifact's stack. Activation
+    /// **requires a promotion receipt** — a [`PromotionRecord`] whose stage is
+    /// [`PromotionStage::Promoted`], which only [`Candidate::approve`] (an
+    /// `Actor::Human`) produces. There is no way to make a bare version active
+    /// without such a record, so an agent/system caller cannot activate its own
+    /// draft and bypass the human-approval gate (ADR-010, exit criterion 2).
+    pub fn activate(&mut self, record: &PromotionRecord) -> Result<(), PromotionError> {
+        if record.stage != PromotionStage::Promoted {
+            return Err(PromotionError::NotPromoted {
+                stage: record.stage,
+            });
+        }
+        let stack = self.history.entry(record.artifact.stem()).or_default();
+        // Idempotent: re-activating the version already on top is a no-op, so the
+        // stack never grows a duplicate (`[11, 12, 12]`) that would make a
+        // subsequent rollback pop back to the *same* version instead of the
+        // predecessor.
+        if stack.last() != Some(&record.artifact.version) {
+            stack.push(record.artifact.version);
+        }
+        Ok(())
     }
 
     /// The currently active version of an artifact stem, if any.
@@ -363,13 +462,23 @@ mod tests {
         ArtifactVersion::new(ArtifactKind::Router, "tool-selection", 12)
     }
 
+    /// A promotion receipt for a version — as `approve()` would produce for a
+    /// human-approved candidate. Used to activate a version in tests.
+    fn promoted(version: u32) -> PromotionRecord {
+        PromotionRecord {
+            artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", version),
+            actor_kind: "human".into(),
+            stage: PromotionStage::Promoted,
+        }
+    }
+
     fn drive_to_comparison(c: &mut Candidate) {
         c.run_regression(false).unwrap();
         c.start_shadow().unwrap();
         c.start_canary().unwrap();
         assert_eq!(c.observe_canary(false).unwrap(), CanaryOutcome::Continuing);
         c.finish_canary().unwrap();
-        assert_eq!(c.stage, PromotionStage::ComparisonReady);
+        assert_eq!(c.stage(), PromotionStage::ComparisonReady);
     }
 
     #[test]
@@ -383,7 +492,7 @@ mod tests {
         let mut c = Candidate::draft(artifact(), &human());
         drive_to_comparison(&mut c);
         let record = c.approve(&human()).unwrap();
-        assert_eq!(c.stage, PromotionStage::Promoted);
+        assert_eq!(c.stage(), PromotionStage::Promoted);
         assert_eq!(record.actor_kind, "human");
         assert_eq!(record.artifact.to_string(), "router/tool-selection/12");
     }
@@ -400,7 +509,7 @@ mod tests {
             PromotionError::RequiresHumanApproval { actor: "agent" }
         ));
         // The candidate did NOT promote.
-        assert_eq!(c.stage, PromotionStage::ComparisonReady);
+        assert_eq!(c.stage(), PromotionStage::ComparisonReady);
     }
 
     #[test]
@@ -425,15 +534,19 @@ mod tests {
         // Every transition method is exercised; none but approve() reaches Promoted.
         let mut c = Candidate::draft(artifact(), &agent());
         c.run_regression(false).unwrap();
-        assert_ne!(c.stage, PromotionStage::Promoted);
+        assert_ne!(c.stage(), PromotionStage::Promoted);
         c.start_shadow().unwrap();
-        assert_ne!(c.stage, PromotionStage::Promoted);
+        assert_ne!(c.stage(), PromotionStage::Promoted);
         c.start_canary().unwrap();
-        assert_ne!(c.stage, PromotionStage::Promoted);
+        assert_ne!(c.stage(), PromotionStage::Promoted);
         c.observe_canary(false).unwrap();
-        assert_ne!(c.stage, PromotionStage::Promoted);
+        assert_ne!(c.stage(), PromotionStage::Promoted);
         c.finish_canary().unwrap();
-        assert_ne!(c.stage, PromotionStage::Promoted, "only approve() promotes");
+        assert_ne!(
+            c.stage(),
+            PromotionStage::Promoted,
+            "only approve() promotes"
+        );
     }
 
     #[test]
@@ -441,7 +554,7 @@ mod tests {
         let mut c = Candidate::draft(artifact(), &human());
         let err = c.run_regression(true).unwrap_err();
         assert_eq!(err, PromotionError::RegressedOffline);
-        assert_eq!(c.stage, PromotionStage::Rejected);
+        assert_eq!(c.stage(), PromotionStage::Rejected);
     }
 
     #[test]
@@ -456,7 +569,7 @@ mod tests {
             c.observe_canary(true).unwrap(),
             CanaryOutcome::AutoRolledBack
         );
-        assert_eq!(c.stage, PromotionStage::RolledBack);
+        assert_eq!(c.stage(), PromotionStage::RolledBack);
     }
 
     #[test]
@@ -479,16 +592,8 @@ mod tests {
     #[test]
     fn rollback_restores_the_predecessor_version() {
         let mut active = ActiveVersions::new();
-        active.activate(&ArtifactVersion::new(
-            ArtifactKind::Router,
-            "tool-selection",
-            11,
-        ));
-        active.activate(&ArtifactVersion::new(
-            ArtifactKind::Router,
-            "tool-selection",
-            12,
-        ));
+        active.activate(&promoted(11)).unwrap();
+        active.activate(&promoted(12)).unwrap();
         assert_eq!(active.active("router/tool-selection"), Some(12));
         // One command restores the predecessor.
         let restored = active.rollback("router/tool-selection");
@@ -497,10 +602,56 @@ mod tests {
     }
 
     #[test]
+    fn re_activating_the_same_version_is_idempotent() {
+        // Activating the version already on top must not push a duplicate — else
+        // the stack becomes [11, 12, 12] and a rollback pops back to 12, not 11.
+        let mut active = ActiveVersions::new();
+        active.activate(&promoted(11)).unwrap();
+        active.activate(&promoted(12)).unwrap();
+        active.activate(&promoted(12)).unwrap(); // duplicate activation
+        assert_eq!(active.active("router/tool-selection"), Some(12));
+        // Rollback restores the *real* predecessor, proving no duplicate corrupted it.
+        assert_eq!(active.rollback("router/tool-selection"), Some(11));
+        assert_eq!(active.active("router/tool-selection"), Some(11));
+    }
+
+    #[test]
     fn rollback_without_a_predecessor_is_a_noop() {
         let mut active = ActiveVersions::new();
-        active.activate(&artifact());
+        active.activate(&promoted(12)).unwrap();
         assert_eq!(active.rollback("router/tool-selection"), None);
+        assert_eq!(active.active("router/tool-selection"), Some(12));
+    }
+
+    #[test]
+    fn activation_requires_a_promoted_record() {
+        // The exit-criterion-2 activation-bypass guard: a record that is NOT a
+        // completed human promotion (e.g. a rollback receipt, or a fabricated
+        // non-promoted record) cannot make a version active.
+        let mut active = ActiveVersions::new();
+        let not_promoted = PromotionRecord {
+            artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", 99),
+            actor_kind: "agent".into(),
+            stage: PromotionStage::ComparisonReady,
+        };
+        let err = active.activate(&not_promoted).unwrap_err();
+        assert!(matches!(err, PromotionError::NotPromoted { .. }));
+        assert_eq!(
+            active.active("router/tool-selection"),
+            None,
+            "nothing was activated"
+        );
+    }
+
+    #[test]
+    fn a_human_approval_record_activates() {
+        // The genuine path: approve() (a human) produces a Promoted record, which
+        // is exactly what activate() accepts.
+        let mut c = Candidate::draft(artifact(), &human());
+        drive_to_comparison(&mut c);
+        let record = c.approve(&human()).unwrap();
+        let mut active = ActiveVersions::new();
+        active.activate(&record).unwrap();
         assert_eq!(active.active("router/tool-selection"), Some(12));
     }
 

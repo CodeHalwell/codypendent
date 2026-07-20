@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use codypendent_eval::{
     cluster_failures, grade, rank_by_frequency, ActiveVersions, ArtifactKind, ArtifactVersion,
-    CanaryOutcome, Candidate, PromotionError, PromotionStage, RegressionSuite, RunObservation,
-    Signal, Trace,
+    CanaryOutcome, Candidate, PromotionError, PromotionRecord, PromotionStage, RegressionSuite,
+    RunObservation, Signal, Trace,
 };
 use codypendent_protocol::events::Actor;
 use codypendent_protocol::ids::{AgentId, ModelId, RunId, UserId};
@@ -30,6 +30,19 @@ fn grader_agent() -> Actor {
         run_id: RunId::new(),
         model: ModelId("claude-sonnet-5".into()),
     }
+}
+
+/// Drive a candidate all the way through a human approval and return its receipt
+/// — the only way to obtain a `PromotionRecord` (its fields are private and it
+/// does not deserialize, so it cannot be forged).
+fn promote_to_receipt(artifact: ArtifactVersion) -> PromotionRecord {
+    let mut c = Candidate::draft(artifact, &human());
+    c.run_regression(false).unwrap();
+    c.start_shadow().unwrap();
+    c.start_canary().unwrap();
+    c.observe_canary(false).unwrap();
+    c.finish_canary().unwrap();
+    c.approve(&human()).unwrap()
 }
 
 /// Three production traces for the same failure mode (a cargo command failure on
@@ -105,7 +118,7 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
     let mut candidate = Candidate::draft(artifact.clone(), &grader_agent());
     let regressed = suite.evaluate(&obs).regressed();
     candidate.run_regression(regressed).unwrap();
-    assert_eq!(candidate.stage, PromotionStage::RegressionPassed);
+    assert_eq!(candidate.stage(), PromotionStage::RegressionPassed);
     candidate.start_shadow().unwrap();
     candidate.start_canary().unwrap();
     assert_eq!(
@@ -121,20 +134,27 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
         Err(PromotionError::RequiresHumanApproval { .. })
     ));
     assert_eq!(
-        candidate.stage,
+        candidate.stage(),
         PromotionStage::ComparisonReady,
         "still not promoted"
     );
 
-    // 6. A human approves → promoted, and the version activates.
+    // 6. A human approves → promoted, and the version activates. Activation
+    //    requires this promotion receipt — there is no way to activate v5 without
+    //    the human-approved record `approve` returned (the record's fields are
+    //    private and it does not deserialize, so it can't be forged).
     let record = candidate.approve(&human()).unwrap();
-    assert_eq!(candidate.stage, PromotionStage::Promoted);
-    assert_eq!(record.actor_kind, "human");
-    assert_eq!(record.artifact.to_string(), "skill/rust-ci/5");
+    assert_eq!(candidate.stage(), PromotionStage::Promoted);
+    assert_eq!(record.actor_kind(), "human");
+    assert_eq!(record.artifact().to_string(), "skill/rust-ci/5");
 
     let mut active = ActiveVersions::new();
-    active.activate(&ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4)); // the predecessor
-    active.activate(&artifact);
+    // The predecessor v4 was itself activated by its own prior human promotion —
+    // its receipt comes from a real approval, not a hand-built struct.
+    let predecessor_record =
+        promote_to_receipt(ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4));
+    active.activate(&predecessor_record).unwrap();
+    active.activate(&record).unwrap();
     assert_eq!(active.active("skill/rust-ci"), Some(5));
 
     // 7. Rollback is one operation and restores the predecessor (reversible).
@@ -170,7 +190,7 @@ fn a_candidate_that_reintroduces_the_failure_is_rejected_before_promotion() {
     );
     let err = candidate.run_regression(report.regressed()).unwrap_err();
     assert_eq!(err, PromotionError::RegressedOffline);
-    assert_eq!(candidate.stage, PromotionStage::Rejected);
+    assert_eq!(candidate.stage(), PromotionStage::Rejected);
     // No human — and no code path — can promote a rejected candidate.
     assert!(candidate.approve(&human()).is_err());
 }
@@ -191,7 +211,7 @@ fn a_canary_regression_auto_rolls_back_a_human_approved_pipeline() {
         candidate.observe_canary(true).unwrap(),
         CanaryOutcome::AutoRolledBack
     );
-    assert_eq!(candidate.stage, PromotionStage::RolledBack);
+    assert_eq!(candidate.stage(), PromotionStage::RolledBack);
     // It cannot then be approved — it never reached the decision point.
     assert!(candidate.approve(&human()).is_err());
 }

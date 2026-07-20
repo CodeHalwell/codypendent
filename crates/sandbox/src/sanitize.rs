@@ -40,23 +40,53 @@ impl Sanitized {
     }
 }
 
+/// How much input to scan per output byte before giving up. Bounds CPU on an
+/// oversized stream even when little of it is retained.
+const INPUT_SCAN_FACTOR: usize = 4;
+/// A floor on the input scan, so a tiny `max_bytes` still scans enough real input
+/// to fill it.
+const MIN_INPUT_SCAN_BYTES: usize = 64 * 1024;
+/// The most characters a single escape sequence may consume before it is
+/// abandoned. Real CSI/OSC sequences are short; an unterminated one must not be
+/// scanned forever.
+const MAX_ESCAPE_SCAN: usize = 256;
+
 /// Sanitize untrusted `raw` output attributed to `origin`, capped to `max_bytes`.
 ///
 /// * Terminal control sequences are removed: C0 controls (except `\n` and `\t`),
 ///   the `\x1b` escape and the CSI/OSC sequences it introduces, and the DEL byte.
 /// * The result is truncated to `max_bytes` on a UTF-8 boundary.
+/// * Both the retained output and the total input scanned are bounded, so an
+///   oversized stream can exhaust neither memory nor CPU.
 #[must_use]
 pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize) -> Sanitized {
-    let mut text = String::with_capacity(raw.len());
+    // Bound BOTH the retained output and the total input scanned. The output cap
+    // stops a huge *kept* stream from allocating; the input-scan cap stops a huge
+    // *stripped* stream (C0 controls, an unterminated escape) from burning CPU even
+    // though it produces little or no output (CPU-DoS guard). Capacity is capped to
+    // the output budget, never the (untrusted, possibly enormous) input size.
+    let input_budget = max_bytes
+        .saturating_mul(INPUT_SCAN_FACTOR)
+        .max(MIN_INPUT_SCAN_BYTES);
+    let mut text = String::with_capacity(raw.len().min(max_bytes));
     let mut stripped = 0usize;
+    let mut truncated = false;
+    let mut consumed = 0usize;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
+        // Stop when either budget is reached — enough output kept, or enough input
+        // scanned. Either way there is more input, so the result is truncated.
+        if text.len() >= max_bytes || consumed >= input_budget {
+            truncated = true;
+            break;
+        }
+        consumed += c.len_utf8();
         match c {
-            // Escape: drop it and the sequence it introduces (CSI `\x1b[ … final`,
-            // OSC `\x1b] … BEL/ST`, or a lone two-char escape).
+            // Escape: drop it and the (length-capped) sequence it introduces (CSI
+            // `\x1b[ … final`, OSC `\x1b] … BEL/ST`, or a lone two-char escape).
             '\u{1b}' => {
                 stripped += 1;
-                strip_escape_sequence(&mut chars, &mut stripped);
+                consumed += strip_escape_sequence(&mut chars, &mut stripped);
             }
             // Keep newline and tab — meaningful whitespace, not a control attack.
             '\n' | '\t' => text.push(c),
@@ -67,9 +97,10 @@ pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize
         }
     }
 
-    let truncated = text.len() > max_bytes;
-    if truncated {
-        // Truncate on a char boundary at or below the cap.
+    if text.len() > max_bytes {
+        // A final multi-byte char may have overshot the cap; truncate to a char
+        // boundary at or below it.
+        truncated = true;
         let mut end = max_bytes;
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
@@ -87,18 +118,28 @@ pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize
 
 /// Consume the remainder of an escape sequence after the leading `\x1b` has been
 /// seen. Handles CSI (`[`), OSC (`]`, terminated by BEL or ST), and short escapes.
+/// Returns the number of bytes consumed, and **abandons** a sequence that runs
+/// past [`MAX_ESCAPE_SCAN`] characters — so an unterminated CSI/OSC can't be
+/// scanned to the end of a huge stream in one call (the tail is then treated as
+/// ordinary content by the caller's loop, bounded by its own input budget).
 fn strip_escape_sequence(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     stripped: &mut usize,
-) {
+) -> usize {
+    let mut consumed = 0usize;
+    let mut scanned = 0usize;
     match chars.peek().copied() {
         Some('[') => {
             // CSI: params/intermediates until a final byte in 0x40..=0x7e.
             chars.next();
             *stripped += 1;
+            consumed += 1;
+            scanned += 1;
             for c in chars.by_ref() {
                 *stripped += 1;
-                if ('\u{40}'..='\u{7e}').contains(&c) {
+                consumed += c.len_utf8();
+                scanned += 1;
+                if ('\u{40}'..='\u{7e}').contains(&c) || scanned >= MAX_ESCAPE_SCAN {
                     break;
                 }
             }
@@ -107,15 +148,20 @@ fn strip_escape_sequence(
             // OSC: until BEL (0x07) or ST (ESC \).
             chars.next();
             *stripped += 1;
+            consumed += 1;
+            scanned += 1;
             while let Some(c) = chars.next() {
                 *stripped += 1;
-                if c == '\u{07}' {
+                consumed += c.len_utf8();
+                scanned += 1;
+                if c == '\u{07}' || scanned >= MAX_ESCAPE_SCAN {
                     break;
                 }
                 if c == '\u{1b}' {
                     if let Some('\\') = chars.peek().copied() {
                         chars.next();
                         *stripped += 1;
+                        consumed += 1;
                     }
                     break;
                 }
@@ -125,9 +171,11 @@ fn strip_escape_sequence(
             // Two-character escape: consume the next byte.
             chars.next();
             *stripped += 1;
+            consumed += 1;
         }
         None => {}
     }
+    consumed
 }
 
 #[cfg(test)]
@@ -195,5 +243,36 @@ mod tests {
         let s = sanitize_untrusted("plugin:flood", &raw, 10);
         assert!(s.truncated);
         assert!(s.as_evidence_block().contains("truncated"));
+    }
+
+    #[test]
+    fn a_flood_of_stripped_controls_is_bounded() {
+        // A megabyte of BEL controls yields no output. Without an input-scan bound
+        // the loop would scan all of it (CPU-DoS); it must stop at the input budget
+        // instead of running to the end.
+        let raw = "\u{07}".repeat(1_000_000);
+        let s = sanitize_untrusted("plugin:flood", &raw, 16);
+        assert!(s.text.is_empty(), "controls produce no output");
+        assert!(
+            s.truncated,
+            "the scan stopped at the input budget, not the end"
+        );
+        // Only a bounded prefix was scanned, not all 1,000,000 bytes.
+        assert!(s.stripped_controls < 1_000_000);
+    }
+
+    #[test]
+    fn an_unterminated_escape_does_not_consume_the_whole_stream() {
+        // An OSC that never terminates, followed by a megabyte of text. The escape
+        // scan is length-capped, so the text after it still reaches output (proving
+        // the escape did not swallow the whole stream), and the call stays bounded.
+        let raw = format!("\u{1b}]8;;{}", "A".repeat(1_000_000));
+        let s = sanitize_untrusted("plugin:evil", &raw, 4096);
+        assert!(
+            !s.text.is_empty(),
+            "content after a length-capped escape survives"
+        );
+        assert!(s.truncated);
+        assert!(s.text.len() <= 4096);
     }
 }

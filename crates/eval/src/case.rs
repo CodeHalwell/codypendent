@@ -40,8 +40,14 @@ impl Assertion {
     pub fn check(&self, obs: &RunObservation) -> bool {
         match self {
             Assertion::TestsPass => obs.tests_passed == Some(true),
-            Assertion::FileChanged { path } => obs.changed_files.iter().any(|f| f == path),
-            Assertion::FileUnchanged { path } => !obs.changed_files.iter().any(|f| f == path),
+            Assertion::FileChanged { path } => {
+                let want = normalize_path(path);
+                obs.changed_files.iter().any(|f| normalize_path(f) == want)
+            }
+            Assertion::FileUnchanged { path } => {
+                let want = normalize_path(path);
+                !obs.changed_files.iter().any(|f| normalize_path(f) == want)
+            }
             Assertion::SymbolExists { symbol } => obs.existing_symbols.iter().any(|s| s == symbol),
             Assertion::CommandNotExecuted { contains } => {
                 !obs.executed_commands.iter().any(|c| c.contains(contains))
@@ -74,6 +80,23 @@ impl Assertion {
             Assertion::PatchScopeLimit { max_files } => format!("patch-scope<={max_files}"),
         }
     }
+}
+
+/// Normalize a repository-relative path for comparison: strip a leading `./` and
+/// any trailing `/`. Makes a `FileChanged`/`FileUnchanged` assertion robust to the
+/// cosmetic `./`-prefix difference between how a runner emits a changed path and
+/// how an assertion author writes it.
+///
+/// It deliberately does **not** rewrite `\\` to `/`: git reports paths with
+/// forward slashes on every platform, and on Unix `\\` is a legal *filename*
+/// character — rewriting it would make `src\page.rs` (a real file) wrongly match
+/// `src/page.rs` (a different file). It also does not resolve `..` or absolutize;
+/// assertions and observations are expected to share the same relative base.
+fn normalize_path(path: &str) -> String {
+    path.strip_prefix("./")
+        .unwrap_or(path)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// An evaluation case (the Chapter 16 `EvalCase`). Costs/durations are plain
@@ -266,6 +289,46 @@ mod tests {
         let result = case().score(&passing_obs());
         assert!(result.passed());
         assert!(result.failures().is_empty());
+    }
+
+    #[test]
+    fn file_assertions_normalize_the_dot_slash_prefix() {
+        // The assertion writes `./src/page.rs`; the runner emits `src/page.rs`.
+        // They must still match after the `./`-prefix normalization.
+        let obs = RunObservation {
+            changed_files: vec!["src/page.rs".into()],
+            ..Default::default()
+        };
+        assert!(Assertion::FileChanged {
+            path: "./src/page.rs".into()
+        }
+        .check(&obs));
+        assert!(!Assertion::FileUnchanged {
+            path: "./src/page.rs".into()
+        }
+        .check(&obs));
+    }
+
+    #[test]
+    fn a_backslash_filename_is_not_confused_with_a_separator() {
+        // On Unix, `src\page.rs` is a real single file, distinct from `src/page.rs`.
+        // Normalization must NOT rewrite the backslash, or this would wrongly match.
+        let obs = RunObservation {
+            changed_files: vec!["src\\page.rs".into()],
+            ..Default::default()
+        };
+        assert!(
+            !Assertion::FileChanged {
+                path: "src/page.rs".into()
+            }
+            .check(&obs),
+            "a literal backslash filename must not match a slash path"
+        );
+        // It matches itself, of course.
+        assert!(Assertion::FileChanged {
+            path: "src\\page.rs".into()
+        }
+        .check(&obs));
     }
 
     #[test]

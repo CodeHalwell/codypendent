@@ -58,9 +58,12 @@ sha2 = "0.10"
 hex = "0.4"
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
-# publisher signature over the artifact checksum; `base64` decodes the signature
-# and publisher key carried as text in `plugin.toml`'s `[security]`. Pinned to a
-# version that builds on the workspace's rust-version (1.82).
+# publisher signature over the canonical `codypendent-plugin-signature-v1` digest
+# (`sandbox::verify::signing_digest`) — a digest of the *whole manifest* (every
+# field but the signature), so a signature can't be replayed against any altered
+# field (capabilities, runtime command, resource caps, scopes, …); `base64`
+# decodes the signature and publisher key carried as text in `plugin.toml`'s
+# `[security]`. Pinned to a version that builds on the workspace's rust-version (1.82).
 ed25519-dalek = "=2.2.0"
 base64 = "0.22"
 

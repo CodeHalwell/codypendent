@@ -45,19 +45,28 @@ impl Signal {
         }
     }
 
-    /// Whether this is a negative (failure) signal.
+    /// Whether this is a negative (failure) signal. An **exhaustive** match, so a
+    /// newly added [`Signal`] variant fails to compile until it is explicitly
+    /// categorized as positive or negative — a new signal can never silently
+    /// default to "positive".
     #[must_use]
     pub fn is_negative(self) -> bool {
-        matches!(
-            self,
+        match self {
             Signal::InvalidToolCall
-                | Signal::CommandFailure
-                | Signal::Regression
-                | Signal::UnnecessaryEdits
-                | Signal::ExcessiveCost
-                | Signal::FabricatedDependency
-                | Signal::PolicyViolation
-        )
+            | Signal::CommandFailure
+            | Signal::Regression
+            | Signal::UnnecessaryEdits
+            | Signal::ExcessiveCost
+            | Signal::FabricatedDependency
+            | Signal::PolicyViolation => true,
+            Signal::PatchApplies
+            | Signal::CompilationSucceeds
+            | Signal::TargetedTestsPass
+            | Signal::FullSuitePasses
+            | Signal::LintPasses
+            | Signal::RegressionTestAdded
+            | Signal::UserAcceptsPatch => false,
+        }
     }
 
     #[must_use]
