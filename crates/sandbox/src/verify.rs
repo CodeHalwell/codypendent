@@ -8,20 +8,18 @@
 //! explicitly opted into allowing unsigned plugins.
 //!
 //! The checksum binds the manifest to a specific artifact. The signature binds a
-//! **canonical digest** that covers the checksum *and the security-relevant
-//! manifest fields* — id, version, kind, and the requested capabilities — to a
-//! publisher (see [`signing_digest`]). Signing that digest (raw bytes, not a hex
-//! string) means a valid publisher signature cannot be replayed against a
-//! manifest whose `[capabilities]` (or kind/runtime identity) has been altered:
-//! change any signed field and the digest — and so the required signature —
-//! changes with it.
+//! **canonical digest of the entire manifest** (every field except the signature
+//! itself) to a publisher (see [`signing_digest`]). Signing the whole manifest
+//! means a valid publisher signature cannot be replayed against a manifest whose
+//! `[capabilities]`, runtime command, resource caps, scopes, or any other field
+//! has been altered: change any signed field and the digest — and so the required
+//! signature — changes with it.
 
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::PluginManifest;
-use crate::permission::CapabilitySet;
 
 /// Policy for plugins whose manifest carries no signature (`[plugins].unsigned`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,98 +69,44 @@ pub fn checksum_of(artifact: &[u8]) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
-/// The 32-byte digest a publisher signs: a SHA-256 over a canonical, versioned
-/// encoding of the artifact checksum plus the security-relevant manifest fields —
-/// id, version, kind, the runtime execution identity (command/protocol/working
-/// directory), the resource caps, and the requested capabilities in sorted order.
-/// Binding all of these into the signed material is what stops a valid checksum
-/// signature from being reused against a manifest whose permissions, command, or
-/// isolation limits were swapped.
+/// The 32-byte digest a publisher signs: a SHA-256 over the **entire manifest** —
+/// every field except the signature itself — canonically serialized. Signing the
+/// whole manifest, rather than an enumerated subset of fields, binds *every*
+/// security-relevant field at once: the requested capabilities, the runtime
+/// execution identity (command/protocol/working directory), the resource-isolation
+/// caps, the installable scopes, the sandbox profile, the update policy, and the
+/// artifact checksum. A valid signature can therefore never be replayed against a
+/// manifest that was altered in *any* way — there is no unsigned field left to
+/// tamper with, which forecloses the whole class of "field X wasn't signed" replays.
 ///
-/// The encoding is **injective**: every field is length-prefixed (its byte length
-/// is committed before its bytes), and the capability list is count-prefixed with
-/// each capability's class and value length-prefixed in turn. So no field value —
-/// including an attacker-chosen capability string containing newlines or `=` — can
-/// forge a delimiter or merge with an adjacent field. Two manifests digest equal
-/// **iff** they have the same checksum, identity, runtime, and exact capability
-/// set. Capabilities come from a [`CapabilitySet`] (sorted + deduplicated) and the
-/// checksum is lower-cased, so declaration order and hex casing don't matter. This
-/// is the signing contract a packaging tool implements.
+/// The serialization is deterministic (the manifest is all named struct fields,
+/// enums, scalars, and ordered `Vec`s — no maps or floats), so signer and verifier
+/// reproduce identical bytes; it is unambiguous (JSON escapes every value), so no
+/// field value can forge a delimiter; and its length is committed under the hash.
+/// The signature field is blanked before serializing, since a signature cannot sign
+/// itself. This is the signing contract a packaging tool implements.
 ///
 /// The `codypendent-plugin-signature-v1` domain-separation tag **versions the
 /// signature scheme**: a signature only verifies against the scheme it was produced
 /// under, and a future scheme change bumps the tag so the two never collide. This
 /// crate deliberately accepts **only** the current scheme — there is no fallback to
 /// verifying a bare-checksum signature. Accepting that weaker form would reopen
-/// exactly the capability/command-swap replay this digest closes, so it is refused
-/// by design rather than kept for backward compatibility (no signed plugins ship
-/// against an older contract — signed packaging targets this digest from the outset).
+/// exactly the field-swap replays this digest closes, so it is refused by design
+/// rather than kept for backward compatibility (no signed plugins ship against an
+/// older contract — signed packaging targets this digest from the outset).
 #[must_use]
 pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
+    // Sign the whole manifest minus the signature field (which cannot sign itself),
+    // canonically serialized — so no field is left unbound and there is no
+    // enumerate-every-security-field footgun.
+    let mut signable = manifest.clone();
+    signable.security.signature = String::new();
+    let canonical = serde_json::to_vec(&signable).expect("plugin manifest serializes");
     let mut hasher = Sha256::new();
-    // Domain separator (fixed length — no prefix needed).
     hasher.update(b"codypendent-plugin-signature-v1");
-    hash_field(
-        &mut hasher,
-        b"checksum",
-        manifest
-            .security
-            .checksum
-            .trim()
-            .to_ascii_lowercase()
-            .as_bytes(),
-    );
-    hash_field(&mut hasher, b"id", manifest.id.trim().as_bytes());
-    hash_field(&mut hasher, b"version", manifest.version.trim().as_bytes());
-    hash_field(&mut hasher, b"kind", manifest.kind.as_str().as_bytes());
-    // Execution identity: binding command/protocol/working_directory stops a
-    // command-hijack replay (a swapped `runtime.command` must break verification).
-    hash_field(
-        &mut hasher,
-        b"command",
-        manifest.runtime.command.trim().as_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        b"protocol",
-        manifest.runtime.protocol.trim().as_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        b"working_directory",
-        manifest.runtime.working_directory.trim().as_bytes(),
-    );
-    // Resource caps are an isolation *control*, and `SandboxProfile::derive` copies
-    // them straight into the enforced profile — so bind them too, or a signed
-    // manifest could be replayed with weakened memory/CPU/wall/output limits. The
-    // four u64s are packed big-endian into one fixed-width, length-prefixed field.
-    let mut resources = Vec::with_capacity(32);
-    resources.extend_from_slice(&manifest.resources.memory_mb.to_be_bytes());
-    resources.extend_from_slice(&manifest.resources.cpu_seconds.to_be_bytes());
-    resources.extend_from_slice(&manifest.resources.wall_seconds.to_be_bytes());
-    resources.extend_from_slice(&manifest.resources.maximum_output_mb.to_be_bytes());
-    hash_field(&mut hasher, b"resources", &resources);
-    // The full requested permission set: count-prefixed, then each capability's
-    // class + value length-prefixed, so the set is bound unambiguously.
-    let caps = CapabilitySet::from_spec(&manifest.capabilities);
-    hasher.update((caps.len() as u64).to_be_bytes());
-    for cap in caps.iter() {
-        hash_field(&mut hasher, b"cap-class", cap.class().as_bytes());
-        hash_field(&mut hasher, b"cap-value", cap.value().as_bytes());
-    }
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    hasher.update(&canonical);
     hasher.finalize().into()
-}
-
-/// Absorb a labeled, **length-prefixed** field into the hasher: the label length +
-/// label, then the value length + value (both lengths as `u64` big-endian). The
-/// length prefixes make the encoding injective — a value cannot contain bytes that
-/// impersonate a delimiter or the next field, which is what closes the
-/// capability-string injection collision.
-fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
-    hasher.update((label.len() as u64).to_be_bytes());
-    hasher.update(label);
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value);
 }
 
 /// Verify a plugin artifact against its manifest under the given unsigned policy
@@ -170,9 +114,9 @@ fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
 ///
 /// * The artifact must hash to the manifest's checksum.
 /// * If the manifest is signed, `publisher_key` (32 raw ed25519 public-key bytes)
-///   must verify the signature over the [`signing_digest`] — which binds the
-///   checksum *and* the security-relevant manifest fields (id/version/kind/
-///   capabilities), so a signature cannot be replayed against altered permissions.
+///   must verify the signature over the [`signing_digest`] — the digest of the
+///   whole manifest, so a signature cannot be replayed against *any* altered field
+///   (permissions, runtime command, resource caps, scopes, …).
 /// * If the manifest is unsigned, [`UnsignedPolicy`] decides.
 ///
 /// The publisher key is supplied by the caller (the daemon resolves it from the
