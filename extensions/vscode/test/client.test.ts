@@ -309,3 +309,107 @@ describe("DaemonClient reconnect with resume", () => {
     client.stop();
   });
 });
+
+describe("DaemonClient offline queue + resume token", () => {
+  it("queues an approval decision while disconnected and flushes it after the next attach", async () => {
+    const sockets: FakeSocket[] = [];
+    let releaseWait: (() => void) | undefined;
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      // Park the reconnect loop until the test releases it, so there is a
+      // genuine no-socket window to click Approve in.
+      wait: () =>
+        new Promise<void>((resolve) => {
+          releaseWait = resolve;
+        }),
+    });
+    client.start();
+    await flush();
+    const first = sockets[0];
+    first.emit("connect");
+    first.deliver(serverHelloPayload());
+    await flush();
+    first.deliver(catchupPayload(0));
+    await flush();
+    expect(client.connectionStatus).toBe("attached");
+
+    // The daemon drops; the user clicks Approve during the backoff window.
+    first.destroy();
+    await flush();
+    expect(sockets.length).toBe(1);
+    client.resolveApproval("55555555-5555-5555-5555-555555555555", "Approve");
+
+    // Reconnect and attach; the queued decision must flush after the Catchup.
+    releaseWait?.();
+    await flush();
+    const second = sockets[1];
+    second.emit("connect");
+    second.deliver(serverHelloPayload());
+    await flush();
+    second.deliver(catchupPayload(0));
+    await flush();
+
+    const commands = second
+      .sent()
+      .map((e) => e.payload)
+      .filter((p): p is { type: "Command" } & Command => p.type === "Command");
+    const resolve = commands.find((c) => c.body.type === "ResolveApproval");
+    expect(resolve, "the queued ResolveApproval must be delivered").toBeDefined();
+    if (resolve && resolve.body.type === "ResolveApproval") {
+      expect(resolve.body.approval_id).toBe("55555555-5555-5555-5555-555555555555");
+      expect(resolve.body.decision).toEqual({ type: "Approve" });
+    }
+    // Ordering: the attach was sent before the flushed decision.
+    const kinds = commands.map((c) => c.body.type);
+    expect(kinds.indexOf("AttachSession")).toBeLessThan(kinds.indexOf("ResolveApproval"));
+    client.stop();
+  });
+
+  it("presents the daemon-minted resume token on the next ClientHello", async () => {
+    const sockets: FakeSocket[] = [];
+    let releaseWait: (() => void) | undefined;
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () =>
+        new Promise<void>((resolve) => {
+          releaseWait = resolve;
+        }),
+    });
+    client.start();
+    await flush();
+    const first = sockets[0];
+    first.emit("connect");
+    await flush();
+    // The first ClientHello carries no token.
+    const firstHello = first.sent().find((e) => e.payload.type === "ClientHello");
+    expect(firstHello).toBeDefined();
+    expect((firstHello?.payload as { resume_token?: string }).resume_token).toBeUndefined();
+
+    first.deliver({ ...serverHelloPayload(), resume_token: "tok-1" } as Payload);
+    await flush();
+    first.destroy();
+    await flush();
+
+    releaseWait?.();
+    await flush();
+    const second = sockets[1];
+    second.emit("connect");
+    await flush();
+    const secondHello = second.sent().find((e) => e.payload.type === "ClientHello");
+    expect(secondHello).toBeDefined();
+    expect((secondHello?.payload as { resume_token?: string }).resume_token).toBe("tok-1");
+    client.stop();
+  });
+});

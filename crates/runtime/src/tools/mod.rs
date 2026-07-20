@@ -111,6 +111,18 @@ pub enum ToolError {
     /// `git apply --check` rejected the patch; nothing was applied.
     #[error("patch does not apply: {0}")]
     PatchDoesNotApply(String),
+    /// A daemon-issued helper process (ripgrep, git) exceeded its wall-clock
+    /// bound and was killed. Distinct from a `shell.run` timeout, which is a
+    /// successful [`ShellOutcome`] with `timed_out` set: these helpers have no
+    /// partial-outcome shape, so a hang surfaces as this refusal instead of
+    /// wedging the run (cancellation is blind while a tool executes).
+    #[error("`{tool}` timed out after {seconds}s and was killed")]
+    TimedOut {
+        /// The tool that hung.
+        tool: &'static str,
+        /// The bound that expired.
+        seconds: u64,
+    },
     /// Underlying I/O failure spawning or talking to a child process or file.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -132,6 +144,7 @@ impl ToolError {
             ToolError::ProgramNotFound(_) => "tool.program-not-found",
             ToolError::InvalidRange { .. } => "tool.invalid-range",
             ToolError::PatchDoesNotApply(_) => "tool.patch-does-not-apply",
+            ToolError::TimedOut { .. } => "tool.timed-out",
             ToolError::Io(_) => "tool.io-error",
             ToolError::Other(_) => "tool.error",
         }
@@ -214,12 +227,20 @@ fn display_command(program: &std::path::Path, args: &[String]) -> String {
     out
 }
 
+/// Hard ceiling on any single command's wall clock, applied even when the
+/// command scope declares no ceiling of its own (`maximum_seconds == 0`). The
+/// request's `timeout` is model-supplied, so without this an unset scope
+/// ceiling would let a model-chosen `u64::MAX` run forever.
+const ABSOLUTE_MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// Clamp an effective timeout to the command scope's wall-clock ceiling. A
-/// ceiling of zero means "unset" and leaves `requested` untouched.
+/// ceiling of zero means "unset": the request is then bounded only by
+/// [`ABSOLUTE_MAX_TIMEOUT`].
 fn effective_timeout(requested: Duration, maximum_seconds: u64) -> Duration {
+    let bounded = requested.min(ABSOLUTE_MAX_TIMEOUT);
     if maximum_seconds == 0 {
-        requested
+        bounded
     } else {
-        requested.min(Duration::from_secs(maximum_seconds))
+        bounded.min(Duration::from_secs(maximum_seconds))
     }
 }

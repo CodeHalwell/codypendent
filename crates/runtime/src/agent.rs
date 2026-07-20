@@ -1046,11 +1046,10 @@ impl FrameworkAgentRuntime {
     /// filesystem read.
     async fn read_provenance(&self, path: &Path, run: &RunContext) -> SourceProvenance {
         let path_str = path.to_string_lossy();
-        let dirty = run.ide_dirty_buffers.iter().find(|buffer| {
-            path_str == buffer.path.as_str()
-                || path_str.ends_with(&buffer.path)
-                || buffer.path.ends_with(path_str.as_ref())
-        });
+        let dirty = run
+            .ide_dirty_buffers
+            .iter()
+            .find(|buffer| same_file(path_str.as_ref(), &buffer.path));
         match dirty {
             Some(buffer) => match tokio::fs::read(path).await {
                 Ok(bytes) if digest_bytes(&bytes) == buffer.sha256 => SourceProvenance::Filesystem,
@@ -1232,7 +1231,10 @@ impl FrameworkAgentRuntime {
             PreparedTool::GitHubCheckSummary { repo, input } => match self.github.as_ref() {
                 None => github_unconfigured(),
                 Some(client) => {
-                    match client.create_check_run_summary(&repo, &input.request).await {
+                    match client
+                        .create_check_run_summary(&repo, &input.request, &input.idempotency_key)
+                        .await
+                    {
                         Ok(check) => (
                             format!(
                                 "posted check-run summary `{}` [{}]",
@@ -1363,6 +1365,23 @@ enum PreparedTool {
 // ---------------------------------------------------------------------------
 
 /// The tool-result tuple for a `github.*` call made without a configured client.
+/// Whether `candidate` names the same file as `path`, allowing one side to be
+/// workspace-relative where the other is absolute: exact equality, or a
+/// whole-component suffix ("src/b.rs" matches "/repo/src/b.rs"). The suffix
+/// must align at a `/` boundary — a plain string `ends_with` would let a dirty
+/// buffer for `b.rs` claim a read of `lib.rs` and mislabel its provenance.
+fn same_file(path: &str, candidate: &str) -> bool {
+    if path == candidate {
+        return true;
+    }
+    fn component_suffix(longer: &str, shorter: &str) -> bool {
+        longer.len() > shorter.len()
+            && longer.ends_with(shorter)
+            && longer.as_bytes()[longer.len() - shorter.len() - 1] == b'/'
+    }
+    component_suffix(path, candidate) || component_suffix(candidate, path)
+}
+
 fn github_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
     (
         "github is not configured (no token available)".to_string(),
@@ -1574,9 +1593,14 @@ fn build_chronicle(
 ///
 /// This is a focused implementation compiled behind `provider-openai`; a live
 /// endpoint is not available in this environment, so it has no live test. The
-/// transcript translation is intentionally simple (tool results are replayed as
-/// user turns rather than threaded by `call_id`), which is sufficient for the
-/// Phase 1 single-tool-at-a-time loop.
+/// transcript translation is intentionally simple: tool results are replayed
+/// as clearly-marked **user** turns rather than threaded by `call_id`. That is
+/// a wire-safety requirement, not just simplicity — the loop's transcript does
+/// not retain the assistant's `tool_calls` turn, and OpenAI-compatible servers
+/// reject a `role: tool` message that is not preceded by an assistant message
+/// carrying the matching `tool_call_id` (HTTP 400). A user-role replay is
+/// valid everywhere and sufficient for the Phase 1 single-tool-at-a-time loop
+/// (`to_messages_never_emits_orphan_tool_roles` pins this).
 #[cfg(feature = "provider-openai")]
 pub struct FrameworkModelDriver {
     client: agent_framework_openai::OpenAIChatCompletionClient,
@@ -1722,7 +1746,7 @@ impl FrameworkModelDriver {
     }
 
     fn to_messages(transcript: &[TurnItem]) -> Vec<agent_framework_core::types::Message> {
-        use agent_framework_core::types::{Message, Role};
+        use agent_framework_core::types::Message;
         let mut messages = vec![Message::system(
             "You are a coding agent. Use the provided tools to inspect and modify \
              the repository, then finish with a short summary.",
@@ -1731,8 +1755,11 @@ impl FrameworkModelDriver {
             let message = match item {
                 TurnItem::Objective(text) => Message::user(text.clone()),
                 TurnItem::Assistant(text) => Message::assistant(text.clone()),
+                // NOT `Role::tool()`: an orphan tool message (no preceding
+                // assistant `tool_calls` with a matching id) is rejected with a
+                // 400 by strict OpenAI-wire servers. See the type-level docs.
                 TurnItem::ToolResult { tool, output } => {
-                    Message::new(Role::tool(), format!("[{tool}] {output}"))
+                    Message::user(format!("[tool result: {tool}]\n{output}"))
                 }
                 TurnItem::Steering(text) => Message::user(text.clone()),
             };
@@ -1841,6 +1868,50 @@ mod tests {
         assert!(token.is_cancelled());
         // A `never` token stays false even with its source dropped.
         assert!(!CancellationToken::never().is_cancelled());
+    }
+
+    #[test]
+    fn same_file_matches_only_on_component_boundaries() {
+        // Exact and relative-vs-absolute matches.
+        assert!(same_file("/repo/src/lib.rs", "/repo/src/lib.rs"));
+        assert!(same_file("/repo/src/lib.rs", "src/lib.rs"));
+        assert!(same_file("src/lib.rs", "/repo/src/lib.rs"));
+        assert!(same_file("/repo/src/lib.rs", "lib.rs"));
+        // The regression: `lib.rs` string-ends-with `b.rs`, but they are
+        // different files — a dirty buffer for `b.rs` must not claim a read of
+        // `lib.rs` (that mislabeled provenance as `unsaved-ide-buffer`).
+        assert!(!same_file("/repo/src/lib.rs", "b.rs"));
+        assert!(!same_file("b.rs", "/repo/src/lib.rs"));
+        assert!(!same_file("/repo/src/lib.rs", "ib.rs"));
+        // A partial directory name is not a match either.
+        assert!(!same_file("/repo/src/lib.rs", "rc/lib.rs"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_never_emits_orphan_tool_roles() {
+        use agent_framework_core::types::Role;
+        // The loop's transcript has no assistant `tool_calls` turn, so a
+        // `role: tool` replay would be an orphan strict OpenAI-wire servers
+        // reject with a 400. Tool results must ride as marked user turns.
+        let transcript = vec![
+            TurnItem::Objective("fix the test".to_string()),
+            TurnItem::Assistant("looking".to_string()),
+            TurnItem::ToolResult {
+                tool: "shell.run".to_string(),
+                output: "exit 0".to_string(),
+            },
+            TurnItem::Steering("also check CI".to_string()),
+        ];
+        let messages = FrameworkModelDriver::to_messages(&transcript);
+        assert_eq!(messages.len(), 5, "system + four transcript items");
+        assert!(
+            messages.iter().all(|m| m.role != Role::tool()),
+            "no orphan tool-role messages may reach the wire"
+        );
+        let replay = &messages[3];
+        assert_eq!(replay.role, Role::user());
+        assert!(replay.text().contains("[tool result: shell.run]"));
     }
 
     #[test]

@@ -70,7 +70,45 @@ pub async fn load_events(
     .bind(session_id.to_string())
     .fetch_all(pool)
     .await?;
+    rows_to_events(rows)
+}
 
+/// Load the events with `after < sequence <= through`, in sequence order. The
+/// window is filtered in SQL — the `(session_id, sequence)` primary key serves
+/// it — so an attach catch-up reads only the gap: a client one event behind on
+/// a 100k-event session must not pay a full-history read per reconnect.
+pub async fn load_events_between(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    after: u64,
+    through: u64,
+) -> anyhow::Result<Vec<SessionEvent>> {
+    let rows: Vec<EventRow> = sqlx::query_as(
+        "SELECT sequence, occurred_at, actor, body, causation_id, correlation_id \
+         FROM events WHERE session_id = ? AND sequence > ? AND sequence <= ? \
+         ORDER BY sequence ASC",
+    )
+    .bind(session_id.to_string())
+    .bind(i64::try_from(after).unwrap_or(i64::MAX))
+    .bind(i64::try_from(through).unwrap_or(i64::MAX))
+    .fetch_all(pool)
+    .await?;
+    rows_to_events(rows)
+}
+
+/// Whether `session_id` exists in the sessions table. The attach path uses
+/// this to reject a session id the daemon has never seen — an empty catch-up
+/// must mean "empty session", never "typo'd id".
+pub async fn session_exists(pool: &SqlitePool, session_id: SessionId) -> anyhow::Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Decode raw event rows into [`SessionEvent`]s.
+fn rows_to_events(rows: Vec<EventRow>) -> anyhow::Result<Vec<SessionEvent>> {
     let mut events = Vec::with_capacity(rows.len());
     for (sequence, occurred_at, actor, body, causation_id, correlation_id) in rows {
         events.push(SessionEvent {

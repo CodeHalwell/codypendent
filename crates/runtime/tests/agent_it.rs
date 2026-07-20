@@ -1003,6 +1003,7 @@ impl GitHubApi for RecordingGitHub {
         &self,
         _repo: &RepoId,
         req: &model::NewCheckRun,
+        idempotency_key: &str,
     ) -> Result<model::CheckRun, GitHubError> {
         self.summaries.lock().unwrap().push(req.name.clone());
         Ok(model::CheckRun {
@@ -1010,6 +1011,7 @@ impl GitHubApi for RecordingGitHub {
             name: req.name.clone(),
             status: "completed".to_string(),
             conclusion: req.conclusion.clone(),
+            external_id: Some(idempotency_key.to_string()),
         })
     }
 }

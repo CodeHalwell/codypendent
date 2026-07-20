@@ -89,16 +89,14 @@ pub enum Subscription {
     RepositoryStatus,
     /// Budget usage and warnings.
     BudgetState,
-    /// A collaborative document's CRDT sync stream + suggestion/presence updates
-    /// (Phase 4 STEP 4.3). The intended behaviour is for the daemon to publish
-    /// `DocumentSync` messages to subscribers as the authoritative replica
-    /// advances.
-    ///
-    /// **Delivery is not yet wired.** This subscription variant is the wire
-    /// contract; the server's subscription matcher and a `Payload::DocumentSync`
-    /// delivery path are part of the Phase 4 *client-transport* slice tracked in
-    /// the roadmap. Until then, attaching with this subscription is accepted but
-    /// receives no document updates.
+    /// A collaborative document's CRDT sync stream (Phase 4 STEP 4.3): as the
+    /// authoritative replica advances, the daemon fans each `DocumentSync` out
+    /// to subscribers over a per-document hub, delivered as
+    /// [`Payload::DocumentSync`](crate::envelope::Payload). A subscriber's
+    /// baseline comes from the document read path; this stream carries the
+    /// post-subscribe updates it merges (idempotent CRDT merge, so no
+    /// watermark is needed). Re-attaching with a different `Document` set
+    /// replaces the previous forwarders.
     Document { document_id: DocumentId },
     #[serde(other)]
     Unknown,

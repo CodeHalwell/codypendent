@@ -201,6 +201,10 @@ pub fn parse_update_pull_request(args: &Value) -> Result<UpdatePullRequestInput,
 pub struct CreateCheckRunInput {
     /// The check-run request body.
     pub request: NewCheckRun,
+    /// Derived replay-safety key (`head_sha:name`): the same summary name on
+    /// the same commit is one logical write, however many times the model
+    /// proposes it. Carried to GitHub as the check run's `external_id`.
+    pub idempotency_key: String,
 }
 
 /// Post a check-run summary against a commit.
@@ -224,16 +228,21 @@ pub fn parse_create_check_run(args: &Value) -> Result<CreateCheckRunInput, Strin
             .map(str::to_string)
             .ok_or_else(|| format!("github.create_check_run_summary requires a string `{key}`"))
     };
+    let name = string("name")?;
+    let head_sha = string("head_sha")?;
+    let idempotency_key = format!("{head_sha}:{name}");
     Ok(CreateCheckRunInput {
         request: NewCheckRun {
-            name: string("name")?,
-            head_sha: string("head_sha")?,
+            name,
+            head_sha,
             summary: string("summary")?,
             conclusion: args
                 .get("conclusion")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            external_id: None,
         },
+        idempotency_key,
     })
 }
 
@@ -331,5 +340,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.request.head_sha, "abc");
+        assert_eq!(ok.idempotency_key, "abc:ci");
+        assert!(ok.request.external_id.is_none());
     }
 }

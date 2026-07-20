@@ -81,6 +81,12 @@ export interface ServerHello {
   daemon_version: string;
   daemon_instance: Uuid;
   heartbeat_interval_ms: number;
+  /**
+   * Daemon-minted token this client presents in its next `ClientHello` to be
+   * recognized as the same identity across reconnects. Optional for wire
+   * compatibility with older daemons.
+   */
+  resume_token?: string;
 }
 
 /** `ClientRole` — internally tagged, `{ "type": "Contributor" }` etc. */
@@ -150,7 +156,22 @@ export type ApprovalScope =
 export type ProposedAction =
   | { type: "ReadFiles"; paths: string[] }
   | { type: "WritePatch"; patch: Uuid }
-  | { type: "ExecuteCommand"; program: string; args: string[] }
+  | {
+      type: "ExecuteCommand";
+      program: string;
+      args: string[];
+      /**
+       * The child's COMPLETE environment as `[name, value]` pairs (Rust
+       * `Vec<(String, String)>` — serde tuples are JSON arrays). Carried so
+       * the approver sees every binding: an unshown, model-controlled
+       * environment could smuggle execution hijacks (`LD_PRELOAD`,
+       * `RUSTC_WRAPPER`, a shadowed `PATH`) past a benign-looking command.
+       * The approval card MUST render this. Optional for older daemons.
+       */
+      environment?: [string, string][];
+      /** The working directory the command runs in, when constrained. */
+      cwd?: string | null;
+    }
   | { type: "NetworkRequest"; destination: string }
   | { type: "GitCommit"; repository: string }
   | { type: "GitPush"; remote: string; branch: string }
@@ -253,6 +274,7 @@ export type EventBody =
   | { type: "SteeringApplied"; run_id: Uuid }
   | { type: "BudgetWarning"; run_id: Uuid; dimension: BudgetDimension; used: number; limit: number }
   | { type: "RunCompleted"; run_id: Uuid; disposition: RunDisposition; chronicle: ArtifactRef }
+  | { type: "ClientPresenceChanged"; client_id: Uuid; role: ClientRole; present: boolean }
   | { type: "Unknown" };
 
 export interface SessionEvent {
@@ -373,7 +395,7 @@ export type Payload =
   | ({ type: "ClientHello" } & ClientHello)
   | ({ type: "ServerHello" } & ServerHello)
   | ({ type: "Command" } & Command)
-  | { type: "CommandAccepted"; command_id: Uuid; sequence?: number }
+  | { type: "CommandAccepted"; command_id: Uuid; sequence?: number; created_run?: Uuid }
   | ({ type: "CommandRejected" } & CodypendentError)
   | ({ type: "Event" } & SessionEvent)
   | { type: "Catchup"; catchup: Catchup }

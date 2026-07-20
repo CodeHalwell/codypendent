@@ -11,7 +11,7 @@ use codypendent_integrations::github::model::{NewCheckRun, NewPullRequest, Updat
 use codypendent_integrations::github::{
     GitHubApi, GitHubError, GitHubToken, RepoId, RestGitHubClient,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SENTINEL_TOKEN: &str = "ghp_SEKRET";
@@ -163,6 +163,7 @@ fn token_never_serialized() {
         head_sha: "abc123".to_string(),
         summary: "ok".to_string(),
         conclusion: Some("success".to_string()),
+        external_id: Some("key".to_string()),
     };
     for value in [
         serde_json::to_string(&new_pr).expect("serialize new pr"),
@@ -245,4 +246,189 @@ async fn hostile_path_parameters_are_refused_before_any_request() {
         .await
         .expect_err("no mock mounted");
     assert!(matches!(err, GitHubError::Api { .. }));
+}
+
+#[tokio::test]
+async fn check_run_summary_nests_output_and_is_idempotent() {
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let key = "abc:ci";
+
+    let check_run_json = serde_json::json!({
+        "id": 9,
+        "name": "ci",
+        "status": "completed",
+        "conclusion": "success",
+        "external_id": key,
+    });
+
+    // First list: no runs on the commit yet, so the client creates.
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/commits/abc/check-runs"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "check_runs": [] })),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    // Later lists serve the created run, external_id marker and all.
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/commits/abc/check-runs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "check_runs": [check_run_json] })),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    // The POST must carry the wire shape GitHub actually reads — the summary
+    // nested under `output` (a flat top-level `summary` is silently ignored by
+    // the real API) plus the replay marker as `external_id` — and be hit at
+    // most once across both calls.
+    Mock::given(method("POST"))
+        .and(path("/repos/o/r/check-runs"))
+        .and(body_partial_json(serde_json::json!({
+            "name": "ci",
+            "head_sha": "abc",
+            "conclusion": "success",
+            "external_id": key,
+            "output": { "title": "ci", "summary": "all green" },
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(check_run_json.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let gh = client(&server);
+    let req = NewCheckRun {
+        name: "ci".to_string(),
+        head_sha: "abc".to_string(),
+        summary: "all green".to_string(),
+        conclusion: Some("success".to_string()),
+        external_id: None,
+    };
+
+    let first = gh
+        .create_check_run_summary(&repo, &req, key)
+        .await
+        .expect("first create");
+    let second = gh
+        .create_check_run_summary(&repo, &req, key)
+        .await
+        .expect("second create");
+
+    assert_eq!(first.id, 9);
+    assert_eq!(
+        second.id, 9,
+        "retry must find the existing check run by external_id"
+    );
+    // `.expect(1)` on the POST mock is verified when `server` drops.
+}
+
+#[tokio::test]
+async fn pagination_refuses_lookalike_origin_next_links() {
+    // A hostile `Link: rel="next"` pointing at a prefix-lookalike host
+    // (`<base>.evil.test`) must not be followed — the follow-up request would
+    // carry the bearer token to the attacker. The mock returns such a link on
+    // the first page; the client must stop after page one rather than error or
+    // leak a second request (which would fail to resolve anyway).
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let evil_next = format!(
+        "{}.evil.test/repos/o/r/issues/1/comments?page=2",
+        server.uri()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues/1/comments"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([comment_json(1, "first page")]))
+                .insert_header("link", format!("<{evil_next}>; rel=\"next\"").as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let gh = client(&server);
+    let comments = gh
+        .list_review_comments(&repo, 1)
+        .await
+        .expect("list first page");
+    assert_eq!(
+        comments.len(),
+        1,
+        "the lookalike next link must not be followed"
+    );
+}
+
+#[tokio::test]
+async fn check_run_idempotency_scans_past_the_first_page() {
+    // GitHub's default page is 30 (we ask for 100); a busy commit can push the
+    // external_id marker beyond page one. The scan must follow rel="next" —
+    // stopping at the first page would treat a retry as new and duplicate the
+    // create. No POST mock is mounted: reaching the create endpoint would 404
+    // into an Api error and fail this test.
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let key = "abc:ci";
+
+    let filler: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            serde_json::json!({
+                "id": i,
+                "name": format!("job-{i}"),
+                "status": "completed",
+                "conclusion": "success",
+                "external_id": "",
+            })
+        })
+        .collect();
+    let next = format!(
+        "{}/repos/o/r/commits/abc/check-runs?per_page=100&page=2",
+        server.uri()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/commits/abc/check-runs"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "check_runs": [{
+                "id": 999,
+                "name": "ci",
+                "status": "completed",
+                "conclusion": "success",
+                "external_id": key,
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/commits/abc/check-runs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "check_runs": filler }))
+                .insert_header("link", format!("<{next}>; rel=\"next\"").as_str()),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let gh = client(&server);
+    let req = NewCheckRun {
+        name: "ci".to_string(),
+        head_sha: "abc".to_string(),
+        summary: "s".to_string(),
+        conclusion: Some("success".to_string()),
+        external_id: None,
+    };
+    let found = gh
+        .create_check_run_summary(&repo, &req, key)
+        .await
+        .expect("the page-2 marker must be found without creating");
+    assert_eq!(found.id, 999);
 }

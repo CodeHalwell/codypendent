@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::WebhookError;
 
 /// Configuration for the webhook listener.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct WebhooksConfig {
     /// Whether the listener is enabled. Disabled by default — a webhook endpoint
     /// is never opened unless explicitly turned on.
@@ -26,6 +26,18 @@ pub struct WebhooksConfig {
     /// stored in model context or the database.
     #[serde(default)]
     pub secret: Option<String>,
+}
+
+/// Manual `Debug` so a `{:?}` of the config (or any struct embedding it) can
+/// never print the shared secret — the same treatment `GitHubToken` gets.
+impl std::fmt::Debug for WebhooksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhooksConfig")
+            .field("enabled", &self.enabled)
+            .field("listen_addr", &self.listen_addr)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The default bind address: loopback, so nothing is exposed off-host.

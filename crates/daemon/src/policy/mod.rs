@@ -483,30 +483,53 @@ enum GitOp {
 }
 
 /// Build a canonical [`PathScope`] from unexpanded root/deny strings and a
-/// context. Roots and deny entries whose variables cannot be resolved (e.g.
-/// `$HOME` when it is unset) are dropped.
+/// context.
+///
+/// Failure directions differ by list. A root that cannot be expanded is
+/// dropped — the scope only narrows, which is fail-closed. A DENY entry that
+/// cannot be expanded must NOT be dropped: silently losing `$HOME/.ssh` in a
+/// daemon started with a stripped environment would run with a *weaker* policy
+/// than configured. Instead the whole scope is poisoned (no roots ⇒ every path
+/// classifies `OutsideRoots` ⇒ reads/writes deny) until the environment can
+/// honor the configured denials. Home is resolved via `$HOME` with an OS
+/// fallback (`directories`), so the poison only triggers when the home
+/// directory is genuinely unknowable.
 fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> PathScope {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let expand = |entries: &[String]| -> Vec<PathBuf> {
-        entries
-            .iter()
-            .filter_map(|entry| {
-                let expanded = expand_vars(entry, ctx, home.as_deref());
-                if expanded.is_none() {
-                    // Dropping a DENY entry silently *weakens* the policy (e.g.
-                    // the `$HOME/.ssh` denial vanishes in a daemon started with
-                    // a stripped environment) — make the degradation loud.
-                    tracing::warn!(
-                        entry,
-                        "policy path entry dropped: $HOME is not set in this environment"
-                    );
-                }
-                expanded
-            })
-            .map(|expanded| scope::canonicalize_lenient(Path::new(&expanded)))
-            .collect()
-    };
-    PathScope::new(expand(roots), expand(deny))
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
+
+    let canonical = |expanded: String| scope::canonicalize_lenient(Path::new(&expanded));
+
+    let mut denies = Vec::with_capacity(deny.len());
+    for entry in deny {
+        match expand_vars(entry, ctx, home.as_deref()) {
+            Some(expanded) => denies.push(canonical(expanded)),
+            None => {
+                tracing::error!(
+                    entry,
+                    "policy DENY entry is unresolvable ($HOME unknown); failing closed: \
+                     all path access is refused until the daemon runs with a resolvable home"
+                );
+                return PathScope::new(Vec::new(), denies);
+            }
+        }
+    }
+
+    let expanded_roots = roots
+        .iter()
+        .filter_map(|entry| {
+            let expanded = expand_vars(entry, ctx, home.as_deref());
+            if expanded.is_none() {
+                // A dropped root only narrows the scope; still worth a loud note.
+                tracing::warn!(entry, "policy root dropped: $HOME is unknown");
+            }
+            expanded
+        })
+        .map(canonical)
+        .collect();
+
+    PathScope::new(expanded_roots, denies)
 }
 
 /// Substitute `$REPOSITORY`, `$WORKTREE`, and `$HOME` in a raw path string.

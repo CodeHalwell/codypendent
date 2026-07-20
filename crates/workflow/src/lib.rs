@@ -49,6 +49,6 @@ pub use model::{
 };
 pub use registry::{SetRegistry, WorkflowRegistry};
 pub use store::{
-    ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord, WorkflowRunRecord,
-    WorkflowRunSnapshot, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    blocked_node_ids, ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord,
+    WorkflowRunRecord, WorkflowRunSnapshot, WorkflowRunState, WorkflowStore, WorkflowStoreError,
 };

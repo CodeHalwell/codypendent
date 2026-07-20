@@ -121,6 +121,34 @@ async fn attach(
     }
 }
 
+/// Bind `role` to the connection via an attach targeting a throwaway session
+/// id. The attach itself is REJECTED (`protocol.session-not-found`) — the
+/// daemon refuses to fabricate an empty catch-up for an unknown session — but
+/// the requested role still binds to the connection, which is all a role
+/// bootstrap needs.
+async fn bind_role(stream: &mut UnixStream, client_id: ClientId, role: ClientRole, key: &str) {
+    let reply = send_recv(
+        stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AttachSession {
+                    session_id: SessionId::new(),
+                    last_seen_sequence: None,
+                    subscriptions: vec![Subscription::SessionSummary],
+                    requested_role: role,
+                },
+                key,
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::Error(error) => assert_eq!(error.code, "protocol.session-not-found"),
+        other => panic!("expected session-not-found for role bootstrap, got {other:?}"),
+    }
+}
+
 /// Read frames (ignoring stray heartbeat Pings) until an `Event` arrives.
 async fn read_until_event(stream: &mut UnixStream) -> SessionEvent {
     for _ in 0..6 {
@@ -202,17 +230,9 @@ async fn create_attach_and_two_clients_observe_one_event() {
     let c1 = ClientId::new();
     let mut s1 = connect(&paths).await;
     handshake(&mut s1, c1).await;
-    // CreateSession needs a role; establish Contributor via a prior attach.
-    let _ = attach(
-        &mut s1,
-        c1,
-        SessionId::new(),
-        None,
-        ClientRole::Contributor,
-        vec![Subscription::SessionSummary],
-        "att-role",
-    )
-    .await;
+    // CreateSession needs a role; establish Contributor via a role-bootstrap
+    // attach (rejected for the unknown session, but the role binds).
+    bind_role(&mut s1, c1, ClientRole::Contributor, "att-role").await;
 
     let reply = send_recv(
         &mut s1,
@@ -434,19 +454,10 @@ async fn observer_start_run_is_role_denied() {
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
 
-    // Attach as Observer, then attempt StartRun. Role is checked before session
+    // Bind Observer, then attempt StartRun. Role is checked before session
     // existence, so an Observer is denied regardless of the target session.
     let session_id = SessionId::new();
-    let _ = attach(
-        &mut stream,
-        client_id,
-        session_id,
-        None,
-        ClientRole::Observer,
-        vec![Subscription::SessionSummary],
-        "obs-att",
-    )
-    .await;
+    bind_role(&mut stream, client_id, ClientRole::Observer, "obs-att").await;
 
     let reply = send_recv(
         &mut stream,
@@ -482,13 +493,10 @@ async fn observer_cannot_acquire_a_document_lease() {
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
-    let _ = attach(
+    bind_role(
         &mut stream,
         client_id,
-        SessionId::new(),
-        None,
         ClientRole::Observer,
-        vec![Subscription::SessionSummary],
         "obs-lease-att",
     )
     .await;
@@ -529,13 +537,10 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
-    let _ = attach(
+    bind_role(
         &mut stream,
         client_id,
-        SessionId::new(),
-        None,
         ClientRole::Contributor,
-        vec![Subscription::SessionSummary],
         "contrib-lease-att",
     )
     .await;

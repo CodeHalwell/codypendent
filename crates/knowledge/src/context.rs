@@ -214,9 +214,25 @@ pub async fn assemble_context(
     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
 
-    // 3. Cited memories in the requested scopes (currently-live view).
+    // 3. Cited memories in the requested scopes (currently-live view), capped.
+    // The 2.3 funnel budgets tool/skill disclosure; without a ceiling here the
+    // memory section regrew the exact failure mode that budget exists to
+    // prevent — every live memory of a long-lived repository, unbounded. The
+    // store returns oldest-first, so keeping the tail keeps the newest.
     let records = MemoryStore::new().query(pool, scopes, None).await?;
-    let memories = records.iter().map(ContextMemory::from_record).collect();
+    let dropped = records.len().saturating_sub(MAX_CONTEXT_MEMORIES);
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            kept = MAX_CONTEXT_MEMORIES,
+            "context memory ceiling applied (newest kept)"
+        );
+    }
+    let memories = records
+        .iter()
+        .skip(dropped)
+        .map(ContextMemory::from_record)
+        .collect();
 
     Ok(ContextManifest {
         repository_map,
@@ -225,6 +241,12 @@ pub async fn assemble_context(
         memories,
     })
 }
+
+/// Ceiling on memories injected into one run context (newest survive). Chosen
+/// to keep the memory section within the same order of magnitude as the
+/// disclosed tool/skill cards; retrieval-ranked memory selection is Phase 7+
+/// territory — until then recency is the only defensible ordering.
+const MAX_CONTEXT_MEMORIES: usize = 32;
 
 /// The visibility chain the retrieval funnel filters against: the caller's
 /// `scopes`, always widened with [`System`](Scope::System) (built-ins live there)

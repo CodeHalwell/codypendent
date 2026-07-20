@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use codypendent_daemon::artifacts::Provenance;
 use codypendent_daemon::policy::{CommandScope, PathScope, ScopeVerdict};
@@ -21,6 +22,29 @@ use super::{ArtifactSink, CapabilityKind, ToolError, IN_MEMORY_CAP};
 
 /// The program both Git tools require in the allow-list.
 const GIT: &str = "git";
+
+/// Wall-clock bound on one git invocation. These are local worktree operations
+/// (`diff`, `apply`) that finish in seconds; without a bound a wedged git (lock
+/// contention, a filter/smudge process gone wrong) blocks the run forever —
+/// cancellation is blind while a tool executes. Both commands set
+/// `kill_on_drop`, so expiring the timeout (dropping the wait future) kills the
+/// child.
+const GIT_TIMEOUT_SECS: u64 = 300;
+
+/// Await a git wait-future under [`GIT_TIMEOUT_SECS`], surfacing expiry as a
+/// structured [`ToolError::TimedOut`] for `tool`.
+async fn bounded_git<T>(
+    tool: &'static str,
+    wait: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T, ToolError> {
+    match tokio::time::timeout(Duration::from_secs(GIT_TIMEOUT_SECS), wait).await {
+        Ok(result) => result.map_err(ToolError::Io),
+        Err(_elapsed) => Err(ToolError::TimedOut {
+            tool,
+            seconds: GIT_TIMEOUT_SECS,
+        }),
+    }
+}
 
 /// Guard shared by both Git tools: `git` allow-listed and `cwd` in scope.
 fn guard(
@@ -109,7 +133,12 @@ impl GitDiff {
             .stdin(Stdio::null())
             .kill_on_drop(true);
         harden_git_env(&mut command);
-        let output = command.output().await.map_err(map_spawn)?;
+        let output = bounded_git(Self::NAME, command.output())
+            .await
+            .map_err(|e| match e {
+                ToolError::Io(io) => map_spawn(io),
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -251,7 +280,7 @@ async fn run_git_apply(
         stdin.shutdown().await?;
     }
 
-    child.wait_with_output().await.map_err(ToolError::Io)
+    bounded_git(ApplyPatch::NAME, child.wait_with_output()).await
 }
 
 /// Strip ambient git interposition variables (a repo config or the daemon's own
@@ -268,10 +297,20 @@ fn harden_git_env(command: &mut Command) {
         "GIT_PAGER",
         "GIT_EDITOR",
         "GIT_ASKPASS",
+        // The whole injected-config family: the deprecated GIT_CONFIG plus the
+        // modern GIT_CONFIG_GLOBAL/SYSTEM overrides and GIT_CONFIG_COUNT/
+        // KEY_n/VALUE_n parameter injection — any of these can point diff/apply
+        // at config that runs an arbitrary program (core.fsmonitor, filters).
         "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
     ] {
         command.env_remove(key);
     }
+    // GIT_CONFIG_COUNT gates the numbered KEY_n/VALUE_n pairs; removing the
+    // count disables the whole set without enumerating n.
+    command.env_remove("GIT_CONFIG_COUNT");
     command.env("GIT_TERMINAL_PROMPT", "0");
 }
 

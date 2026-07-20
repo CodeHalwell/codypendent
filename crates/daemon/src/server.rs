@@ -551,8 +551,12 @@ async fn handle_request(
                     subscriptions,
                     requested_role,
                 } => {
+                    // The requested role binds to the *connection* even when the
+                    // attach itself is rejected (unknown session): role is a
+                    // connection-level assertion under the Phase 1 local trust
+                    // model, not a per-session grant.
                     conn.role = *requested_role;
-                    handle_attach(
+                    let attached = handle_attach(
                         state,
                         writer,
                         conn,
@@ -567,8 +571,9 @@ async fn handle_request(
                     // Remember the attachment so a detach presence event fires when
                     // this connection ends (STEP 3.7). De-duplicated by session: a
                     // re-attach on the same connection must not queue a second
-                    // detach for the same client+session.
-                    if !conn.attached.iter().any(|(s, _)| s == session_id) {
+                    // detach for the same client+session. A rejected attach must
+                    // not be remembered — there is nothing to detach from.
+                    if attached && !conn.attached.iter().any(|(s, _)| s == session_id) {
                         conn.attached.push((*session_id, *requested_role));
                     }
                 }
@@ -911,7 +916,8 @@ async fn handle_request(
 
 /// Register a connection's interest in a session: subscribe to its live stream,
 /// reply with catch-up (missed events, or a snapshot when too far behind), and
-/// spawn a task that forwards matching future events to this client.
+/// spawn a task that forwards matching future events to this client. Returns
+/// whether the attach was accepted (`false` = unknown session, error replied).
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     state: &Arc<ServerState>,
@@ -923,15 +929,35 @@ async fn handle_attach(
     session_id: SessionId,
     last_seen: u64,
     subscriptions: Vec<Subscription>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    // Reject an attach to a session this daemon has never seen. An empty
+    // catch-up here used to make a typo'd id indistinguishable from a valid
+    // empty session — the client then bound a blank UI to a dead id whose
+    // every `StartRun` rejected `session-not-found`. Clients that probe a
+    // remembered id (the TUI's resume flow) treat a non-`Catchup` reply as
+    // "gone" and fall through to creating a fresh session.
+    if !ledger::session_exists(&state.pool, session_id).await? {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::Error(ProtocolError {
+                code: "protocol.session-not-found".to_string(),
+                message: format!("no session {session_id}"),
+                retryable: false,
+            }),
+        );
+        send(writer, &reply).await?;
+        return Ok(false);
+    }
+
     // Subscribe *before* computing catch-up so an event published during the
     // read cannot slip through the gap. An event committed between subscribing
-    // and `load_events` is then delivered twice — once in catch-up, once on the
-    // live receiver — so the forwarder drops anything at or below the catch-up
-    // watermark (`current_max`) to avoid a double-render on the attach race.
+    // and the window read is then delivered twice — once in catch-up, once on
+    // the live receiver — so the forwarder drops anything at or below the
+    // catch-up watermark (`current_max`) to avoid a double-render on the
+    // attach race.
     let receiver = state.subscriptions.subscribe(session_id);
 
-    // Current max sequence (0 for an empty/absent session).
+    // Current max sequence (0 for an empty session).
     let current_max = ledger::next_sequence(&state.pool, session_id)
         .await?
         .saturating_sub(1);
@@ -939,15 +965,13 @@ async fn handle_attach(
 
     let catchup = if gap <= CATCHUP_EVENT_LIMIT {
         // Cap replay at `current_max` — the live forwarder's drop watermark. An
-        // event committed between reading `current_max` and this `load_events`
+        // event committed between reading `current_max` and this window read
         // has sequence > current_max, so it is NOT dropped by the forwarder;
         // excluding it here keeps it delivered exactly once (live), instead of
-        // both in catch-up and live.
-        let events: Vec<SessionEvent> = ledger::load_events(&state.pool, session_id)
-            .await?
-            .into_iter()
-            .filter(|event| event.sequence > last_seen && event.sequence <= current_max)
-            .collect();
+        // both in catch-up and live. The window is filtered in SQL so the read
+        // costs the gap, not the whole session history.
+        let events: Vec<SessionEvent> =
+            ledger::load_events_between(&state.pool, session_id, last_seen, current_max).await?;
         Catchup::Events {
             from: last_seen + 1,
             through: current_max,
@@ -1016,7 +1040,7 @@ async fn handle_attach(
     // during a handoff to VS Code) see it join. Emitted after the forwarder is
     // live so the arriving client also receives its own presence event.
     publish_presence(state, session_id, client_id, conn.role, true).await;
-    Ok(())
+    Ok(true)
 }
 
 /// Append a `ClientPresenceChanged` event and fan it out to the session's
@@ -1228,16 +1252,22 @@ fn random_secret() -> Vec<u8> {
 
 /// Opaque, daemon-signed resume tokens (STEP 1.11).
 ///
-/// A token is `hex(payload_json) + "." + hex(signature)`, where the signature is
-/// a keyed SHA-256 over the payload (`sha256(secret || payload || secret)`). The
-/// payload carries the `client_id`, the last observed sequence, and a 24h
-/// validity window; verification rejects a tampered signature or an expired
-/// token.
+/// A token is `hex(payload_json) + "." + hex(signature)`, where the signature
+/// is HMAC-SHA256 over the payload. HMAC (not an ad-hoc keyed hash: the
+/// original `sha256(secret‖payload‖secret)` sandwich has no security proof and
+/// invites length-extension-shaped mistakes) with the `Mac` API's
+/// constant-time verification (a `==` string compare leaks a timing oracle on
+/// the signature prefix). The payload carries the `client_id`, the last
+/// observed sequence, and a 24h validity window; verification rejects a
+/// tampered signature or an expired token.
 mod resume {
     use chrono::{DateTime, Utc};
     use codypendent_protocol::ClientId;
+    use hmac::{Hmac, Mac};
     use serde::{Deserialize, Serialize};
-    use sha2::{Digest, Sha256};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
 
     /// A resume token is valid for 24 hours from issue.
     const TOKEN_TTL_HOURS: i64 = 24;
@@ -1251,13 +1281,18 @@ mod resume {
         pub(super) expires_at: DateTime<Utc>,
     }
 
-    /// Keyed SHA-256: `sha256(secret || payload || secret)`, hex-encoded.
+    /// HMAC-SHA256 over `payload`, keyed by `secret`. HMAC accepts any key
+    /// length, so construction cannot fail.
+    fn mac(secret: &[u8], payload: &[u8]) -> HmacSha256 {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
+        mac.update(payload);
+        mac
+    }
+
+    /// The hex-encoded signature for `payload` (mint-side; verification goes
+    /// through [`Mac::verify_slice`], never a string compare).
     pub(super) fn sign(secret: &[u8], payload: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(secret);
-        hasher.update(payload);
-        hasher.update(secret);
-        hex::encode(hasher.finalize())
+        hex::encode(mac(secret, payload).finalize().into_bytes())
     }
 
     /// Mint a token binding `client_id` + `last_sequence`, valid for 24h.
@@ -1278,14 +1313,14 @@ mod resume {
         format!("{}.{}", hex::encode(&payload), signature)
     }
 
-    /// Verify a token, returning its claims iff the signature matches and it has
-    /// not expired. A malformed, tampered, or expired token yields `None`.
+    /// Verify a token, returning its claims iff the signature matches (in
+    /// constant time) and it has not expired. A malformed, tampered, or
+    /// expired token yields `None`.
     pub(super) fn verify_resume_token(secret: &[u8], token: &str) -> Option<ResumeClaims> {
         let (payload_hex, signature_hex) = token.split_once('.')?;
         let payload = hex::decode(payload_hex).ok()?;
-        if sign(secret, &payload) != signature_hex {
-            return None;
-        }
+        let signature = hex::decode(signature_hex).ok()?;
+        mac(secret, &payload).verify_slice(&signature).ok()?;
         let claims: ResumeClaims = serde_json::from_slice(&payload).ok()?;
         if claims.expires_at <= Utc::now() {
             return None;

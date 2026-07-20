@@ -206,6 +206,13 @@ async fn event_loop(
     // re-attach with `last_seen_sequence` replays exactly the gap. Also
     // dedups: catch-up + live can overlap during that window.
     let mut last_seen: u64 = attach_watermark;
+    // Events held back while a gap repair is in flight. They must NOT fold (or
+    // advance `last_seen`) before the replay lands: advancing the watermark to
+    // the gap-revealing event made every replayed event read as a duplicate
+    // and silently discarded the whole repair — a lagged TUI permanently lost
+    // the missed span (worst case, an ApprovalRequested).
+    let mut gap_buffer: Vec<SessionEvent> = Vec::new();
+    let mut repairing = false;
 
     loop {
         let action = tokio::select! {
@@ -213,11 +220,55 @@ async fn event_loop(
                 Some(ReaderSignal::Event(event)) => {
                     if event.sequence != 0 && event.sequence <= last_seen {
                         Action::NoOp // duplicate of something already folded
+                    } else if repairing {
+                        // Hold ordering: nothing folds past the missing span
+                        // until the replay has landed.
+                        gap_buffer.push(*event);
+                        Action::NoOp
+                    } else if last_seen != 0 && event.sequence > last_seen + 1 {
+                        // Gap: re-attach to replay the missed span. The daemon
+                        // replaces this connection's forwarder and replies
+                        // with a Catchup the reader forwards back. Buffer this
+                        // event instead of folding it now — it is out of order
+                        // until the span before it has been replayed.
+                        let attach = command_envelope(
+                            client_id,
+                            CommandBody::AttachSession {
+                                session_id,
+                                last_seen_sequence: Some(last_seen),
+                                subscriptions: default_subscriptions(),
+                                requested_role: ClientRole::Controller,
+                            },
+                        );
+                        let _ = out_tx.send(attach).await;
+                        repairing = true;
+                        gap_buffer.push(*event);
+                        Action::NoOp
                     } else {
-                        if last_seen != 0 && event.sequence > last_seen + 1 {
-                            // Gap: re-attach to replay the missed span. The
-                            // daemon replaces this connection's forwarder and
-                            // replies with a Catchup the reader forwards back.
+                        last_seen = last_seen.max(event.sequence);
+                        Action::DaemonEvent(event)
+                    }
+                }
+                Some(ReaderSignal::Rejected { code, message }) => {
+                    Action::Notice(format!("command rejected: {message} ({code})"))
+                }
+                Some(ReaderSignal::Catchup(catchup)) => {
+                    // Fold the gap replay (the daemon already windowed it to
+                    // `(last_seen, through]`, and a too-large gap arrives as a
+                    // snapshot), then drain the events buffered while the
+                    // repair was in flight — watermark-deduped, in order. If
+                    // the buffer itself still reveals a missing span (more
+                    // loss while repairing), repair again and keep the tail.
+                    let through = fold_catchup(state, *catchup);
+                    last_seen = last_seen.max(through);
+                    repairing = false;
+                    let mut buffered = std::mem::take(&mut gap_buffer);
+                    buffered.sort_by_key(|event| event.sequence);
+                    for (index, event) in buffered.iter().enumerate() {
+                        if event.sequence <= last_seen {
+                            continue;
+                        }
+                        if event.sequence > last_seen + 1 {
                             let attach = command_envelope(
                                 client_id,
                                 CommandBody::AttachSession {
@@ -228,24 +279,12 @@ async fn event_loop(
                                 },
                             );
                             let _ = out_tx.send(attach).await;
+                            repairing = true;
+                            gap_buffer = buffered[index..].to_vec();
+                            break;
                         }
-                        last_seen = last_seen.max(event.sequence);
-                        Action::DaemonEvent(event)
-                    }
-                }
-                Some(ReaderSignal::Rejected { code, message }) => {
-                    Action::Notice(format!("command rejected: {message} ({code})"))
-                }
-                Some(ReaderSignal::Catchup(catchup)) => {
-                    // Fold the gap replay; live events past it resume above.
-                    if let Catchup::Events { events, through, .. } = *catchup {
-                        for event in events {
-                            if event.sequence > last_seen {
-                                last_seen = last_seen.max(event.sequence);
-                                reduce(state, Action::DaemonEvent(Box::new(event)));
-                            }
-                        }
-                        last_seen = last_seen.max(through);
+                        last_seen = event.sequence;
+                        reduce(state, Action::DaemonEvent(Box::new(event.clone())));
                     }
                     Action::NoOp
                 }

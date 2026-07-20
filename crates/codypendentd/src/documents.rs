@@ -86,15 +86,17 @@ impl DocumentMutator for KnowledgeDocumentMutator {
             let mode = CollaborationMode::default_for_scope(&scope);
 
             // Enforce single-writer over the target range before applying.
-            leases
-                .require(
-                    &pool,
-                    document_id,
-                    mutation_block_target(&mutation),
-                    &author,
-                )
-                .await
-                .map_err(map_lease_error)?;
+            match lease_requirement(&mutation) {
+                LeaseRequirement::WholeDocument => leases
+                    .require(&pool, document_id, None, &author)
+                    .await
+                    .map_err(map_lease_error)?,
+                LeaseRequirement::Block(block_id) => leases
+                    .require(&pool, document_id, Some(block_id), &author)
+                    .await
+                    .map_err(map_lease_error)?,
+                LeaseRequirement::None => {}
+            }
 
             let outcome = apply_mutation(&pool, document_id, &mutation, mode, &author)
                 .await
@@ -176,22 +178,37 @@ fn human_author(client_id: ClientId) -> DocumentAuthor {
     }
 }
 
-/// The block range a mutation writes, for lease enforcement. A **structural** edit
-/// (block insert/delete) takes the whole-document lease (`None`) — it reshapes the
-/// block list, so it must not proceed while any block is being written. A text
-/// edit or annotation is scoped to its target block. Accepting/rejecting a
-/// suggestion is a *resolution* action (a role decision, not a fresh content
-/// write), so it takes no lease here.
-fn mutation_block_target(mutation: &DocumentMutation) -> Option<&str> {
+/// What single-writer enforcement a mutation needs before it applies.
+enum LeaseRequirement<'a> {
+    /// A structural edit (block insert/delete) reshapes the block list, so it
+    /// must not proceed while any block is being written.
+    WholeDocument,
+    /// A text edit or annotation is scoped to its target block.
+    Block(&'a str),
+    /// No lease contention at all. Accepting/rejecting a suggestion is a
+    /// *resolution* action — a role decision over an already-annotated range,
+    /// protected by the suggestion store's own drift guards (revision match +
+    /// original-text match + atomic pending-claim) — not a fresh content
+    /// write. Mapping it to a whole-document requirement (the old behavior)
+    /// locked approvers out of the review rail whenever any writer held any
+    /// block lease.
+    None,
+}
+
+/// The lease enforcement a mutation requires (see [`LeaseRequirement`]).
+fn lease_requirement(mutation: &DocumentMutation) -> LeaseRequirement<'_> {
     match mutation {
-        DocumentMutation::EditText { block_id, .. } => Some(block_id),
-        DocumentMutation::Annotate { suggestion } => Some(&suggestion.block_id),
-        DocumentMutation::Insert { .. }
-        | DocumentMutation::Delete { .. }
-        | DocumentMutation::AcceptSuggestion { .. }
-        | DocumentMutation::RejectSuggestion { .. } => None,
-        // A newer client's op — apply_mutation rejects it as unsupported.
-        _ => None,
+        DocumentMutation::EditText { block_id, .. } => LeaseRequirement::Block(block_id),
+        DocumentMutation::Annotate { suggestion } => LeaseRequirement::Block(&suggestion.block_id),
+        DocumentMutation::Insert { .. } | DocumentMutation::Delete { .. } => {
+            LeaseRequirement::WholeDocument
+        }
+        DocumentMutation::AcceptSuggestion { .. } | DocumentMutation::RejectSuggestion { .. } => {
+            LeaseRequirement::None
+        }
+        // A newer client's op — apply_mutation rejects it as unsupported, and
+        // the whole-document requirement is the conservative gate until then.
+        _ => LeaseRequirement::WholeDocument,
     }
 }
 
@@ -406,5 +423,56 @@ mod tests {
             .await
             .expect_err("a phantom document cannot be leased");
         assert_eq!(err.code, "document.not-found");
+    }
+
+    #[tokio::test]
+    async fn suggestion_resolution_needs_no_lease_while_a_writer_holds_a_block() {
+        use codypendent_knowledge::docs::collab::SuggestionStore;
+        use codypendent_protocol::document::SuggestionInput;
+
+        let (_tmp, pool) = temp_pool().await;
+        let doc = seed_document(&pool).await;
+        let mutator = KnowledgeDocumentMutator::new(pool.clone());
+
+        // Writer A holds block "p" and proposes a range replacement (an
+        // annotation is always a suggestion, whatever the mode).
+        let a = ClientId::new();
+        mutator.acquire(acquire(doc, Some("p"), a)).await.unwrap();
+        mutator
+            .apply_mutation(DocumentMutationRequest {
+                document_id: doc,
+                mutation: DocumentMutation::Annotate {
+                    suggestion: SuggestionInput {
+                        block_id: "p".into(),
+                        range_start: 0,
+                        range_end: 5,
+                        replacement: "HELLO".into(),
+                        rationale: None,
+                    },
+                },
+                client_id: a,
+            })
+            .await
+            .expect("the lease holder annotates its own block");
+        let pending = SuggestionStore::new().pending(&pool, doc).await.unwrap();
+        let suggestion_id = pending
+            .first()
+            .expect("the annotation is pending")
+            .id
+            .clone();
+
+        // Approver B holds no lease. Resolution is a role decision guarded by
+        // the suggestion store's own drift checks — the old whole-document
+        // lease mapping refused this with `document.range-leased` whenever any
+        // writer held any block, locking approvers out of the review rail.
+        let b = ClientId::new();
+        mutator
+            .apply_mutation(DocumentMutationRequest {
+                document_id: doc,
+                mutation: DocumentMutation::AcceptSuggestion { suggestion_id },
+                client_id: b,
+            })
+            .await
+            .expect("accepting a suggestion must not contend for the writer's lease");
     }
 }
