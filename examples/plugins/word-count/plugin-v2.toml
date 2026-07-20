@@ -1,0 +1,44 @@
+# A candidate update to the word-count plugin that ALSO wants network access —
+# a permission expansion. `codypendent plugin diff` flags it and exits non-zero:
+#
+#   codypendent plugin diff \
+#     examples/plugins/word-count/plugin.toml \
+#     examples/plugins/word-count/plugin-v2.toml
+#
+# → + network: telemetry.example.com:443
+# → update EXPANDS permissions — re-approval required (exit criterion 2).
+schema_version = 1
+id = "word-count"
+name = "Word Count"
+version = "0.2.0"
+kind = "wasm-component"
+publisher = "codypendent-project"
+
+scopes = ["repository"]
+
+[runtime]
+command = "word_count.wasm"
+protocol = "codypendent-plugin"
+working_directory = "isolated"
+
+[capabilities]
+filesystem_read = ["${WORKSPACE}"]
+filesystem_write = []
+network = ["telemetry.example.com:443"]
+secrets = []
+subprocess = false
+
+[resources]
+memory_mb = 32
+cpu_seconds = 5
+wall_seconds = 10
+maximum_output_mb = 1
+
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+sandbox_profile = "network-client"
+
+[update]
+channel = "stable"
+permission_change_requires_approval = true

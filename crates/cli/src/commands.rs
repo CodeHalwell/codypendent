@@ -550,6 +550,139 @@ fn workflow_summary(compiled: &codypendent_workflow::CompiledWorkflow) -> String
     )
 }
 
+/// `codypendent plugin inspect <FILE>` (Phase 6 STEP 6.1): parse a `plugin.toml`
+/// and render its identity, requested capabilities, resource caps, and trust
+/// posture — the "evaluate permissions (render the capability list to the user)"
+/// step, before a plugin is ever enabled. Manifest parsing only; nothing runs.
+pub fn plugin_inspect(file: &std::path::Path) -> anyhow::Result<()> {
+    let toml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading plugin manifest {}", file.display()))?;
+    let manifest = codypendent_sandbox::parse_manifest(&toml)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+    print!("{}", plugin_report(&manifest));
+    Ok(())
+}
+
+/// `codypendent plugin diff <INSTALLED> <UPDATE>` (Phase 6 STEP 6.1): parse both
+/// manifests, print the capability permission diff, and report whether the update
+/// expands permissions and so requires re-approval (exit criterion 2). Exits
+/// non-zero when the update expands permissions, so a caller (or CI) can gate on
+/// it.
+pub fn plugin_diff(installed: &std::path::Path, update: &std::path::Path) -> anyhow::Result<()> {
+    let installed_manifest = read_manifest(installed)?;
+    let update_manifest = read_manifest(update)?;
+    if installed_manifest.id != update_manifest.id {
+        anyhow::bail!(
+            "these are different plugins ({} vs {}); a diff compares versions of one plugin",
+            installed_manifest.id,
+            update_manifest.id
+        );
+    }
+    let old = codypendent_sandbox::CapabilitySet::from_spec(&installed_manifest.capabilities);
+    let new = codypendent_sandbox::CapabilitySet::from_spec(&update_manifest.capabilities);
+    let diff = old.diff_to(&new);
+    print!("{}", plugin_diff_report(&installed_manifest.id, &diff));
+    if diff.expands_permissions() {
+        // A widening update is not applied without re-approval — signal that with a
+        // non-zero exit so automation blocks on it.
+        anyhow::bail!("update expands permissions — re-approval required before it can be applied");
+    }
+    Ok(())
+}
+
+fn read_manifest(file: &std::path::Path) -> anyhow::Result<codypendent_sandbox::PluginManifest> {
+    let toml = std::fs::read_to_string(file)
+        .with_context(|| format!("reading plugin manifest {}", file.display()))?;
+    codypendent_sandbox::parse_manifest(&toml)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))
+}
+
+/// A human rendering of a plugin manifest's identity, capabilities, resources, and
+/// trust posture. Pure, so it is tested directly.
+fn plugin_report(manifest: &codypendent_sandbox::PluginManifest) -> String {
+    use codypendent_sandbox::CapabilitySet;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} v{} ({}) — publisher {}",
+        manifest.id,
+        manifest.version,
+        manifest.kind.as_str(),
+        manifest.publisher,
+    );
+    let trust = if manifest.security.is_signed() {
+        "signed"
+    } else {
+        "unsigned"
+    };
+    let checksum = if manifest.security.checksum.is_empty() {
+        "no checksum"
+    } else {
+        manifest.security.checksum.as_str()
+    };
+    let profile = if manifest.security.sandbox_profile.is_empty() {
+        "(none)"
+    } else {
+        manifest.security.sandbox_profile.as_str()
+    };
+    let _ = writeln!(
+        out,
+        "  trust: {trust} ({checksum}), sandbox profile {profile}"
+    );
+
+    let caps = CapabilitySet::from_spec(&manifest.capabilities);
+    if caps.is_empty() {
+        let _ = writeln!(
+            out,
+            "  capabilities: none — this plugin requests no capabilities"
+        );
+    } else {
+        let _ = writeln!(out, "  capabilities:");
+        for cap in caps.iter() {
+            let _ = writeln!(out, "    {cap}");
+        }
+    }
+
+    let r = &manifest.resources;
+    let _ = writeln!(
+        out,
+        "  resources: {} MB mem, {} CPU s, {} wall s, {} MB output",
+        r.memory_mb, r.cpu_seconds, r.wall_seconds, r.maximum_output_mb,
+    );
+    if !manifest.scopes.is_empty() {
+        let _ = writeln!(out, "  scopes: {}", manifest.scopes.join(", "));
+    }
+    out
+}
+
+/// A human rendering of a permission diff between two versions of a plugin, with
+/// the re-approval verdict. Pure, so it is tested directly.
+fn plugin_diff_report(id: &str, diff: &codypendent_sandbox::PermissionDiff) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if diff.is_identical() {
+        let _ = writeln!(out, "{id}: no permission changes — safe to update.");
+        return out;
+    }
+    let _ = writeln!(out, "{id}: permission changes:");
+    let _ = writeln!(out, "{}", diff.render());
+    if diff.expands_permissions() {
+        let _ = writeln!(
+            out,
+            "\u{2192} update EXPANDS permissions — re-approval required (exit criterion 2)."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\u{2192} update only narrows permissions — safe to update."
+        );
+    }
+    out
+}
+
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
 fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) -> String {
     format!(
@@ -713,5 +846,145 @@ steps:
             value["nodes"][1]["action"]["name"],
             "github.update-pull-request"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+
+    const GITHUB_MANIFEST: &str = r#"
+schema_version = 1
+id = "github"
+name = "GitHub Integration"
+version = "0.1.0"
+kind = "native-process"
+publisher = "codypendent-project"
+scopes = ["user", "organization", "repository"]
+[runtime]
+command = "codypendent-plugin-github"
+protocol = "mcp-stdio"
+[capabilities]
+network = ["api.github.com:443", "uploads.github.com:443"]
+secrets = ["github-token"]
+subprocess = false
+[resources]
+memory_mb = 256
+cpu_seconds = 60
+wall_seconds = 120
+maximum_output_mb = 20
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+sandbox_profile = "network-client"
+"#;
+
+    #[test]
+    fn report_renders_identity_capabilities_and_trust() {
+        let manifest = codypendent_sandbox::parse_manifest(GITHUB_MANIFEST).unwrap();
+        let report = plugin_report(&manifest);
+        assert!(report.contains("github v0.1.0 (native-process)"));
+        assert!(report.contains("trust: unsigned"));
+        assert!(report.contains("sandbox profile network-client"));
+        // The capability list is rendered verbatim, one per line.
+        assert!(report.contains("network: api.github.com:443"));
+        assert!(report.contains("network: uploads.github.com:443"));
+        assert!(report.contains("secret: github-token"));
+        assert!(report.contains("256 MB mem"));
+        assert!(report.contains("scopes: user, organization, repository"));
+    }
+
+    #[test]
+    fn report_notes_a_capability_free_plugin() {
+        let manifest = codypendent_sandbox::parse_manifest(
+            "schema_version = 1\nid = \"theme\"\nname = \"T\"\nversion = \"1.0.0\"\nkind = \"wasm-component\"\npublisher = \"me\"\n[runtime]\ncommand = \"t.wasm\"\n",
+        )
+        .unwrap();
+        let report = plugin_report(&manifest);
+        assert!(report.contains("requests no capabilities"));
+    }
+
+    #[test]
+    fn inspect_reads_a_manifest_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugin.toml");
+        std::fs::write(&path, GITHUB_MANIFEST).unwrap();
+        plugin_inspect(&path).expect("inspect succeeds on a valid manifest");
+    }
+
+    #[test]
+    fn inspect_surfaces_a_parse_error_with_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "schema_version = 99\nid = \"x\"\n").unwrap();
+        let err = plugin_inspect(&path).unwrap_err().to_string();
+        assert!(err.contains("bad.toml"), "error names the file: {err}");
+    }
+
+    fn diff_report_for(installed_net: &[&str], update_net: &[&str]) -> String {
+        let spec = |net: &[&str]| codypendent_sandbox::CapabilitiesSpec {
+            filesystem_read: vec![],
+            filesystem_write: vec![],
+            network: net.iter().map(|s| s.to_string()).collect(),
+            secrets: vec![],
+            subprocess: false,
+        };
+        let old = codypendent_sandbox::CapabilitySet::from_spec(&spec(installed_net));
+        let new = codypendent_sandbox::CapabilitySet::from_spec(&spec(update_net));
+        plugin_diff_report("github", &old.diff_to(&new))
+    }
+
+    #[test]
+    fn diff_report_flags_an_expanding_update() {
+        let report = diff_report_for(
+            &["api.github.com:443"],
+            &["api.github.com:443", "uploads.github.com:443"],
+        );
+        assert!(report.contains("+ network: uploads.github.com:443"));
+        assert!(report.contains("EXPANDS permissions"));
+    }
+
+    #[test]
+    fn diff_report_marks_an_identical_update_safe() {
+        let report = diff_report_for(&["api.github.com:443"], &["api.github.com:443"]);
+        assert!(report.contains("no permission changes"));
+    }
+
+    #[test]
+    fn diff_report_marks_a_narrowing_update_safe() {
+        let report = diff_report_for(&["a:1", "b:2"], &["a:1"]);
+        assert!(report.contains("only narrows"));
+        assert!(!report.contains("EXPANDS"));
+    }
+
+    #[test]
+    fn diff_command_exits_nonzero_when_permissions_expand() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.toml");
+        let update = dir.path().join("update.toml");
+        std::fs::write(&installed, GITHUB_MANIFEST).unwrap();
+        // The update adds a filesystem_read capability.
+        let expanded = GITHUB_MANIFEST.replace(
+            "network = [\"api.github.com:443\", \"uploads.github.com:443\"]",
+            "network = [\"api.github.com:443\", \"uploads.github.com:443\"]\nfilesystem_read = [\"/etc\"]",
+        );
+        std::fs::write(&update, expanded).unwrap();
+        let err = plugin_diff(&installed, &update).unwrap_err().to_string();
+        assert!(err.contains("re-approval required"), "got: {err}");
+    }
+
+    #[test]
+    fn diff_rejects_two_different_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&a, GITHUB_MANIFEST).unwrap();
+        std::fs::write(
+            &b,
+            GITHUB_MANIFEST.replace("id = \"github\"", "id = \"gitlab\""),
+        )
+        .unwrap();
+        let err = plugin_diff(&a, &b).unwrap_err().to_string();
+        assert!(err.contains("different plugins"));
     }
 }

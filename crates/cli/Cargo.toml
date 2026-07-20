@@ -23,6 +23,9 @@ codypendent-integrations = { workspace = true }
 # The declarative workflow compiler, exposed via `codypendent workflow validate`
 # (Phase 5 STEP 5.1) so authors can check a manifest before it ever runs.
 codypendent-workflow = { workspace = true }
+# The plugin security boundary, exposed via `codypendent plugin inspect`/`diff`
+# (Phase 6 STEP 6.1) so a user sees a plugin's capabilities + permission diff.
+codypendent-sandbox = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
