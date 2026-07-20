@@ -22,6 +22,7 @@ pub mod framing;
 pub mod handshake;
 pub mod ide;
 pub mod ids;
+pub mod input;
 pub mod run;
 pub mod version;
 
@@ -43,6 +44,12 @@ pub use ide::{
     WorkspaceEdit,
 };
 pub use ids::*;
+pub use input::{
+    transcription_allowed, AudioArtifact, ClassificationError, GitHubRefKind, GitHubReference,
+    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, ModelObservation,
+    OffDevicePolicy, ScopeLevel, SymbolRef, Transcript, TranscriptionMode,
+    DEFAULT_MEDIA_CLASSIFICATION,
+};
 pub use run::{
     AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel,
     RunDisposition, RunState, ToolOutcome,
