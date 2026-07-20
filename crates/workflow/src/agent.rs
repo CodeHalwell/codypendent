@@ -48,6 +48,13 @@ pub struct AgentProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The workflow *role* this profile fulfils (e.g. `implementer`). A workflow
+    /// step names a short role; this is how a profile declares which role it
+    /// serves. When absent, the role defaults to the last dotted segment of
+    /// `id` — so `code.implementer` fulfils `implementer` — see
+    /// [`AgentProfile::fulfilled_role`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// The scope the profile applies at (e.g. `repository`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -75,6 +82,25 @@ pub struct AgentProfile {
     /// The conditions the agent must satisfy to complete.
     #[serde(default)]
     pub completion: AgentCompletion,
+}
+
+impl AgentProfile {
+    /// The workflow role this profile fulfils: its explicit [`role`](Self::role)
+    /// when set, otherwise the last dotted segment of its [`id`](Self::id) (the
+    /// whole id when it has no dot). This is the key a workflow step's short
+    /// `role` resolves against — a manifest's `role: implementer` binds to the
+    /// canonical `id = "code.implementer"` profile through the suffix fallback,
+    /// while an explicit `role` lets a profile whose id does not end in the role
+    /// name still serve it.
+    #[must_use]
+    pub fn fulfilled_role(&self) -> &str {
+        match self.role.as_deref() {
+            Some(role) => role,
+            // `rsplit` on a non-empty string always yields at least one segment;
+            // the id is validated non-empty, so this never falls through.
+            None => self.id.rsplit('.').next().unwrap_or(self.id.as_str()),
+        }
+    }
 }
 
 /// The capability permissions an agent declares.
@@ -136,6 +162,30 @@ mod tests {
             .completion
             .requires
             .contains(&"targeted-tests-pass".to_owned()));
+    }
+
+    #[test]
+    fn fulfilled_role_defaults_to_the_last_dotted_id_segment() {
+        // The canonical profile has no explicit role, so it fulfils the short
+        // role `implementer` (the last segment of `code.implementer`) — the exact
+        // role the `repair-github-check` manifest's `patch` step names.
+        let profile = parse_agent_profile(include_str!("../../../docs/specs/agent.toml")).unwrap();
+        assert_eq!(profile.role, None);
+        assert_eq!(profile.fulfilled_role(), "implementer");
+    }
+
+    #[test]
+    fn an_explicit_role_overrides_the_id_suffix() {
+        let toml = "schema_version = 1\nid = \"code.impl\"\nname = \"A\"\nrole = \"implementer\"\n";
+        let profile = parse_agent_profile(toml).unwrap();
+        assert_eq!(profile.fulfilled_role(), "implementer");
+
+        // A dotless id fulfils itself.
+        let toml = "schema_version = 1\nid = \"reviewer\"\nname = \"R\"\n";
+        assert_eq!(
+            parse_agent_profile(toml).unwrap().fulfilled_role(),
+            "reviewer"
+        );
     }
 
     #[test]

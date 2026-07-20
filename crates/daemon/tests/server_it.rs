@@ -595,6 +595,83 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
 }
 
 #[tokio::test]
+async fn start_workflow_is_role_denied_then_transport_unavailable() {
+    // Phase 5 STEP 5.2: `StartWorkflow` is intercepted at the connection level
+    // like `MutateDocument`. The daemon's own test server injects no starter, so
+    // the command is rejected structurally rather than crashing the connection —
+    // and an Observer is role-denied before the starter is even consulted.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let manifest =
+        "schema_version: 1\nid: wf\nversion: 1\nsteps:\n  - id: a\n    tool: repository.test\n";
+
+    // An Observer is role-denied (the role is checked before the starter).
+    let observer = ClientId::new();
+    let mut obs_stream = connect(&paths).await;
+    handshake(&mut obs_stream, observer).await;
+    bind_role(
+        &mut obs_stream,
+        observer,
+        ClientRole::Observer,
+        "obs-wf-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut obs_stream,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::StartWorkflow {
+                    manifest: manifest.to_string(),
+                    inputs: serde_json::Value::Null,
+                },
+                "wf-observer",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    // A Contributor gets past the role gate but the transport is unwired.
+    let contributor = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, contributor).await;
+    bind_role(
+        &mut stream,
+        contributor,
+        ClientRole::Contributor,
+        "contrib-wf-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            contributor,
+            Payload::Command(command(
+                CommandBody::StartWorkflow {
+                    manifest: manifest.to_string(),
+                    inputs: serde_json::Value::Null,
+                },
+                "wf-contributor",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "workflow.transport-unavailable");
+        }
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn attaching_a_second_client_emits_presence() {
     // STEP 3.7: presence events let each attached client see who else is here.
     let tmp = tempfile::tempdir().unwrap();

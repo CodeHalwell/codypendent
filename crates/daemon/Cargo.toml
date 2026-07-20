@@ -38,6 +38,7 @@ hmac = { workspace = true }
 [dev-dependencies]
 codypendent-test-support = { workspace = true }
 tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

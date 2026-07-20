@@ -101,6 +101,12 @@ pub enum Action {
     OpenDocs,
     /// Toggle the code-graph edge inspector (`G`).
     OpenEdges,
+    /// Toggle the workflow-graph view (`W`): nodes with state, action, agent,
+    /// worktree, approval, retry, dependencies, and declared outputs.
+    OpenWorkflow,
+    /// Toggle the blackboard view (`B`): the typed artifacts agents share within
+    /// a workflow run, with author, confidence, evidence, and payload summary.
+    OpenBlackboard,
 
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,

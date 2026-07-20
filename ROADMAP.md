@@ -50,7 +50,17 @@ the release gate is the
 > `WorkflowStore` (5.2 durable store), carries agent-profile (`agent.toml`)
 > parsing, and holds a per-run `BlackboardStore` for the typed, evidence-gated
 > artifact channel agents share (5.3) — the daemon-free foundation for durable
-> multi-agent orchestration. In parallel, a **Codex-informed TUI backlog** is
+> multi-agent orchestration, now advancing on three fronts. A model-free
+> **driver** (`WorkflowDriver` + a `NodeExecutor` seam) advances a run through the
+> ready frontier — resumable, node-level provenance recorded — proven end-to-end
+> with a fake executor. **Runs are creatable through the daemon**: a
+> `StartWorkflow` command compiles a manifest and creates a durable run via a
+> `WorkflowStarter` seam (assembly-implemented over `create_run`). And two
+> read-only **client surfaces** have landed — a TUI workflow-graph view over the
+> compiled projection (per-node state / agent / worktree, grouped by workflow) and
+> a TUI blackboard view over the per-run artifact boards (kind / author /
+> confidence / evidence) — each fed by a CLI seam.
+> In parallel, a **Codex-informed TUI backlog** is
 > tracked near the end of this file: the conversation-centred shell, command
 > palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
 > have all shipped.
@@ -203,12 +213,22 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         user-facing entry point now: `codypendent workflow validate <file>`
         parses + compiles a manifest and reports the validated graph (or the
         precise error, tagged with the file), so an author checks a manifest
-        before it ever runs. *Remaining for 5.1:* lowering onto framework graphs,
-        and replacing the hard-coded `/fix-ci` flow with this definition (both
-        gated on the role→profile resolution the manifest's short roles imply but
-        that is not yet defined). Agent-profile (`agent.toml`) parsing has landed —
-        `parse_agent_profile` reads role/mode/autonomy/model_policy/skills/tools/
-        permissions/budget/completion (the canonical profile parses in a test).
+        before it ever runs. **Role→profile resolution is now defined** — the gate
+        the rest of 5.1 waited on. An `AgentProfileSet` loads a directory of
+        `agent.toml` profiles and indexes them by the role each *fulfils*:
+        `AgentProfile::fulfilled_role` is the profile's explicit `role` field, else
+        the last dotted segment of its id — so the canonical `code.implementer`
+        binds a manifest's short `role: implementer` — and the set refuses a
+        directory where two profiles claim one role (a role resolves to exactly one
+        profile). `codypendent workflow validate <file> --agents <dir>` uses it to
+        cross-check that every agent step's role resolves, reporting each
+        unresolved `step → role` before a run reaches it (the tool/skill half still
+        needs the live registry). Agent-profile (`agent.toml`) parsing had already
+        landed — `parse_agent_profile` reads
+        role/mode/autonomy/model_policy/skills/tools/permissions/budget/completion.
+        *Remaining for 5.1:* lowering the compiled graph onto framework
+        orchestration builders, and replacing the hard-coded `/fix-ci` flow with
+        the declarative `repair-github-check` definition.
   - [x] **5.2 (durable store)** migration 0010 + a `WorkflowStore` over SQLite:
         durable workflow runs, a per-node record (state / attempt / cost /
         start+end times — the node-level provenance the graph view needs), and
@@ -229,10 +249,46 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         node. The compiled graph is now a serializable projection
         (`CompiledWorkflow: Serialize`, tagged node actions), surfaced by
         `codypendent workflow show <file> [--json]` — the read model a graph view
-        renders. *Remaining for 5.2:* the daemon startup-recovery **wiring** over
-        the incomplete-runs list, node-lifecycle ledger events, the
-        pause/resume/retry-from-node **commands** that drive these store ops, and
-        the TUI workflow-graph view over the projection.
+        renders. **The TUI workflow-graph view over that projection has now
+        landed:** a read-only overlay (reached from the command palette, or the
+        bare `W` once a browser is open — like `D`/`G` in the conversation shell)
+        that lists a repository's compiled workflow nodes in topological order,
+        grouped by workflow, and — for the focused node — renders its action,
+        lifecycle state, agent, worktree, approval, retry, dependencies, and
+        declared outputs (exit criterion 3's per-node state / agent / worktree).
+        It is fed by a CLI seam that compiles `.codypendent/workflows/*.yaml`
+        into self-contained `WorkflowNodeCard`s (the one place the workflow crate
+        meets the pure TUI crate, mirroring the Docs/Edges wiring), skipping a
+        manifest that does not compile rather than failing the view. State/cost
+        are the pre-run values (`pending` / `—`); overlaying a durable run's live
+        per-node state and cost lands with the daemon executor. **The engine loop
+        over the store — the `WorkflowDriver` — has now landed:** it advances a
+        run through the `ready_nodes` frontier, executing each node via a
+        `NodeExecutor` seam and recording the transition (attempt / cost /
+        agent-run id) through `transition_node`, until the run reaches a terminal
+        `Completed`/`Failed`. It is **resumable** (a `Completed` node is never in
+        the frontier; a node left `Running` by an interrupted drive is reset to
+        `Pending` and re-driven exactly once) and **model-free** — the daemon
+        fills `NodeExecutor` with the agent loop / tool layer, while the crate's
+        tests fill it with a fake executor, so linear completion, failure blocking
+        only its dependents, retry-to-success, resume-skips-completed, and a
+        diamond frontier are all proven without a model call. A `NodeObserver`
+        sees every transition (the seam the daemon fills to emit
+        `WorkflowNodeTransitioned` events). **Runs are now creatable through the
+        daemon:** a `StartWorkflow` command (carrying the manifest YAML + typed
+        inputs) is intercepted at the connection level like `MutateDocument` and
+        applied through a `WorkflowStarter` seam — implemented in the `codypendentd`
+        assembly over `compile_yaml` + `WorkflowStore::create_run_idempotent` (keyed
+        by the command's idempotency key, so a duplicate delivery resolves to the
+        same run) on the daemon's pool — replying `WorkflowRunStarted` with the new
+        run id (or
+        `CommandRejected` when the manifest does not compile; a daemon without the
+        seam rejects it `workflow.transport-unavailable`, an Observer is
+        role-denied). *Remaining for 5.2:* wiring the **driver** into that seam
+        behind a real `NodeExecutor` (so a created run actually advances), the
+        startup-recovery pass over the incomplete-runs list, node-lifecycle ledger
+        events over the observer, and the pause/resume/retry-from-node **commands**
+        that drive these store ops.
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code
@@ -246,8 +302,16 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         daemon-decoupled. The read surface a projection needs is in place:
         `query` (live or full board, kind-filtered), `get` (one item by id,
         run-scoped), and `history` (an artifact's full supersession lineage,
-        oldest first). *Remaining for 5.3:* daemon read/write **commands** +
-        subscription delivery over that surface, and the TUI blackboard view.
+        oldest first). **The TUI blackboard view has now landed:** a read-only
+        overlay (command palette, or the bare `B`) that lists the artifacts on the
+        active runs' boards — grouped by run — and, for the focused artifact,
+        renders its kind, author, confidence, evidence, revision, and a payload
+        summary, dimming a superseded item. It is fed by a CLI seam that queries
+        each incomplete run's board over the shared pool and renders the opaque
+        JSON payload/author/evidence to human strings (empty until the executor
+        posts artifacts). *Remaining for 5.3:* daemon read/write **commands** +
+        subscription delivery over that surface (the write path an agent's
+        `blackboard.post` tool drives).
 - [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes

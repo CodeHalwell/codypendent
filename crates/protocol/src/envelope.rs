@@ -108,6 +108,13 @@ pub enum Payload {
         command_id: CommandId,
         grant: DocumentLeaseGrant,
     },
+    /// A `StartWorkflow` command was accepted; carries the new durable workflow-run
+    /// id (Phase 5 STEP 5.2). A distinct reply from `CommandAccepted` because the
+    /// client needs the run id back to track / show the run it just started.
+    WorkflowRunStarted {
+        command_id: CommandId,
+        workflow_run_id: String,
+    },
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
     /// A collaborative document's CRDT sync update, delivered to the clients
@@ -299,6 +306,25 @@ mod tests {
                 assert_eq!(grant.block_id.as_deref(), Some("b3"));
             }
             other => panic!("expected DocumentLeaseGranted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_run_started_payload_round_trips() {
+        let command_id = CommandId::new();
+        let started = Payload::WorkflowRunStarted {
+            command_id,
+            workflow_run_id: "0192abcd-run".to_string(),
+        };
+        match round_trip_payload(started) {
+            Payload::WorkflowRunStarted {
+                command_id: id,
+                workflow_run_id,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(workflow_run_id, "0192abcd-run");
+            }
+            other => panic!("expected WorkflowRunStarted, got {other:?}"),
         }
     }
 

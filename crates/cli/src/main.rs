@@ -147,9 +147,16 @@ enum IndexCommand {
 enum WorkflowCommand {
     /// Parse and compile a `workflow.yaml`, reporting the validated graph or the
     /// precise error. Structural validation only; it does not run the workflow.
+    /// With `--agents`, it additionally cross-checks that every agent step's role
+    /// resolves to a profile in that directory.
     Validate {
         /// Path to the workflow manifest to validate.
         file: PathBuf,
+        /// Optional directory of `agent.toml` profiles to resolve step roles
+        /// against (e.g. `.codypendent/agents`). When given, an agent step naming
+        /// a role no profile fulfils is reported as an error.
+        #[arg(long)]
+        agents: Option<PathBuf>,
     },
     /// Compile a `workflow.yaml` and print its full graph (nodes, actions, edges,
     /// approvals, outputs) as a human tree, or the JSON projection with `--json`.
@@ -251,7 +258,9 @@ async fn main() -> anyhow::Result<()> {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
         TopCommand::Workflow { command } => match command {
-            WorkflowCommand::Validate { file } => commands::workflow_validate(&file),
+            WorkflowCommand::Validate { file, agents } => {
+                commands::workflow_validate(&file, agents.as_deref())
+            }
             WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
         },
         TopCommand::Acp { repo } => {

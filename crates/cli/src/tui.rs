@@ -44,8 +44,9 @@ use codypendent_protocol::{
     CommandId, Envelope, Payload, RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, Action, AppState, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
+    map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
+    WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,12 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     state.memories = projections.memories;
     state.docs = projections.docs;
     state.edges = projections.edges;
+    state.blackboard = projections.blackboard;
+    // Phase 5 STEP 5.2: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests. This reads files, not the
+    // knowledge db, so it is a standalone projection; a malformed manifest logs
+    // and is skipped rather than failing the TUI.
+    state.workflow = load_workflows(&repo);
 
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
@@ -639,6 +646,7 @@ struct KnowledgeProjections {
     memories: Vec<MemoryCard>,
     docs: Vec<DocCard>,
     edges: Vec<GraphEdgeCard>,
+    blackboard: Vec<BlackboardItemCard>,
 }
 
 /// The cap on edges surfaced in the inspector. A large repository's graph can
@@ -669,6 +677,7 @@ async fn load_knowledge(
         memories: Vec::new(),
         docs: Vec::new(),
         edges: Vec::new(),
+        blackboard: Vec::new(),
     };
 
     let database_path = paths.data_dir.join("codypendent.db");
@@ -712,6 +721,10 @@ async fn load_knowledge(
 
     let docs = load_docs(&pool, &scopes).await;
     let edges = load_edges(&pool, repository).await;
+    // Phase 5 STEP 5.3: the blackboard artifacts on the active workflow runs. The
+    // workflow tables share this database (the migrations are workspace-wide), so
+    // the same pool serves them; empty until a run posts artifacts.
+    let blackboard = load_blackboard(&pool).await;
 
     pool.close().await;
     KnowledgeProjections {
@@ -719,6 +732,7 @@ async fn load_knowledge(
         memories,
         docs,
         edges,
+        blackboard,
     }
 }
 
@@ -1022,6 +1036,318 @@ fn edge_card(edge: &CodeEdge, names: &HashMap<CodeNodeId, String>) -> GraphEdgeC
     }
 }
 
+/// The cap on workflow nodes surfaced in the view. A pathological manifest set
+/// could declare a very large graph; the read-only view shows the first
+/// [`MAX_WORKFLOW_NODES`] (in discovery + topological order) and logs when it
+/// truncates — never a silent cut.
+const MAX_WORKFLOW_NODES: usize = 500;
+
+/// Compile the repository's declared workflow manifests
+/// (`.codypendent/workflows/*.{yaml,yml}`) and project each compiled node into a
+/// [`WorkflowNodeCard`] for the workflow-graph view (Phase 5 STEP 5.2). This is
+/// the CLI's job precisely because the TUI crate performs no I/O and never
+/// depends on `codypendent-workflow`; the mapping from the compiled graph to the
+/// projection happens here and nowhere else.
+///
+/// Manifests are compiled in sorted filename order for a deterministic view; an
+/// unreadable or non-compiling manifest logs to stderr and is skipped, so one
+/// broken file drops only its own workflow — never the others, and never the
+/// TUI. Nodes keep their compiled topological order. State/cost are the pre-run
+/// values (`pending` / `—`); overlaying a durable run's live per-node
+/// state/cost lands with the daemon-side workflow executor.
+fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
+    let dir = repo.join(".codypendent").join("workflows");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // A repository with no workflows directory is the common case — an empty
+        // view, not an error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            eprintln!(
+                "codypendent: workflow view unavailable (reading {}: {error})",
+                dir.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    // Collect and sort the manifest paths so the view order is deterministic.
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("yaml" | "yml")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut cards = Vec::new();
+    for path in files {
+        let yaml = match std::fs::read_to_string(&path) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                eprintln!(
+                    "codypendent: skipping workflow {} ({error})",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match codypendent_workflow::compile_yaml(&yaml) {
+            Ok(compiled) => {
+                let label = format!("{} v{}", compiled.id, compiled.version);
+                cards.extend(
+                    compiled
+                        .nodes
+                        .iter()
+                        .map(|node| workflow_node_card(&label, node)),
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "codypendent: skipping workflow {} (does not compile: {error})",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if cards.len() > MAX_WORKFLOW_NODES {
+        eprintln!(
+            "codypendent: workflow view showing the first {MAX_WORKFLOW_NODES} of {} nodes",
+            cards.len()
+        );
+        cards.truncate(MAX_WORKFLOW_NODES);
+    }
+    cards
+}
+
+/// Map one [`CompiledNode`](codypendent_workflow::CompiledNode) into the view's
+/// [`WorkflowNodeCard`], pre-rendering every field to a human string. `workflow`
+/// is the owning workflow's `id vN` label the view groups by. State/cost are the
+/// pre-run values a compiled (not-yet-run) graph carries.
+fn workflow_node_card(
+    workflow: &str,
+    node: &codypendent_workflow::CompiledNode,
+) -> WorkflowNodeCard {
+    use codypendent_workflow::{ApprovalPolicy, NodeAction, WorkspaceMode};
+
+    let dash = || "\u{2014}".to_owned(); // "—"
+    let (kind, action, agent, model_policy) = match &node.action {
+        NodeAction::Agent {
+            role,
+            model_policy,
+            skill,
+        } => {
+            let action = match skill {
+                Some(skill) => format!("agent {role} \u{b7} skill {skill}"),
+                None => format!("agent {role}"),
+            };
+            (
+                "agent".to_owned(),
+                action,
+                role.clone(),
+                model_policy.clone().unwrap_or_else(dash),
+            )
+        }
+        NodeAction::Tool { name } => ("tool".to_owned(), format!("tool {name}"), dash(), dash()),
+    };
+
+    let workspace = match node.workspace_mode {
+        WorkspaceMode::SharedWorktree => "shared worktree",
+        WorkspaceMode::IsolatedWorktree => "isolated worktree",
+    }
+    .to_owned();
+
+    let approval = match node.approval {
+        Some(ApprovalPolicy::BeforeWrite) => "before write".to_owned(),
+        Some(ApprovalPolicy::Always) => "always".to_owned(),
+        None => "none".to_owned(),
+    };
+
+    let retry = {
+        let attempts = node.retry.attempts;
+        let unit = if attempts == 1 { "attempt" } else { "attempts" };
+        if node.retry.backoff_seconds == 0 {
+            format!("{attempts} {unit}")
+        } else {
+            format!(
+                "{attempts} {unit} \u{b7} {}s backoff",
+                node.retry.backoff_seconds
+            )
+        }
+    };
+
+    let join = |items: &[String]| {
+        if items.is_empty() {
+            dash()
+        } else {
+            items.join(", ")
+        }
+    };
+
+    WorkflowNodeCard {
+        workflow: workflow.to_owned(),
+        id: node.id.clone(),
+        action,
+        kind,
+        // A compiled-but-not-yet-run node is pending; a durable run record
+        // overlays a live state here once the executor lands.
+        state: "pending".to_owned(),
+        agent,
+        model_policy,
+        workspace,
+        approval,
+        retry,
+        depends_on: join(&node.depends_on),
+        outputs: join(&node.outputs),
+        // No run has recorded a cost against a compiled-only node.
+        cost: dash(),
+    }
+}
+
+/// The cap on blackboard artifacts surfaced in the view — a long-running board
+/// can accumulate many; the read-only view shows the first [`MAX_BLACKBOARD_ITEMS`]
+/// (newest first, across the active runs) and logs when it truncates.
+const MAX_BLACKBOARD_ITEMS: usize = 500;
+
+/// Project the blackboard artifacts on the active workflow runs into
+/// [`BlackboardItemCard`]s (Phase 5 STEP 5.3). The workflow tables share the
+/// knowledge database (the migrations are workspace-wide), so the same pool
+/// serves them. Runs are the daemon's non-terminal set (the boards worth
+/// watching); each run's full board — live and superseded — is queried so the
+/// view can dim corrected artifacts. Empty until the executor posts artifacts; a
+/// query failure logs and skips that run rather than failing the view.
+async fn load_blackboard(pool: &sqlx::SqlitePool) -> Vec<BlackboardItemCard> {
+    use codypendent_workflow::{BlackboardStore, WorkflowStore};
+
+    let runs = match WorkflowStore::new().list_incomplete_runs(pool).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!("codypendent: could not list workflow runs: {error}");
+            return Vec::new();
+        }
+    };
+
+    let board = BlackboardStore::new();
+    let mut cards = Vec::new();
+    for run in runs {
+        let run_label = format!("{} \u{b7} run {}", run.workflow_id, short_run_id(&run.id));
+        match board.query(pool, &run.id, None, true).await {
+            Ok(items) => cards.extend(
+                items
+                    .iter()
+                    .map(|item| blackboard_item_card(&run_label, item)),
+            ),
+            Err(error) => {
+                eprintln!(
+                    "codypendent: could not query the blackboard for run {}: {error}",
+                    run.id
+                );
+            }
+        }
+        if cards.len() >= MAX_BLACKBOARD_ITEMS {
+            eprintln!(
+                "codypendent: blackboard view showing the first {MAX_BLACKBOARD_ITEMS} artifacts"
+            );
+            cards.truncate(MAX_BLACKBOARD_ITEMS);
+            break;
+        }
+    }
+    cards
+}
+
+/// Map a [`BlackboardItem`](codypendent_workflow::BlackboardItem) into the view's
+/// [`BlackboardItemCard`], rendering its opaque JSON payload/author/evidence to
+/// human strings. `run` is the owning run's label the view groups by.
+fn blackboard_item_card(
+    run: &str,
+    item: &codypendent_workflow::BlackboardItem,
+) -> BlackboardItemCard {
+    BlackboardItemCard {
+        run: run.to_owned(),
+        kind: item.kind.as_str().to_owned(),
+        summary: summarize_json(&item.payload),
+        author: summarize_author(&item.author),
+        confidence: item
+            .confidence
+            .map_or_else(|| "\u{2014}".to_owned(), |c| format!("{c:.2}")),
+        evidence: if item.evidence.is_empty() {
+            "\u{2014}".to_owned()
+        } else {
+            format!("{} ref(s)", item.evidence.len())
+        },
+        revision: format!("r{}", item.revision),
+        superseded: item.superseded_by.is_some(),
+    }
+}
+
+/// The first 8 characters of a run id, for a compact run label.
+fn short_run_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// A one-line human summary of an opaque artifact payload: a string payload as-is;
+/// an object's first human-text field (`summary`/`title`/`statement`/…) when one
+/// is present; otherwise its compact JSON. Capped so a large payload cannot blow
+/// out the card.
+fn summarize_json(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => {
+            let field = [
+                "summary",
+                "title",
+                "statement",
+                "text",
+                "description",
+                "message",
+            ]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str));
+            match field {
+                Some(text) => text.to_owned(),
+                None => value.to_string(),
+            }
+        }
+        other => other.to_string(),
+    };
+    truncate_chars(&raw, 200)
+}
+
+/// A compact rendering of an opaque author record: a string as-is; an object's
+/// `role`/`agent` as `"agent <role>"`; otherwise its compact JSON.
+fn summarize_author(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => match map
+            .get("role")
+            .or_else(|| map.get("agent"))
+            .and_then(Value::as_str)
+        {
+            Some(role) => format!("agent {role}"),
+            None => value.to_string(),
+        },
+        other => other.to_string(),
+    };
+    truncate_chars(&raw, 80)
+}
+
+/// Truncate to at most `max` characters, appending an ellipsis when cut (char-safe
+/// so a multi-byte boundary is never split).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}\u{2026}")
+    }
+}
+
 fn collab_mode_label(mode: CollaborationMode) -> &'static str {
     match mode {
         CollaborationMode::Ask => "ask",
@@ -1262,5 +1588,166 @@ mod tests {
         // A forward-compat variant we can't inspect is accepted rather than
         // discarding a possibly-resumable session against a newer daemon.
         assert!(catchup_proves_session_exists(&Catchup::Unknown));
+    }
+
+    /// A manifest exercising both action kinds and every rendered node field: an
+    /// agent step with a skill, an isolated worktree, and a before-write
+    /// approval; a tool step with a multi-attempt retry and a dependency.
+    const TEST_MANIFEST: &str = "\
+schema_version: 1
+id: repair-github-check
+version: 1
+orchestration_reason: independent-review
+budget:
+  maximum_cost_usd: 5.0
+  maximum_agents: 2
+steps:
+  - id: patch
+    agent:
+      role: implementer
+      model_policy: coding
+    skill: code.repair
+    workspace:
+      mode: isolated-worktree
+    approval: before-write
+    outputs: [proposed_patch]
+  - id: verify
+    depends_on: [patch]
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+";
+
+    #[test]
+    fn workflow_node_card_renders_agent_and_tool_nodes() {
+        let compiled = codypendent_workflow::compile_yaml(TEST_MANIFEST).expect("compiles");
+        let label = format!("{} v{}", compiled.id, compiled.version);
+        let cards: Vec<_> = compiled
+            .nodes
+            .iter()
+            .map(|node| workflow_node_card(&label, node))
+            .collect();
+
+        let patch = cards.iter().find(|c| c.id == "patch").expect("patch node");
+        assert_eq!(patch.workflow, "repair-github-check v1");
+        assert_eq!(patch.kind, "agent");
+        assert_eq!(patch.agent, "implementer");
+        assert_eq!(patch.model_policy, "coding");
+        assert!(
+            patch.action.contains("skill code.repair"),
+            "{}",
+            patch.action
+        );
+        assert_eq!(patch.workspace, "isolated worktree");
+        assert_eq!(patch.approval, "before write");
+        // A compiled-but-not-yet-run node is pending with no recorded cost.
+        assert_eq!(patch.state, "pending");
+        assert_eq!(patch.cost, "\u{2014}");
+        assert_eq!(patch.depends_on, "\u{2014}"); // no dependencies
+        assert_eq!(patch.outputs, "proposed_patch");
+
+        let verify = cards
+            .iter()
+            .find(|c| c.id == "verify")
+            .expect("verify node");
+        assert_eq!(verify.kind, "tool");
+        assert_eq!(verify.agent, "\u{2014}");
+        assert_eq!(verify.model_policy, "\u{2014}");
+        assert_eq!(verify.action, "tool repository.test");
+        assert_eq!(verify.workspace, "shared worktree");
+        assert_eq!(verify.approval, "none");
+        assert_eq!(verify.retry, "2 attempts \u{b7} 5s backoff");
+        assert_eq!(verify.depends_on, "patch");
+    }
+
+    #[test]
+    fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        // No workflows directory → an empty view, not an error.
+        assert!(load_workflows(repo).is_empty());
+
+        let dir = repo.join(".codypendent").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("repair.yaml"), TEST_MANIFEST).unwrap();
+        // A manifest that parses but fails to compile (no steps) is skipped, not
+        // fatal — the good workflow still loads.
+        std::fs::write(
+            dir.join("broken.yaml"),
+            "schema_version: 1\nid: broken\nversion: 1\nsteps: []\n",
+        )
+        .unwrap();
+        // A non-manifest file is ignored by extension.
+        std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let cards = load_workflows(repo);
+        assert_eq!(
+            cards.len(),
+            2,
+            "both nodes of the good manifest, none of the broken"
+        );
+        assert!(cards.iter().all(|c| c.workflow == "repair-github-check v1"));
+        // Nodes keep their compiled topological order.
+        assert_eq!(cards[0].id, "patch");
+        assert_eq!(cards[1].id, "verify");
+    }
+
+    #[test]
+    fn blackboard_item_card_renders_opaque_payload_and_provenance() {
+        use codypendent_workflow::{BlackboardItem, BlackboardKind};
+        use serde_json::json;
+
+        let item = BlackboardItem {
+            id: "0192-abc".to_owned(),
+            kind: BlackboardKind::Finding,
+            payload: json!({ "summary": "off-by-one in paginate()", "detail": "…" }),
+            author: json!({ "role": "investigator", "run": "r1" }),
+            confidence: Some(0.85),
+            evidence: vec![json!({ "artifact": "a1" }), json!({ "artifact": "a2" })],
+            revision: 1,
+            superseded_by: None,
+        };
+        let card = blackboard_item_card("repair-github-check \u{b7} run 0192abcd", &item);
+        assert_eq!(card.kind, "finding");
+        assert_eq!(card.summary, "off-by-one in paginate()");
+        assert_eq!(card.author, "agent investigator");
+        assert_eq!(card.confidence, "0.85");
+        assert_eq!(card.evidence, "2 ref(s)");
+        assert_eq!(card.revision, "r1");
+        assert!(!card.superseded);
+    }
+
+    #[test]
+    fn json_summaries_fall_back_gracefully() {
+        use codypendent_workflow::{BlackboardItem, BlackboardKind};
+        use serde_json::json;
+
+        // A string payload is used verbatim; an object without a known text field
+        // falls back to compact JSON rather than panicking.
+        assert_eq!(summarize_json(&json!("plain text")), "plain text");
+        assert!(summarize_json(&json!({ "x": 1 })).contains("\"x\""));
+        assert!(summarize_author(&json!({ "who": "?" })).contains("who"));
+
+        // A superseded hypothesis with no confidence or evidence renders em dashes.
+        let item = BlackboardItem {
+            id: "1".to_owned(),
+            kind: BlackboardKind::Hypothesis,
+            payload: json!("a guess"),
+            author: json!("someone"),
+            confidence: None,
+            evidence: vec![],
+            revision: 3,
+            superseded_by: Some("2".to_owned()),
+        };
+        let card = blackboard_item_card("run", &item);
+        assert_eq!(card.summary, "a guess");
+        assert_eq!(card.author, "someone");
+        assert_eq!(card.confidence, "\u{2014}");
+        assert_eq!(card.evidence, "\u{2014}");
+        assert_eq!(card.revision, "r3");
+        assert!(card.superseded);
     }
 }

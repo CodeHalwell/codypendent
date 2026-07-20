@@ -12,6 +12,7 @@
 mod documents;
 mod executor;
 mod scan;
+mod workflows;
 
 use std::path::PathBuf;
 use std::sync::Arc;
