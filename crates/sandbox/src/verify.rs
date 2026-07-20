@@ -77,56 +77,80 @@ pub fn checksum_of(artifact: &[u8]) -> String {
 /// the capabilities into the signed material is what stops a valid checksum
 /// signature from being reused against a manifest whose permissions were swapped.
 ///
-/// The encoding is deterministic — capabilities come from a [`CapabilitySet`],
-/// which is sorted and deduplicated, and the checksum is lower-cased — so the
-/// signer and verifier always agree regardless of declaration order or hex
-/// casing. This is the signing contract a packaging tool implements.
+/// The encoding is **injective**: every field is length-prefixed (its byte length
+/// is committed before its bytes), and the capability list is count-prefixed with
+/// each capability's class and value length-prefixed in turn. So no field value —
+/// including an attacker-chosen capability string containing newlines or `=` — can
+/// forge a delimiter or merge with an adjacent field. Two manifests digest equal
+/// **iff** they have the same checksum, identity, runtime, and exact capability
+/// set. Capabilities come from a [`CapabilitySet`] (sorted + deduplicated) and the
+/// checksum is lower-cased, so declaration order and hex casing don't matter. This
+/// is the signing contract a packaging tool implements.
 ///
-/// The leading `codypendent-plugin-signature-v1` line is a domain-separation tag
-/// that **versions the signature scheme**: a signature only verifies against the
-/// scheme it was produced under, and a future scheme change bumps the tag so the
-/// two never collide. This crate deliberately accepts **only** the current scheme
-/// — there is no fallback to verifying a bare-checksum signature. Accepting that
-/// weaker form would reopen exactly the capability/command-swap replay this digest
-/// closes, so it is refused by design rather than kept for backward compatibility
-/// (no signed plugins ship against an older contract — signed packaging targets
-/// this digest from the outset).
+/// The `codypendent-plugin-signature-v1` domain-separation tag **versions the
+/// signature scheme**: a signature only verifies against the scheme it was produced
+/// under, and a future scheme change bumps the tag so the two never collide. This
+/// crate deliberately accepts **only** the current scheme — there is no fallback to
+/// verifying a bare-checksum signature. Accepting that weaker form would reopen
+/// exactly the capability/command-swap replay this digest closes, so it is refused
+/// by design rather than kept for backward compatibility (no signed plugins ship
+/// against an older contract — signed packaging targets this digest from the outset).
 #[must_use]
 pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
-    let mut payload = String::new();
-    payload.push_str("codypendent-plugin-signature-v1\n");
-    payload.push_str("checksum=");
-    payload.push_str(&manifest.security.checksum.trim().to_ascii_lowercase());
-    payload.push('\n');
-    payload.push_str("id=");
-    payload.push_str(manifest.id.trim());
-    payload.push('\n');
-    payload.push_str("version=");
-    payload.push_str(manifest.version.trim());
-    payload.push('\n');
-    payload.push_str("kind=");
-    payload.push_str(manifest.kind.as_str());
-    payload.push('\n');
-    // Execution identity: the command/protocol/working-directory a signed manifest
-    // launches. Binding these stops a command-hijack replay — keeping the valid
-    // checksum + signature while swapping `runtime.command` to run an arbitrary
-    // binary must break verification.
-    payload.push_str("command=");
-    payload.push_str(manifest.runtime.command.trim());
-    payload.push('\n');
-    payload.push_str("protocol=");
-    payload.push_str(manifest.runtime.protocol.trim());
-    payload.push('\n');
-    payload.push_str("working_directory=");
-    payload.push_str(manifest.runtime.working_directory.trim());
-    payload.push('\n');
-    // Sorted, deduplicated capability lines — the full requested permission set.
-    for cap in CapabilitySet::from_spec(&manifest.capabilities).iter() {
-        payload.push_str("cap=");
-        payload.push_str(&cap.to_string());
-        payload.push('\n');
+    let mut hasher = Sha256::new();
+    // Domain separator (fixed length — no prefix needed).
+    hasher.update(b"codypendent-plugin-signature-v1");
+    hash_field(
+        &mut hasher,
+        b"checksum",
+        manifest
+            .security
+            .checksum
+            .trim()
+            .to_ascii_lowercase()
+            .as_bytes(),
+    );
+    hash_field(&mut hasher, b"id", manifest.id.trim().as_bytes());
+    hash_field(&mut hasher, b"version", manifest.version.trim().as_bytes());
+    hash_field(&mut hasher, b"kind", manifest.kind.as_str().as_bytes());
+    // Execution identity: binding command/protocol/working_directory stops a
+    // command-hijack replay (a swapped `runtime.command` must break verification).
+    hash_field(
+        &mut hasher,
+        b"command",
+        manifest.runtime.command.trim().as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"protocol",
+        manifest.runtime.protocol.trim().as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"working_directory",
+        manifest.runtime.working_directory.trim().as_bytes(),
+    );
+    // The full requested permission set: count-prefixed, then each capability's
+    // class + value length-prefixed, so the set is bound unambiguously.
+    let caps = CapabilitySet::from_spec(&manifest.capabilities);
+    hasher.update((caps.len() as u64).to_be_bytes());
+    for cap in caps.iter() {
+        hash_field(&mut hasher, b"cap-class", cap.class().as_bytes());
+        hash_field(&mut hasher, b"cap-value", cap.value().as_bytes());
     }
-    Sha256::digest(payload.as_bytes()).into()
+    hasher.finalize().into()
+}
+
+/// Absorb a labeled, **length-prefixed** field into the hasher: the label length +
+/// label, then the value length + value (both lengths as `u64` big-endian). The
+/// length prefixes make the encoding injective — a value cannot contain bytes that
+/// impersonate a delimiter or the next field, which is what closes the
+/// capability-string injection collision.
+fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_be_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 /// Verify a plugin artifact against its manifest under the given unsigned policy
@@ -375,5 +399,46 @@ signature = "unset"
         let mut different_version = base.clone();
         different_version.version = "9.9.9".into();
         assert_ne!(signing_digest(&different_version), d0, "version is bound");
+
+        let mut different_command = base.clone();
+        different_command.runtime.command = "totally-different".into();
+        assert_ne!(
+            signing_digest(&different_command),
+            d0,
+            "runtime command is bound"
+        );
+    }
+
+    #[test]
+    fn capability_value_injection_does_not_collide_with_a_split_capability() {
+        // The review's attack: manifest A declares ONE filesystem_read whose value
+        // embeds delimiter-looking bytes; manifest B declares that same safe read
+        // PLUS a real network capability. Under a naive newline-joined encoding
+        // these two could hash equal, letting A's signature authorize B's added
+        // network access. The length-prefixed encoding must keep them distinct.
+        let checksum = checksum_of(b"x");
+        let mut a = manifest_with_caps(&checksum, &[]);
+        a.capabilities.filesystem_read = vec!["safe\ncap-value=8\nevil:443".into()];
+        let mut b = manifest_with_caps(&checksum, &["evil:443"]);
+        b.capabilities.filesystem_read = vec!["safe".into()];
+        assert_ne!(
+            signing_digest(&a),
+            signing_digest(&b),
+            "an injected capability value must not collide with a split capability set"
+        );
+
+        // Concretely: a valid signature over A must not verify B (which gained
+        // network access), even though both share the checksum + publisher key.
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let key = signing.verifying_key();
+        sign(&mut a, &signing);
+        b.security.signature = a.security.signature.clone();
+        let err =
+            verify_artifact(&b, b"x", Some(key.as_bytes()), UnsignedPolicy::Deny).unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::SignatureMismatch,
+            "A's signature must not authorize B"
+        );
     }
 }
