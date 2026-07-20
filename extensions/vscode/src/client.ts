@@ -100,7 +100,7 @@ export interface DaemonClientEvents {
   serverHello: (hello: ServerHello) => void;
   catchup: (catchup: Catchup) => void;
   event: (event: SessionEvent) => void;
-  commandAccepted: (info: { command_id: Uuid; sequence?: number }) => void;
+  commandAccepted: (info: { command_id: Uuid; sequence?: number; created_run?: Uuid }) => void;
   commandRejected: (error: CodypendentError) => void;
   protocolError: (error: ProtocolError) => void;
   error: (error: Error) => void;
@@ -134,9 +134,20 @@ export class DaemonClient extends EventEmitter {
   private readonly connect: ConnectionFactory;
   private readonly wait: (ms: number) => Promise<void>;
 
-  // The ONLY retained state beyond the live connection: the highest ledger
-  // sequence observed. Presented on re-attach so the daemon resumes the stream.
+  // Retained across connections: the highest ledger sequence observed
+  // (presented on re-attach so the daemon resumes the stream) and the daemon's
+  // resume token (presented in the next ClientHello so the daemon recognizes
+  // this as the same client identity across reconnects).
   private lastSeenSequence: number | undefined;
+  private resumeToken: string | undefined;
+
+  // User-intent commands (approval decisions, run starts, user input) issued
+  // while no socket exists. Silently dropping them was the worst failure mode
+  // this client had: clicking Approve during a reconnect backoff lost the
+  // decision while the card stayed pending. Queued commands keep their minted
+  // idempotency keys and flush after the next successful attach.
+  private readonly offlineQueue: Command[] = [];
+  private static readonly MAX_QUEUED_COMMANDS = 256;
 
   private socket: SocketLike | undefined;
   private decoder = new FrameDecoder();
@@ -202,12 +213,15 @@ export class DaemonClient extends EventEmitter {
     decision: ApprovalDecision["type"],
     scope: ApprovalScope["type"] = "Once",
   ): void {
-    this.sendCommand({
-      type: "ResolveApproval",
-      approval_id: approvalId,
-      decision: { type: decision },
-      scope: { type: scope },
-    });
+    this.sendCommand(
+      {
+        type: "ResolveApproval",
+        approval_id: approvalId,
+        decision: { type: decision },
+        scope: { type: scope },
+      },
+      { queueIfOffline: true },
+    );
   }
 
   /** Start a run in the attached session. */
@@ -221,20 +235,28 @@ export class DaemonClient extends EventEmitter {
     if (repository !== undefined) {
       body.repository = repository;
     }
-    this.sendCommand(body);
+    this.sendCommand(body, { queueIfOffline: true });
   }
 
   /** Submit steering / user input into the attached session. */
   submitUserInput(text: string, mode: AgentMode["type"] = "Build"): void {
-    this.sendCommand({
-      type: "SubmitUserInput",
-      session_id: this.sessionId,
-      text,
-      mode: { type: mode },
-    });
+    this.sendCommand(
+      {
+        type: "SubmitUserInput",
+        session_id: this.sessionId,
+        text,
+        mode: { type: mode },
+      },
+      { queueIfOffline: true },
+    );
   }
 
-  /** Push a debounced IDE context snapshot (STEP 3.4/3.5 `UpdateIdeContext`). */
+  /**
+   * Push a debounced IDE context snapshot (STEP 3.4/3.5 `UpdateIdeContext`).
+   * Never queued: it is high-frequency latest-wins projection state — a stale
+   * snapshot flushed after a reconnect would be worse than none, and the next
+   * editor change resends it anyway.
+   */
   sendIdeContext(update: IdeContextUpdate): void {
     this.sendCommand({
       type: "UpdateIdeContext",
@@ -333,11 +355,18 @@ export class DaemonClient extends EventEmitter {
     switch (payload.type) {
       case "ServerHello": {
         const hello = payload as { type: "ServerHello" } & ServerHello;
+        // Keep the daemon-minted resume token: presenting it in the next
+        // ClientHello preserves this client's identity across reconnects
+        // (without it, every reconnect is a brand-new client to the daemon).
+        if (typeof hello.resume_token === "string" && hello.resume_token.length > 0) {
+          this.resumeToken = hello.resume_token;
+        }
         this.emit("serverHello", {
           selected_protocol: hello.selected_protocol,
           daemon_version: hello.daemon_version,
           daemon_instance: hello.daemon_instance,
           heartbeat_interval_ms: hello.heartbeat_interval_ms,
+          resume_token: hello.resume_token,
         });
         // Send the attach, but do NOT claim "attached" yet: the daemon proves a
         // successful attach by replying with a `Catchup`. Marking attached (and
@@ -364,6 +393,10 @@ export class DaemonClient extends EventEmitter {
         onAttached();
         this.applyCatchup(catchup);
         this.emit("catchup", catchup);
+        // The connection is proven live: deliver what the user did while
+        // disconnected (idempotency keys were minted at click time, so a
+        // duplicate delivery cannot double-apply).
+        this.flushOfflineQueue();
         break;
       }
       case "Event": {
@@ -381,10 +414,11 @@ export class DaemonClient extends EventEmitter {
         break;
       }
       case "CommandAccepted": {
-        const accepted = payload as { command_id: Uuid; sequence?: number };
+        const accepted = payload as { command_id: Uuid; sequence?: number; created_run?: Uuid };
         this.emit("commandAccepted", {
           command_id: accepted.command_id,
           sequence: accepted.sequence,
+          created_run: accepted.created_run,
         });
         break;
       }
@@ -432,8 +466,12 @@ export class DaemonClient extends EventEmitter {
       client_version: this.clientVersion,
       supported_protocols: [PROTOCOL_V1],
       capabilities: IDE_CAPABILITIES,
-      // resume_token omitted (null in Rust) — absent on the wire.
     };
+    // Present the daemon-minted token from the previous connection, if any —
+    // absent on the wire for a first connection.
+    if (this.resumeToken !== undefined) {
+      (payload as { resume_token?: string }).resume_token = this.resumeToken;
+    }
     this.sendEnvelope(this.buildEnvelope(payload, { withSession: false }));
   }
 
@@ -450,14 +488,34 @@ export class DaemonClient extends EventEmitter {
     this.sendCommand(body);
   }
 
-  private sendCommand(body: CommandBody): void {
+  private sendCommand(body: CommandBody, opts: { queueIfOffline?: boolean } = {}): void {
     const command: Command = {
       command_id: randomUUID(),
       idempotency_key: randomUUID(),
       body,
     };
+    if (!this.socket && opts.queueIfOffline && !this.stopped) {
+      if (this.offlineQueue.length >= DaemonClient.MAX_QUEUED_COMMANDS) {
+        this.emit(
+          "error",
+          new Error("offline command queue is full; dropping the oldest queued command"),
+        );
+        this.offlineQueue.shift();
+      }
+      this.offlineQueue.push(command);
+      return;
+    }
     const payload: Payload = { type: "Command", ...command };
     this.sendEnvelope(this.buildEnvelope(payload, { withSession: true }));
+  }
+
+  /** Deliver commands queued while disconnected, oldest first. */
+  private flushOfflineQueue(): void {
+    const queued = this.offlineQueue.splice(0);
+    for (const command of queued) {
+      const payload: Payload = { type: "Command", ...command };
+      this.sendEnvelope(this.buildEnvelope(payload, { withSession: true }));
+    }
   }
 
   private buildEnvelope(payload: Payload, opts: { withSession: boolean }): Envelope {

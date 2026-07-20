@@ -53,6 +53,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(output);
 
   // Virtual-document provider backing `vscode.diff` for proposed change sets.
+  // Bounded: each PatchProposed adds two entries, and an unbounded map grows
+  // for the whole window lifetime — evict oldest beyond the cap (an evicted
+  // diff view simply renders empty if reopened later, which is acceptable for
+  // a transient preview).
+  const MAX_DIFF_ENTRIES = 64;
   const diffContents = new Map<string, string>();
   const diffProvider: vscode.TextDocumentContentProvider = {
     provideTextDocumentContent(uri) {
@@ -62,6 +67,17 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, diffProvider),
   );
+
+  function rememberDiffContent(key: string, content: string): void {
+    diffContents.set(key, content);
+    while (diffContents.size > MAX_DIFF_ENTRIES) {
+      const oldest = diffContents.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      diffContents.delete(oldest);
+    }
+  }
 
   async function showDiff(
     title: string,
@@ -73,8 +89,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const stamp = Date.now();
     const leftUri = vscode.Uri.parse(`${DIFF_SCHEME}:/${leftLabel}-${stamp}`);
     const rightUri = vscode.Uri.parse(`${DIFF_SCHEME}:/${rightLabel}-${stamp}`);
-    diffContents.set(leftUri.toString(), left);
-    diffContents.set(rightUri.toString(), right);
+    rememberDiffContent(leftUri.toString(), left);
+    rememberDiffContent(rightUri.toString(), right);
     await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, title);
   }
 
@@ -114,6 +130,14 @@ export function activate(context: vscode.ExtensionContext): void {
               client?.startRun(raw.objective, "Build", workspaceRepo());
             }
             break;
+        }
+      });
+      // Clear the module reference when the user closes/disposes the view —
+      // a postMessage to a disposed webview rejects, and `post` guards only
+      // on `undefined`.
+      webviewView.onDidDispose(() => {
+        if (view === webviewView) {
+          view = undefined;
         }
       });
       post({ kind: "status", status: client?.connectionStatus ?? "closed" });
@@ -427,8 +451,28 @@ function describeAction(action: ProposedAction): string {
       return `read ${Array.isArray(action.paths) ? action.paths.length : 0} file(s)`;
     case "WritePatch":
       return `write patch ${String(action.patch)}`;
-    case "ExecuteCommand":
-      return `run ${String(action.program)} ${Array.isArray(action.args) ? action.args.join(" ") : ""}`.trim();
+    case "ExecuteCommand": {
+      // The environment and cwd MUST be on the card: the protocol carries them
+      // precisely so an approver cannot be tricked by a benign-looking command
+      // with a smuggled LD_PRELOAD/RUSTC_WRAPPER/shadowed-PATH binding or a
+      // surprising working directory (mirrors the TUI's approval card).
+      let text =
+        `run ${String(action.program)} ${Array.isArray(action.args) ? action.args.join(" ") : ""}`.trim();
+      if (typeof action.cwd === "string" && action.cwd.length > 0) {
+        text += ` [cwd: ${action.cwd}]`;
+      }
+      const environment = Array.isArray(action.environment) ? action.environment : [];
+      if (environment.length > 0) {
+        const bindings = environment
+          .filter((pair): pair is [string, string] => Array.isArray(pair) && pair.length === 2)
+          .map(([name, value]) => `${name}=${value}`)
+          .join(", ");
+        text += ` [env: ${bindings}]`;
+      } else {
+        text += " [env: empty]";
+      }
+      return text;
+    }
     case "NetworkRequest":
       return `network request to ${String(action.destination)}`;
     case "GitCommit":
