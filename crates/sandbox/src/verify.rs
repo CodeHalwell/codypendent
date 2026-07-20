@@ -97,6 +97,19 @@ pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
     payload.push_str("kind=");
     payload.push_str(manifest.kind.as_str());
     payload.push('\n');
+    // Execution identity: the command/protocol/working-directory a signed manifest
+    // launches. Binding these stops a command-hijack replay — keeping the valid
+    // checksum + signature while swapping `runtime.command` to run an arbitrary
+    // binary must break verification.
+    payload.push_str("command=");
+    payload.push_str(manifest.runtime.command.trim());
+    payload.push('\n');
+    payload.push_str("protocol=");
+    payload.push_str(manifest.runtime.protocol.trim());
+    payload.push('\n');
+    payload.push_str("working_directory=");
+    payload.push_str(manifest.runtime.working_directory.trim());
+    payload.push('\n');
     // Sorted, deduplicated capability lines — the full requested permission set.
     for cap in CapabilitySet::from_spec(&manifest.capabilities).iter() {
         payload.push_str("cap=");

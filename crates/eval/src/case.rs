@@ -82,17 +82,19 @@ impl Assertion {
     }
 }
 
-/// Normalize a path for comparison: unify separators to `/` and strip a leading
-/// `./`. Makes a `FileChanged`/`FileUnchanged` assertion robust to the cosmetic
-/// differences (Windows `\\` vs `/`, a `./` prefix) between how a runner emits a
-/// changed path and how an assertion author writes it. It does not resolve `..`
-/// or absolutize — assertions and observations are expected to use the same
-/// repository-relative base.
+/// Normalize a repository-relative path for comparison: strip a leading `./` and
+/// any trailing `/`. Makes a `FileChanged`/`FileUnchanged` assertion robust to the
+/// cosmetic `./`-prefix difference between how a runner emits a changed path and
+/// how an assertion author writes it.
+///
+/// It deliberately does **not** rewrite `\\` to `/`: git reports paths with
+/// forward slashes on every platform, and on Unix `\\` is a legal *filename*
+/// character — rewriting it would make `src\page.rs` (a real file) wrongly match
+/// `src/page.rs` (a different file). It also does not resolve `..` or absolutize;
+/// assertions and observations are expected to share the same relative base.
 fn normalize_path(path: &str) -> String {
-    let unified = path.replace('\\', "/");
-    unified
-        .strip_prefix("./")
-        .unwrap_or(&unified)
+    path.strip_prefix("./")
+        .unwrap_or(path)
         .trim_end_matches('/')
         .to_string()
 }
@@ -290,22 +292,43 @@ mod tests {
     }
 
     #[test]
-    fn file_assertions_normalize_paths() {
-        // The assertion writes `./src/page.rs`; the runner emits a Windows-style
-        // `src\page.rs`. They must still match after normalization.
-        let assertion = Assertion::FileChanged {
-            path: "./src/page.rs".into(),
+    fn file_assertions_normalize_the_dot_slash_prefix() {
+        // The assertion writes `./src/page.rs`; the runner emits `src/page.rs`.
+        // They must still match after the `./`-prefix normalization.
+        let obs = RunObservation {
+            changed_files: vec!["src/page.rs".into()],
+            ..Default::default()
         };
+        assert!(Assertion::FileChanged {
+            path: "./src/page.rs".into()
+        }
+        .check(&obs));
+        assert!(!Assertion::FileUnchanged {
+            path: "./src/page.rs".into()
+        }
+        .check(&obs));
+    }
+
+    #[test]
+    fn a_backslash_filename_is_not_confused_with_a_separator() {
+        // On Unix, `src\page.rs` is a real single file, distinct from `src/page.rs`.
+        // Normalization must NOT rewrite the backslash, or this would wrongly match.
         let obs = RunObservation {
             changed_files: vec!["src\\page.rs".into()],
             ..Default::default()
         };
-        assert!(assertion.check(&obs));
-        // And FileUnchanged is correctly false for the same normalized path.
-        let unchanged = Assertion::FileUnchanged {
-            path: "src/page.rs".into(),
-        };
-        assert!(!unchanged.check(&obs));
+        assert!(
+            !Assertion::FileChanged {
+                path: "src/page.rs".into()
+            }
+            .check(&obs),
+            "a literal backslash filename must not match a slash path"
+        );
+        // It matches itself, of course.
+        assert!(Assertion::FileChanged {
+            path: "src\\page.rs".into()
+        }
+        .check(&obs));
     }
 
     #[test]

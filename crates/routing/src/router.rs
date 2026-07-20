@@ -271,12 +271,14 @@ impl<'a> Router<'a> {
             return false;
         }
         // 2 + 3. Required capabilities, with the node's size *estimates* folded into
-        //    the fit check: a model must hold at least `estimated_input_tokens` of
-        //    context and `estimated_output_tokens` of output, even when the caller
-        //    left the explicit `min_*` requirements at their defaults. Otherwise a
-        //    large task could route to a model whose window cannot hold it.
+        //    the fit check, even when the caller left the explicit `min_*`
+        //    requirements at their defaults. The context window must hold the whole
+        //    task — input *and* generated output both live in it — so the context
+        //    minimum uses `total_tokens()`, not just the input; the output minimum
+        //    uses the output estimate. Otherwise a large task could route to a model
+        //    whose window cannot hold it.
         let mut required = node.required;
-        required.min_context_tokens = required.min_context_tokens.max(node.estimated_input_tokens);
+        required.min_context_tokens = required.min_context_tokens.max(node.total_tokens());
         required.min_output_tokens = required.min_output_tokens.max(node.estimated_output_tokens);
         model.capabilities.satisfies(&required)
     }

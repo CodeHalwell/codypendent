@@ -144,13 +144,43 @@ pub enum PromotionError {
 }
 
 /// A record of a promotion or rollback, for the audit trail.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// **Unforgeable by construction.** The fields are private and there is no public
+/// constructor — a `PromotionRecord` is minted only by [`Candidate::approve`] (an
+/// `Actor::Human`) or [`Candidate::rollback`]. It derives `Serialize` so a receipt
+/// can be written to the audit log, but **not** `Deserialize`, so a caller cannot
+/// rehydrate a forged receipt from JSON and hand it to
+/// [`ActiveVersions::activate`]. Together with the private fields, that makes the
+/// no-self-promotion gate unbypassable in safe Rust (the workspace denies
+/// `unsafe_code`): the only way to obtain a `Promoted` receipt is a real human
+/// approval.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PromotionRecord {
-    pub artifact: ArtifactVersion,
+    artifact: ArtifactVersion,
     /// Who performed the action (a human for a promotion).
-    pub actor_kind: String,
+    actor_kind: String,
     /// The stage transitioned into.
-    pub stage: PromotionStage,
+    stage: PromotionStage,
+}
+
+impl PromotionRecord {
+    /// The artifact version this receipt promotes (or rolled back).
+    #[must_use]
+    pub fn artifact(&self) -> &ArtifactVersion {
+        &self.artifact
+    }
+
+    /// The kind of actor that performed the action (`human` for a promotion).
+    #[must_use]
+    pub fn actor_kind(&self) -> &str {
+        &self.actor_kind
+    }
+
+    /// The stage this receipt records.
+    #[must_use]
+    pub fn stage(&self) -> PromotionStage {
+        self.stage
+    }
 }
 
 /// A candidate moving through the pipeline.
@@ -320,10 +350,14 @@ impl ActiveVersions {
                 stage: record.stage,
             });
         }
-        self.history
-            .entry(record.artifact.stem())
-            .or_default()
-            .push(record.artifact.version);
+        let stack = self.history.entry(record.artifact.stem()).or_default();
+        // Idempotent: re-activating the version already on top is a no-op, so the
+        // stack never grows a duplicate (`[11, 12, 12]`) that would make a
+        // subsequent rollback pop back to the *same* version instead of the
+        // predecessor.
+        if stack.last() != Some(&record.artifact.version) {
+            stack.push(record.artifact.version);
+        }
         Ok(())
     }
 
@@ -512,6 +546,20 @@ mod tests {
         // One command restores the predecessor.
         let restored = active.rollback("router/tool-selection");
         assert_eq!(restored, Some(11));
+        assert_eq!(active.active("router/tool-selection"), Some(11));
+    }
+
+    #[test]
+    fn re_activating_the_same_version_is_idempotent() {
+        // Activating the version already on top must not push a duplicate — else
+        // the stack becomes [11, 12, 12] and a rollback pops back to 12, not 11.
+        let mut active = ActiveVersions::new();
+        active.activate(&promoted(11)).unwrap();
+        active.activate(&promoted(12)).unwrap();
+        active.activate(&promoted(12)).unwrap(); // duplicate activation
+        assert_eq!(active.active("router/tool-selection"), Some(12));
+        // Rollback restores the *real* predecessor, proving no duplicate corrupted it.
+        assert_eq!(active.rollback("router/tool-selection"), Some(11));
         assert_eq!(active.active("router/tool-selection"), Some(11));
     }
 

@@ -32,6 +32,19 @@ fn grader_agent() -> Actor {
     }
 }
 
+/// Drive a candidate all the way through a human approval and return its receipt
+/// — the only way to obtain a `PromotionRecord` (its fields are private and it
+/// does not deserialize, so it cannot be forged).
+fn promote_to_receipt(artifact: ArtifactVersion) -> PromotionRecord {
+    let mut c = Candidate::draft(artifact, &human());
+    c.run_regression(false).unwrap();
+    c.start_shadow().unwrap();
+    c.start_canary().unwrap();
+    c.observe_canary(false).unwrap();
+    c.finish_canary().unwrap();
+    c.approve(&human()).unwrap()
+}
+
 /// Three production traces for the same failure mode (a cargo command failure on
 /// a CI-diagnosis task with the same error fingerprint), plus one clean success.
 fn production_traces() -> Vec<Trace> {
@@ -128,20 +141,19 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
 
     // 6. A human approves → promoted, and the version activates. Activation
     //    requires this promotion receipt — there is no way to activate v5 without
-    //    the human-approved record `approve` returned.
+    //    the human-approved record `approve` returned (the record's fields are
+    //    private and it does not deserialize, so it can't be forged).
     let record = candidate.approve(&human()).unwrap();
     assert_eq!(candidate.stage, PromotionStage::Promoted);
-    assert_eq!(record.actor_kind, "human");
-    assert_eq!(record.artifact.to_string(), "skill/rust-ci/5");
+    assert_eq!(record.actor_kind(), "human");
+    assert_eq!(record.artifact().to_string(), "skill/rust-ci/5");
 
     let mut active = ActiveVersions::new();
-    // The predecessor v4 was itself activated by its own prior human promotion.
-    let predecessor = PromotionRecord {
-        artifact: ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4),
-        actor_kind: "human".into(),
-        stage: PromotionStage::Promoted,
-    };
-    active.activate(&predecessor).unwrap();
+    // The predecessor v4 was itself activated by its own prior human promotion —
+    // its receipt comes from a real approval, not a hand-built struct.
+    let predecessor_record =
+        promote_to_receipt(ArtifactVersion::new(ArtifactKind::Skill, "rust-ci", 4));
+    active.activate(&predecessor_record).unwrap();
     active.activate(&record).unwrap();
     assert_eq!(active.active("skill/rust-ci"), Some(5));
 
