@@ -118,7 +118,7 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
     let mut candidate = Candidate::draft(artifact.clone(), &grader_agent());
     let regressed = suite.evaluate(&obs).regressed();
     candidate.run_regression(regressed).unwrap();
-    assert_eq!(candidate.stage, PromotionStage::RegressionPassed);
+    assert_eq!(candidate.stage(), PromotionStage::RegressionPassed);
     candidate.start_shadow().unwrap();
     candidate.start_canary().unwrap();
     assert_eq!(
@@ -134,7 +134,7 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
         Err(PromotionError::RequiresHumanApproval { .. })
     ));
     assert_eq!(
-        candidate.stage,
+        candidate.stage(),
         PromotionStage::ComparisonReady,
         "still not promoted"
     );
@@ -144,7 +144,7 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
     //    the human-approved record `approve` returned (the record's fields are
     //    private and it does not deserialize, so it can't be forged).
     let record = candidate.approve(&human()).unwrap();
-    assert_eq!(candidate.stage, PromotionStage::Promoted);
+    assert_eq!(candidate.stage(), PromotionStage::Promoted);
     assert_eq!(record.actor_kind(), "human");
     assert_eq!(record.artifact().to_string(), "skill/rust-ci/5");
 
@@ -190,7 +190,7 @@ fn a_candidate_that_reintroduces_the_failure_is_rejected_before_promotion() {
     );
     let err = candidate.run_regression(report.regressed()).unwrap_err();
     assert_eq!(err, PromotionError::RegressedOffline);
-    assert_eq!(candidate.stage, PromotionStage::Rejected);
+    assert_eq!(candidate.stage(), PromotionStage::Rejected);
     // No human — and no code path — can promote a rejected candidate.
     assert!(candidate.approve(&human()).is_err());
 }
@@ -211,7 +211,7 @@ fn a_canary_regression_auto_rolls_back_a_human_approved_pipeline() {
         candidate.observe_canary(true).unwrap(),
         CanaryOutcome::AutoRolledBack
     );
-    assert_eq!(candidate.stage, PromotionStage::RolledBack);
+    assert_eq!(candidate.stage(), PromotionStage::RolledBack);
     // It cannot then be approved — it never reached the decision point.
     assert!(candidate.approve(&human()).is_err());
 }
