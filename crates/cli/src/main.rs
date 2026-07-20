@@ -26,6 +26,13 @@
 //! ```text
 //! codypendent workflow validate path/to/workflow.yaml
 //! ```
+//!
+//! Phase 6 STEP 6.1 adds plugin inspection and permission-diffing:
+//!
+//! ```text
+//! codypendent plugin inspect path/to/plugin.toml
+//! codypendent plugin diff installed.toml update.toml
+//! ```
 
 use std::path::PathBuf;
 
@@ -94,6 +101,11 @@ enum TopCommand {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Inspect plugin manifests and their permissions (Phase 6).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
     /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
     /// `agent_servers` config points at this; it is not meant to be run by hand.
@@ -166,6 +178,27 @@ enum WorkflowCommand {
         /// Emit the compiled graph as JSON instead of a human tree.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Parse a `plugin.toml` and render its identity, the capability list it
+    /// requests, its resource caps, and its trust posture (signed? sandbox
+    /// profile) — the "evaluate permissions" step a user sees before enabling a
+    /// plugin (Phase 6 STEP 6.1). Manifest parsing only; it does not run anything.
+    Inspect {
+        /// Path to the plugin manifest to inspect.
+        file: PathBuf,
+    },
+    /// Compare an installed `plugin.toml` against an update and print the
+    /// permission diff, reporting whether the update expands permissions and so
+    /// requires re-approval (Phase 6 STEP 6.1, exit criterion 2).
+    Diff {
+        /// The currently-installed manifest.
+        installed: PathBuf,
+        /// The candidate update manifest.
+        update: PathBuf,
     },
 }
 
@@ -262,6 +295,10 @@ async fn main() -> anyhow::Result<()> {
                 commands::workflow_validate(&file, agents.as_deref())
             }
             WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
+        },
+        TopCommand::Plugin { command } => match command {
+            PluginCommand::Inspect { file } => commands::plugin_inspect(&file),
+            PluginCommand::Diff { installed, update } => commands::plugin_diff(&installed, &update),
         },
         TopCommand::Acp { repo } => {
             let repo = match repo {

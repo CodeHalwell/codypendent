@@ -47,6 +47,31 @@ pub enum DataClassification {
     Unknown,
 }
 
+impl DataClassification {
+    /// A restrictiveness rank, least (0) to most. `Unknown` ranks above `Secret`
+    /// so an unrecognized (newer) classification is treated as at least as
+    /// restrictive as the strictest one this build knows. Use this to compare two
+    /// classifications for gating checks (routing, export, off-device transfer).
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            DataClassification::Public => 0,
+            DataClassification::Internal => 1,
+            DataClassification::Confidential => 2,
+            DataClassification::Secret => 3,
+            DataClassification::Unknown => 4,
+        }
+    }
+
+    /// Whether data at this classification may leave the device given a policy
+    /// that permits everything up to and including `max_off_device`. More
+    /// restrictive data than the policy allows stays local.
+    #[must_use]
+    pub fn allowed_off_device(self, max_off_device: DataClassification) -> bool {
+        self.rank() <= max_off_device.rank()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

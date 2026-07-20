@@ -1,0 +1,43 @@
+# An example Codypendent plugin manifest (Phase 6). A minimal WASM-component
+# plugin that counts words in a granted file — the "preferred runtime for new
+# Codypendent-native plugins" (Chapter 05). It requests exactly one capability
+# (read access to the workspace), so `codypendent plugin inspect` shows a small,
+# legible permission surface.
+#
+#   codypendent plugin inspect examples/plugins/word-count/plugin.toml
+#
+schema_version = 1
+id = "word-count"
+name = "Word Count"
+version = "0.1.0"
+kind = "wasm-component"
+publisher = "codypendent-project"
+
+scopes = ["repository"]
+
+[runtime]
+command = "word_count.wasm"
+protocol = "codypendent-plugin"
+working_directory = "isolated"
+
+[capabilities]
+filesystem_read = ["${WORKSPACE}"]
+filesystem_write = []
+network = []
+secrets = []
+subprocess = false
+
+[resources]
+memory_mb = 32
+cpu_seconds = 5
+wall_seconds = 10
+maximum_output_mb = 1
+
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+sandbox_profile = "compute-only"
+
+[update]
+channel = "stable"
+permission_change_requires_approval = true

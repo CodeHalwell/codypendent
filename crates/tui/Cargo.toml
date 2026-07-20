@@ -14,6 +14,11 @@ crossterm = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Theme packs (Phase 6, STEP 6.6) are data-only TOML manifests. Parsing them
+# here keeps themes in one crate; the loader rejects any manifest that declares
+# an execution capability (README: theme plugins get no execution permissions).
+toml = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

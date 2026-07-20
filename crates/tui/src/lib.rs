@@ -34,6 +34,7 @@ pub mod render;
 pub mod state;
 pub mod terminal;
 pub mod theme;
+pub mod theme_pack;
 
 pub use action::{Action, Intent};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
@@ -45,4 +46,5 @@ pub use state::{
     SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard,
 };
 pub use terminal::TerminalGuard;
-pub use theme::Theme;
+pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};
+pub use theme_pack::{load_theme_pack, ThemePackError, ThemePackManifest};
