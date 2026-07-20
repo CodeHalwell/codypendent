@@ -81,6 +81,16 @@ pub fn checksum_of(artifact: &[u8]) -> String {
 /// which is sorted and deduplicated, and the checksum is lower-cased — so the
 /// signer and verifier always agree regardless of declaration order or hex
 /// casing. This is the signing contract a packaging tool implements.
+///
+/// The leading `codypendent-plugin-signature-v1` line is a domain-separation tag
+/// that **versions the signature scheme**: a signature only verifies against the
+/// scheme it was produced under, and a future scheme change bumps the tag so the
+/// two never collide. This crate deliberately accepts **only** the current scheme
+/// — there is no fallback to verifying a bare-checksum signature. Accepting that
+/// weaker form would reopen exactly the capability/command-swap replay this digest
+/// closes, so it is refused by design rather than kept for backward compatibility
+/// (no signed plugins ship against an older contract — signed packaging targets
+/// this digest from the outset).
 #[must_use]
 pub fn signing_digest(manifest: &PluginManifest) -> [u8; 32] {
     let mut payload = String::new();

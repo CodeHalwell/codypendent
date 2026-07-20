@@ -350,7 +350,11 @@ are the remaining wiring.
       new `codypendent-sandbox` crate (the manual's "crate justified by a
       security boundary"). It parses `plugin.toml` (the `docs/specs/plugin.toml`
       shape) with `deny_unknown_fields`; verifies the artifact by sha256 checksum
-      and an ed25519 publisher signature over that checksum, under a
+      and an ed25519 publisher signature over a canonical
+      `codypendent-plugin-signature-v1` digest that binds the checksum together
+      with the security-relevant manifest fields (id/version/kind/runtime/
+      capabilities) — so a valid signature can't be replayed against altered
+      permissions or a swapped command — under a
       default-**deny** unsigned policy; models capabilities as a comparable
       `CapabilitySet` and computes the **permission diff** that blocks a
       capability-expanding update until re-approved while auto-applying an
