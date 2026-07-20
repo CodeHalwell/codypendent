@@ -84,8 +84,12 @@ impl BlackboardKind {
         )
     }
 
-    fn parse(s: &str) -> Result<Self, BlackboardError> {
-        Ok(match s {
+    /// Parse a manifest-facing kind string (the inverse of
+    /// [`as_str`](Self::as_str)); `None` for an unknown kind. The workflow
+    /// compiler validates declared step `outputs` against this.
+    #[must_use]
+    pub fn parse_kind(s: &str) -> Option<Self> {
+        Some(match s {
             "finding" => BlackboardKind::Finding,
             "hypothesis" => BlackboardKind::Hypothesis,
             "decision" => BlackboardKind::Decision,
@@ -94,8 +98,12 @@ impl BlackboardKind {
             "test_result" => BlackboardKind::TestResult,
             "document_draft" => BlackboardKind::DocumentDraft,
             "open_question" => BlackboardKind::OpenQuestion,
-            other => return Err(BlackboardError::NotFound(format!("kind {other}"))),
+            _ => return None,
         })
+    }
+
+    fn parse(s: &str) -> Result<Self, BlackboardError> {
+        Self::parse_kind(s).ok_or_else(|| BlackboardError::NotFound(format!("kind {s}")))
     }
 }
 

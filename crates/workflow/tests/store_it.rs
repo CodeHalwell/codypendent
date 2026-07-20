@@ -372,6 +372,22 @@ async fn a_failed_dependency_blocks_the_dependent() {
             .is_empty(),
         "d must stay blocked while its dependency b is failed"
     );
+
+    // `resume` must agree with the frontier: `d` is non-terminal but stranded
+    // behind failed `b`, so it is NOT the next node — the run has no
+    // schedulable work, and the blocked set names the stranded node with its
+    // blocker. (The old behavior reported `d` as `next_node`, so a recovery
+    // loop composing list_incomplete_runs + resume livelocked here.)
+    let plan = store.resume(&pool, &id, &compiled).await.unwrap();
+    assert_eq!(
+        plan.next_node, None,
+        "a node stranded behind a failure is not resumable"
+    );
+    assert_eq!(
+        plan.blocked_nodes,
+        vec![("d".to_string(), "b".to_string())],
+        "the stranded node and its blocking ancestor are reported"
+    );
 }
 
 #[tokio::test]

@@ -35,7 +35,7 @@ steps:
     workspace:
       mode: isolated-worktree
     approval: before-write
-    outputs: [patch]
+    outputs: [proposed_patch]
 
   - id: verify
     depends_on: [patch]
@@ -43,14 +43,14 @@ steps:
     retry:
       attempts: 2
       backoff_seconds: 5
-    outputs: [test-result]
+    outputs: [test_result]
 
   - id: review
     depends_on: [verify]
     agent:
       role: reviewer
       model_policy: review
-    outputs: [review]
+    outputs: [decision]
 
   - id: publish
     depends_on: [review]

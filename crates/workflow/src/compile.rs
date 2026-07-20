@@ -43,6 +43,15 @@ pub enum CompileError {
     /// The workflow has no steps.
     #[error("workflow has no steps")]
     NoSteps,
+    /// A step declares an output that is not a blackboard artifact kind.
+    /// Outputs are the typed channel agents share (STEP 5.3); an unknown kind
+    /// would declare an artifact nothing can ever post.
+    #[error(
+        "step `{step}` declares output `{output}`, which is not a blackboard \
+         artifact kind (finding, hypothesis, decision, code_location, \
+         proposed_patch, test_result, document_draft, open_question)"
+    )]
+    UnknownOutputKind { step: String, output: String },
     /// A step's id is empty.
     #[error("a step has an empty id")]
     EmptyStepId,
@@ -371,6 +380,17 @@ pub fn compile(definition: &WorkflowDefinition) -> Result<CompiledWorkflow, Comp
         if step.skill.is_some() && step.agent.is_none() {
             return Err(CompileError::SkillWithoutAgent(step.id.clone()));
         }
+        // Declared outputs are blackboard artifact kinds — validate them here
+        // so a typo (`test-result` for `test_result`) fails at compile time
+        // instead of declaring an artifact nothing can ever post.
+        for output in &step.outputs {
+            if crate::blackboard::BlackboardKind::parse_kind(output).is_none() {
+                return Err(CompileError::UnknownOutputKind {
+                    step: step.id.clone(),
+                    output: output.clone(),
+                });
+            }
+        }
     }
 
     // Dependencies resolve, no self-loops. Deduplicate within a step so a repeated
@@ -624,6 +644,28 @@ mod tests {
         assert_eq!(compiled.node("a").unwrap().dependents, vec!["b"]);
         assert_eq!(compiled.node("c").unwrap().depends_on, vec!["b"]);
         assert_eq!(compiled.node("c").unwrap().topo_order, 2);
+    }
+
+    #[test]
+    fn rejects_an_unknown_output_kind() {
+        // `test-result` is the classic typo for `test_result`: outputs declare
+        // blackboard artifact kinds, and an unknown kind names an artifact
+        // nothing can ever post.
+        let mut step = tool_step("verify", &[]);
+        step.outputs = vec!["test-result".to_owned()];
+        let err = compile(&definition(vec![step])).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CompileError::UnknownOutputKind { step, output }
+                    if step == "verify" && output == "test-result"
+            ),
+            "expected UnknownOutputKind, got {err:?}"
+        );
+
+        let mut valid = tool_step("verify", &[]);
+        valid.outputs = vec!["test_result".to_owned(), "finding".to_owned()];
+        compile(&definition(vec![valid])).expect("valid blackboard kinds compile");
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! [`crate::db`]) — so its recovery and idempotency semantics are testable
 //! without the daemon; the daemon wires it into workflow startup recovery.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -171,9 +171,16 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumePlan {
     pub snapshot: WorkflowRunSnapshot,
-    /// The first non-terminal node in topological order, or `None` when the run
-    /// has no work left.
+    /// The first *resumable* non-terminal node in topological order — one with
+    /// no `Failed`/`Skipped` ancestor — or `None` when the run has no
+    /// schedulable work left. A run with `next_node: None` but a non-empty
+    /// [`blocked_nodes`](Self::blocked_nodes) is finished-in-failure, not
+    /// resumable: a recovery loop must not spin on it (it needs
+    /// `retry_from_node` on the failed ancestor, or a terminal disposition).
     pub next_node: Option<String>,
+    /// Non-terminal nodes that can never become ready under this snapshot,
+    /// paired with the terminal-but-not-completed ancestor blocking each.
+    pub blocked_nodes: Vec<(String, String)>,
     pub latest_checkpoint: Option<Checkpoint>,
 }
 
@@ -472,7 +479,9 @@ impl WorkflowStore {
 
     /// Prepare to resume a run against a freshly compiled workflow. **Refuses a
     /// changed graph signature** (STEP 5.2); otherwise returns the snapshot, the
-    /// first incomplete node to continue from, and the latest checkpoint.
+    /// first *resumable* incomplete node to continue from (never one stranded
+    /// behind a `Failed`/`Skipped` ancestor — see [`ResumePlan::next_node`]),
+    /// the permanently blocked set, and the latest checkpoint.
     pub async fn resume(
         &self,
         pool: &SqlitePool,
@@ -490,15 +499,18 @@ impl WorkflowStore {
                 found: current,
             });
         }
+        let blocked_nodes = blocked_node_ids(compiled, &snapshot);
+        let blocked: HashSet<&str> = blocked_nodes.iter().map(|(id, _)| id.as_str()).collect();
         let next_node = snapshot
             .nodes
             .iter()
-            .find(|node| !node.state.is_terminal())
+            .find(|node| !node.state.is_terminal() && !blocked.contains(node.node_id.as_str()))
             .map(|node| node.node_id.clone());
         let latest_checkpoint = self.latest_checkpoint(pool, workflow_run_id).await?;
         Ok(ResumePlan {
             snapshot,
             next_node,
+            blocked_nodes,
             latest_checkpoint,
         })
     }
@@ -609,4 +621,57 @@ pub fn ready_node_ids(compiled: &CompiledWorkflow, snapshot: &WorkflowRunSnapsho
         })
         .map(|node| node.id.clone())
         .collect()
+}
+
+/// The non-terminal nodes that can never become ready under `snapshot`: a
+/// dependency — direct or transitive — ended `Failed` or `Skipped` (terminal
+/// but not `Completed`), so [`ready_node_ids`] will never surface them. Each is
+/// paired with its blocking ancestor. Pure, like [`ready_node_ids`], and the
+/// half [`WorkflowStore::resume`] uses to keep `next_node` honest: without it,
+/// a recovery loop composing `list_incomplete_runs` + `resume` livelocked on a
+/// run whose first incomplete node was stranded behind a failure.
+#[must_use]
+pub fn blocked_node_ids(
+    compiled: &CompiledWorkflow,
+    snapshot: &WorkflowRunSnapshot,
+) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+    let states: HashMap<&str, NodeState> = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node.state))
+        .collect();
+    // Propagate blockers in topological order: a node is blocked by a
+    // dependency that itself ended Failed/Skipped, or by whatever blocks a
+    // dependency. `compiled.nodes` are topologically ordered, so each
+    // dependency's entry is settled before its dependents are visited.
+    let mut blocker_of: HashMap<&str, &str> = HashMap::new();
+    let mut blocked = Vec::new();
+    for node in &compiled.nodes {
+        let mut blocker: Option<&str> = None;
+        for dep in &node.depends_on {
+            match states.get(dep.as_str()) {
+                Some(NodeState::Failed) | Some(NodeState::Skipped) => {
+                    blocker = Some(dep.as_str());
+                    break;
+                }
+                _ => {}
+            }
+            if let Some(upstream) = blocker_of.get(dep.as_str()) {
+                blocker = Some(upstream);
+                break;
+            }
+        }
+        if let Some(blocking) = blocker {
+            blocker_of.insert(node.id.as_str(), blocking);
+            let live = states
+                .get(node.id.as_str())
+                .map(|state| !state.is_terminal())
+                .unwrap_or(false);
+            if live {
+                blocked.push((node.id.clone(), blocking.to_owned()));
+            }
+        }
+    }
+    blocked
 }
