@@ -156,11 +156,19 @@ pub trait GitHubApi: Send + Sync {
         req: &model::UpdatePullRequest,
     ) -> Result<model::PullRequest, GitHubError>;
 
-    /// Create a check-run summary against a commit SHA.
+    /// Create a check-run summary against a commit SHA, idempotently: if a
+    /// check run on `req.head_sha` already carries `idempotency_key` as its
+    /// `external_id`, that existing run is returned and no new one is created.
+    ///
+    /// Personal-mode caveat: the check-runs API requires a GitHub App
+    /// installation token — a personal `gh auth token`/PAT is refused with
+    /// `403`, which surfaces as a structured [`GitHubError::Api`] (App-mode
+    /// credentials are Phase 6+ work).
     async fn create_check_run_summary(
         &self,
         repo: &RepoId,
         req: &model::NewCheckRun,
+        idempotency_key: &str,
     ) -> Result<model::CheckRun, GitHubError>;
 }
 

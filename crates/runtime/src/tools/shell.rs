@@ -202,8 +202,21 @@ impl Shell {
         };
         let duration = started.elapsed();
 
-        let (stdout_bytes, stdout_overflow) = join_drain(out_task).await?;
-        let (stderr_bytes, stderr_overflow) = join_drain(err_task).await?;
+        // After a group kill the pipes normally reach EOF at once — but a
+        // grandchild that escaped the kill (e.g. `kill` binary missing, or a
+        // re-parented process) can hold the write end open indefinitely. Bound
+        // the drain so `execute` always returns; whatever was captured so far
+        // is kept and the stream is flagged as overflowed.
+        let (stdout_bytes, stdout_overflow) = if timed_out {
+            join_drain_bounded(out_task).await?
+        } else {
+            join_drain(out_task).await?
+        };
+        let (stderr_bytes, stderr_overflow) = if timed_out {
+            join_drain_bounded(err_task).await?
+        } else {
+            join_drain(err_task).await?
+        };
 
         // Spill full output and build the salient view referencing it.
         let stdout_ref = spill(sink, "text/plain", run_id, &stdout_bytes).await?;
@@ -231,9 +244,11 @@ impl Shell {
 
 /// Whether a model-supplied environment variable name can hijack what the
 /// command actually executes: shared-library interposers (`LD_*`/`DYLD_*`),
-/// compiler/tool wrappers (`*_WRAPPER`), git's external-program hooks, shell
-/// startup files, and `PATH` (which redirects the child's own subprocess
-/// lookups even though the top-level program is resolved on the daemon's PATH).
+/// compiler/tool wrappers (`*_WRAPPER`), git's external-program hooks and
+/// injected config (`GIT_CONFIG*`), interpreter startup/option injection
+/// (`NODE_OPTIONS`, `PYTHON*`, `PERL5*`, `RUBYOPT`), shell startup files and
+/// `CDPATH`, and `PATH` (which redirects the child's own subprocess lookups
+/// even though the top-level program is resolved on the daemon's PATH).
 fn is_denied_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
@@ -246,8 +261,17 @@ fn is_denied_env(name: &str) -> bool {
             | "BASH_ENV"
             | "ENV"
             | "SHELLOPTS"
+            | "CDPATH"
+            | "NODE_OPTIONS"
+            | "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "PYTHONHOME"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "RUBYOPT"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
+        || upper.starts_with("GIT_CONFIG")
         || upper.ends_with("_WRAPPER")
 }
 
@@ -316,6 +340,28 @@ async fn join_drain(
         Err(join) => Err(ToolError::Other(anyhow::anyhow!(
             "output reader task failed: {join}"
         ))),
+    }
+}
+
+/// Grace period a drain task gets after the child was killed before it is
+/// abandoned (an escaped grandchild can hold the pipe open forever).
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Like [`join_drain`], but bounded: used after a timeout kill, where the pipe
+/// may never reach EOF. On expiry the reader task is aborted and the stream is
+/// reported as empty-and-overflowed rather than wedging the whole tool call.
+async fn join_drain_bounded(
+    mut task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) -> Result<(Vec<u8>, bool), ToolError> {
+    match tokio::time::timeout(DRAIN_GRACE, &mut task).await {
+        Ok(Ok(result)) => result.map_err(ToolError::Io),
+        Ok(Err(join)) => Err(ToolError::Other(anyhow::anyhow!(
+            "output reader task failed: {join}"
+        ))),
+        Err(_elapsed) => {
+            task.abort();
+            Ok((Vec::new(), true))
+        }
     }
 }
 

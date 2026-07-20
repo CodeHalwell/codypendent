@@ -72,11 +72,23 @@ impl RestGitHubClient {
         })
     }
 
-    /// Start a request with the fixed personal-mode headers set.
+    /// Start a request with the fixed personal-mode headers set. The
+    /// `Authorization` value is marked sensitive so any future debug rendering
+    /// of the request (reqwest redacts sensitive headers) cannot print the
+    /// bearer token.
     fn request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
-        self.http
-            .request(method, url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token.expose()))
+        let builder = self.http.request(method, url);
+        let raw = format!("Bearer {}", self.token.expose());
+        let builder = match HeaderValue::from_str(&raw) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                builder.header(AUTHORIZATION, value)
+            }
+            // An invalid header value (impossible for a real token) keeps the
+            // old behavior: the builder records the error and the send fails.
+            Err(_) => builder.header(AUTHORIZATION, raw),
+        };
+        builder
             .header(ACCEPT, ACCEPT_VALUE)
             .header(API_VERSION_HEADER, API_VERSION_VALUE)
     }
@@ -134,7 +146,7 @@ impl RestGitHubClient {
             Ok(response)
         } else {
             let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
+            let message = read_error_snippet(response).await;
             Err(GitHubError::Api { status, message })
         }
     }
@@ -171,7 +183,7 @@ impl RestGitHubClient {
             let page: Vec<T> = serde_json::from_slice(&bytes)?;
             items.extend(page);
             match next {
-                Some(next_url) if next_url.starts_with(&self.base_url) => url = next_url,
+                Some(next_url) if same_origin(&next_url, &self.base_url) => url = next_url,
                 _ => break,
             }
         }
@@ -192,6 +204,34 @@ impl RestGitHubClient {
     }
 }
 
+/// Ceiling on an error-body diagnostic snippet. Error bodies are
+/// server-controlled text that flows into diagnostics (and, via tool
+/// observations, into the model transcript) — an unbounded `text()` here would
+/// be both an OOM surface and an oversized injection channel.
+const MAX_ERROR_SNIPPET_BYTES: usize = 64 * 1024;
+
+/// Read at most [`MAX_ERROR_SNIPPET_BYTES`] of a non-2xx body for diagnostics,
+/// truncating (with a marker) rather than erroring — the status code is the
+/// signal; the body is best-effort context.
+async fn read_error_snippet(mut response: reqwest::Response) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_SNIPPET_BYTES - bytes.len();
+        if chunk.len() > room {
+            bytes.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut message = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        message.push_str("… [truncated]");
+    }
+    message
+}
+
 /// Read a response body up to `cap` bytes, erroring (never truncating silently)
 /// past it — a response that big is wrong, and an unbounded read is an OOM.
 async fn read_bounded(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, GitHubError> {
@@ -206,6 +246,20 @@ async fn read_bounded(mut response: reqwest::Response, cap: usize) -> Result<Vec
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Whether `next_url` stays on `base_url`'s origin. A plain prefix test is not
+/// enough: `https://api.github.com.evil.com/…` starts with
+/// `https://api.github.com` but is a different host, and the follow-up request
+/// would carry the bearer token there. The base never ends in `/`
+/// (constructor-trimmed), so a same-origin URL continues with `/`, `?`, or
+/// nothing — anything else (a host character like `.` or `:`) is a different
+/// origin.
+fn same_origin(next_url: &str, base_url: &str) -> bool {
+    match next_url.strip_prefix(base_url) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with('?'),
+        None => false,
+    }
 }
 
 /// The `rel="next"` target of a `Link` header, if present.
@@ -420,12 +474,24 @@ impl GitHubApi for RestGitHubClient {
         &self,
         repo: &RepoId,
         req: &model::NewCheckRun,
+        idempotency_key: &str,
     ) -> Result<model::CheckRun, GitHubError> {
         validate_repo(repo)?;
+        // Idempotency: check runs have no free-text body to mark, so the key
+        // rides in `external_id`, which GitHub stores verbatim and serves back.
+        // A prior run on this commit carrying the key proves the create
+        // happened — return it rather than duplicating.
+        for run in self.list_check_runs(repo, &req.head_sha).await? {
+            if run.external_id.as_deref() == Some(idempotency_key) {
+                return Ok(run);
+            }
+        }
+        let mut payload = req.clone();
+        payload.external_id = Some(idempotency_key.to_string());
         self.send_json(
             Method::POST,
             &format!("/repos/{}/{}/check-runs", repo.owner, repo.repo),
-            req,
+            &payload,
         )
         .await
     }

@@ -73,6 +73,11 @@ pub struct CheckRun {
     /// The conclusion (`success`, `failure`, ...), present once completed.
     #[serde(default)]
     pub conclusion: Option<String>,
+    /// The creator-supplied replay-safety marker, if one was set (see
+    /// [`NewCheckRun::external_id`]). GitHub serves `""` for runs created
+    /// without one.
+    #[serde(default)]
+    pub external_id: Option<String>,
 }
 
 /// The author of a comment.
@@ -154,15 +159,59 @@ pub struct UpdatePullRequest {
 }
 
 /// The request body for creating a check-run summary against a commit.
-#[derive(Debug, Clone, Serialize)]
+///
+/// The caller-facing shape is flat, but the wire shape is not: GitHub's
+/// create-check-run endpoint takes the human-readable text nested under
+/// `output` (with a mandatory `title`) and *silently ignores* unknown
+/// top-level fields — a flat `summary` would be dropped without error. The
+/// manual [`Serialize`] impl below emits the nested wire shape.
+#[derive(Debug, Clone)]
 pub struct NewCheckRun {
-    /// The check-run name.
+    /// The check-run name (also used as the `output.title`).
     pub name: String,
     /// The commit SHA the check run reports on.
     pub head_sha: String,
-    /// A short human-readable summary.
+    /// A short human-readable summary (sent as `output.summary`).
     pub summary: String,
     /// The conclusion (`success`, `failure`, ...), if the run is complete.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// GitHub infers `status: completed` when a conclusion is present.
     pub conclusion: Option<String>,
+    /// The replay-safety marker: stored by GitHub verbatim and read back when
+    /// scanning for a prior create with the same key (the check-run analogue
+    /// of the hidden body marker — check runs have no free-text body to mark).
+    pub external_id: Option<String>,
+}
+
+impl Serialize for NewCheckRun {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        #[derive(Serialize)]
+        struct Output<'a> {
+            title: &'a str,
+            summary: &'a str,
+        }
+        let mut fields = 3;
+        fields += usize::from(self.conclusion.is_some());
+        fields += usize::from(self.external_id.is_some());
+        let mut state = serializer.serialize_struct("NewCheckRun", fields)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("head_sha", &self.head_sha)?;
+        if let Some(conclusion) = &self.conclusion {
+            state.serialize_field("conclusion", conclusion)?;
+        }
+        if let Some(external_id) = &self.external_id {
+            state.serialize_field("external_id", external_id)?;
+        }
+        state.serialize_field(
+            "output",
+            &Output {
+                title: &self.name,
+                summary: &self.summary,
+            },
+        )?;
+        state.end()
+    }
 }

@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use codypendent_daemon::policy::{PathScope, ScopeVerdict};
 use codypendent_protocol::ProposedAction;
@@ -13,6 +14,12 @@ use super::{CapabilityKind, ToolError};
 
 /// Maximum matches returned; beyond this the search stops and flags truncation.
 const MATCH_CAP: usize = 200;
+
+/// Wall-clock bound on one search. A pathological regex can drive ripgrep into
+/// effectively unbounded backtracking-like blowup; without a bound the run's
+/// cancellation is blind while the tool executes, so a hung search would wedge
+/// the run indefinitely.
+const SEARCH_TIMEOUT_SECS: u64 = 120;
 
 /// Typed input for [`Search::execute`].
 #[derive(Debug, Clone)]
@@ -115,36 +122,52 @@ impl Search {
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("rg stdout unavailable")))?;
         let mut reader = BufReader::new(stdout).lines();
 
-        let mut matches = Vec::new();
-        let mut truncated = false;
-        while let Some(line) = reader.next_line().await? {
-            let Ok(event) = serde_json::from_str::<RgEvent>(&line) else {
-                continue;
-            };
-            if event.kind != "match" {
-                continue;
+        let collect = async {
+            let mut matches = Vec::new();
+            let mut truncated = false;
+            while let Some(line) = reader.next_line().await? {
+                let Ok(event) = serde_json::from_str::<RgEvent>(&line) else {
+                    continue;
+                };
+                if event.kind != "match" {
+                    continue;
+                }
+                let Some(data) = event.data else { continue };
+                let (Some(path), Some(line_number), Some(text)) =
+                    (data.path, data.line_number, data.lines)
+                else {
+                    continue;
+                };
+                let path = PathBuf::from(path.text);
+                // Defensive scope confinement even though rg was pointed at roots.
+                if !matches!(scope.classify(&path), ScopeVerdict::Allowed) {
+                    continue;
+                }
+                matches.push(SearchMatch {
+                    path,
+                    line_number,
+                    line: text.text.trim_end_matches(['\n', '\r']).to_string(),
+                });
+                if matches.len() >= MATCH_CAP {
+                    truncated = true;
+                    break;
+                }
             }
-            let Some(data) = event.data else { continue };
-            let (Some(path), Some(line_number), Some(text)) =
-                (data.path, data.line_number, data.lines)
-            else {
-                continue;
-            };
-            let path = PathBuf::from(path.text);
-            // Defensive scope confinement even though rg was pointed at roots.
-            if !matches!(scope.classify(&path), ScopeVerdict::Allowed) {
-                continue;
+            Ok::<_, ToolError>((matches, truncated))
+        };
+
+        let bound = Duration::from_secs(SEARCH_TIMEOUT_SECS);
+        let (matches, truncated) = match tokio::time::timeout(bound, collect).await {
+            Ok(collected) => collected?,
+            Err(_elapsed) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(ToolError::TimedOut {
+                    tool: Self::NAME,
+                    seconds: SEARCH_TIMEOUT_SECS,
+                });
             }
-            matches.push(SearchMatch {
-                path,
-                line_number,
-                line: text.text.trim_end_matches(['\n', '\r']).to_string(),
-            });
-            if matches.len() >= MATCH_CAP {
-                truncated = true;
-                break;
-            }
-        }
+        };
 
         // Stop ripgrep early if we hit the cap, then reap.
         let _ = child.start_kill();

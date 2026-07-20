@@ -181,26 +181,48 @@ async fn shell_run_rejects_execution_hijacking_env() {
     let sink = store_sink!(store, pool);
 
     let cwd = std::fs::canonicalize(dir.path()).unwrap();
-    // A benign-looking `env` run that smuggles a compiler wrapper: refused before
-    // any process spawns, so a re-used/auto-granted approval can't be bypassed by
-    // an unshown, execution-hijacking environment binding.
-    let request = CommandRequest {
-        program: "env".into(),
-        args: vec![],
-        cwd,
-        environment: vec![EnvironmentBinding::new("RUSTC_WRAPPER", "/tmp/evil")],
-        timeout: Duration::from_secs(10),
-    };
-    let err = Shell::execute(
-        &request,
-        &canon_scope(dir.path()),
-        &cmd_scope(&["env"]),
-        &sink,
-        RunId::new(),
-    )
-    .await
-    .expect_err("a denied environment binding must refuse the run");
-    assert_eq!(err.code(), "tool.environment-not-allowlisted");
+    // A benign-looking `env` run that smuggles an execution hijack: refused
+    // before any process spawns, so a re-used/auto-granted approval can't be
+    // bypassed by an unshown binding. One representative per denied family:
+    // compiler wrappers, loader interposition, interpreter option/startup
+    // injection (node/python/perl/ruby), git config injection, and CDPATH.
+    for (name, value) in [
+        ("RUSTC_WRAPPER", "/tmp/evil"),
+        ("LD_PRELOAD", "/tmp/evil.so"),
+        ("NODE_OPTIONS", "--require /tmp/evil.js"),
+        ("PYTHONPATH", "/tmp/evil"),
+        ("PYTHONSTARTUP", "/tmp/evil.py"),
+        ("PERL5OPT", "-M/tmp/evil"),
+        ("RUBYOPT", "-r/tmp/evil"),
+        ("GIT_CONFIG_GLOBAL", "/tmp/evil.gitconfig"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("CDPATH", "/tmp"),
+    ] {
+        let request = CommandRequest {
+            program: "env".into(),
+            args: vec![],
+            cwd: cwd.clone(),
+            environment: vec![EnvironmentBinding::new(name, value)],
+            timeout: Duration::from_secs(10),
+        };
+        let err = match Shell::execute(
+            &request,
+            &canon_scope(dir.path()),
+            &cmd_scope(&["env"]),
+            &sink,
+            RunId::new(),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("binding `{name}` must refuse the run"),
+        };
+        assert_eq!(
+            err.code(),
+            "tool.environment-not-allowlisted",
+            "binding `{name}` refused for the wrong reason"
+        );
+    }
 }
 
 #[tokio::test]

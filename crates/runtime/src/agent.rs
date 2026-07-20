@@ -1232,7 +1232,10 @@ impl FrameworkAgentRuntime {
             PreparedTool::GitHubCheckSummary { repo, input } => match self.github.as_ref() {
                 None => github_unconfigured(),
                 Some(client) => {
-                    match client.create_check_run_summary(&repo, &input.request).await {
+                    match client
+                        .create_check_run_summary(&repo, &input.request, &input.idempotency_key)
+                        .await
+                    {
                         Ok(check) => (
                             format!(
                                 "posted check-run summary `{}` [{}]",
