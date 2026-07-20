@@ -360,13 +360,29 @@ impl GitHubApi for RestGitHubClient {
     ) -> Result<Vec<model::CheckRun>, GitHubError> {
         validate_repo(repo)?;
         validate_git_ref(git_ref)?;
-        let wrapper: CheckRunsResponse = self
-            .get_json(&format!(
-                "/repos/{}/{}/commits/{git_ref}/check-runs",
-                repo.owner, repo.repo
-            ))
-            .await?;
-        Ok(wrapper.check_runs)
+        // Paginated like the PR/comment lists — and for the same reason: the
+        // check-run idempotency scan matches `external_id` against this list,
+        // and GitHub's default page is 30. A busy commit with more check runs
+        // than one page would hide the marker and let a retry duplicate the
+        // create. The endpoint wraps its array (`{total_count, check_runs}`),
+        // so it cannot ride `get_json_paginated`'s bare-array decode.
+        let mut url = format!(
+            "{}/repos/{}/{}/commits/{git_ref}/check-runs?per_page=100",
+            self.base_url, repo.owner, repo.repo
+        );
+        let mut runs: Vec<model::CheckRun> = Vec::new();
+        for _ in 0..MAX_LIST_PAGES {
+            let response = self.send(self.request(Method::GET, &url)).await?;
+            let next = next_page_link(response.headers());
+            let bytes = read_bounded(response, MAX_JSON_BODY_BYTES).await?;
+            let page: CheckRunsResponse = serde_json::from_slice(&bytes)?;
+            runs.extend(page.check_runs);
+            match next {
+                Some(next_url) if same_origin(&next_url, &self.base_url) => url = next_url,
+                _ => break,
+            }
+        }
+        Ok(runs)
     }
 
     async fn download_job_logs(&self, repo: &RepoId, job_id: u64) -> Result<Vec<u8>, GitHubError> {

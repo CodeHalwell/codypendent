@@ -205,8 +205,9 @@ impl Shell {
         // After a group kill the pipes normally reach EOF at once — but a
         // grandchild that escaped the kill (e.g. `kill` binary missing, or a
         // re-parented process) can hold the write end open indefinitely. Bound
-        // the drain so `execute` always returns; whatever was captured so far
-        // is kept and the stream is flagged as overflowed.
+        // the drain so `execute` always returns; on that (double-failure) edge
+        // the partial capture is abandoned — the stream comes back empty and
+        // flagged overflowed, never a silent hang.
         let (stdout_bytes, stdout_overflow) = if timed_out {
             join_drain_bounded(out_task).await?
         } else {

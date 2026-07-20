@@ -243,14 +243,13 @@ impl WorktreeManager {
         // orphaned) blocks re-allocation twice over: its row trips the
         // UNIQUE(worktree_path) index, and its surviving branch makes
         // `worktree add -b` refuse. Clear both, but only where provably
-        // lossless: the row's terminal disposition was already acted on (patch
-        // exported / orphan adopted / directory retained), and the branch is
-        // deleted only when every commit on it is reachable from HEAD — a
-        // branch holding unmerged work refuses the allocation instead.
-        sqlx::query("DELETE FROM workspace_leases WHERE worktree_path = ? AND state != 'active'")
-            .bind(worktree_path.to_string_lossy().as_ref())
-            .execute(pool)
-            .await?;
+        // lossless — and in this order: verify the branch FIRST, because a
+        // `BranchHoldsWork` refusal must leave the old lease row intact (it is
+        // the only metadata tying a retained worktree/branch to its owner run;
+        // deleting it before refusing would downgrade the next boot's
+        // reconciliation to an unassociated-orphan report). The branch itself
+        // is deleted only when every commit on it is reachable from HEAD; the
+        // stale row goes only once the allocation can actually proceed.
         if run_git(
             &repo,
             &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
@@ -267,6 +266,10 @@ impl WorktreeManager {
                 }
             }
         }
+        sqlx::query("DELETE FROM workspace_leases WHERE worktree_path = ? AND state != 'active'")
+            .bind(worktree_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await?;
 
         // Record the base commit, then create branch + worktree atomically. Using
         // `add -b <branch> <path> <base>` creates the branch at HEAD (== base) and
@@ -1240,6 +1243,21 @@ mod tests {
         assert!(
             matches!(err, WorktreeError::BranchHoldsWork { .. }),
             "unexpected error: {err:?}"
+        );
+
+        // The refusal must leave the released lease row in place: it is the
+        // only metadata tying the retained worktree/branch to its owner run,
+        // and deleting it before refusing would strand them as unassociated
+        // orphans at the next boot's reconciliation.
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM workspace_leases WHERE worktree_path = ?")
+                .bind(lease.worktree_path.to_string_lossy().as_ref())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the refused re-allocation must not delete the lease row"
         );
     }
 }
