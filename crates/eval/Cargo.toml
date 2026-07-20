@@ -1,0 +1,19 @@
+[package]
+name = "codypendent-eval"
+description = "codypendent-eval: the evaluation and learning loop (Phase 7, STEP 7.1/7.4/7.5). EvalCase/Assertion harness, execution-grounded trace graders, failure clustering, and the shadow->canary->approve->rollback promotion pipeline that structurally forbids self-promotion. Pure logic — daemon-free so the gate is testable in isolation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+# Actor (the Human-approval gate) is a shared wire type; reusing it makes the
+# no-self-promotion rule express in the same vocabulary as the ledger.
+codypendent-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

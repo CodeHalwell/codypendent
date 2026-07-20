@@ -546,6 +546,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codypendent-eval"
+version = "0.1.0"
+dependencies = [
+ "codypendent-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "codypendent-integrations"
 version = "0.1.0"
 dependencies = [

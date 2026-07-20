@@ -12,6 +12,7 @@ members = [
     "crates/workflow",
     "crates/sandbox",
     "crates/routing",
+    "crates/eval",
     "crates/test-support",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
@@ -38,6 +39,7 @@ codypendent-integrations = { path = "crates/integrations" }
 codypendent-workflow = { path = "crates/workflow" }
 codypendent-sandbox = { path = "crates/sandbox" }
 codypendent-routing = { path = "crates/routing" }
+codypendent-eval = { path = "crates/eval" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
