@@ -243,6 +243,69 @@ impl WorkflowStore {
         Ok(id)
     }
 
+    /// Create a durable run **idempotently**, keyed by a client `idempotency_key`
+    /// (the command's key). The run id is derived deterministically from the key,
+    /// so a duplicate delivery of the same `StartWorkflow` (a client retrying after
+    /// a lost acknowledgement) maps to the *same* run instead of creating a second
+    /// one — the durable equivalent of the command write path's idempotency.
+    ///
+    /// The run row is inserted `OR IGNORE`: on a duplicate the primary-key
+    /// (derived id) conflict is ignored, no second run or node set is created, and
+    /// the existing id is returned. SQLite serialises writes, so two concurrent
+    /// duplicate deliveries resolve to one run. Returns the run id in both cases.
+    pub async fn create_run_idempotent(
+        &self,
+        pool: &SqlitePool,
+        compiled: &CompiledWorkflow,
+        idempotency_key: &str,
+        inputs: &Value,
+    ) -> Result<String, WorkflowStoreError> {
+        let id = deterministic_run_id(idempotency_key);
+        let now = Utc::now().to_rfc3339();
+        let signature = compiled.signature();
+
+        let mut tx = pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO workflow_runs \
+             (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?)",
+        )
+        .bind(&id)
+        .bind(&compiled.id)
+        .bind(i64::from(compiled.version))
+        .bind(&signature)
+        .bind(serde_json::to_string(inputs)?)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // A duplicate delivery: the run (and its nodes) already exist from the
+        // first application. Nothing to insert — return the same id.
+        if inserted == 0 {
+            tx.commit().await?;
+            return Ok(id);
+        }
+
+        for node in &compiled.nodes {
+            sqlx::query(
+                "INSERT INTO workflow_nodes \
+                 (id, workflow_run_id, node_id, state, attempt, topo_order, agent_run_id, cost_json) \
+                 VALUES (?, ?, ?, 'pending', 0, ?, NULL, NULL)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&id)
+            .bind(&node.id)
+            .bind(node.topo_order as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// Set a run's lifecycle state.
     pub async fn set_run_state(
         &self,
@@ -593,6 +656,19 @@ impl WorkflowStore {
 
         Ok(to_reset.into_iter().collect())
     }
+}
+
+/// A deterministic workflow-run id derived from a command's idempotency key, so a
+/// duplicate `StartWorkflow` delivery resolves to the same run (the anchor
+/// [`WorkflowStore::create_run_idempotent`] inserts on). A `wfrun-` prefix keeps
+/// it distinguishable from a random `create_run` id at a glance; the 128-bit SHA-256
+/// prefix is collision-resistant for distinct keys.
+fn deterministic_run_id(idempotency_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"workflow-run\x00");
+    hasher.update(idempotency_key.as_bytes());
+    format!("wfrun-{}", hex::encode(&hasher.finalize()[..16]))
 }
 
 /// The pure scheduling core of [`WorkflowStore::ready_nodes`]: the ids of the

@@ -278,8 +278,10 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         daemon:** a `StartWorkflow` command (carrying the manifest YAML + typed
         inputs) is intercepted at the connection level like `MutateDocument` and
         applied through a `WorkflowStarter` seam — implemented in the `codypendentd`
-        assembly over `compile_yaml` + `WorkflowStore::create_run` on the daemon's
-        pool — replying `WorkflowRunStarted` with the new run id (or
+        assembly over `compile_yaml` + `WorkflowStore::create_run_idempotent` (keyed
+        by the command's idempotency key, so a duplicate delivery resolves to the
+        same run) on the daemon's pool — replying `WorkflowRunStarted` with the new
+        run id (or
         `CommandRejected` when the manifest does not compile; a daemon without the
         seam rejects it `workflow.transport-unavailable`, an Observer is
         role-denied). *Remaining for 5.2:* wiring the **driver** into that seam

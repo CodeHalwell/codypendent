@@ -95,10 +95,21 @@ impl AgentProfileSet {
             dir: dir.to_path_buf(),
             source,
         })?;
-        let mut files: Vec<PathBuf> = read
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
-            .collect();
+        // Propagate a per-entry read failure rather than silently dropping it: a
+        // skipped entry could be a profile a workflow needs (the load's whole-or-
+        // nothing contract), so an I/O error here fails the load like a file read
+        // or parse error does.
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in read {
+            let entry = entry.map_err(|source| AgentProfileSetError::ReadDir {
+                dir: dir.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+                files.push(path);
+            }
+        }
         files.sort();
 
         let mut set = Self::new();

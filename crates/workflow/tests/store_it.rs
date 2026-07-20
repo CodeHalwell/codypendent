@@ -51,6 +51,38 @@ async fn create_run_seeds_pending_nodes_in_topological_order() {
 }
 
 #[tokio::test]
+async fn create_run_idempotent_dedups_by_key() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+
+    // Two creations with the same idempotency key resolve to one run (a duplicate
+    // StartWorkflow delivery after a lost ack does not fork a second run).
+    let first = store
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }))
+        .await
+        .unwrap();
+    let second = store
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }))
+        .await
+        .unwrap();
+    assert_eq!(first, second, "same key ⇒ same run id");
+
+    // Exactly one run, with its three pending nodes (not six).
+    assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 1);
+    let snap = store.snapshot(&pool, &first).await.unwrap().unwrap();
+    assert_eq!(snap.nodes.len(), 3);
+
+    // A different key is a different run.
+    let other = store
+        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }))
+        .await
+        .unwrap();
+    assert_ne!(first, other);
+    assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn transitions_record_state_attempt_and_cost() {
     let (_tmp, pool) = temp_pool().await;
     let compiled = compile_yaml(MANIFEST).unwrap();

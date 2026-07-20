@@ -842,6 +842,10 @@ async fn handle_request(
                     let start = StartWorkflowRequest {
                         manifest: manifest.clone(),
                         inputs: inputs.clone(),
+                        // Carry the command's idempotency key so a duplicate
+                        // delivery resolves to the same durable run (the write
+                        // path's idempotency, applied to this intercepted command).
+                        idempotency_key: command.idempotency_key.clone(),
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {

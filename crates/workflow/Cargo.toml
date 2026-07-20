@@ -26,9 +26,10 @@ anyhow = { workspace = true }
 # Stable graph signature for the resume guard (STEP 5.2).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The driver honours a node's retry backoff with `tokio::time::sleep` (STEP 5.2).
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -25,6 +25,11 @@ pub struct StartWorkflowRequest {
     /// The typed inputs the manifest declares (opaque JSON to the daemon; the
     /// store records them with the run).
     pub inputs: Value,
+    /// The command's idempotency key: a duplicate `StartWorkflow` delivery (a
+    /// client retrying after a lost acknowledgement) carries the same key, so the
+    /// seam creates the run idempotently — the same key resolves to the same run
+    /// rather than a second one.
+    pub idempotency_key: String,
     /// The identity of the starting client, for attribution.
     pub client_id: ClientId,
 }

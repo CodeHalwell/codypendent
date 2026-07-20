@@ -1524,6 +1524,25 @@ fn textwrap_summary(summary: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in summary.split_whitespace() {
+        // A single word wider than the panel (a long path, URL, or hash) is
+        // hard-split into width-sized chunks so no produced line overflows.
+        if word.chars().count() > WIDTH {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chars = word.chars().peekable();
+            while chars.peek().is_some() {
+                let chunk: String = chars.by_ref().take(WIDTH).collect();
+                // Push full-width chunks; keep the short remainder in `current` so
+                // a following word can still join it.
+                if chars.peek().is_some() {
+                    lines.push(chunk);
+                } else {
+                    current = chunk;
+                }
+            }
+            continue;
+        }
         if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > WIDTH {
             lines.push(std::mem::take(&mut current));
         }

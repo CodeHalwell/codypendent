@@ -41,7 +41,10 @@ impl WorkflowStarter for WorkflowRunStarter {
         let pool = self.pool.clone();
         Box::pin(async move {
             let StartWorkflowRequest {
-                manifest, inputs, ..
+                manifest,
+                inputs,
+                idempotency_key,
+                ..
             } = request;
 
             // Compile the manifest — a malformed workflow is the client's to fix,
@@ -55,10 +58,12 @@ impl WorkflowStarter for WorkflowRunStarter {
                 )
             })?;
 
-            // Create the durable run (one `pending` node per step). A store error
-            // may be transient (a busy database), so mark it retryable.
+            // Create the durable run idempotently, keyed by the command's
+            // idempotency key: a duplicate `StartWorkflow` delivery resolves to the
+            // same run rather than a second one. A store error may be transient (a
+            // busy database), so mark it retryable.
             WorkflowStore::new()
-                .create_run(&pool, &compiled, None, &inputs)
+                .create_run_idempotent(&pool, &compiled, &idempotency_key, &inputs)
                 .await
                 .map_err(|error| {
                     CodypendentError::new(
@@ -112,6 +117,7 @@ steps:
             .start(StartWorkflowRequest {
                 manifest: MANIFEST.to_owned(),
                 inputs: json!({ "pull_request": 7 }),
+                idempotency_key: "cmd-1".to_owned(),
                 client_id: ClientId::new(),
             })
             .await
@@ -133,6 +139,36 @@ steps:
     }
 
     #[tokio::test]
+    async fn a_duplicate_delivery_resolves_to_the_same_run() {
+        let (_tmp, pool) = temp_pool().await;
+        let starter = WorkflowRunStarter::new(pool.clone());
+        let request = || StartWorkflowRequest {
+            manifest: MANIFEST.to_owned(),
+            inputs: json!({ "pull_request": 7 }),
+            idempotency_key: "cmd-dup".to_owned(),
+            client_id: ClientId::new(),
+        };
+
+        // Two deliveries of the same command (same idempotency key) create exactly
+        // one durable run — a retry after a lost ack does not duplicate it.
+        let first = starter.start(request()).await.expect("first start");
+        let second = starter.start(request()).await.expect("duplicate start");
+        assert_eq!(
+            first, second,
+            "a duplicate delivery returns the same run id"
+        );
+        assert_eq!(
+            WorkflowStore::new()
+                .list_incomplete_runs(&pool)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "only one run exists despite two deliveries"
+        );
+    }
+
+    #[tokio::test]
     async fn start_rejects_an_uncompilable_manifest_without_creating_a_run() {
         let (_tmp, pool) = temp_pool().await;
         let starter = WorkflowRunStarter::new(pool.clone());
@@ -142,6 +178,7 @@ steps:
                 // Valid header but no steps → a compile error, not a panic.
                 manifest: "schema_version: 1\nid: empty\nversion: 1\nsteps: []\n".to_owned(),
                 inputs: json!(null),
+                idempotency_key: "cmd-bad".to_owned(),
                 client_id: ClientId::new(),
             })
             .await

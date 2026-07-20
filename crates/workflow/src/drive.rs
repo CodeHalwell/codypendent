@@ -249,7 +249,24 @@ impl WorkflowDriver {
         observer: &O,
     ) -> Result<(), WorkflowStoreError> {
         let max_attempts = node.retry.attempts.max(1);
-        let mut attempt = 1u32;
+        // Resume from the node's **persisted** attempt, not a fresh 1: a node
+        // interrupted mid-retry (reset `Running` → `Pending` on entry, its attempt
+        // preserved) must not restart its attempt count, or it could exceed
+        // `max_attempts` across a restart and regress its recorded provenance. A
+        // never-run node carries attempt 0, so this starts it at 1.
+        let mut attempt = self
+            .store
+            .snapshot(pool, workflow_run_id)
+            .await?
+            .and_then(|snapshot| {
+                snapshot
+                    .nodes
+                    .into_iter()
+                    .find(|record| record.node_id == node.id)
+                    .map(|record| record.attempt)
+            })
+            .unwrap_or(0)
+            .max(1);
         loop {
             self.store
                 .transition_node(
@@ -287,9 +304,18 @@ impl WorkflowDriver {
                     observer.on_transition(&node.id, NodeState::Completed, attempt);
                     return Ok(());
                 }
-                // A retryable failure: bump the attempt and re-drive (the store
-                // records the new attempt on the next `Running` transition).
+                // A retryable failure: honour the declared backoff, then bump the
+                // attempt and re-drive (the store records the new attempt on the
+                // next `Running` transition). The backoff keeps a transiently
+                // failing tool/service from being hammered when the manifest asked
+                // for a delay; a zero backoff (the default) waits not at all.
                 NodeOutcome::Failed { .. } if attempt < max_attempts => {
+                    if node.retry.backoff_seconds > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            node.retry.backoff_seconds,
+                        ))
+                        .await;
+                    }
                     attempt += 1;
                 }
                 NodeOutcome::Failed { .. } => {
@@ -525,6 +551,63 @@ steps:
         let b = snap.nodes.iter().find(|n| n.node_id == "b").unwrap();
         assert_eq!(b.state, NodeState::Completed);
         assert_eq!(b.attempt, 2, "the durable record shows the second attempt");
+    }
+
+    #[tokio::test]
+    async fn resume_honors_the_persisted_attempt_count() {
+        // A node crashed while running attempt 2 of a 2-attempt policy: it is left
+        // `Running` with attempt 2 in the store. On resume it must run at most once
+        // more (attempt 2) and then fail — never restart at attempt 1 and execute a
+        // third time.
+        let manifest = "\
+schema_version: 1
+id: flaky
+version: 1
+steps:
+  - id: a
+    tool: repository.test
+    retry:
+      attempts: 2
+";
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(manifest).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}))
+            .await
+            .unwrap();
+
+        // Simulate the crash: `a` was interrupted while running attempt 2.
+        store
+            .transition_node(&pool, &run_id, "a", NodeState::Running, 2, None, None)
+            .await
+            .unwrap();
+
+        // An executor that always fails `a`. Without honouring the persisted
+        // attempt this would run twice more (a fresh 1 then 2); with the fix it runs
+        // exactly once (attempt 2) and then exhausts the policy.
+        let executor = ScriptedExecutor::default().with(
+            "a",
+            vec![
+                NodeOutcome::failed("still broken"),
+                NodeOutcome::failed("still broken"),
+            ],
+        );
+        let final_state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, WorkflowRunState::Failed);
+        assert_eq!(
+            executor.calls_for("a"),
+            1,
+            "a runs once more (attempt 2), not a fresh attempt 1 + 2"
+        );
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        let a = snap.nodes.iter().find(|n| n.node_id == "a").unwrap();
+        assert_eq!(a.state, NodeState::Failed);
+        assert_eq!(a.attempt, 2);
     }
 
     #[tokio::test]
