@@ -270,8 +270,15 @@ impl<'a> Router<'a> {
         if !model.is_local() && !self.policy.hosted_allows(node.data_classification) {
             return false;
         }
-        // 2 + 3. Required capabilities (including the context/output size fit).
-        model.capabilities.satisfies(&node.required)
+        // 2 + 3. Required capabilities, with the node's size *estimates* folded into
+        //    the fit check: a model must hold at least `estimated_input_tokens` of
+        //    context and `estimated_output_tokens` of output, even when the caller
+        //    left the explicit `min_*` requirements at their defaults. Otherwise a
+        //    large task could route to a model whose window cannot hold it.
+        let mut required = node.required;
+        required.min_context_tokens = required.min_context_tokens.max(node.estimated_input_tokens);
+        required.min_output_tokens = required.min_output_tokens.max(node.estimated_output_tokens);
+        model.capabilities.satisfies(&required)
     }
 
     /// Cheapest eligible model in `candidates` (min expected cost; ties broken by
@@ -594,6 +601,48 @@ mod tests {
         let router = Router::new(&models, &policy);
         let d = router.route(&node(DataClassification::Internal)).unwrap();
         assert_eq!(d.model, ModelId("big-ctx".into()));
+    }
+
+    #[test]
+    fn a_large_size_estimate_filters_a_small_model_even_with_default_requirements() {
+        // The node leaves `required` at its defaults (min_context/min_output = 0)
+        // but *estimates* a 120k-token input. A 32k-context model must be filtered
+        // by folding the estimate into the fit check — otherwise a task too big for
+        // the window would route to it.
+        let small = model(
+            "small-ctx",
+            ModelLocation::Hosted,
+            0.99,
+            0.001,
+            500.0,
+            32_000,
+        );
+        let big = model(
+            "big-ctx",
+            ModelLocation::Hosted,
+            0.80,
+            0.010,
+            700.0,
+            200_000,
+        );
+        let models = vec![small, big];
+        let policy = RoutingPolicy::balanced();
+        let router = Router::new(&models, &policy);
+        let task = TaskNode {
+            classification: classify(&TaskSignals::from_objective(
+                "build", "agent", 120_000, "big",
+            )),
+            required: RequiredCapabilities::default(), // no explicit minimums
+            data_classification: DataClassification::Internal,
+            estimated_input_tokens: 120_000,
+            estimated_output_tokens: 2_000,
+        };
+        let d = router.route(&task).unwrap();
+        assert_eq!(
+            d.model,
+            ModelId("big-ctx".into()),
+            "the 32k model can't hold a 120k task"
+        );
     }
 
     #[test]

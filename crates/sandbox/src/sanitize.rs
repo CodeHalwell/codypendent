@@ -47,10 +47,21 @@ impl Sanitized {
 /// * The result is truncated to `max_bytes` on a UTF-8 boundary.
 #[must_use]
 pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize) -> Sanitized {
-    let mut text = String::with_capacity(raw.len());
+    // Cap the initial allocation to the output budget, never the (untrusted,
+    // possibly enormous) input size — a plugin returning hundreds of megabytes
+    // must not make the daemon pre-allocate a matching buffer (DoS/OOM guard).
+    let mut text = String::with_capacity(raw.len().min(max_bytes));
     let mut stripped = 0usize;
+    let mut truncated = false;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
+        // Stop once the output has reached its budget: there is more input, so it
+        // is truncated. Bounds the work done on an oversized input, not just the
+        // allocation.
+        if text.len() >= max_bytes {
+            truncated = true;
+            break;
+        }
         match c {
             // Escape: drop it and the sequence it introduces (CSI `\x1b[ … final`,
             // OSC `\x1b] … BEL/ST`, or a lone two-char escape).
@@ -67,9 +78,10 @@ pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize
         }
     }
 
-    let truncated = text.len() > max_bytes;
-    if truncated {
-        // Truncate on a char boundary at or below the cap.
+    if text.len() > max_bytes {
+        // A final multi-byte char may have overshot the cap; truncate to a char
+        // boundary at or below it.
+        truncated = true;
         let mut end = max_bytes;
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;

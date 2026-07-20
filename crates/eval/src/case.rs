@@ -40,8 +40,14 @@ impl Assertion {
     pub fn check(&self, obs: &RunObservation) -> bool {
         match self {
             Assertion::TestsPass => obs.tests_passed == Some(true),
-            Assertion::FileChanged { path } => obs.changed_files.iter().any(|f| f == path),
-            Assertion::FileUnchanged { path } => !obs.changed_files.iter().any(|f| f == path),
+            Assertion::FileChanged { path } => {
+                let want = normalize_path(path);
+                obs.changed_files.iter().any(|f| normalize_path(f) == want)
+            }
+            Assertion::FileUnchanged { path } => {
+                let want = normalize_path(path);
+                !obs.changed_files.iter().any(|f| normalize_path(f) == want)
+            }
             Assertion::SymbolExists { symbol } => obs.existing_symbols.iter().any(|s| s == symbol),
             Assertion::CommandNotExecuted { contains } => {
                 !obs.executed_commands.iter().any(|c| c.contains(contains))
@@ -74,6 +80,21 @@ impl Assertion {
             Assertion::PatchScopeLimit { max_files } => format!("patch-scope<={max_files}"),
         }
     }
+}
+
+/// Normalize a path for comparison: unify separators to `/` and strip a leading
+/// `./`. Makes a `FileChanged`/`FileUnchanged` assertion robust to the cosmetic
+/// differences (Windows `\\` vs `/`, a `./` prefix) between how a runner emits a
+/// changed path and how an assertion author writes it. It does not resolve `..`
+/// or absolutize — assertions and observations are expected to use the same
+/// repository-relative base.
+fn normalize_path(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    unified
+        .strip_prefix("./")
+        .unwrap_or(&unified)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// An evaluation case (the Chapter 16 `EvalCase`). Costs/durations are plain
@@ -266,6 +287,25 @@ mod tests {
         let result = case().score(&passing_obs());
         assert!(result.passed());
         assert!(result.failures().is_empty());
+    }
+
+    #[test]
+    fn file_assertions_normalize_paths() {
+        // The assertion writes `./src/page.rs`; the runner emits a Windows-style
+        // `src\page.rs`. They must still match after normalization.
+        let assertion = Assertion::FileChanged {
+            path: "./src/page.rs".into(),
+        };
+        let obs = RunObservation {
+            changed_files: vec!["src\\page.rs".into()],
+            ..Default::default()
+        };
+        assert!(assertion.check(&obs));
+        // And FileUnchanged is correctly false for the same normalized path.
+        let unchanged = Assertion::FileUnchanged {
+            path: "src/page.rs".into(),
+        };
+        assert!(!unchanged.check(&obs));
     }
 
     #[test]
