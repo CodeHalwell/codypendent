@@ -99,11 +99,14 @@ impl RuntimeExecutor {
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
         let mut scanned = HashSet::new();
         scanned.insert(startup_repository);
+        // The first workflow host this process builds: no existing drive-lock
+        // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
             pool.clone(),
             paths.clone(),
             subscriptions.clone(),
             approvals.clone(),
+            None,
             None,
         );
         Self {
@@ -132,14 +135,21 @@ impl RuntimeExecutor {
     pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
         self.github = Some(github.clone());
         // Rebuild the workflow host so agent nodes drive with the same GitHub
-        // client. Called once at startup before any run exists, so replacing the
-        // (still-empty) per-run drive-lock registry is safe.
+        // client, but SHARE the existing drive-lock registry rather than minting
+        // a fresh one (P5-D6c): today this is called once at startup before any
+        // run exists, but a fresh registry would only be safe under that
+        // construction-order assumption — carrying the same registry forward
+        // means a drive already serializing under the OLD host would still
+        // serialize against the NEW host for the same run id even if that
+        // assumption ever stopped holding.
+        let drive_locks = self.workflow_host.drive_locks();
         self.workflow_host = build_workflow_host(
             self.pool.clone(),
             self.paths.clone(),
             self.subscriptions.clone(),
             self.approvals.clone(),
             Some(github),
+            Some(drive_locks),
         );
         self
     }

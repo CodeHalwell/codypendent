@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use crate::executor::{
     artifact_sink, artifact_store, load_model_registry, resolve_github_repo, run_journal,
 };
-use crate::workflows::WorkflowConductorHost;
+use crate::workflows::{DriveLockRegistry, WorkflowConductorHost};
 
 /// Model policy + budget recorded on an agent-node run row (the same defaults the
 /// daemon's `StartRun` write path uses).
@@ -87,14 +87,19 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 }
 
 /// Build the workflow host over one shared [`AgentLoopNodeExecutor`] carrying the
-/// production driver factory. Used by [`RuntimeExecutor::new`] and rebuilt by
-/// `with_github` so agent nodes drive with the daemon's GitHub client.
+/// production driver factory. Used by [`RuntimeExecutor::new`] (`drive_locks:
+/// None` — the first host this process builds, so a fresh registry) and
+/// rebuilt by `with_github` so agent nodes drive with the daemon's GitHub
+/// client (`drive_locks: Some(existing)` — reconfiguring an ALREADY-running
+/// host must carry its per-run drive-lock registry forward, not mint a fresh
+/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c).
 pub(crate) fn build_workflow_host(
     pool: SqlitePool,
     paths: RuntimePaths,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
     github: Option<Arc<dyn GitHubApi>>,
+    drive_locks: Option<DriveLockRegistry>,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
@@ -107,7 +112,12 @@ pub(crate) fn build_workflow_host(
         github,
         factory,
     );
-    WorkflowConductorHost::new(pool, Arc::new(executor))
+    match drive_locks {
+        Some(drive_locks) => {
+            WorkflowConductorHost::with_drive_locks(pool, Arc::new(executor), drive_locks)
+        }
+        None => WorkflowConductorHost::new(pool, Arc::new(executor)),
+    }
 }
 
 /// Executes one workflow node: drives an **agent** node through the agent loop;
