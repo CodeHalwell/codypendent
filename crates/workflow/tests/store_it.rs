@@ -584,3 +584,79 @@ async fn run_state_transitions_persist() {
         .unwrap_err();
     assert!(matches!(err, WorkflowStoreError::NotFound(_)));
 }
+
+#[tokio::test]
+async fn set_run_state_if_legal_only_applies_from_the_given_states() {
+    // The general-purpose primitive behind the P5-D5 lost-pause fix: a
+    // conditional UPDATE that applies only when the run's CURRENT state is
+    // one of `legal_from`, mirroring the daemon's FP-3
+    // `projections::set_run_state_if_legal`.
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}), None)
+        .await
+        .unwrap();
+
+    // The run is Pending — a transition legal only from Completed/Failed
+    // must not apply.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Completed, WorkflowRunState::Failed],
+            WorkflowRunState::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 0, "an illegal prior state must not apply");
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Pending,
+        "the run is untouched"
+    );
+
+    // Pending IS in the legal set — the transition applies.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Pending, WorkflowRunState::Running],
+            WorkflowRunState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "a legal prior state must apply");
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Running
+    );
+
+    // Applying it AGAIN now fails: the run is Running, no longer Pending, and
+    // the (fixed) legal set from the previous call no longer matches once we
+    // narrow it back to just Pending — proving the check is against the
+    // CURRENT state, not a cached one.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Pending],
+            WorkflowRunState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+
+    // An empty `legal_from` can never match anything.
+    let affected = store
+        .set_run_state_if_legal(&pool, &id, &[], WorkflowRunState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Running,
+        "still Running — neither call above touched it"
+    );
+}

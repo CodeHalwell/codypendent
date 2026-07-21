@@ -383,6 +383,50 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Transition a run to `state` **only if** its CURRENT state is one of
+    /// `legal_from` — a single atomic conditional `UPDATE`, never a separate
+    /// read-then-write. Mirrors the daemon's `projections::set_run_state_if_legal`
+    /// (FP-3) at this crate's layer: a caller whose legality check happened
+    /// against an earlier read — or, here, whose write simply races an
+    /// independent writer that does not take the per-run drive lock
+    /// (`PauseWorkflow`, by design — P5-D3) — cannot silently clobber a state
+    /// that has since moved (the P5-D5 follow-up: the driver's own first
+    /// transition into `Running` used to be an unconditional write here).
+    ///
+    /// Returns the number of rows affected: `1` if the transition applied,
+    /// `0` if the run does not exist or its current state was not in
+    /// `legal_from`.
+    pub async fn set_run_state_if_legal(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        legal_from: &[WorkflowRunState],
+        state: WorkflowRunState,
+    ) -> Result<u64, WorkflowStoreError> {
+        if legal_from.is_empty() {
+            // No prior state makes this transition legal — nothing can
+            // match, so skip the round-trip.
+            return Ok(0);
+        }
+        let placeholders = legal_from
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE workflow_runs SET state = ?, updated_at = ? \
+             WHERE id = ? AND state IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(state.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id);
+        for from in legal_from {
+            query = query.bind(from.as_str());
+        }
+        Ok(query.execute(pool).await?.rows_affected())
+    }
+
     /// Transition a node to `state` with the given `attempt`, stamping
     /// `started_at` the first time it runs and setting `ended_at` to the terminal
     /// time — or **clearing it** when the node is not terminal, so a node retried

@@ -219,9 +219,29 @@ impl WorkflowDriver {
             }
         }
 
-        self.store
-            .set_run_state(pool, workflow_run_id, WorkflowRunState::Running)
-            .await?;
+        // Start driving: a conditional transition (P5-D5 follow-up), not the
+        // unconditional write this used to be. `PauseWorkflow` deliberately
+        // does not take the per-run drive lock a live drive holds (P5-D3, so
+        // the cooperative "stops at the next boundary" contract stays
+        // snappy), so a pause can commit between the snapshot read above and
+        // this point. Without the CAS, this write would silently clobber
+        // that just-committed `Paused` back to `Running` and the frontier
+        // loop below would proceed as though the pause never happened.
+        if !self
+            .try_transition_to_running(pool, workflow_run_id)
+            .await?
+        {
+            // Someone else won the race and moved the run before we could —
+            // bail without touching the frontier, reporting the run's
+            // CURRENT (freshly re-read) state, exactly like the P5-D5 guard
+            // above. The pause sticks.
+            let current = self
+                .store
+                .snapshot(pool, workflow_run_id)
+                .await?
+                .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+            return Ok(current.run.state);
+        }
 
         // Advance the frontier until nothing can make progress — or until a
         // concurrent `pause`/`cancel` (STEP 5.2 lifecycle commands) asks the driver
@@ -282,6 +302,41 @@ impl WorkflowDriver {
             .set_run_state(pool, workflow_run_id, final_state)
             .await?;
         Ok(final_state)
+    }
+
+    /// Attempt to start driving `workflow_run_id`: transition it from
+    /// `Pending`/`Running` into `Running`, via a conditional `UPDATE` rather
+    /// than an unconditional write (P5-D5 follow-up). `PauseWorkflow`
+    /// deliberately does not take the per-run drive lock a live drive holds
+    /// (P5-D3 — taking it there would make pause block until the CURRENT
+    /// drive fully finishes, breaking its cooperative "stops at the next
+    /// boundary" contract), so a pause can commit between
+    /// [`run_observed`](Self::run_observed)'s initial signature/state read
+    /// and this call. Without the CAS here, this write would silently
+    /// clobber that just-committed `Paused` back to `Running`, and the
+    /// frontier loop would then proceed as though the pause never happened —
+    /// a lost pause with no signal to the client.
+    ///
+    /// Returns `true` if the transition applied (the caller proceeds to
+    /// drive the frontier); `false` if it did not — the run's current state
+    /// is no longer `Pending`/`Running`, and the caller must bail without
+    /// touching the frontier, reporting the run's freshly re-read current
+    /// state.
+    async fn try_transition_to_running(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<bool, WorkflowStoreError> {
+        let affected = self
+            .store
+            .set_run_state_if_legal(
+                pool,
+                workflow_run_id,
+                &[WorkflowRunState::Pending, WorkflowRunState::Running],
+                WorkflowRunState::Running,
+            )
+            .await?;
+        Ok(affected > 0)
     }
 
     /// Drive one node through its retry policy: transition to `Running`, execute,
@@ -923,6 +978,78 @@ steps:
         assert_eq!(
             a.cost, None,
             "the crash-recovery reset must not leave the stale cost in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_transition_to_running_refuses_a_run_that_moved_since_the_initial_read() {
+        // P5-D5 follow-up (lost-pause race): deterministic reproduction of the
+        // exact window a real race hits — no scheduling luck, same discipline
+        // as the FP-3 fix. `run_observed`'s initial snapshot read sees
+        // Pending/Running (passing the P5-D5 guard), but a `PauseWorkflow`
+        // command — which deliberately does not take the per-run drive lock,
+        // P5-D3 — commits `Paused` before `run_observed` reaches this exact
+        // method. Simulated here by committing that "concurrent" pause
+        // directly and sequentially (no real concurrency needed to prove the
+        // write itself refuses), then calling the SAME method
+        // `run_observed` calls at that point.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        store
+            .set_run_state(&pool, &run_id, WorkflowRunState::Paused)
+            .await
+            .unwrap();
+
+        let driver = WorkflowDriver::new();
+        let transitioned = driver
+            .try_transition_to_running(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(!transitioned, "must not transition once the run has moved");
+
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            snap.run.state,
+            WorkflowRunState::Paused,
+            "the run must still be Paused, never clobbered back to Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_transition_to_running_applies_when_nothing_raced_in() {
+        // The happy path: no concurrent pause, so the transition applies
+        // normally — this is what makes `start`/`resume`/`retry`/`recover`
+        // still reach `Running` and drive (their pre-drive state is always
+        // Pending or Running with nothing else racing in the tests that
+        // exercise them).
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        let driver = WorkflowDriver::new();
+        let transitioned = driver
+            .try_transition_to_running(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(transitioned);
+        assert_eq!(
+            store
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run
+                .state,
+            WorkflowRunState::Running
         );
     }
 }
