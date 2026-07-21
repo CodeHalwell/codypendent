@@ -1,5 +1,6 @@
 //! Daemon lifecycle commands (Phase 0), the headless JSONL client (STEP 1.13:
-//! `run` and `attach`), and the Phase-2 `index rebuild` maintenance command.
+//! `run` and `attach`), the Phase-2 `index rebuild` maintenance command, and
+//! `docs publish` (Phase 4 STEP 4.4).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -7,12 +8,14 @@ use std::time::Duration;
 
 use anyhow::Context;
 use codypendent_knowledge::{
-    db as knowledge_db, register_builtins, retrieve, HashingEmbedder, Registry, RetrievalConfig,
-    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+    db as knowledge_db, plan_publication, publications, register_builtins, retrieve, DocumentStore,
+    HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
+    RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ClientRole, CommandBody, Payload, SessionId, Subscription, WorkspaceId,
+    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DocumentId, Payload,
+    SessionId, Subscription, WorkspaceId,
 };
 
 use crate::client;
@@ -423,6 +426,282 @@ pub async fn open(
         ),
     }
     Ok(())
+}
+
+/// `codypendent docs publish --target <T>` (Phase 4 STEP 4.4). Which Git
+/// target to publish to, decoupled from `clap`'s `ValueEnum` derive (mirrors
+/// `codypendent_knowledge::PublishTarget`'s three variants with CLI-friendly
+/// names: `repo-file` / `docs-branch` / `doc-pr`).
+pub enum PublishTargetKind {
+    RepoFile,
+    DocsBranch,
+    DocPr,
+}
+
+/// `codypendent docs publish <DOCUMENT> --target <T>` (Phase 4 STEP 4.4,
+/// closing the deferred "executing a `PublishPlan`" roadmap item).
+///
+/// Opens the daemon's database directly (the CLI projection seam — the same
+/// read-only pattern the TUI's Docs view and `index rebuild` use) to load the
+/// document and compute the exact deterministic plan the daemon itself will
+/// compute, so the target/changed-files/Git-action preview printed here is
+/// never a guess (STEP 4.4.2). After confirming (or `--yes`), ensures a
+/// daemon, sends `PublishDocument` — which durably parks an approval and
+/// replies with the parked plan the daemon computed independently — then
+/// immediately resolves that approval with the confirmed decision over the
+/// SAME connection (this CLI invocation is the human approver). A rejection
+/// performs no write. On approval the daemon executes in the background, so
+/// this polls the publication history briefly for the resulting commit before
+/// reporting the outcome.
+pub async fn docs_publish(
+    paths: &RuntimePaths,
+    document_id: DocumentId,
+    target: PublishTargetKind,
+    path: Option<String>,
+    branch: Option<String>,
+    title: Option<String>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let doc = DocumentStore::new()
+        .snapshot_document(&pool, document_id)
+        .await
+        .with_context(|| format!("loading document {document_id}"))?
+        .ok_or_else(|| anyhow::anyhow!("no document {document_id}"))?;
+
+    let resolved_target = resolve_publish_target(target, &doc.title, path, branch, title);
+    let plan = plan_publication(&doc, resolved_target.clone());
+
+    println!("Publish plan for \"{}\" ({document_id}):", doc.title);
+    println!("  target: {}", describe_publish_target(&resolved_target));
+    println!("  changed files:");
+    for file in &plan.changed_files {
+        println!("    {file}");
+    }
+    println!("  git action: {}", plan.git_action);
+
+    let approved = if yes {
+        true
+    } else {
+        print!("Publish? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+
+    let decision = if approved {
+        ApprovalDecision::Approve
+    } else {
+        ApprovalDecision::Reject
+    };
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let approval_id = docs_publish_over_connection(
+        &mut conn,
+        document_id,
+        to_wire_target(&resolved_target),
+        decision,
+    )
+    .await?;
+    println!("Parked approval {approval_id}.");
+
+    if !approved {
+        println!("Publish rejected; nothing was written.");
+        return Ok(());
+    }
+
+    let existing = publications(&pool, document_id).await?.len();
+    match wait_for_new_publication(&pool, document_id, existing).await {
+        Some(publication) => println!(
+            "Published \"{}\" ({document_id}) -> commit {}",
+            doc.title,
+            publication.git_commit.as_deref().unwrap_or("(none)")
+        ),
+        None => println!(
+            "Publish approved; the daemon is still executing it in the background. \
+             Check the daemon log, or re-run `codypendent docs publish` shortly to see \
+             the recorded commit."
+        ),
+    }
+    Ok(())
+}
+
+/// The connected core of [`docs_publish`]: handshake, bind the `Controller`
+/// role, send `PublishDocument`, then immediately resolve the parked approval
+/// with `decision` over the SAME connection (this CLI invocation is the human
+/// approver — the confirmation already happened before this is called).
+/// Returns the parked [`ApprovalId`](codypendent_protocol::ApprovalId). Split
+/// out so a test can drive it against a mock daemon, mirroring
+/// [`workflow_run_over_connection`].
+pub async fn docs_publish_over_connection(
+    conn: &mut Connection,
+    document_id: DocumentId,
+    target: codypendent_protocol::document::PublishTarget,
+    decision: ApprovalDecision,
+) -> anyhow::Result<codypendent_protocol::ApprovalId> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::PublishDocument {
+            document_id,
+            target,
+        })
+        .await?;
+    let approval_id = match reply.payload {
+        Payload::DocumentPublishRequested { approval_id, .. } => approval_id,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("publish rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to PublishDocument: {other:?}"),
+    };
+
+    let reply = conn
+        .send_command(CommandBody::ResolveApproval {
+            approval_id,
+            decision,
+            scope: ApprovalScope::Once,
+        })
+        .await?;
+    match reply.payload {
+        Payload::CommandAccepted { .. } => Ok(approval_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "could not resolve the publish approval: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to ResolveApproval: {other:?}"),
+    }
+}
+
+/// Resolve `kind` (plus any explicit `--path`/`--branch`/`--title`) into the
+/// knowledge engine's domain `PublishTarget`, filling in sensible defaults: a
+/// slug of the document's title under `docs/` for `path`, `docs/publish` for
+/// `branch`, and `Publish: <title>` for a PR's `title`.
+fn resolve_publish_target(
+    kind: PublishTargetKind,
+    document_title: &str,
+    path: Option<String>,
+    branch: Option<String>,
+    title: Option<String>,
+) -> KnowledgePublishTarget {
+    let path = path.unwrap_or_else(|| format!("docs/{}.md", slugify(document_title)));
+    match kind {
+        PublishTargetKind::RepoFile => KnowledgePublishTarget::RepositoryFile { path },
+        PublishTargetKind::DocsBranch => {
+            let branch = branch.unwrap_or_else(|| "docs/publish".to_string());
+            KnowledgePublishTarget::DocsBranchCommit { branch, path }
+        }
+        PublishTargetKind::DocPr => {
+            let branch = branch.unwrap_or_else(|| "docs/publish".to_string());
+            let title = title.unwrap_or_else(|| format!("Publish: {document_title}"));
+            KnowledgePublishTarget::DocumentationPr {
+                branch,
+                path,
+                title,
+            }
+        }
+    }
+}
+
+/// A short human description of a target, matching the daemon seam's own
+/// `describe_target` (kept independent — the CLI's is a client-side preview
+/// computed from the SAME plan function, not a value the daemon returns until
+/// after `PublishDocument` is sent).
+fn describe_publish_target(target: &KnowledgePublishTarget) -> String {
+    match target {
+        KnowledgePublishTarget::RepositoryFile { path } => format!("repository file {path}"),
+        KnowledgePublishTarget::DocsBranchCommit { branch, path } => {
+            format!("docs-branch commit {path} on {branch}")
+        }
+        KnowledgePublishTarget::DocumentationPr {
+            branch,
+            path,
+            title,
+        } => format!("documentation PR \"{title}\" ({path} on {branch})"),
+    }
+}
+
+/// Convert the knowledge engine's domain `PublishTarget` into its wire mirror
+/// for the `PublishDocument` command.
+fn to_wire_target(
+    target: &KnowledgePublishTarget,
+) -> codypendent_protocol::document::PublishTarget {
+    use codypendent_protocol::document::PublishTarget as Wire;
+    match target {
+        KnowledgePublishTarget::RepositoryFile { path } => {
+            Wire::RepositoryFile { path: path.clone() }
+        }
+        KnowledgePublishTarget::DocsBranchCommit { branch, path } => Wire::DocsBranchCommit {
+            branch: branch.clone(),
+            path: path.clone(),
+        },
+        KnowledgePublishTarget::DocumentationPr {
+            branch,
+            path,
+            title,
+        } => Wire::DocumentationPr {
+            branch: branch.clone(),
+            path: path.clone(),
+            title: title.clone(),
+        },
+    }
+}
+
+/// A filesystem/branch-safe slug: lowercased alphanumerics, runs of anything
+/// else collapsed to a single `-`, with no leading/trailing dash. Never empty
+/// (falls back to `document`).
+fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "document".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Poll the publication history for a fresh row beyond `existing_count`
+/// (the daemon's execution is fire-and-forget once the approval resolves),
+/// or give up after a generous bound and let the caller report "still
+/// running" rather than hang indefinitely.
+async fn wait_for_new_publication(
+    pool: &sqlx::SqlitePool,
+    document_id: DocumentId,
+    existing_count: usize,
+) -> Option<Publication> {
+    for _ in 0..100 {
+        let published = publications(pool, document_id).await.ok()?;
+        if published.len() > existing_count {
+            return published.into_iter().next();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
 }
 
 /// `codypendent workflow validate <FILE> [--agents <DIR>]` (Phase 5 STEP 5.1):

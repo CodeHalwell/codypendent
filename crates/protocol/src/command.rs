@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{DocumentEditLease, DocumentMutation};
+use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, DocumentId, RunId, SessionId, WorkspaceId};
@@ -125,6 +125,24 @@ pub enum CommandBody {
     /// no-op — so a client that loses the acknowledgement can retry safely.
     ReleaseDocumentLease {
         lease_id: String,
+    },
+    /// Publish a document's current revision to a Git target (Phase 4 STEP 4.4,
+    /// closing the deferred "executing a `PublishPlan`" roadmap item).
+    ///
+    /// Handled at the connection level like `MutateDocument`/`StartWorkflow`
+    /// (documents live outside the session ledger): the daemon computes the
+    /// deterministic publish plan, then durably parks its approval — carrying
+    /// the plan's target, changed files, and resulting Git action, shown
+    /// verbatim on the approval card before any write — through the
+    /// assembly's `DocumentPublisher` seam, and replies
+    /// [`DocumentPublishRequested`](crate::envelope::Payload::DocumentPublishRequested)
+    /// with the parked plan. Nothing is written until a human resolves the
+    /// approval through the ordinary `ResolveApproval` command; a rejection
+    /// executes nothing. Requires the `Controller` role; a daemon assembled
+    /// without a publisher rejects it `document.transport-unavailable`.
+    PublishDocument {
+        document_id: DocumentId,
+        target: PublishTarget,
     },
     /// Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).
     ///
@@ -290,6 +308,12 @@ mod tests {
         });
         round_trip(CommandBody::ReleaseDocumentLease {
             lease_id: "lease-1".to_string(),
+        });
+        round_trip(CommandBody::PublishDocument {
+            document_id: DocumentId::new(),
+            target: crate::document::PublishTarget::RepositoryFile {
+                path: "docs/architecture.md".to_string(),
+            },
         });
         round_trip(CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),

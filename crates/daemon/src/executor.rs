@@ -113,6 +113,18 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`DocumentPublisher`](crate::documents::DocumentPublisher)
+    /// that computes an accepted `PublishDocument` command's plan, parks its
+    /// approval, and (once approved) executes it (Phase 4 STEP 4.4). Bundled with
+    /// the document seams for the same reason — it names `codypendent-knowledge`,
+    /// which only the assembly can. The default `None` leaves publication unwired
+    /// (rejected `document.transport-unavailable`).
+    fn document_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::documents::DocumentPublisher>> {
+        None
+    }
+
     /// The assembly-provided [`WorkflowStarter`](crate::workflows::WorkflowStarter)
     /// that creates a durable run from an accepted `StartWorkflow` command (Phase 5
     /// STEP 5.2). Bundled with the executor like the document seams — it names

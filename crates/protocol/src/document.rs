@@ -60,6 +60,34 @@ pub struct SuggestionInput {
     pub rationale: Option<String>,
 }
 
+/// Where a document publish writes (Phase 4 STEP 4.4). Wire mirror of
+/// `codypendent-knowledge`'s `PublishTarget` domain type — the protocol crate
+/// cannot name the knowledge crate, so this carries the same three targets
+/// across the wire and the `codypendentd` assembly converts one into the
+/// other before computing the plan. Internally tagged with a
+/// [`PublishTarget::Unknown`] fallback so a target a newer peer added
+/// deserializes and is rejected structurally rather than crashing the peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PublishTarget {
+    /// Write the rendered Markdown to a repository file via an approval-gated
+    /// change set on the working tree.
+    RepositoryFile { path: String },
+    /// Commit the rendered Markdown to a dedicated docs branch, worktree-safe
+    /// (the primary checkout is never touched).
+    DocsBranchCommit { branch: String, path: String },
+    /// Open (or update) a documentation pull request via the Phase 3 GitHub
+    /// write path.
+    DocumentationPr {
+        branch: String,
+        path: String,
+        title: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 /// A CRDT sync message for a `Document` subscription: opaque Loro update or
 /// snapshot bytes plus the document it belongs to. Receivers merge `update` into
 /// their local replica; senders emit it after applying a mutation. Opaque so the
@@ -215,5 +243,35 @@ mod tests {
         assert!(!json.contains("block_id"));
         let parsed: DocumentLeaseGrant = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.block_id, None);
+    }
+
+    fn round_trip_target(target: PublishTarget) {
+        let json = serde_json::to_string(&target).expect("serialize");
+        let parsed: PublishTarget = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(target, parsed);
+    }
+
+    #[test]
+    fn every_publish_target_round_trips() {
+        round_trip_target(PublishTarget::RepositoryFile {
+            path: "docs/architecture.md".into(),
+        });
+        round_trip_target(PublishTarget::DocsBranchCommit {
+            branch: "docs/publish".into(),
+            path: "docs/architecture.md".into(),
+        });
+        round_trip_target(PublishTarget::DocumentationPr {
+            branch: "docs/publish".into(),
+            path: "docs/architecture.md".into(),
+            title: "Publish: Architecture".into(),
+        });
+    }
+
+    #[test]
+    fn unknown_publish_target_kind_deserializes_to_unknown() {
+        let parsed: PublishTarget =
+            serde_json::from_value(serde_json::json!({ "kind": "teleport_repository" }))
+                .expect("unknown kind must parse, not error");
+        assert!(matches!(parsed, PublishTarget::Unknown));
     }
 }

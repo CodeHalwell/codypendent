@@ -595,6 +595,90 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
 }
 
 #[tokio::test]
+async fn publish_document_requires_controller_then_transport_unavailable() {
+    // Phase 4 STEP 4.4: `PublishDocument` is intercepted at the connection
+    // level like `MutateDocument`/`StartWorkflow`. Publishing is a Git write,
+    // so it is gated tighter than `MutateDocument` (which only denies
+    // Observer) — only a `Controller` may issue it. The daemon's own test
+    // server injects no publisher, so a Controller gets past the role gate but
+    // the command is rejected structurally rather than crashing the connection.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let target = codypendent_protocol::document::PublishTarget::RepositoryFile {
+        path: "docs/architecture.md".to_string(),
+    };
+
+    // A Contributor is role-denied (Controller-only, unlike MutateDocument).
+    let contributor = ClientId::new();
+    let mut contrib_stream = connect(&paths).await;
+    handshake(&mut contrib_stream, contributor).await;
+    bind_role(
+        &mut contrib_stream,
+        contributor,
+        ClientRole::Contributor,
+        "contrib-publish-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut contrib_stream,
+        &Envelope::request(
+            contributor,
+            Payload::Command(command(
+                CommandBody::PublishDocument {
+                    document_id: codypendent_protocol::DocumentId::new(),
+                    target: target.clone(),
+                },
+                "publish-contributor",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    // A Controller gets past the role gate but the transport is unwired.
+    let controller = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, controller).await;
+    bind_role(
+        &mut stream,
+        controller,
+        ClientRole::Controller,
+        "controller-publish-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            controller,
+            Payload::Command(command(
+                CommandBody::PublishDocument {
+                    document_id: codypendent_protocol::DocumentId::new(),
+                    target,
+                },
+                "publish-controller",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "document.transport-unavailable");
+        }
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    // The Contributor's connection is simply dropped (as `start_workflow_is_
+    // role_denied_then_transport_unavailable` drops its Observer connection) —
+    // only one `Shutdown` request must reach the single daemon instance.
+    drop(contrib_stream);
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn start_workflow_is_role_denied_then_transport_unavailable() {
     // Phase 5 STEP 5.2: `StartWorkflow` is intercepted at the connection level
     // like `MutateDocument`. The daemon's own test server injects no starter, so

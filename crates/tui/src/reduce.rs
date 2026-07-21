@@ -788,6 +788,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
         ProposedAction::NetworkRequest { destination } => format!("NetworkConnect ({destination})"),
         ProposedAction::GitCommit { repository } => format!("GitCommit ({repository})"),
         ProposedAction::GitPush { remote, branch } => format!("GitPush ({remote} {branch})"),
+        ProposedAction::PublishDocument { target, .. } => format!("GitCommit ({target})"),
         _ => "unsupported capability".to_owned(),
     }
 }
