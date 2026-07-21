@@ -12,7 +12,8 @@ use codypendent_knowledge::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ClientRole, CommandBody, Payload, SessionId, Subscription, WorkspaceId,
+    AgentMode, ClientRole, CommandBody, Payload, PromotionAction, SessionId, Subscription,
+    WorkspaceId,
 };
 
 use crate::client;
@@ -630,6 +631,189 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
     })
     .await?;
     Ok(())
+}
+
+// --- STEP 7.1: eval harness runner -------------------------------------------
+
+/// `codypendent eval run --suite <NAME> [--policy P] --report out.json`
+/// (Phase 7 STEP 7.1). Loads every case in the suite, runs each headlessly
+/// against its pinned fixture revision, scores it, and writes the aggregate
+/// [`codypendent_eval::SuiteReport`] to `--report`. `policy` is recorded on
+/// stdout only — Phase 7 routing is not yet wired into `StartRun` (see the
+/// roadmap's "routing⇄eval composition" note), so it does not yet select a
+/// model.
+pub async fn eval_run(
+    paths: &RuntimePaths,
+    suite: &str,
+    policy: Option<String>,
+    report: &std::path::Path,
+) -> anyhow::Result<()> {
+    let suite_dir = crate::eval::resolve_suite_dir(suite)?;
+    let cases = crate::eval::load_suite(&suite_dir)?;
+    println!(
+        "eval: loaded {} case(s) from {}{}",
+        cases.len(),
+        suite_dir.display(),
+        policy
+            .as_deref()
+            .map(|p| format!(" (policy: {p}, not yet enforced)"))
+            .unwrap_or_default()
+    );
+    let fixture_root = crate::eval::fixture_root(&suite_dir, "tiny-crate")?;
+    let suite_report = crate::eval::run_suite(paths, &cases, &fixture_root).await?;
+
+    let json = serde_json::to_string_pretty(&suite_report)?;
+    std::fs::write(report, json)
+        .with_context(|| format!("writing suite report to {}", report.display()))?;
+
+    let passed = suite_report.results.iter().filter(|r| r.passed()).count();
+    println!(
+        "eval: {passed}/{} case(s) passed ({:.0}%); report written to {}",
+        suite_report.results.len(),
+        suite_report.success_rate() * 100.0,
+        report.display()
+    );
+    if !suite_report.all_passed() {
+        anyhow::bail!(
+            "eval suite did not pass: failed case(s): {}",
+            suite_report.failed_case_ids().join(", ")
+        );
+    }
+    Ok(())
+}
+
+// --- STEP 7.5: promotion pipeline commands ----------------------------------
+
+/// `codypendent promote propose --kind K --name NAME --version N
+/// [--requires-permission-review]` (Phase 7 STEP 7.5). Ensures a daemon (like
+/// `workflow run`, this is the "creation" verb) and prints the new candidate id.
+pub async fn promote_propose(
+    paths: &RuntimePaths,
+    kind: String,
+    name: String,
+    version: u32,
+    requires_permission_review: bool,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let candidate_id =
+        promote_propose_over_connection(&mut conn, kind, name, version, requires_permission_review)
+            .await?;
+    println!("promotion candidate proposed: {candidate_id}");
+    Ok(())
+}
+
+/// The connected core of [`promote_propose`]: handshake, bind the `Controller`
+/// role, send `ProposePromotion`, and return the new candidate id. Split out
+/// for the same testability reason as [`workflow_run_over_connection`].
+pub async fn promote_propose_over_connection(
+    conn: &mut Connection,
+    kind: String,
+    name: String,
+    version: u32,
+    requires_permission_review: bool,
+) -> anyhow::Result<String> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::ProposePromotion {
+            kind,
+            name,
+            version,
+            requires_permission_review,
+        })
+        .await?;
+    match reply.payload {
+        Payload::PromotionProposed { candidate_id, .. } => Ok(candidate_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("propose rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to ProposePromotion: {other:?}"),
+    }
+}
+
+/// `codypendent promote advance <CANDIDATE_ID> --step <STEP> [--regressed]`
+/// (Phase 7 STEP 7.5).
+pub async fn promote_advance(
+    paths: &RuntimePaths,
+    candidate_id: String,
+    action: PromotionAction,
+) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::AdvancePromotion {
+            candidate_id,
+            action,
+        },
+        "advance",
+    )
+    .await
+}
+
+/// `codypendent promote approve <CANDIDATE_ID>` — the human-approval gate
+/// (Phase 7 STEP 7.5, ADR-010). This command does not start a daemon: approving
+/// only makes sense against an already-running one with a real candidate.
+pub async fn promote_approve(paths: &RuntimePaths, candidate_id: String) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::ApprovePromotion { candidate_id },
+        "approve",
+    )
+    .await
+}
+
+/// `codypendent promote rollback <CANDIDATE_ID>` (Phase 7 STEP 7.5).
+pub async fn promote_rollback(paths: &RuntimePaths, candidate_id: String) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::RollbackPromotion { candidate_id },
+        "rollback",
+    )
+    .await
+}
+
+/// Send one promotion command to a *running* daemon (mirrors
+/// [`lifecycle_command`]: advancing/approving/rolling back only makes sense
+/// against a daemon that already exists) and report whether it was accepted.
+async fn promotion_command(
+    paths: &RuntimePaths,
+    body: CommandBody,
+    verb: &str,
+) -> anyhow::Result<()> {
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    promotion_command_over_connection(&mut conn, body, verb).await
+}
+
+/// The connected core of [`promotion_command`]: handshake, bind the
+/// `Controller` role, send `body`, and report whether it was accepted. Split
+/// out (and `pub`, like [`workflow_run_over_connection`]) so a test can drive
+/// it against a hand-rolled mock daemon.
+pub async fn promotion_command_over_connection(
+    conn: &mut Connection,
+    body: CommandBody,
+    verb: &str,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn.send_command(body).await?;
+    match reply.payload {
+        Payload::CommandAccepted { .. } => {
+            println!("promotion {verb} accepted");
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "promotion {verb} rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to promotion {verb}: {other:?}"),
+    }
 }
 
 /// A human, indented rendering of a compiled workflow graph. Pure, so it is tested

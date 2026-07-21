@@ -102,6 +102,17 @@ enum TopCommand {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Run the evaluation harness against a fixture suite (Phase 7 STEP 7.1).
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+    /// Drive a learnable artifact through the evaluation-gated promotion
+    /// pipeline (Phase 7 STEP 7.5) — nothing promotes itself (ADR-010).
+    Promote {
+        #[command(subcommand)]
+        command: PromoteCommand,
+    },
     /// Inspect plugin manifests and their permissions (Phase 6).
     Plugin {
         #[command(subcommand)]
@@ -210,6 +221,100 @@ enum WorkflowCommand {
         #[arg(long)]
         node: String,
     },
+}
+
+#[derive(Subcommand)]
+enum EvalCommand {
+    /// Execute an `evals/tasks/` suite headlessly over the JSONL client and
+    /// write a `SuiteReport` (Phase 7 STEP 7.1). Ensures a daemon; each case
+    /// starts its own run against its pinned fixture repository.
+    Run {
+        /// The suite directory under `evals/tasks/` (e.g. `core` for
+        /// `evals/tasks/core/`), or a path to it directly.
+        #[arg(long, default_value = "core")]
+        suite: String,
+        /// The model-policy name the cases declare they run under. Recorded in
+        /// the report; Phase 7 routing is not yet wired into `StartRun` (see
+        /// the roadmap), so this does not yet select a model — every case
+        /// runs under whatever the daemon's own `models.toml` resolves for its
+        /// mode.
+        #[arg(long)]
+        policy: Option<String>,
+        /// Where to write the `SuiteReport` JSON.
+        #[arg(long)]
+        report: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromoteCommand {
+    /// Draft a candidate for the promotion pipeline (Phase 7 STEP 7.5). Prints
+    /// the new candidate id.
+    Propose {
+        /// The artifact kind: `retrieval`, `skill`, `prompt`, `router`,
+        /// `workflow`, or `model-profile`.
+        #[arg(long)]
+        kind: String,
+        /// The artifact's name (e.g. `tool-selection`).
+        #[arg(long)]
+        name: String,
+        /// The version being proposed.
+        #[arg(long)]
+        version: u32,
+        /// Mark this candidate as synthesized (e.g. by a skill-clustering
+        /// pipeline): it must pass permission review before it may enter
+        /// evaluation.
+        #[arg(long)]
+        requires_permission_review: bool,
+    },
+    /// Advance a candidate through the offline-regression / shadow / canary
+    /// legs of the pipeline. `--regressed` supplies the caller's verdict for
+    /// the `regression`/`observe-canary` steps (default: no regression); this
+    /// command *records* a result, it does not compute one — see the report's
+    /// notes on what live shadow/canary traffic capture still needs.
+    Advance {
+        /// The candidate id (as printed by `promote propose`).
+        candidate_id: String,
+        /// Which transition to attempt.
+        #[arg(long, value_enum)]
+        step: PromoteStepArg,
+        /// The regression/canary verdict for `regression`/`observe-canary`
+        /// (ignored by the other steps).
+        #[arg(long)]
+        regressed: bool,
+    },
+    /// **Approve and promote a candidate** (ADR-010: requires the `Controller`
+    /// role, which this local-first socket maps to a human operator — an
+    /// agent/system-initiated approval is refused structurally).
+    Approve { candidate_id: String },
+    /// Manually roll back a promoted candidate to its predecessor version.
+    Rollback { candidate_id: String },
+}
+
+/// `codypendent promote advance --step <STEP>`.
+#[derive(Clone, Copy, ValueEnum)]
+enum PromoteStepArg {
+    Regression,
+    Shadow,
+    Canary,
+    ObserveCanary,
+    FinishCanary,
+}
+
+impl PromoteStepArg {
+    /// Map this CLI-facing step (plus the `--regressed` verdict, which only
+    /// `Regression`/`ObserveCanary` consume) onto the wire [`PromotionAction`](
+    /// codypendent_protocol::PromotionAction).
+    fn into_wire(self, regressed: bool) -> codypendent_protocol::PromotionAction {
+        use codypendent_protocol::PromotionAction;
+        match self {
+            PromoteStepArg::Regression => PromotionAction::RunRegression { regressed },
+            PromoteStepArg::Shadow => PromotionAction::StartShadow,
+            PromoteStepArg::Canary => PromotionAction::StartCanary,
+            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary { regressed },
+            PromoteStepArg::FinishCanary => PromotionAction::FinishCanary,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -339,6 +444,35 @@ async fn main() -> anyhow::Result<()> {
                 workflow_run_id,
                 node,
             } => commands::workflow_retry(&paths, workflow_run_id, node).await,
+        },
+        TopCommand::Eval { command } => match command {
+            EvalCommand::Run {
+                suite,
+                policy,
+                report,
+            } => commands::eval_run(&paths, &suite, policy, &report).await,
+        },
+        TopCommand::Promote { command } => match command {
+            PromoteCommand::Propose {
+                kind,
+                name,
+                version,
+                requires_permission_review,
+            } => {
+                commands::promote_propose(&paths, kind, name, version, requires_permission_review)
+                    .await
+            }
+            PromoteCommand::Advance {
+                candidate_id,
+                step,
+                regressed,
+            } => commands::promote_advance(&paths, candidate_id, step.into_wire(regressed)).await,
+            PromoteCommand::Approve { candidate_id } => {
+                commands::promote_approve(&paths, candidate_id).await
+            }
+            PromoteCommand::Rollback { candidate_id } => {
+                commands::promote_rollback(&paths, candidate_id).await
+            }
         },
         TopCommand::Plugin { command } => match command {
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),
