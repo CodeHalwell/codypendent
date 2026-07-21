@@ -73,13 +73,28 @@ fn default_subscriptions() -> Vec<Subscription> {
 /// catch-up, and runs the event loop until the user detaches (`q`) or the daemon
 /// closes the stream. Detaching never affects the run — the daemon keeps it
 /// going; a later `codypendent` reopens the same session and catches up.
-pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
+///
+/// `theme_override` is `--theme <NAME>` / `CODYPENDENT_THEME` (resolved by the
+/// caller, flag winning over env — see `main.rs`): a built-in variant name or
+/// a theme-pack id under `<data-dir>/themes/<id>.toml` (STEP 6.6, see
+/// `theme_select`). Resolved before any daemon/socket work so a bad name fails
+/// fast on a normal cooked terminal instead of after entering raw mode.
+pub async fn run(
+    paths: &RuntimePaths,
+    repo: PathBuf,
+    theme_override: Option<String>,
+) -> anyhow::Result<()> {
     let repo = repo
         .canonicalize()
         .with_context(|| format!("{}: not a valid, accessible directory", repo.display()))?;
     if !repo.is_dir() {
         bail!("{}: not a directory", repo.display());
     }
+
+    // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
+    // with a manual override that always wins, replacing the old hardcoded
+    // `Theme::dark()`.
+    let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
 
     commands::ensure_daemon(paths).await?;
     let mut conn = Connection::connect(&paths.socket_path).await?;
@@ -153,7 +168,6 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     let input_running = Arc::new(AtomicBool::new(true));
     spawn_input_thread(input_tx, Arc::clone(&input_running));
 
-    let theme = Theme::dark();
     let (mut width, _) = crossterm::terminal::size().unwrap_or((80, 24));
 
     let mut ticker = tokio::time::interval(TICK);
