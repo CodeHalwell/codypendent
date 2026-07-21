@@ -29,7 +29,7 @@ pub mod version;
 pub use artifact::{ArtifactRef, DataClassification};
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, SessionProjection};
-pub use command::{Command, CommandBody};
+pub use command::{Command, CommandBody, PromotionAction};
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, SuggestionInput,
 };

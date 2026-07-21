@@ -41,6 +41,10 @@ use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
 use crate::projections;
+use crate::promotion::{
+    AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
+    RollbackPromotionRequest,
+};
 use crate::subscriptions::SubscriptionHub;
 use crate::workflows::{
     PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest, StartWorkflowRequest,
@@ -105,6 +109,12 @@ pub struct ServerState {
     /// (those commands are then rejected `workflow.transport-unavailable`); injected
     /// together with `starter` by the assembly.
     pub lifecycle: Option<Arc<dyn WorkflowLifecycle>>,
+    /// Drives the evaluation-gated promotion pipeline (Phase 7 STEP 7.5):
+    /// propose/advance/approve/rollback. `None` in a lib-only / test embedding
+    /// (every promotion command is then rejected
+    /// `promotion.transport-unavailable`); the assembly injects a
+    /// `codypendent-eval`-backed implementation over the pool.
+    pub promotion: Option<Arc<dyn PromotionGateway>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -183,6 +193,7 @@ pub async fn run_with_executor_on(
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
+    let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
     let documents = DocumentHub::new();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
@@ -231,6 +242,7 @@ pub async fn run_with_executor_on(
         leaser,
         starter,
         lifecycle,
+        promotion,
     });
 
     #[cfg(unix)]
@@ -958,6 +970,227 @@ async fn handle_request(
                         };
                         send(writer, &reply).await?;
                     }
+                }
+                // A promotion candidate lives in its own durable store outside
+                // the session ledger — so, like `StartWorkflow`, it is
+                // intercepted here and applied through the assembly's
+                // `PromotionGateway` seam rather than the event write path
+                // (Phase 7 STEP 7.5). A draft may be authored by anyone
+                // (including an agent/grader), so this is gated like
+                // `StartWorkflow` — any role but `Observer`.
+                CommandBody::ProposePromotion {
+                    kind,
+                    name,
+                    version,
+                    requires_permission_review,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not propose a promotion candidate".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let propose = ProposePromotionRequest {
+                        kind: kind.clone(),
+                        name: name.clone(),
+                        version: *version,
+                        requires_permission_review: *requires_permission_review,
+                        idempotency_key: command.idempotency_key.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.propose(propose).await {
+                        Ok(candidate_id) => Envelope::reply_to(
+                            &request,
+                            Payload::PromotionProposed {
+                                command_id: command.command_id,
+                                candidate_id,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Advancing through regression/shadow/canary is likewise open to
+                // any role but `Observer` — the same reasoning as
+                // `ProposePromotion`; only the final `approve`/`rollback` step
+                // requires `Controller` (below).
+                CommandBody::AdvancePromotion {
+                    candidate_id,
+                    action,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not advance a promotion candidate".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let advance = AdvancePromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        action: action.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.advance(advance).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // **The human-approval gate (ADR-010, exit criterion 2).** Only a
+                // `Controller` may issue this command; over this local-first
+                // socket, a `Controller`-role connection IS the human operator
+                // (Chapter 03 / `ConnState::role`'s own doc — the single
+                // connecting user is trusted with control), the same mapping
+                // `apply_resolve_approval` already uses for `resolved_by`. There
+                // is no wire field for a caller to *supply* an actor — the
+                // `Actor::Human` constructed just below is the ONLY actor this
+                // code path can ever hand to the promotion seam, so an
+                // agent/system-initiated approve cannot even be expressed here,
+                // let alone succeed; `Candidate::approve` then refuses a
+                // non-human actor a second, structural time regardless.
+                CommandBody::ApprovePromotion { candidate_id } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may approve a promotion".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let client_id = conn.client_id_or(request.client_id);
+                    let approve = ApprovePromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        // The ONE place an `Actor::Human` is minted for this
+                        // command — from the authenticated connection's role,
+                        // never from client-supplied data.
+                        approver: codypendent_protocol::Actor::Human {
+                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                        },
+                        client_id,
+                    };
+                    let reply = match gateway.approve(approve).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // A manual rollback is likewise `Controller`-only — the engine
+                // itself does not require a human actor to roll back (stopping a
+                // bad change needs no human), but the daemon still reserves the
+                // action to the trusted local operator and attributes it as
+                // `Actor::Human`, so it is never confused in the audit trail with
+                // the system-attributed auto-rollback a canary regression
+                // produces on its own (`AdvancePromotion { ObserveCanary }`).
+                CommandBody::RollbackPromotion { candidate_id } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may roll back a promotion".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let client_id = conn.client_id_or(request.client_id);
+                    let rollback = RollbackPromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        actor: codypendent_protocol::Actor::Human {
+                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                        },
+                        client_id,
+                    };
+                    let reply = match gateway.rollback(rollback).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
                 }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is

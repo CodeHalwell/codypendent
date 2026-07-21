@@ -45,6 +45,7 @@ use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
+use crate::promotion::PromotionStoreGateway;
 use crate::scan;
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor};
 use crate::workflows::WorkflowConductorHost;
@@ -83,6 +84,11 @@ pub struct RuntimeExecutor {
     /// the server pulls out, so their per-run drive locks are the same registry —
     /// a `PauseWorkflow` and the `StartWorkflow` drive it pauses serialize together.
     workflow_host: WorkflowConductorHost<AgentLoopNodeExecutor>,
+    /// The promotion-pipeline gateway (Phase 7 STEP 7.5): backs
+    /// `ProposePromotion`/`AdvancePromotion`/`ApprovePromotion`/`RollbackPromotion`.
+    /// Stateless beyond the pool, so it is built once here and cloned out by
+    /// [`RunExecutor::promotion_gateway`].
+    promotion: PromotionStoreGateway,
 }
 
 impl RuntimeExecutor {
@@ -106,6 +112,7 @@ impl RuntimeExecutor {
             approvals.clone(),
             None,
         );
+        let promotion = PromotionStoreGateway::new(pool.clone());
         Self {
             pool,
             paths,
@@ -115,6 +122,7 @@ impl RuntimeExecutor {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
             workflow_host,
+            promotion,
         }
     }
 
@@ -569,6 +577,14 @@ impl RunExecutor for RuntimeExecutor {
         // Pause/resume/retry an existing durable run over the same host (Phase 5
         // STEP 5.2).
         Some(Arc::new(self.workflow_host.clone()))
+    }
+
+    fn promotion_gateway(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::promotion::PromotionGateway>> {
+        // Propose/advance/approve/roll back a promotion candidate (Phase 7 STEP
+        // 7.5) over `codypendent-eval`'s durable store.
+        Some(Arc::new(self.promotion.clone()))
     }
 }
 

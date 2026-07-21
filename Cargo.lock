@@ -486,6 +486,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "codypendent-eval",
  "codypendent-integrations",
  "codypendent-knowledge",
  "codypendent-protocol",
@@ -509,6 +510,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "codypendent-daemon",
+ "codypendent-eval",
  "codypendent-integrations",
  "codypendent-knowledge",
  "codypendent-protocol",
@@ -551,10 +553,18 @@ dependencies = [
 name = "codypendent-eval"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "codypendent-protocol",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

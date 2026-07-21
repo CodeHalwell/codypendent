@@ -18,6 +18,7 @@ codypendent-protocol = { workspace = true }
 codypendent-knowledge = { workspace = true }
 codypendent-integrations = { workspace = true }
 codypendent-workflow = { workspace = true }
+codypendent-eval = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

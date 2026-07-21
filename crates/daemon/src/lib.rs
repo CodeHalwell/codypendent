@@ -18,6 +18,7 @@ pub mod documents;
 pub mod executor;
 pub mod policy;
 pub mod projections;
+pub mod promotion;
 pub mod recovery;
 pub mod subscriptions;
 pub mod workflows;

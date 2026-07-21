@@ -178,6 +178,85 @@ pub enum CommandBody {
         /// The node id to re-drive from (its transitive dependents reset with it).
         node_id: String,
     },
+    /// Draft a candidate for the evaluation-gated promotion pipeline (Phase 7
+    /// STEP 7.5 — nothing promotes itself, ADR-010).
+    ///
+    /// Handled at the connection level like `StartWorkflow` (a promotion
+    /// candidate lives in its own durable store outside the session ledger):
+    /// the daemon creates a draft through its `PromotionGateway` seam and
+    /// replies [`Payload::PromotionProposed`](crate::envelope::Payload::PromotionProposed)
+    /// with the new candidate id — or `CommandRejected` when a synthesized
+    /// candidate needs permission review, or the daemon has no promotion
+    /// transport (`promotion.transport-unavailable`). `kind` is the wire name
+    /// of an `ArtifactKind` (e.g. `"skill"`, `"router"`); an unrecognized kind
+    /// is rejected rather than guessed at.
+    ProposePromotion {
+        kind: String,
+        name: String,
+        version: u32,
+        #[serde(default)]
+        requires_permission_review: bool,
+    },
+    /// Advance a candidate through the offline-regression / shadow / canary
+    /// legs of the pipeline (Phase 7 STEP 7.5). `action` names exactly which
+    /// transition to attempt; an illegal transition (wrong stage, or an
+    /// unobserved canary trying to finish) is rejected verbatim as the
+    /// underlying state-machine error, never silently coerced into success.
+    /// Same connection-level handling and role gating as `ProposePromotion`.
+    AdvancePromotion {
+        candidate_id: String,
+        action: PromotionAction,
+    },
+    /// **Approve and promote a candidate.** The human-approval gate
+    /// (ADR-010, exit criterion 2): the daemon authenticates the acting party
+    /// as `Actor::Human` from the connection's role — over this local-first
+    /// socket, a `Controller`-role connection **is** the human operator (the
+    /// same mapping `ResolveApproval` already uses for `resolved_by`) — and
+    /// only a `Controller` may issue this command; every other role, and
+    /// necessarily every non-human actor, is refused structurally before the
+    /// promotion seam is ever invoked. No field on the wire lets a caller
+    /// *supply* an actor — that would defeat the whole point of ADR-010.
+    ApprovePromotion {
+        candidate_id: String,
+    },
+    /// Manually roll back a promoted candidate to its predecessor version
+    /// (Phase 7 STEP 7.5, exit criterion 4: reversible). Requires the
+    /// `Controller` role like `ApprovePromotion`, and — unlike approval — the
+    /// engine itself does not restrict rollback to a human actor (stopping a
+    /// bad change needs no human, only promoting a good one does); the
+    /// daemon still attributes the connection's mapped `Actor::Human` so a
+    /// manual rollback is never confused with the system-attributed
+    /// auto-rollback a canary regression produces on its own.
+    RollbackPromotion {
+        candidate_id: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One legal state-machine transition to attempt via `AdvancePromotion`
+/// (Phase 7 STEP 7.5). Mirrors `codypendent_eval::promote::Candidate`'s
+/// methods exactly; `regressed`/canary-observation verdicts are supplied by
+/// the caller — this command *records* a result, it does not compute one (see
+/// the crate-level docs on why live shadow/canary traffic capture is a
+/// separate, later concern).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[non_exhaustive]
+pub enum PromotionAction {
+    /// Run the offline regression suite; `regressed` is the caller's verdict.
+    RunRegression { regressed: bool },
+    /// Begin the shadow run.
+    StartShadow,
+    /// Begin the limited canary.
+    StartCanary,
+    /// Record one canary signal observation; `regressed` is the caller's
+    /// verdict. A regression auto-rolls-back immediately (no human needed to
+    /// *stop* a bad change).
+    ObserveCanary { regressed: bool },
+    /// Finish the canary and assemble the comparison. Refused if no
+    /// observation was ever recorded (a canary must not "pass" unobserved).
+    FinishCanary,
     #[serde(other)]
     Unknown,
 }
@@ -305,6 +384,72 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             node_id: "verify".to_string(),
         });
+        round_trip(CommandBody::ProposePromotion {
+            kind: "router".to_string(),
+            name: "tool-selection".to_string(),
+            version: 12,
+            requires_permission_review: false,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::RunRegression { regressed: false },
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::StartShadow,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::StartCanary,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::ObserveCanary { regressed: true },
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::FinishCanary,
+        });
+        round_trip(CommandBody::ApprovePromotion {
+            candidate_id: "cand-abc123".to_string(),
+        });
+        round_trip(CommandBody::RollbackPromotion {
+            candidate_id: "cand-abc123".to_string(),
+        });
+    }
+
+    #[test]
+    fn propose_promotion_without_the_review_flag_reparses_to_false() {
+        // A payload missing `requires_permission_review` entirely (what an
+        // older client, or one hand-constructing the minimal shape, sends)
+        // must still parse — defaulted to `false` — rather than erroring.
+        let json = serde_json::json!({
+            "type": "ProposePromotion",
+            "kind": "skill",
+            "name": "rust-ci",
+            "version": 1,
+        });
+        let parsed: CommandBody = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            parsed,
+            CommandBody::ProposePromotion {
+                kind: "skill".to_string(),
+                name: "rust-ci".to_string(),
+                version: 1,
+                requires_permission_review: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_promotion_action_tag_deserializes_to_unknown() {
+        // Forward-compatibility (RULE 1) for the nested PromotionAction enum,
+        // exactly like CommandBody's own Unknown fallback.
+        let parsed: PromotionAction = serde_json::from_value(
+            serde_json::json!({ "type": "RunOnnxInference", "confidence": 0.9 }),
+        )
+        .expect("unknown tag must parse, not error");
+        assert!(matches!(parsed, PromotionAction::Unknown));
     }
 
     #[test]

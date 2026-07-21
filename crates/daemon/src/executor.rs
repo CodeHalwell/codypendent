@@ -137,4 +137,16 @@ pub trait RunExecutor: Send + Sync {
     ) -> Option<std::sync::Arc<dyn crate::workflows::WorkflowLifecycle>> {
         None
     }
+
+    /// The assembly-provided [`PromotionGateway`](crate::promotion::PromotionGateway)
+    /// that drives the evaluation-gated promotion pipeline (Phase 7 STEP 7.5).
+    /// Bundled with the executor like the workflow seams — it names
+    /// `codypendent-eval` and the pool, which only the assembly can. The default
+    /// `None` leaves every promotion command unwired: the executor-less server
+    /// and the daemon's own tests then reject them
+    /// `promotion.transport-unavailable`, exactly as `StartWorkflow` is rejected
+    /// without a starter.
+    fn promotion_gateway(&self) -> Option<std::sync::Arc<dyn crate::promotion::PromotionGateway>> {
+        None
+    }
 }

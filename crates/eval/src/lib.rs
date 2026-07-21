@@ -18,15 +18,25 @@
 //!   promote → rollback. **No self-promotion**: only an
 //!   [`Actor::Human`](codypendent_protocol::events::Actor) can approve, enforced in
 //!   the state machine (ADR-010, exit criterion 2).
+//! * [`store`] — [`PromotionStore`](store::PromotionStore): durable persistence
+//!   for `promote`'s state machine (STEP 7.5 daemon wiring), over a SQLite pool
+//!   (migration `0015_promotion.sql`). Adds `sqlx` to this crate but keeps it
+//!   "daemon-free" in the sense the rest of this module doc uses the phrase: no
+//!   dependency on `codypendent-daemon` (mirrors `codypendent-workflow`'s own
+//!   store), and the same no-self-promotion property, since the store only ever
+//!   persists the RESULT of a real state-machine transition.
 //!
-//! Everything here is pure and daemon-free, so the gate — *nothing promotes
-//! itself* — is proven in isolation.
+//! The `case`/`cluster`/`grade`/`regression`/`promote` state machines are pure
+//! and daemon-free, so the gate — *nothing promotes itself* — is proven in
+//! isolation; `store` is this crate's one persistence seam.
 
 pub mod case;
 pub mod cluster;
+pub mod db;
 pub mod grade;
 pub mod promote;
 pub mod regression;
+pub mod store;
 
 pub use case::{Assertion, AssertionResult, CaseResult, EvalCase, RunObservation, SuiteReport};
 pub use cluster::{cluster_failures, rank_by_frequency, ClusterKey, FailureCluster};
@@ -36,3 +46,4 @@ pub use promote::{
     PromotionRecord, PromotionStage,
 };
 pub use regression::{RegressionReport, RegressionSuite};
+pub use store::{CandidateSnapshot, PromotionStore, PromotionStoreError};
