@@ -23,6 +23,28 @@ use anyhow::{Context, Result};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_tui::{load_theme_pack, ColorDepth, Theme, ThemePreferences, ThemeVariant};
 
+/// Merge the `--theme` flag with the `CODYPENDENT_THEME` env var into the
+/// single override name [`resolve_theme`]/[`resolve_theme_for_depth`] take.
+///
+/// The flag wins, but an empty/whitespace-only value from EITHER source is
+/// treated as absent and falls through to the other — `--theme ""` falls
+/// through to `CODYPENDENT_THEME`, and an empty/unset env var falls through
+/// to no override, never the other way around. This mirrors `RuntimePaths`'
+/// own `non_empty_env` convention (an empty override is a misconfiguration,
+/// not a real value), and is why each source is filtered *before* combining:
+/// `Option::or_else` only runs its closure when the receiver is `None`, so
+/// filtering only *after* combining would let a present-but-empty flag
+/// short-circuit past a real env var.
+///
+/// Pure and independent of `std::env`, so the precedence is directly
+/// testable without mutating the process environment.
+pub fn resolve_theme_override(flag: Option<String>, env: Option<String>) -> Option<String> {
+    fn non_empty(value: Option<String>) -> Option<String> {
+        value.filter(|v| !v.trim().is_empty())
+    }
+    non_empty(flag).or_else(|| non_empty(env))
+}
+
 /// Data-only theme packs (STEP 6.6) load from `<data-dir>/themes/<id>.toml` —
 /// the existing data-dir convention (see the module docs on
 /// `RuntimePaths`), alongside the CLI's other ad hoc data-dir paths (e.g.
@@ -113,6 +135,54 @@ mod tests {
 
     fn paths_in(dir: &Path) -> RuntimePaths {
         RuntimePaths::from_data_dir(dir.to_path_buf())
+    }
+
+    #[test]
+    fn flag_wins_over_env() {
+        assert_eq!(
+            resolve_theme_override(Some("dark".to_string()), Some("light".to_string())),
+            Some("dark".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_flag_falls_through_to_env() {
+        assert_eq!(
+            resolve_theme_override(Some(String::new()), Some("light".to_string())),
+            Some("light".to_string())
+        );
+        // Whitespace-only counts as empty too.
+        assert_eq!(
+            resolve_theme_override(Some("   ".to_string()), Some("light".to_string())),
+            Some("light".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_env_falls_through_to_no_override() {
+        assert_eq!(
+            resolve_theme_override(None, Some(String::new())),
+            None,
+            "an empty env var must not surface as an override"
+        );
+        assert_eq!(resolve_theme_override(None, Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn both_empty_is_no_override() {
+        assert_eq!(
+            resolve_theme_override(Some(String::new()), Some(String::new())),
+            None
+        );
+        assert_eq!(resolve_theme_override(None, None), None);
+    }
+
+    #[test]
+    fn a_real_env_value_is_used_when_the_flag_is_absent() {
+        assert_eq!(
+            resolve_theme_override(None, Some("high-contrast".to_string())),
+            Some("high-contrast".to_string())
+        );
     }
 
     #[test]

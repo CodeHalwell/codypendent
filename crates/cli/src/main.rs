@@ -37,7 +37,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codypendent_cli::{commands, tui};
+use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{AgentMode, SessionId};
 
@@ -291,13 +291,11 @@ enum EventsFormat {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = RuntimePaths::resolve()?;
-    // `--theme` wins over `CODYPENDENT_THEME`; an empty value (either source)
-    // is treated as unset, matching `RuntimePaths`' own `non_empty_env` rule
-    // for env overrides.
-    let theme_override = cli
-        .theme
-        .or_else(|| std::env::var("CODYPENDENT_THEME").ok())
-        .filter(|v| !v.trim().is_empty());
+    // `--theme` wins over `CODYPENDENT_THEME`; an empty value from either
+    // source falls through to the other (see `theme_select::resolve_theme_override`
+    // for why each source must be filtered before combining them).
+    let theme_override =
+        theme_select::resolve_theme_override(cli.theme, std::env::var("CODYPENDENT_THEME").ok());
     let Some(command) = cli.command else {
         // Bare `codypendent`: open the TUI for the current directory's repo.
         return tui::run(&paths, std::env::current_dir()?, theme_override).await;
