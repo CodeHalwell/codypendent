@@ -86,8 +86,10 @@ fn package_parse_round_trip() {
     assert_eq!(item.trust.publisher, "local-user");
     assert_eq!(item.trust.tier, TrustTier::FirstParty);
 
-    // A non-empty scripts/ entrypoint makes the skill non-executable in Phase 2.
-    assert!(!item.executable);
+    // STEP 6.4: a script-bearing skill is now executable — its `scripts/` run
+    // confined through the OS sandbox (the Phase-2 non-executable restriction is
+    // lifted). The run itself still fails closed where no sandbox backend exists.
+    assert!(item.executable);
 
     // Languages plus the human title are retained as keywords.
     assert!(item.keywords.iter().any(|k| k == "rust"));

@@ -493,6 +493,7 @@ dependencies = [
  "codypendent-tui",
  "codypendent-workflow",
  "crossterm",
+ "directories",
  "ratatui",
  "serde",
  "serde_json",
@@ -589,6 +590,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "codypendent-protocol",
+ "codypendent-sandbox",
  "hex",
  "loro",
  "notify",
@@ -665,6 +667,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]
