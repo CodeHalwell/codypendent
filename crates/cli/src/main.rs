@@ -199,6 +199,11 @@ enum WorkflowCommand {
         /// '{"pull_request": 7}'). Defaults to null.
         #[arg(long)]
         inputs: Option<String>,
+        /// Repository the workflow's agent nodes operate on (each writing node is
+        /// carved its own isolated worktree from it). Defaults to the current
+        /// directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Pause a running workflow run so its driver stops launching new nodes; resume
     /// it later with `workflow resume` (Phase 5 STEP 5.2).
@@ -341,8 +346,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::workflow_validate(&file, agents.as_deref())
             }
             WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
-            WorkflowCommand::Run { file, inputs } => {
-                commands::workflow_run(&paths, &file, inputs).await
+            WorkflowCommand::Run { file, inputs, repo } => {
+                let repo = match repo {
+                    Some(repo) => repo,
+                    None => std::env::current_dir()?,
+                };
+                commands::workflow_run(&paths, &file, inputs, repo).await
             }
             WorkflowCommand::Pause { workflow_run_id } => {
                 commands::workflow_pause(&paths, workflow_run_id).await

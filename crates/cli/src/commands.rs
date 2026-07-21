@@ -498,15 +498,19 @@ pub fn workflow_show(file: &std::path::Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `codypendent workflow run <FILE> [--inputs <JSON>]` (Phase 5 STEP 5.2): start a
-/// durable workflow run. Ensures a daemon, sends `StartWorkflow`, and prints the
-/// new run id the daemon drives to a terminal state in the background. The manifest
-/// content (never a path) is what crosses the wire, and `--inputs` is parsed as a
-/// JSON value the manifest's typed inputs bind to.
+/// `codypendent workflow run <FILE> [--inputs <JSON>] [--repo <PATH>]` (Phase 5
+/// STEP 5.2): start a durable workflow run. Ensures a daemon, sends `StartWorkflow`,
+/// and prints the new run id the daemon drives to a terminal state in the
+/// background. The manifest content (never a path) is what crosses the wire,
+/// `--inputs` is parsed as a JSON value the manifest's typed inputs bind to, and
+/// `repo`'s canonical path is carried so the daemon carves each writing node its
+/// own isolated worktree from *this* checkout (Phase 5 T5) — mirroring how the
+/// `run` command carries `StartRun`'s repository.
 pub async fn workflow_run(
     paths: &RuntimePaths,
     file: &std::path::Path,
     inputs: Option<String>,
+    repo: PathBuf,
 ) -> anyhow::Result<()> {
     let manifest = std::fs::read_to_string(file)
         .with_context(|| format!("reading workflow manifest {}", file.display()))?;
@@ -516,26 +520,44 @@ pub async fn workflow_run(
         }
         None => serde_json::Value::Null,
     };
+    let repo = repo.canonicalize().with_context(|| {
+        format!(
+            "--repo {}: not a valid, accessible directory",
+            repo.display()
+        )
+    })?;
+    if !repo.is_dir() {
+        anyhow::bail!("--repo {}: not a directory", repo.display());
+    }
+    let repository = repo.to_string_lossy().into_owned();
     ensure_daemon(paths).await?;
     let mut conn = Connection::connect(&paths.socket_path).await?;
-    let run_id = workflow_run_over_connection(&mut conn, manifest, inputs).await?;
+    let run_id =
+        workflow_run_over_connection(&mut conn, manifest, inputs, Some(repository)).await?;
     println!("workflow run started: {run_id}");
     Ok(())
 }
 
 /// The connected core of [`workflow_run`]: handshake, bind the `Controller` role,
 /// send `StartWorkflow`, and return the new run id. Split out so a test can drive it
-/// against a mock server (like [`run_over_connection`]).
+/// against a mock server (like [`run_over_connection`]). `repository` is the
+/// canonical repo root the run's agent nodes operate on (Phase 5 T5); `None` lets
+/// the daemon fall back to its startup repository.
 pub async fn workflow_run_over_connection(
     conn: &mut Connection,
     manifest: String,
     inputs: serde_json::Value,
+    repository: Option<String>,
 ) -> anyhow::Result<String> {
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(conn).await?;
     let reply = conn
-        .send_command(CommandBody::StartWorkflow { manifest, inputs })
+        .send_command(CommandBody::StartWorkflow {
+            manifest,
+            inputs,
+            repository,
+        })
         .await?;
     match reply.payload {
         Payload::WorkflowRunStarted {

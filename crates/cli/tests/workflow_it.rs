@@ -108,10 +108,19 @@ async fn mock_daemon(mut stream: UnixStream, workflow_run_id: &str) {
         .expect("connection open");
     let command_id = command_id_of(&start);
     match &expect_command(&start).body {
-        CommandBody::StartWorkflow { manifest, .. } => {
+        CommandBody::StartWorkflow {
+            manifest,
+            repository,
+            ..
+        } => {
             assert!(
                 manifest.contains("schema_version"),
                 "the manifest content crosses the wire, not a path"
+            );
+            assert_eq!(
+                repository.as_deref(),
+                Some("/tmp/workflow-repo"),
+                "the run's repository crosses the wire (Phase 5 T5)"
             );
         }
         other => panic!("expected StartWorkflow, got {other:?}"),
@@ -146,9 +155,14 @@ async fn workflow_run_sends_the_manifest_and_returns_the_run_id() {
     let manifest =
         "schema_version: 1\nid: wf\nversion: 1\nsteps:\n  - id: a\n    tool: repository.test\n"
             .to_string();
-    let run_id = workflow_run_over_connection(&mut conn, manifest, serde_json::json!({ "pr": 7 }))
-        .await
-        .expect("workflow run");
+    let run_id = workflow_run_over_connection(
+        &mut conn,
+        manifest,
+        serde_json::json!({ "pr": 7 }),
+        Some("/tmp/workflow-repo".to_string()),
+    )
+    .await
+    .expect("workflow run");
     assert_eq!(run_id, "wfrun-test-123");
 
     server.await.expect("mock server task");

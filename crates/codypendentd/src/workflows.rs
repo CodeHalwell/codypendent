@@ -244,6 +244,7 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 manifest,
                 inputs,
                 idempotency_key,
+                repository,
                 ..
             } = request;
 
@@ -272,6 +273,9 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                     &idempotency_key,
                     &inputs,
                     Some(&manifest),
+                    // Persist the run's repository so recovery carves each agent
+                    // node's isolated worktree from the right checkout (T5).
+                    repository.as_deref(),
                 )
                 .await
                 .map_err(|error| match error {
@@ -477,6 +481,7 @@ steps:
             manifest: MANIFEST.to_owned(),
             inputs: json!({ "pull_request": 7 }),
             idempotency_key: key.to_owned(),
+            repository: None,
             client_id: ClientId::new(),
         }
     }
@@ -555,6 +560,7 @@ steps:
                 manifest: "schema_version: 1\nid: empty\nversion: 1\nsteps: []\n".to_owned(),
                 inputs: json!(null),
                 idempotency_key: "cmd-bad".to_owned(),
+                repository: None,
                 client_id: ClientId::new(),
             })
             .await
@@ -665,6 +671,7 @@ steps:
                 manifest: different_manifest,
                 inputs: json!({ "pull_request": 7 }),
                 idempotency_key: "cmd-shared-key".to_owned(),
+                repository: None,
                 client_id: ClientId::new(),
             })
             .await

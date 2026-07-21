@@ -132,6 +132,25 @@ pub async fn set_run_state(
     Ok(())
 }
 
+/// Record the workspace lease a run bound its worktree under (Phase 5 T5), on
+/// the reserved `runs.workspace_lease_id` column. This is the run→worktree
+/// provenance link: the lease row ([`crate::worktrees`]) carries the concrete
+/// `worktree_path`, so a run's real worktree is recoverable from its projection
+/// alone. Idempotent-ish: called once when a writing run allocates its worktree;
+/// a read-only run that keeps the repository root records nothing.
+pub async fn set_run_workspace_lease(
+    exec: impl sqlx::SqliteExecutor<'_>,
+    run_id: RunId,
+    lease_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE runs SET workspace_lease_id = ? WHERE id = ?")
+        .bind(lease_id.to_string())
+        .bind(run_id.to_string())
+        .execute(exec)
+        .await?;
+    Ok(())
+}
+
 /// The current [`RunState`] of a run, or `None` if there is no such run. Takes
 /// a generic executor (not only the pool) so a caller can re-read the state
 /// **inside its own write transaction** — the FP-3 fix reads the fresh,

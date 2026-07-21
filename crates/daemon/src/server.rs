@@ -820,7 +820,11 @@ async fn handle_request(
                 // it is intercepted here and applied through the assembly's
                 // `WorkflowStarter` seam rather than the event write path (Phase 5
                 // STEP 5.2). Driving the created run is a later step.
-                CommandBody::StartWorkflow { manifest, inputs } => {
+                CommandBody::StartWorkflow {
+                    manifest,
+                    inputs,
+                    repository,
+                } => {
                     // An Observer may not start a run.
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
@@ -856,6 +860,14 @@ async fn handle_request(
                         // delivery resolves to the same durable run (the write
                         // path's idempotency, applied to this intercepted command).
                         idempotency_key: command.idempotency_key.clone(),
+                        // The run carries its own repository root so its agent
+                        // nodes' isolated worktrees are carved from the right
+                        // checkout (Phase 5 T5); persisted raw so recovery reads
+                        // it back. An older client that sends none leaves the node
+                        // executor to fall back to the daemon's startup repository
+                        // — the fallback is applied at node-execution time, never
+                        // resolved from a wandering `current_dir()` here.
+                        repository: repository.clone(),
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {

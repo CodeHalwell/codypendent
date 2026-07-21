@@ -294,6 +294,11 @@ impl WorkflowStore {
     /// [`IdempotencyKeyReused`](WorkflowStoreError::IdempotencyKeyReused) rather
     /// than silently resolving to the first run's id. SQLite serialises writes,
     /// so two concurrent duplicate deliveries resolve to one run.
+    ///
+    /// `repository` is the checkout the run's agent nodes operate on (Phase 5
+    /// T5), recorded so recovery carves each node's isolated worktree from the
+    /// right tree; `None` records none and the node executor falls back to the
+    /// daemon's startup repository root.
     pub async fn create_run_idempotent(
         &self,
         pool: &SqlitePool,
@@ -301,6 +306,7 @@ impl WorkflowStore {
         idempotency_key: &str,
         inputs: &Value,
         manifest: Option<&str>,
+        repository: Option<&str>,
     ) -> Result<String, WorkflowStoreError> {
         let id = deterministic_run_id(idempotency_key);
         let now = Utc::now().to_rfc3339();
@@ -310,8 +316,8 @@ impl WorkflowStore {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO workflow_runs \
              (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
-              manifest_yaml, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?)",
+              manifest_yaml, repository, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&compiled.id)
@@ -319,6 +325,7 @@ impl WorkflowStore {
         .bind(&signature)
         .bind(serde_json::to_string(inputs)?)
         .bind(manifest)
+        .bind(repository)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -506,6 +513,26 @@ impl WorkflowStore {
         .execute(pool)
         .await?;
         Ok(id)
+    }
+
+    /// The repository root a run's agent nodes operate on (Phase 5 T5), if one
+    /// was recorded. `Ok(None)` means either the run does not exist or it was
+    /// created without a repository (a store-mechanics test, a run from before
+    /// the column existed, or an older client that sent none) — the node
+    /// executor then falls back to the daemon's startup repository root rather
+    /// than deriving it from a wandering `current_dir()`. Recorded once at
+    /// creation, exactly like [`manifest`](Self::manifest), so recovery carves a
+    /// node's isolated worktree from the same checkout the run started against.
+    pub async fn repository(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Option<String>, WorkflowStoreError> {
+        let row = sqlx::query("SELECT repository FROM workflow_runs WHERE id = ?")
+            .bind(workflow_run_id)
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("repository")))
     }
 
     /// The most recent checkpoint for a run, if any.

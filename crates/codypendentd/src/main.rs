@@ -93,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run
     // through the runtime agent loop.
-    let mut executor = RuntimeExecutor::new(pool.clone(), paths.clone(), repository);
+    let mut executor =
+        RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone());
 
     // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
     // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the

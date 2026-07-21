@@ -30,6 +30,12 @@ pub struct StartWorkflowRequest {
     /// seam creates the run idempotently — the same key resolves to the same run
     /// rather than a second one.
     pub idempotency_key: String,
+    /// The canonical repository root the run's agent nodes operate on (Phase 5
+    /// T5). Persisted with the durable run so a per-node isolated worktree is
+    /// carved from the right checkout — and so recovery drives it there after a
+    /// restart. `None` (an older client that sends none) leaves the node executor
+    /// to fall back to the daemon's startup repository root.
+    pub repository: Option<String>,
     /// The identity of the starting client, for attribution.
     pub client_id: ClientId,
 }

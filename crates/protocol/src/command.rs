@@ -146,6 +146,17 @@ pub enum CommandBody {
         /// omitted (a workflow with no required inputs).
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         inputs: serde_json::Value,
+        /// The canonical filesystem root of the repository this workflow's agent
+        /// nodes operate on. A per-user daemon can serve several checkouts over
+        /// one socket, so the run — not the daemon's startup working directory —
+        /// must decide which repository its agent nodes' isolated worktrees are
+        /// carved from (Phase 5 T5, fixing P5-D1). Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun): `#[serde(default)]`
+        /// keeps an older client (which sends none) working — the daemon then
+        /// falls back to its own startup repository root, never a wandering
+        /// `current_dir()` at node-execution time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
     },
     /// Pause a running durable workflow run (Phase 5 STEP 5.2 lifecycle command).
     ///
@@ -294,6 +305,7 @@ mod tests {
         round_trip(CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             inputs: serde_json::json!({ "pull_request": 42 }),
+            repository: Some("/home/user/project".to_string()),
         });
         round_trip(CommandBody::PauseWorkflow {
             workflow_run_id: "wfrun-abc123".to_string(),
@@ -315,9 +327,33 @@ mod tests {
         let body = CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             inputs: serde_json::Value::Null,
+            repository: None,
         };
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(!json.contains("inputs"), "null inputs are skipped: {json}");
+        assert!(
+            !json.contains("repository"),
+            "an absent repository is skipped on the wire: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body, "a payload without either key defaults them");
+    }
+
+    #[test]
+    fn start_workflow_carries_a_repository_when_present() {
+        // A workflow run bound to a repository (Phase 5 T5) serializes the key,
+        // and round-trips back to the same value — the durable store persists it
+        // so recovery drives the run's agent nodes in the right checkout.
+        let body = CommandBody::StartWorkflow {
+            manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            inputs: serde_json::Value::Null,
+            repository: Some("/home/user/project".to_string()),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            json.contains("/home/user/project"),
+            "repository on the wire: {json}"
+        );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);
     }

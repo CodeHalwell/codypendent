@@ -91,11 +91,11 @@ async fn create_run_idempotent_dedups_by_key() {
     // Two creations with the same idempotency key resolve to one run (a duplicate
     // StartWorkflow delivery after a lost ack does not fork a second run).
     let first = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     let second = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     assert_eq!(first, second, "same key ⇒ same run id");
@@ -107,11 +107,63 @@ async fn create_run_idempotent_dedups_by_key() {
 
     // A different key is a different run.
     let other = store
-        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     assert_ne!(first, other);
     assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn create_run_idempotent_records_and_reads_back_the_repository() {
+    // Phase 5 T5: the repository a run's agent nodes operate on is recorded at
+    // creation and read back by the node executor, so recovery carves each
+    // node's isolated worktree from the right checkout. A run created without a
+    // repository reads back `None` (the node executor then falls back to the
+    // daemon's startup repository root).
+    let (_tmp, pool) = temp_pool().await;
+    let store = WorkflowStore::new();
+    let compiled = compile_yaml(MANIFEST).unwrap();
+
+    let bound = store
+        .create_run_idempotent(
+            &pool,
+            &compiled,
+            "cmd-repo",
+            &json!({}),
+            Some(MANIFEST),
+            Some("/home/user/project"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.repository(&pool, &bound).await.unwrap().as_deref(),
+        Some("/home/user/project"),
+        "the recorded repository is read back verbatim"
+    );
+
+    let unbound = store
+        .create_run_idempotent(
+            &pool,
+            &compiled,
+            "cmd-norepo",
+            &json!({}),
+            Some(MANIFEST),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.repository(&pool, &unbound).await.unwrap(),
+        None,
+        "a run created without a repository reads back None"
+    );
+
+    // A run that does not exist is None, not an error.
+    assert_eq!(
+        store.repository(&pool, "wfrun-missing").await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -125,14 +177,14 @@ async fn create_run_idempotent_rejects_a_different_manifest_under_the_same_key()
     let compiled = compile_yaml(MANIFEST).unwrap();
 
     let first = store
-        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None, None)
         .await
         .unwrap();
 
     // Same key + same manifest still dedups (the genuine duplicate-delivery
     // case), unaffected by the mismatch guard.
     let same_again = store
-        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None, None)
         .await
         .unwrap();
     assert_eq!(first, same_again, "same key + same manifest ⇒ same run id");
@@ -145,7 +197,7 @@ async fn create_run_idempotent_rejects_a_different_manifest_under_the_same_key()
     assert_ne!(compiled.signature(), changed.signature());
 
     let err = store
-        .create_run_idempotent(&pool, &changed, "cmd-mismatch", &json!({}), None)
+        .create_run_idempotent(&pool, &changed, "cmd-mismatch", &json!({}), None, None)
         .await
         .unwrap_err();
     assert!(
