@@ -317,10 +317,58 @@ pub enum MemoryClass {
     Code,
 }
 
+/// The number of zero-padded decimal digits in a canonical *sequence-form*
+/// [`Revision`]. Twenty digits covers the whole `u64` range, so a padded
+/// ledger sequence sorts lexicographically the same as numerically (without a
+/// fixed width, `seq:10` would sort before `seq:2`). Ordered memory queries
+/// rely on this equivalence — see [`Revision::is_sequence_form`].
+pub const SEQUENCE_REVISION_DIGITS: usize = 20;
+
+/// The prefix marking a [`Revision`] as an orderable ledger sequence rather
+/// than an opaque git SHA or logical label.
+const SEQUENCE_REVISION_PREFIX: &str = "seq:";
+
 /// A git-or-logical revision string a memory is valid from/until.
+///
+/// Two shapes flow through this type. An **opaque** revision (a git SHA, a
+/// human label) identifies a point but carries no order — comparing two of
+/// them as text is meaningless. A **sequence-form** revision
+/// (`seq:` + a fixed-width, zero-padded ledger sequence, e.g.
+/// `seq:00000000000000000042`) is *totally ordered* and, by the fixed width,
+/// sorts identically as text and as a number. Temporal ("as of revision X")
+/// queries require the sequence form; feeding them a SHA would silently
+/// mis-compare (the bug this distinction closes). Build the ordered form with
+/// [`Revision::sequence`] and check it with [`Revision::is_sequence_form`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Revision(pub String);
+
+impl Revision {
+    /// The canonical orderable revision for a ledger `sequence`:
+    /// `seq:` + a [`SEQUENCE_REVISION_DIGITS`]-wide zero-padded number. The
+    /// fixed width makes lexicographic order match numeric order, which is what
+    /// lets the memory store answer "valid at revision X" with a text-range SQL
+    /// comparison.
+    #[must_use]
+    pub fn sequence(sequence: u64) -> Self {
+        Revision(format!(
+            "{SEQUENCE_REVISION_PREFIX}{sequence:0width$}",
+            width = SEQUENCE_REVISION_DIGITS
+        ))
+    }
+
+    /// Whether this revision is in canonical sequence form (`seq:` followed by
+    /// exactly [`SEQUENCE_REVISION_DIGITS`] ASCII digits) and therefore safe to
+    /// order by text comparison. An opaque SHA or logical label is **not** —
+    /// ordered queries reject it rather than mis-compare.
+    #[must_use]
+    pub fn is_sequence_form(&self) -> bool {
+        let Some(digits) = self.0.strip_prefix(SEQUENCE_REVISION_PREFIX) else {
+            return false;
+        };
+        digits.len() == SEQUENCE_REVISION_DIGITS && digits.bytes().all(|b| b.is_ascii_digit())
+    }
+}
 
 /// How long a memory is retained; the default is 365 days (Chapter 06).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

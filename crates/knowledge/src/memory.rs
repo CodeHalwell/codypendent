@@ -59,6 +59,16 @@ pub enum MemoryError {
     /// it).
     #[error("corrupt memory row: {0}")]
     Corrupt(String),
+    /// An ordered ("as of revision X") query was given a revision that is not
+    /// in canonical sequence form, so it cannot be compared as ordered text
+    /// without silently mis-ranking (C11). The caller must pass a
+    /// [`Revision::sequence`](crate::types::Revision::sequence) revision or use
+    /// the live (`at_revision = None`) view.
+    #[error(
+        "non-orderable revision {0:?}: ordered memory queries require a canonical \
+         sequence-form revision (seq:<zero-padded number>), never a git SHA or label"
+    )]
+    NonOrderableRevision(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -124,6 +134,13 @@ impl MemoryStore {
     /// - `at_revision = Some(rev)` returns records with
     ///   `valid_from <= rev AND (valid_until IS NULL OR rev < valid_until)` —
     ///   i.e. the record that was live at that revision, superseded or not.
+    ///   **`rev` must be in canonical sequence form**
+    ///   ([`Revision::sequence`](crate::types::Revision::sequence)): the
+    ///   comparison is a SQL text-range operation, which is only meaningful for
+    ///   the fixed-width zero-padded `seq:` form. An opaque git SHA or logical
+    ///   label would mis-compare silently, so it is rejected up front with
+    ///   [`MemoryError::NonOrderableRevision`] rather than returning wrong rows
+    ///   (C11).
     /// - `at_revision = None` returns only currently-live records
     ///   (`valid_until IS NULL`).
     ///
@@ -134,6 +151,15 @@ impl MemoryStore {
         scopes: &[Scope],
         at_revision: Option<&Revision>,
     ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        // Fail closed on a revision that cannot be ordered by text comparison,
+        // before touching the database — a SHA reaching the `valid_from <= ?`
+        // range operator is the silent mis-comparison this guards against.
+        if let Some(rev) = at_revision {
+            if !rev.is_sequence_form() {
+                return Err(MemoryError::NonOrderableRevision(rev.0.clone()));
+            }
+        }
+
         if scopes.is_empty() {
             return Ok(Vec::new());
         }
