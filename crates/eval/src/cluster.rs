@@ -24,16 +24,50 @@ pub struct ClusterKey {
 }
 
 impl ClusterKey {
-    /// A stable string form (used for deterministic ordering and lookup).
+    /// A stable, **injective** string form (used for deterministic ordering and
+    /// lookup): each component is length-prefixed rather than joined with a raw
+    /// `|` separator, so no field value — however it embeds `|`, `-`, or any
+    /// other separator-look-alike byte — can shift a boundary and collide two
+    /// distinct keys into the same string (P7-3). `None` and `Some(s)` are also
+    /// kept structurally distinct (an absent field is tagged `N`; a present one
+    /// is tagged `S<len>:<value>`), so `tool: None` can never collide with
+    /// `tool: Some("-")` the way the previous `unwrap_or("-")` encoding did.
+    ///
+    /// Matches the length-prefixing style [`crate`]'s sibling crate uses for its
+    /// own injective digest (`codypendent_sandbox::verify::signing_digest`,
+    /// which length-prefixes its whole canonical payload before hashing) —
+    /// applied here per-field since this is a plain lookup key, not a hash.
     #[must_use]
     pub fn as_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.task_class,
-            self.failing_signal.as_str(),
-            self.tool.as_deref().unwrap_or("-"),
-            self.error_fingerprint.as_deref().unwrap_or("-"),
-        )
+        let mut out = String::new();
+        push_len_prefixed(&mut out, &self.task_class);
+        push_len_prefixed(&mut out, self.failing_signal.as_str());
+        push_optional(&mut out, self.tool.as_deref());
+        push_optional(&mut out, self.error_fingerprint.as_deref());
+        out
+    }
+}
+
+/// Append `s` as `<byte-length>:<s>` (a netstring-style length prefix). Because
+/// the exact byte length is committed *before* the value, nothing inside `s` —
+/// including a `:` or any digit — can be misread as marking where the value
+/// ends: the decoder (conceptually; this key is never actually decoded back) is
+/// always told up front exactly how many bytes to consume.
+fn push_len_prefixed(out: &mut String, s: &str) {
+    out.push_str(&s.len().to_string());
+    out.push(':');
+    out.push_str(s);
+}
+
+/// Append an `Option<&str>` component, tagging presence so `None` can never
+/// collide with a present-but-look-alike value (e.g. `Some("-")`).
+fn push_optional(out: &mut String, value: Option<&str>) {
+    match value {
+        Some(s) => {
+            out.push('S');
+            push_len_prefixed(out, s);
+        }
+        None => out.push('N'),
     }
 }
 
@@ -188,5 +222,116 @@ mod tests {
         ];
         let ranked = rank_by_frequency(cluster_failures(&grades));
         assert_eq!(ranked[0].count(), 2, "the bigger cluster comes first");
+    }
+
+    // --- P7-3: the cluster key encoding is injective (no separator collisions) ---
+
+    /// Reproduces the OLD `"{}|{}|{}|{}"` + `unwrap_or("-")` encoding, purely as
+    /// evidence that the collisions below are real under the reported bug.
+    fn old_buggy_key(k: &ClusterKey) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            k.task_class,
+            k.failing_signal.as_str(),
+            k.tool.as_deref().unwrap_or("-"),
+            k.error_fingerprint.as_deref().unwrap_or("-"),
+        )
+    }
+
+    #[test]
+    fn as_key_does_not_collide_some_dash_with_none() {
+        // The review's first named collision: `tool: Some("-")` vs `tool: None`.
+        let with_literal_dash = ClusterKey {
+            task_class: "task".into(),
+            failing_signal: Signal::CommandFailure,
+            tool: Some("-".into()),
+            error_fingerprint: None,
+        };
+        let with_none = ClusterKey {
+            task_class: "task".into(),
+            failing_signal: Signal::CommandFailure,
+            tool: None,
+            error_fingerprint: None,
+        };
+        assert_eq!(
+            old_buggy_key(&with_literal_dash),
+            old_buggy_key(&with_none),
+            "sanity: reproduces the reported collision under the old encoding"
+        );
+        assert_ne!(
+            with_literal_dash.as_key(),
+            with_none.as_key(),
+            "Some(\"-\") must not collide with None under the fixed encoding"
+        );
+    }
+
+    #[test]
+    fn as_key_does_not_collide_on_pipe_injection_across_a_field_boundary() {
+        // The review's second named collision: a `|` inside `tool` can shift the
+        // separator boundary so a different (tool, error_fingerprint) split
+        // renders the same joined string under the old `"{}|{}|{}|{}"` encoding.
+        let a = ClusterKey {
+            task_class: "task".into(),
+            failing_signal: Signal::CommandFailure,
+            tool: Some("foo|bar".into()),
+            error_fingerprint: None,
+        };
+        let b = ClusterKey {
+            task_class: "task".into(),
+            failing_signal: Signal::CommandFailure,
+            tool: Some("foo".into()),
+            error_fingerprint: Some("bar|-".into()),
+        };
+        assert_eq!(
+            old_buggy_key(&a),
+            old_buggy_key(&b),
+            "sanity: reproduces the reported `|`-injection collision"
+        );
+        assert_ne!(
+            a.as_key(),
+            b.as_key(),
+            "a `|` inside a value must not let two different keys collide"
+        );
+    }
+
+    #[test]
+    fn distinct_tool_values_of_none_and_dash_no_longer_merge_into_one_cluster() {
+        // The end-to-end pin: two traces that are genuinely different failure
+        // modes (no tool reported, vs. a tool literally named "-") must land in
+        // two separate clusters, not merge into one via the key collision.
+        let grades = vec![
+            grade(&Trace {
+                trace_id: "t1".into(),
+                task_class: "small-bug-fix".into(),
+                tool: None,
+                command_failures: 1,
+                ..Default::default()
+            }),
+            grade(&Trace {
+                trace_id: "t2".into(),
+                task_class: "small-bug-fix".into(),
+                tool: Some("-".into()),
+                command_failures: 1,
+                ..Default::default()
+            }),
+        ];
+        let clusters = cluster_failures(&grades);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "tool: None and tool: Some(\"-\") are different failure modes and must not merge"
+        );
+    }
+
+    #[test]
+    fn as_key_round_trips_consistently_for_the_same_key() {
+        // Determinism: the same key always produces the same string.
+        let k = ClusterKey {
+            task_class: "small-bug-fix".into(),
+            failing_signal: Signal::Regression,
+            tool: Some("cargo".into()),
+            error_fingerprint: Some("E0308".into()),
+        };
+        assert_eq!(k.as_key(), k.as_key());
     }
 }
