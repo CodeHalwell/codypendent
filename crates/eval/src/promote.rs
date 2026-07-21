@@ -44,6 +44,31 @@
 //! anywhere) can help. The library makes self-promotion *structurally* impossible
 //! for honest code and leaves *authentication* to the layer that can actually do
 //! it.
+//!
+//! # Hardening (P7-2, P7-5)
+//!
+//! Two properties the state machine now enforces that an earlier revision did
+//! not: [`Candidate::finish_canary`] refuses a canary with zero recorded
+//! observations ([`PromotionError::CanaryUnobserved`]) — a canary that observed
+//! nothing has no signal to have "passed" on, so it can never *silently* reach
+//! `ComparisonReady` unobserved; and [`Candidate::rollback`] threads the actual
+//! requesting [`Actor`] onto its [`PromotionRecord`] instead of hardcoding
+//! `"system"`, while [`Candidate::observe_canary`]'s auto-rollback still
+//! attributes `"system"` (with a reason) since nothing else triggered it. Neither
+//! change touches the one rule this module may never weaken: only
+//! [`Actor::Human`] reaches [`PromotionStage::Promoted`].
+//!
+//! # Persistence (STEP 7.5 daemon wiring)
+//!
+//! [`crate::store::PromotionStore`] persists candidates across restarts. It
+//! adds `sqlx` to this crate (mirroring `codypendent-workflow`'s own
+//! daemon-agnostic store — "daemon-free" here means *no dependency on
+//! `codypendent-daemon`*, not "no database"). The store is deliberately unable
+//! to provide a back door: every mutating method **loads** the persisted
+//! [`Candidate`], calls the **real** state-machine method on it, and persists
+//! the resulting value — there is no SQL path that writes `stage = 'promoted'`
+//! independent of a successful [`Candidate::approve`] call, mirroring how this
+//! module already keeps `Candidate`'s fields private.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,6 +99,24 @@ impl ArtifactKind {
             ArtifactKind::Workflow => "workflow",
             ArtifactKind::ModelProfile => "model-profile",
         }
+    }
+
+    /// Parse the wire name [`Self::as_str`] produces, e.g. for a daemon command
+    /// carrying an artifact kind as a plain `String` (the wire protocol stays
+    /// free of a dependency on this crate — see `codypendent_protocol::PromotionAction`).
+    /// `None` for anything else, so a caller can reject an unrecognized kind
+    /// rather than guessing at one.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "retrieval" => ArtifactKind::RetrievalWeights,
+            "skill" => ArtifactKind::Skill,
+            "prompt" => ArtifactKind::Prompt,
+            "router" => ArtifactKind::Router,
+            "workflow" => ArtifactKind::Workflow,
+            "model-profile" => ArtifactKind::ModelProfile,
+            _ => return None,
+        })
     }
 }
 
@@ -133,12 +176,15 @@ pub enum PromotionStage {
 }
 
 /// The outcome of a canary observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CanaryOutcome {
     /// No regression — the canary continues.
     Continuing,
-    /// A signal regression was detected; the candidate auto-rolled back.
-    AutoRolledBack,
+    /// A signal regression was detected; the candidate auto-rolled back. Carries
+    /// the audit record (P7-5): attributed to `"system"`, with a reason —
+    /// distinct from a manual [`Candidate::rollback`], which attributes the
+    /// actual actor who requested it.
+    AutoRolledBack(PromotionRecord),
 }
 
 /// A promotion-pipeline failure.
@@ -165,6 +211,11 @@ pub enum PromotionError {
         "cannot activate a version without a completed promotion (record stage was {stage:?})"
     )]
     NotPromoted { stage: PromotionStage },
+    /// `finish_canary` was called with zero recorded observations (P7-2): a
+    /// canary that observed nothing has no signal to have "passed" on, so it
+    /// must not be allowed to reach `ComparisonReady`.
+    #[error("cannot finish a canary with zero observations — at least one is required")]
+    CanaryUnobserved,
 }
 
 /// A record of a promotion or rollback, for the audit trail.
@@ -181,10 +232,18 @@ pub enum PromotionError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PromotionRecord {
     artifact: ArtifactVersion,
-    /// Who performed the action (a human for a promotion).
+    /// Who performed the action (a human for a promotion; `human`/`agent`/
+    /// `system`/… for a rollback — see [`Candidate::rollback`] and
+    /// [`Candidate::observe_canary`]).
     actor_kind: String,
     /// The stage transitioned into.
     stage: PromotionStage,
+    /// Why this record was created (P7-5). `None` for a promotion (`approve()`
+    /// needs no reason beyond "a human approved it"). For a rollback: `None` for
+    /// a manual rollback with no stated reason, `Some(_)` for the canary
+    /// auto-rollback, which always records what triggered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 impl PromotionRecord {
@@ -204,6 +263,13 @@ impl PromotionRecord {
     #[must_use]
     pub fn stage(&self) -> PromotionStage {
         self.stage
+    }
+
+    /// Why this record was created, if one was given (P7-5) — e.g. the canary
+    /// regression signal that triggered an auto-rollback.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 
@@ -227,6 +293,12 @@ pub struct Candidate {
     requires_permission_review: bool,
     #[serde(default)]
     permission_reviewed: bool,
+    /// How many canary signal observations have been recorded
+    /// ([`Candidate::observe_canary`]). `finish_canary` requires at least one
+    /// (P7-2) — a canary that observed nothing must not be able to reach
+    /// `ComparisonReady`; "passing" unobserved is not a pass.
+    #[serde(default)]
+    canary_observations: u32,
 }
 
 impl Candidate {
@@ -240,6 +312,7 @@ impl Candidate {
             stage: PromotionStage::Draft,
             requires_permission_review: false,
             permission_reviewed: false,
+            canary_observations: 0,
         }
     }
 
@@ -306,21 +379,36 @@ impl Candidate {
 
     /// Feed a canary signal observation. A regression **auto-rolls-back** the
     /// candidate immediately (no human needed to *stop* a bad change — only to
-    /// *promote* a good one).
+    /// *promote* a good one), producing an audit record attributed to
+    /// `"system"` with a reason (P7-5) — distinct from a manual
+    /// [`Self::rollback`], which attributes the actual requesting actor. Every
+    /// call — regardless of outcome — counts as an observation (P7-2): this is
+    /// what [`Self::finish_canary`] requires at least one of.
     pub fn observe_canary(&mut self, regressed: bool) -> Result<CanaryOutcome, PromotionError> {
         self.expect_stage(PromotionStage::Canary, "observe-canary")?;
+        self.canary_observations += 1;
         if regressed {
             self.stage = PromotionStage::RolledBack;
-            Ok(CanaryOutcome::AutoRolledBack)
+            Ok(CanaryOutcome::AutoRolledBack(PromotionRecord {
+                artifact: self.artifact.clone(),
+                actor_kind: "system".to_string(),
+                stage: PromotionStage::RolledBack,
+                reason: Some("canary observed a regression signal".to_string()),
+            }))
         } else {
             Ok(CanaryOutcome::Continuing)
         }
     }
 
     /// Finish the canary and assemble the comparison — the candidate now awaits a
-    /// human decision.
+    /// human decision. Requires at least one recorded observation (P7-2,
+    /// [`PromotionError::CanaryUnobserved`] otherwise): a canary that observed
+    /// nothing has no signal to have "passed" on.
     pub fn finish_canary(&mut self) -> Result<(), PromotionError> {
         self.expect_stage(PromotionStage::Canary, "finish-canary")?;
+        if self.canary_observations == 0 {
+            return Err(PromotionError::CanaryUnobserved);
+        }
         self.stage = PromotionStage::ComparisonReady;
         Ok(())
     }
@@ -341,17 +429,25 @@ impl Candidate {
             artifact: self.artifact.clone(),
             actor_kind: actor_kind(approver).to_string(),
             stage: PromotionStage::Promoted,
+            reason: None,
         })
     }
 
-    /// Manually roll back a promoted candidate.
-    pub fn rollback(&mut self) -> Result<PromotionRecord, PromotionError> {
+    /// Manually roll back a promoted candidate. `actor` is who requested the
+    /// rollback — recorded on the audit trail (P7-5: previously hardcoded to
+    /// `"system"` regardless of who actually triggered it, losing the acting
+    /// party's identity). Deliberately **not** restricted to [`Actor::Human`]
+    /// (unlike [`Self::approve`]): per the module doc, stopping a bad change
+    /// needs no human, only promoting a good one does — that asymmetry is not
+    /// weakened here.
+    pub fn rollback(&mut self, actor: &Actor) -> Result<PromotionRecord, PromotionError> {
         self.expect_stage(PromotionStage::Promoted, "rollback")?;
         self.stage = PromotionStage::RolledBack;
         Ok(PromotionRecord {
             artifact: self.artifact.clone(),
-            actor_kind: "system".to_string(),
+            actor_kind: actor_kind(actor).to_string(),
             stage: PromotionStage::RolledBack,
+            reason: None,
         })
     }
 
@@ -469,6 +565,7 @@ mod tests {
             artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", version),
             actor_kind: "human".into(),
             stage: PromotionStage::Promoted,
+            reason: None,
         }
     }
 
@@ -485,6 +582,21 @@ mod tests {
     fn artifact_version_renders_the_registry_id() {
         assert_eq!(artifact().to_string(), "router/tool-selection/12");
         assert_eq!(artifact().stem(), "router/tool-selection");
+    }
+
+    #[test]
+    fn every_artifact_kind_round_trips_through_its_wire_name() {
+        for kind in [
+            ArtifactKind::RetrievalWeights,
+            ArtifactKind::Skill,
+            ArtifactKind::Prompt,
+            ArtifactKind::Router,
+            ArtifactKind::Workflow,
+            ArtifactKind::ModelProfile,
+        ] {
+            assert_eq!(ArtifactKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ArtifactKind::parse("not-a-kind"), None);
     }
 
     #[test]
@@ -565,10 +677,15 @@ mod tests {
         c.start_canary().unwrap();
         // A regression signal during canary rolls back immediately — stopping a bad
         // change needs no human, only promoting a good one does.
-        assert_eq!(
-            c.observe_canary(true).unwrap(),
-            CanaryOutcome::AutoRolledBack
-        );
+        let outcome = c.observe_canary(true).unwrap();
+        let CanaryOutcome::AutoRolledBack(record) = outcome else {
+            panic!("expected an auto-rollback, got {outcome:?}");
+        };
+        // P7-5: the auto-rollback record is attributed to "system", with a
+        // reason — distinct from a manual rollback (see
+        // `manual_rollback_records_the_requesting_actor`).
+        assert_eq!(record.actor_kind(), "system");
+        assert!(record.reason().is_some(), "auto-rollback must record why");
         assert_eq!(c.stage(), PromotionStage::RolledBack);
     }
 
@@ -633,6 +750,7 @@ mod tests {
             artifact: ArtifactVersion::new(ArtifactKind::Router, "tool-selection", 99),
             actor_kind: "agent".into(),
             stage: PromotionStage::ComparisonReady,
+            reason: None,
         };
         let err = active.activate(&not_promoted).unwrap_err();
         assert!(matches!(err, PromotionError::NotPromoted { .. }));
@@ -665,6 +783,104 @@ mod tests {
                 action: "approve",
                 ..
             })
+        ));
+    }
+
+    // --- P7-2: finish_canary requires at least one observation ---
+
+    #[test]
+    fn finish_canary_requires_at_least_one_observation() {
+        let mut c = Candidate::draft(artifact(), &human());
+        c.run_regression(false).unwrap();
+        c.start_shadow().unwrap();
+        c.start_canary().unwrap();
+        // No observe_canary() call at all — zero observations.
+        let err = c.finish_canary().unwrap_err();
+        assert_eq!(err, PromotionError::CanaryUnobserved);
+        assert_eq!(
+            c.stage(),
+            PromotionStage::Canary,
+            "an unobserved canary does not advance to ComparisonReady"
+        );
+    }
+
+    #[test]
+    fn finish_canary_succeeds_after_at_least_one_observation() {
+        let mut c = Candidate::draft(artifact(), &human());
+        c.run_regression(false).unwrap();
+        c.start_shadow().unwrap();
+        c.start_canary().unwrap();
+        c.observe_canary(false).unwrap();
+        assert!(c.finish_canary().is_ok());
+        assert_eq!(c.stage(), PromotionStage::ComparisonReady);
+    }
+
+    // --- P7-5: rollback threads the acting party instead of hardcoding "system" ---
+
+    #[test]
+    fn manual_rollback_records_the_requesting_actor() {
+        let mut c = Candidate::draft(artifact(), &human());
+        drive_to_comparison(&mut c);
+        c.approve(&human()).unwrap();
+        let record = c.rollback(&human()).unwrap();
+        assert_eq!(
+            record.actor_kind(),
+            "human",
+            "the human who requested the rollback must be attributed, not \"system\""
+        );
+        assert_eq!(c.stage(), PromotionStage::RolledBack);
+    }
+
+    #[test]
+    fn manual_rollback_by_an_integration_records_that_actor_too() {
+        // rollback() is deliberately not restricted to Actor::Human (only
+        // approve() carries that restriction) — but whoever calls it must be
+        // attributed faithfully, not silently overwritten with "system".
+        let mut c = Candidate::draft(artifact(), &human());
+        drive_to_comparison(&mut c);
+        c.approve(&human()).unwrap();
+        let integration = Actor::Integration {
+            integration_id: "ci".into(),
+        };
+        let record = c.rollback(&integration).unwrap();
+        assert_eq!(record.actor_kind(), "integration");
+    }
+
+    #[test]
+    fn auto_rollback_records_system_and_a_reason() {
+        let mut c = Candidate::draft(artifact(), &human());
+        c.run_regression(false).unwrap();
+        c.start_shadow().unwrap();
+        c.start_canary().unwrap();
+        let outcome = c.observe_canary(true).unwrap();
+        let CanaryOutcome::AutoRolledBack(record) = outcome else {
+            panic!("expected an auto-rollback record");
+        };
+        assert_eq!(
+            record.actor_kind(),
+            "system",
+            "an auto-rollback is system-initiated, not attributed to a human"
+        );
+        assert!(
+            record.reason().is_some(),
+            "an auto-rollback must record why, unlike a bare manual rollback"
+        );
+    }
+
+    #[test]
+    fn approving_a_promotion_still_requires_no_weakening_of_the_human_only_rule() {
+        // Threading an actor into rollback must not loosen approve()'s
+        // human-only gate — the one rule this task is explicitly forbidden from
+        // weakening.
+        let mut c = Candidate::draft(artifact(), &agent());
+        drive_to_comparison(&mut c);
+        assert!(matches!(
+            c.approve(&agent()),
+            Err(PromotionError::RequiresHumanApproval { actor: "agent" })
+        ));
+        assert!(matches!(
+            c.approve(&Actor::System),
+            Err(PromotionError::RequiresHumanApproval { actor: "system" })
         ));
     }
 }
