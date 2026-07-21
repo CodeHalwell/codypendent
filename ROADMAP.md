@@ -60,9 +60,12 @@ the release gate is the
 > under a per-run lock; a startup pass resumes every incomplete run after a crash;
 > and `Controller`-gated `PauseWorkflow`/`ResumeWorkflow`/`RetryWorkflowNode`
 > commands (reachable from `codypendent workflow run/pause/resume/retry`) drive the
-> conductor's cooperative-pause / resume / retry-from-node lifecycle — the leaf
-> per-node execution (the agent-loop bridge) being the one seam still stubbed. And
-> two read-only **client surfaces** have landed — a TUI workflow-graph view over the
+> conductor's cooperative-pause / resume / retry-from-node lifecycle. **Agent nodes
+> now execute the real agent loop** — `AgentLoopNodeExecutor` creates a session +
+> run and drives the loop to a disposition (tested with a `ScriptedDriver`, no
+> model) — with tool-node execution and blackboard-output harvest the remaining
+> leaf work. And two read-only **client surfaces** have landed — a TUI
+> workflow-graph view over the
 > compiled projection (per-node state / agent / worktree, grouped by workflow) and
 > a TUI blackboard view over the per-run artifact boards (kind / author /
 > confidence / evidence) — each fed by a CLI seam.
@@ -332,17 +335,24 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         accurate accept/reject) then drive in the background. All four are reachable
         from the CLI (`codypendent workflow run/pause/resume/retry`). A
         `NodeObserver` emits a node-lifecycle event per transition (surfaced in the
-        daemon log today). *Remaining for 5.2:* the **leaf per-node execution** — the
-        agent-loop bridge (an agent node → a real agent run) and tool-node execution
-        (the manifest tool-name namespace reconciled with the runtime tool registry
-        + the per-node tool arguments the compiled graph does not yet carry) — is the
-        one seam still stubbed (`AgentLoopNodeExecutor` reports each node
-        not-yet-executable, so a run driven today fails cleanly and legibly per
-        node); everything *around* the leaf (create → drive → recover →
-        pause/resume/retry, per-run serialization) is complete and tested with a
-        completing fake executor. The client-facing `Subscription::Workflow` stream
-        that publishes the observer's transitions (mirroring the document CRDT-sync
-        stream) is the other remaining piece.
+        daemon log today). **Agent nodes now execute the real agent loop:**
+        `AgentLoopNodeExecutor` (in `codypendentd`) synthesizes an objective from the
+        node's role + declared outputs + run inputs, creates a session + run, drives
+        the agent loop to a terminal `RunDisposition` through the shared run plumbing
+        (journal / sink / policy / approvals), and maps it to the node's outcome —
+        recording the agent-run id the graph view links to. The model driver is built
+        through a `NodeModelDriverFactory` seam, so the whole agent-node path is tested
+        with a `ScriptedDriver` (no model, no network): a single-agent workflow drives
+        to completion, and a missing model fails the node cleanly rather than hanging.
+        *Remaining for 5.2:* **tool-node execution** (the manifest tool-name namespace
+        reconciled with the runtime tool registry + the per-node tool arguments the
+        compiled graph does not yet carry — a tool node fails cleanly and legibly
+        today), harvesting an agent node's declared `outputs` onto the run's blackboard
+        (the STEP 5.3 `blackboard.post` path, so agent nodes can build on each other),
+        node-level mode/permission resolution from an `agent.toml` profile (every agent
+        node runs in the permissive `Build` mode today, writes still approval-gated),
+        and the client-facing `Subscription::Workflow` stream that publishes the
+        observer's transitions (mirroring the document CRDT-sync stream).
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code

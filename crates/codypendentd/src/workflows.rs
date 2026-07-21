@@ -31,8 +31,9 @@
 //! tool layer — is the [`NodeExecutor`] the host is generic over. This crate can
 //! supply the real, agent-loop-backed executor; the host's own tests inject a fake
 //! that completes/fails nodes on command, so the whole daemon path (create → drive
-//! → recover → pause/resume/retry) is verified without a model. The real leaf
-//! executor ([`AgentLoopNodeExecutor`]) is documented at its definition.
+//! → recover → pause/resume/retry) is verified without a model. The real leaf —
+//! `AgentLoopNodeExecutor` — lives in [`crate::workflow_exec`] and drives an agent
+//! node through the agent loop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,8 +44,8 @@ use codypendent_daemon::workflows::{
 };
 use codypendent_protocol::CodypendentError;
 use codypendent_workflow::{
-    compile_yaml, ConductorError, NodeContext, NodeExecutor, NodeObserver, NodeOutcome, NodeState,
-    WorkflowConductor, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    compile_yaml, ConductorError, NodeExecutor, NodeObserver, NodeState, WorkflowConductor,
+    WorkflowRunState, WorkflowStore, WorkflowStoreError,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -329,48 +330,12 @@ impl NodeObserver for LoggingNodeObserver {
     }
 }
 
-/// The real, daemon-backed leaf executor: it runs one workflow node's work.
-///
-/// The [`WorkflowConductorHost`] owns the scheduling, durability, recovery, and
-/// lifecycle of a run; this fills the one remaining seam — *executing a single
-/// node*. That leaf has semantics the workflow model does not yet pin down: an
-/// **agent** node maps a `role` to an `agent.toml` profile and drives the agent
-/// loop (which needs a resolved model and a session/run to attach to), and a
-/// **tool** node needs the manifest tool-name namespace reconciled with the runtime
-/// tool registry and per-node tool arguments the compiled graph does not yet carry.
-/// Until that node-execution bridge lands, this executor reports each node as not
-/// yet executable — a structured, non-retryable failure naming the node's action —
-/// so a run driven through the real daemon fails cleanly and legibly rather than
-/// hanging or silently completing. Everything *around* the leaf (create, drive,
-/// recover, pause/resume/retry, per-run serialization) is complete and exercised;
-/// swapping in an agent-loop-backed body here is the next step, and the host's
-/// tests already prove the machinery against a completing executor.
-pub struct AgentLoopNodeExecutor;
-
-#[async_trait::async_trait]
-impl NodeExecutor for AgentLoopNodeExecutor {
-    async fn execute(&self, ctx: NodeContext<'_>) -> NodeOutcome {
-        use codypendent_workflow::NodeAction;
-        let detail = match &ctx.node.action {
-            NodeAction::Agent { role, .. } => {
-                format!("agent node (role `{role}`) awaits the agent-loop execution bridge")
-            }
-            NodeAction::Tool { name } => {
-                format!("tool node (`{name}`) awaits the tool-execution bridge")
-            }
-        };
-        NodeOutcome::failed(format!(
-            "node `{}` not executable yet: {detail}",
-            ctx.node.id
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use codypendent_protocol::ClientId;
+    use codypendent_workflow::{NodeContext, NodeOutcome};
     use serde_json::json;
     use std::collections::HashSet;
     use std::time::Duration;

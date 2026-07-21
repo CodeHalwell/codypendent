@@ -12,6 +12,7 @@
 mod documents;
 mod executor;
 mod scan;
+mod workflow_exec;
 mod workflows;
 
 use std::path::PathBuf;

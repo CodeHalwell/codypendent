@@ -46,7 +46,8 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::scan;
-use crate::workflows::{AgentLoopNodeExecutor, WorkflowConductorHost};
+use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor};
+use crate::workflows::WorkflowConductorHost;
 
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
@@ -98,8 +99,13 @@ impl RuntimeExecutor {
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
         let mut scanned = HashSet::new();
         scanned.insert(startup_repository);
-        let workflow_host =
-            WorkflowConductorHost::new(pool.clone(), Arc::new(AgentLoopNodeExecutor));
+        let workflow_host = build_workflow_host(
+            pool.clone(),
+            paths.clone(),
+            subscriptions.clone(),
+            approvals.clone(),
+            None,
+        );
         Self {
             pool,
             paths,
@@ -124,7 +130,17 @@ impl RuntimeExecutor {
     /// gains the `github.*` tools and the policy admits the GitHub API endpoint
     /// so a mutation reaches the approval gate (every write still needs approval).
     pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
-        self.github = Some(github);
+        self.github = Some(github.clone());
+        // Rebuild the workflow host so agent nodes drive with the same GitHub
+        // client. Called once at startup before any run exists, so replacing the
+        // (still-empty) per-run drive-lock registry is safe.
+        self.workflow_host = build_workflow_host(
+            self.pool.clone(),
+            self.paths.clone(),
+            self.subscriptions.clone(),
+            self.approvals.clone(),
+            Some(github),
+        );
         self
     }
 
@@ -145,7 +161,7 @@ impl RuntimeExecutor {
 
     /// The content-addressed store rooted at `<data_dir>/artifacts`.
     fn artifacts(&self) -> ArtifactStore {
-        ArtifactStore::new(self.paths.data_dir.join("artifacts"))
+        artifact_store(&self.paths)
     }
 
     /// Re-launch every run still `Queued` at startup. A crash between committing
@@ -196,85 +212,21 @@ impl RuntimeExecutor {
     /// Load a model registry + a Phase-1 policy from `<data_dir>/models.toml`,
     /// or an error string when none is configured. In a bare environment (no
     /// endpoint, no config) this is the expected path — the run is then failed
-    /// cleanly by the caller.
+    /// cleanly by the caller. Delegates to the [`load_model_registry`] free
+    /// function so the workflow agent-node executor shares the exact loading.
     fn load_registry(&self) -> Result<(ModelRegistry, ModelPolicy), String> {
-        let path = self.paths.data_dir.join("models.toml");
-        if !path.exists() {
-            return Err("no model configured (no models.toml)".to_string());
-        }
-        let configs = load_models(&path).map_err(|e| format!("invalid models.toml: {e}"))?;
-        if configs.is_empty() {
-            return Err("no model configured (models.toml is empty)".to_string());
-        }
-        let ids: Vec<_> = configs.iter().map(|c| c.id.clone()).collect();
-        let registry = ModelRegistry::new(configs);
-        // Phase-1 policy: every mode tries every configured model, in file order,
-        // until one connects. (The Phase-7 utility router replaces this.)
-        let policy = ModelPolicy::new().with_default_candidates(ids);
-        Ok((registry, policy))
+        load_model_registry(&self.paths)
     }
 
-    /// The pool-erased [`RunJournal`]: a persist closure (ledger append, with the
-    /// run projection updated in step for a `RunStateChanged`) and an
-    /// approval-request closure driving the *shared* broker so the runtime's
-    /// `await_decision` observes a client's resolution.
+    /// The pool-erased [`RunJournal`]. Delegates to the shared [`run_journal`].
     fn journal(&self) -> RunJournal {
-        let persist_pool = self.pool.clone();
-        let approve_pool = self.pool.clone();
-        let approve_broker = self.approvals.clone();
-        RunJournal::new(
-            move |session: SessionId, actor: Actor, body: EventBody| {
-                let pool = persist_pool.clone();
-                async move {
-                    // Append first — with an atomic sequence claim, so a live run
-                    // and a concurrent client command can never collide on a
-                    // sequence — then advance the (derived, replay-rebuildable)
-                    // run projection, so an append failure never leaves the
-                    // projection ahead of the ledger.
-                    let event =
-                        ledger::append_next_event(&pool, session, &actor, &body, Utc::now())
-                            .await?;
-                    if let EventBody::RunStateChanged { run_id, state } = &event.body {
-                        projections::set_run_state(&pool, *run_id, *state).await?;
-                    }
-                    Ok(event)
-                }
-            },
-            move |req: ApprovalRequest| {
-                let pool = approve_pool.clone();
-                let broker = approve_broker.clone();
-                async move {
-                    let id = broker
-                        .request(
-                            &pool,
-                            req.session_id,
-                            req.run_id,
-                            req.action,
-                            req.risk,
-                            req.capabilities,
-                            None,
-                        )
-                        .await?;
-                    Ok(id)
-                }
-            },
-        )
+        run_journal(&self.pool, &self.approvals)
     }
 
-    /// The pool-erased [`ArtifactSink`] over the store + pool.
+    /// The pool-erased [`ArtifactSink`] over the store + pool. Delegates to the
+    /// shared [`artifact_sink`].
     fn sink(&self, store: ArtifactStore) -> Box<dyn ArtifactSink> {
-        let pool = self.pool.clone();
-        Box::new(ClosureSink(
-            move |media: String, prov: Provenance, bytes: Vec<u8>| {
-                let store = store.clone();
-                let pool = pool.clone();
-                async move {
-                    store
-                        .put(&pool, &media, DataClassification::Internal, prov, &bytes)
-                        .await
-                }
-            },
-        ))
+        artifact_sink(&self.pool, store)
     }
 
     /// The run body: resolve a model, then drive the agent loop to a terminal
@@ -620,6 +572,92 @@ impl RunExecutor for RuntimeExecutor {
     }
 }
 
+/// Load a model registry + a Phase-1 policy from `<data_dir>/models.toml`, or an
+/// error string when none is configured. Shared by [`RuntimeExecutor::execute`]
+/// and the workflow agent-node executor so both resolve models identically.
+pub(crate) fn load_model_registry(
+    paths: &RuntimePaths,
+) -> Result<(ModelRegistry, ModelPolicy), String> {
+    let path = paths.data_dir.join("models.toml");
+    if !path.exists() {
+        return Err("no model configured (no models.toml)".to_string());
+    }
+    let configs = load_models(&path).map_err(|e| format!("invalid models.toml: {e}"))?;
+    if configs.is_empty() {
+        return Err("no model configured (models.toml is empty)".to_string());
+    }
+    let ids: Vec<_> = configs.iter().map(|c| c.id.clone()).collect();
+    let registry = ModelRegistry::new(configs);
+    // Phase-1 policy: every mode tries every configured model, in file order,
+    // until one connects. (The Phase-7 utility router replaces this.)
+    let policy = ModelPolicy::new().with_default_candidates(ids);
+    Ok((registry, policy))
+}
+
+/// The pool-erased [`RunJournal`]: a persist closure (ledger append, with the run
+/// projection updated in step for a `RunStateChanged`) and an approval-request
+/// closure driving the *shared* broker so the runtime's `await_decision` observes
+/// a client's resolution. Shared by [`RuntimeExecutor`] and the workflow agent-node
+/// executor so both persist run events the same way.
+pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJournal {
+    let persist_pool = pool.clone();
+    let approve_pool = pool.clone();
+    let approve_broker = approvals.clone();
+    RunJournal::new(
+        move |session: SessionId, actor: Actor, body: EventBody| {
+            let pool = persist_pool.clone();
+            async move {
+                let event =
+                    ledger::append_next_event(&pool, session, &actor, &body, Utc::now()).await?;
+                if let EventBody::RunStateChanged { run_id, state } = &event.body {
+                    projections::set_run_state(&pool, *run_id, *state).await?;
+                }
+                Ok(event)
+            }
+        },
+        move |req: ApprovalRequest| {
+            let pool = approve_pool.clone();
+            let broker = approve_broker.clone();
+            async move {
+                let id = broker
+                    .request(
+                        &pool,
+                        req.session_id,
+                        req.run_id,
+                        req.action,
+                        req.risk,
+                        req.capabilities,
+                        None,
+                    )
+                    .await?;
+                Ok(id)
+            }
+        },
+    )
+}
+
+/// The content-addressed [`ArtifactStore`] rooted at `<data_dir>/artifacts`.
+pub(crate) fn artifact_store(paths: &RuntimePaths) -> ArtifactStore {
+    ArtifactStore::new(paths.data_dir.join("artifacts"))
+}
+
+/// The pool-erased [`ArtifactSink`] over the store + pool. Shared by
+/// [`RuntimeExecutor`] and the workflow agent-node executor.
+pub(crate) fn artifact_sink(pool: &SqlitePool, store: ArtifactStore) -> Box<dyn ArtifactSink> {
+    let pool = pool.clone();
+    Box::new(ClosureSink(
+        move |media: String, prov: Provenance, bytes: Vec<u8>| {
+            let store = store.clone();
+            let pool = pool.clone();
+            async move {
+                store
+                    .put(&pool, &media, DataClassification::Internal, prov, &bytes)
+                    .await
+            }
+        },
+    ))
+}
+
 /// The `repository` recorded on the StartRun command that created a queued run,
 /// if any. The commands table stores the applied outcome (`result_json`, with
 /// `created_run`) beside the body, so the originating command is found by the
@@ -648,7 +686,7 @@ async fn queued_run_repository(
 
 /// Resolve a checkout's GitHub `owner/repo` from its `origin` remote, or `None`
 /// if the checkout has no GitHub origin (the `github.*` tools then stay inert).
-async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
+pub(crate) async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repository)
