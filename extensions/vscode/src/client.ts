@@ -78,6 +78,14 @@ export function computeBackoff(attempt: number, config: BackoffConfig = DEFAULT_
   return Math.min(config.maxMs, Math.round(raw));
 }
 
+/**
+ * Offline-queue bound (FP-5): the queue must stay finite so a session left
+ * offline for a long time cannot accumulate unbounded memory. Exported so
+ * tests can fill the queue to exactly this bound without duplicating the
+ * number.
+ */
+export const MAX_QUEUED_COMMANDS = 256;
+
 export interface DaemonClientOptions {
   socketPath: string;
   sessionId: Uuid;
@@ -104,6 +112,15 @@ export interface DaemonClientEvents {
   commandRejected: (error: CodypendentError) => void;
   protocolError: (error: ProtocolError) => void;
   error: (error: Error) => void;
+  /**
+   * An approval decision could not be kept in the offline queue (FP-5): the
+   * queue was already saturated with other pending approvals, so there was
+   * nothing safe left to evict and growing past the bound was refused. Never
+   * emitted for a non-approval intent — those are dropped quietly, since
+   * losing one is an accepted degradation, not a correctness bug the user
+   * must act on.
+   */
+  approvalDropped: (info: { approvalId: Uuid }) => void;
 }
 
 export type ConnectionStatus =
@@ -147,13 +164,19 @@ export class DaemonClient extends EventEmitter {
   // decision while the card stayed pending. Queued commands keep their minted
   // idempotency keys and flush after the next successful attach.
   private readonly offlineQueue: Command[] = [];
-  private static readonly MAX_QUEUED_COMMANDS = 256;
 
   private socket: SocketLike | undefined;
   private decoder = new FrameDecoder();
   private stopped = false;
   private running = false;
   private status: ConnectionStatus = "closed";
+  // Whether the daemon has acknowledged this connection's attach with a
+  // Catchup (FP-4). `this.socket` alone is NOT enough to gate the offline
+  // queue: a socket exists throughout connecting/handshaking/attaching, so a
+  // decision sent in that window would otherwise be written straight to a
+  // session the daemon has not attached yet and be rejected or lost. Reset
+  // false on every new connection attempt and on any close/teardown.
+  private attached = false;
 
   constructor(options: DaemonClientOptions) {
     super();
@@ -296,6 +319,7 @@ export class DaemonClient extends EventEmitter {
   private connectOnce(onAttached: () => void): Promise<void> {
     return new Promise<void>((resolve) => {
       this.decoder = new FrameDecoder();
+      this.attached = false;
       this.setStatus("connecting");
 
       let settled = false;
@@ -345,6 +369,7 @@ export class DaemonClient extends EventEmitter {
       socket.on("close", () => {
         if (this.socket === socket) {
           this.socket = undefined;
+          this.attached = false;
         }
         settle();
       });
@@ -390,6 +415,7 @@ export class DaemonClient extends EventEmitter {
         // now is the connection truly attached and healthy, so reset backoff here
         // rather than on attach-sent.
         this.setStatus("attached");
+        this.attached = true;
         onAttached();
         this.applyCatchup(catchup);
         this.emit("catchup", catchup);
@@ -488,25 +514,78 @@ export class DaemonClient extends EventEmitter {
     this.sendCommand(body);
   }
 
+  /** Narrow a command body to `ResolveApproval` (an approval decision). */
+  private static isApprovalBody(
+    body: CommandBody,
+  ): body is Extract<CommandBody, { type: "ResolveApproval" }> {
+    return body.type === "ResolveApproval";
+  }
+
   private sendCommand(body: CommandBody, opts: { queueIfOffline?: boolean } = {}): void {
     const command: Command = {
       command_id: randomUUID(),
       idempotency_key: randomUUID(),
       body,
     };
-    if (!this.socket && opts.queueIfOffline && !this.stopped) {
-      if (this.offlineQueue.length >= DaemonClient.MAX_QUEUED_COMMANDS) {
-        this.emit(
-          "error",
-          new Error("offline command queue is full; dropping the oldest queued command"),
-        );
-        this.offlineQueue.shift();
-      }
-      this.offlineQueue.push(command);
+    // FP-4: gate on `attached`, not merely `this.socket`. A socket exists
+    // throughout connecting/handshaking/attaching, so gating on its presence
+    // let a decision sent in that window go straight over the wire to a
+    // session the daemon has not attached yet — rejected or lost rather than
+    // queued. Queuing on "not yet attached" covers that window too, and the
+    // Catchup handler flushes the queue in order once attach completes.
+    if (!this.attached && opts.queueIfOffline && !this.stopped) {
+      this.enqueueOffline(command);
       return;
     }
     const payload: Payload = { type: "Command", ...command };
     this.sendEnvelope(this.buildEnvelope(payload, { withSession: true }));
+  }
+
+  /**
+   * Add `command` to the offline queue, enforcing `MAX_QUEUED_COMMANDS`
+   * (FP-5). An approval decision must never be silently dropped, so on
+   * overflow: the oldest NON-approval entry is evicted first, freeing room
+   * for the newcomer; if the queue is saturated with nothing but approvals,
+   * there is nothing safe to evict — an incoming non-approval is dropped
+   * instead (the queue of approvals is left untouched) and an incoming
+   * approval is refused outright with a dedicated, visible `approvalDropped`
+   * event rather than silently evicting someone else's pending approval or
+   * growing the queue past its bound.
+   */
+  private enqueueOffline(command: Command): void {
+    if (this.offlineQueue.length >= MAX_QUEUED_COMMANDS) {
+      const evictIndex = this.offlineQueue.findIndex(
+        (queued) => !DaemonClient.isApprovalBody(queued.body),
+      );
+      if (evictIndex !== -1) {
+        const [dropped] = this.offlineQueue.splice(evictIndex, 1);
+        this.emit(
+          "error",
+          new Error(
+            `offline command queue is full; dropped a queued ${dropped.body.type} command to make room`,
+          ),
+        );
+      } else if (DaemonClient.isApprovalBody(command.body)) {
+        const approvalId = command.body.approval_id;
+        this.emit(
+          "error",
+          new Error(
+            `offline command queue is full of pending approval decisions; approval ${approvalId} could NOT be queued`,
+          ),
+        );
+        this.emit("approvalDropped", { approvalId });
+        return;
+      } else {
+        this.emit(
+          "error",
+          new Error(
+            `offline command queue is full of pending approval decisions; dropped the incoming ${command.body.type} command instead of an approval`,
+          ),
+        );
+        return;
+      }
+    }
+    this.offlineQueue.push(command);
   }
 
   /** Deliver commands queued while disconnected, oldest first. */
@@ -551,6 +630,7 @@ export class DaemonClient extends EventEmitter {
       // and leak the run loop, so a later `start()` would spawn a second loop
       // beside the zombie.
       this.socket = undefined;
+      this.attached = false;
       socket.destroy();
     }
   }

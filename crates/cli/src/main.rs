@@ -37,7 +37,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codypendent_cli::{commands, tui};
+use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{AgentMode, SessionId};
 
@@ -48,6 +48,16 @@ use codypendent_protocol::{AgentMode, SessionId};
     about = "Codypendent — the local-first agentic developer environment"
 )]
 struct Cli {
+    /// Force a theme for the interactive TUI, overriding automatic terminal
+    /// detection (`NO_COLOR`/`COLORTERM`/`TERM`) and any `CODYPENDENT_THEME`
+    /// env var — a manual override always wins (STEP 6.6). Accepts a
+    /// built-in variant (`dark`, `light`, `high-contrast`, `color-blind-safe`,
+    /// `ansi256`, `ansi16`, `monochrome`) or the id of a theme pack loaded
+    /// from `<data-dir>/themes/<id>.toml`. Only meaningful for the bare
+    /// `codypendent` invocation, which is the only one that renders a
+    /// themed UI.
+    #[arg(long)]
+    theme: Option<String>,
     /// With no subcommand, `codypendent` opens the interactive TUI attached to
     /// the current repository's session (STEP 1.12).
     #[command(subcommand)]
@@ -281,9 +291,14 @@ enum EventsFormat {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = RuntimePaths::resolve()?;
+    // `--theme` wins over `CODYPENDENT_THEME`; an empty value from either
+    // source falls through to the other (see `theme_select::resolve_theme_override`
+    // for why each source must be filtered before combining them).
+    let theme_override =
+        theme_select::resolve_theme_override(cli.theme, std::env::var("CODYPENDENT_THEME").ok());
     let Some(command) = cli.command else {
         // Bare `codypendent`: open the TUI for the current directory's repo.
-        return tui::run(&paths, std::env::current_dir()?).await;
+        return tui::run(&paths, std::env::current_dir()?, theme_override).await;
     };
     match command {
         TopCommand::Daemon { command } => match command {

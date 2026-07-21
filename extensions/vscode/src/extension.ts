@@ -215,6 +215,15 @@ export function activate(context: vscode.ExtensionContext): void {
     nextClient.on("error", (error) => {
       output.appendLine(`error: ${error.message}`);
     });
+    // FP-5: the offline queue never silently drops an approval decision, but
+    // when it is saturated with other pending approvals it must refuse a new
+    // one rather than grow unbounded — that refusal is loud, not just logged,
+    // since it means the user's decision did not go through and needs redoing.
+    nextClient.on("approvalDropped", ({ approvalId }) => {
+      void vscode.window.showWarningMessage(
+        `Codypendent: too many approvals are queued while offline; the decision for approval ${approvalId} was NOT saved — resolve it again once reconnected.`,
+      );
+    });
 
     nextClient.start();
     context.subscriptions.push({ dispose: () => nextClient.stop() });

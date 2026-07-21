@@ -1,10 +1,12 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
   computeBackoff,
   DaemonClient,
   DEFAULT_BACKOFF,
+  MAX_QUEUED_COMMANDS,
   type SocketLike,
 } from "../src/client.js";
 import { encodeEnvelope, FrameDecoder } from "../src/protocol/frame.js";
@@ -91,6 +93,44 @@ function attachCommand(socket: FakeSocket): Extract<Command["body"], { type: "At
     throw new Error("no AttachSession command was sent");
   }
   return attach.body;
+}
+
+/** Every command a socket has been sent, in order. */
+function sentCommands(socket: FakeSocket): ({ type: "Command" } & Command)[] {
+  return socket
+    .sent()
+    .map((e) => e.payload)
+    .filter((p): p is { type: "Command" } & Command => p.type === "Command");
+}
+
+/** The `approval_id` of every `ResolveApproval` command in `commands`, in order. */
+function approvalIds(commands: ({ type: "Command" } & Command)[]): string[] {
+  return commands
+    .filter(
+      (
+        c,
+      ): c is { type: "Command" } & Command & {
+        body: Extract<Command["body"], { type: "ResolveApproval" }>;
+      } => c.body.type === "ResolveApproval",
+    )
+    .map((c) => c.body.approval_id);
+}
+
+/** Drive a fresh socket through connect -> ServerHello -> Catchup so any
+ * queued commands flush, then return every command it received, in order. */
+async function connectAttachAndCollect(
+  client: DaemonClient,
+  sockets: FakeSocket[],
+): Promise<({ type: "Command" } & Command)[]> {
+  client.start();
+  await flush();
+  const socket = sockets[0];
+  socket.emit("connect");
+  socket.deliver(serverHelloPayload());
+  await flush();
+  socket.deliver(catchupPayload());
+  await flush();
+  return sentCommands(socket);
 }
 
 const SESSION_ID = "44444444-4444-4444-4444-444444444444";
@@ -410,6 +450,244 @@ describe("DaemonClient offline queue + resume token", () => {
     const secondHello = second.sent().find((e) => e.payload.type === "ClientHello");
     expect(secondHello).toBeDefined();
     expect((secondHello?.payload as { resume_token?: string }).resume_token).toBe("tok-1");
+    client.stop();
+  });
+});
+
+// FP-4: the offline queue previously gated only on "no socket exists", so a
+// decision sent after `connect` but before the daemon acknowledged attach
+// (with a Catchup) went straight over the wire to a session that was not
+// attached yet, instead of being queued.
+describe("DaemonClient queues a decision sent connected-but-pre-attach (FP-4)", () => {
+  it("queues a decision sent between connect and Catchup, then flushes it after attach", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+
+    client.start();
+    await flush();
+    const socket = sockets[0];
+    socket.emit("connect");
+    await flush();
+    // A socket exists and the ClientHello is already out, but the daemon has
+    // not even seen ServerHello yet — the connection is not attached.
+    expect(client.connectionStatus).toBe("handshaking");
+
+    const approvalId = randomUUID();
+    client.resolveApproval(approvalId, "Approve");
+    expect(
+      sentCommands(socket).some((c) => c.body.type === "ResolveApproval"),
+      "the decision must not reach the wire before attach completes",
+    ).toBe(false);
+
+    // AttachSession is sent on ServerHello, but the connection is still only
+    // "attaching" until the daemon replies with a Catchup — the decision must
+    // stay queued through this window too.
+    socket.deliver(serverHelloPayload());
+    await flush();
+    expect(client.connectionStatus).toBe("attaching");
+    expect(sentCommands(socket).some((c) => c.body.type === "ResolveApproval")).toBe(false);
+
+    socket.deliver(catchupPayload());
+    await flush();
+    expect(client.connectionStatus).toBe("attached");
+
+    const commands = sentCommands(socket);
+    const resolve = commands.find((c) => c.body.type === "ResolveApproval");
+    expect(resolve, "the queued decision must flush once attach completes").toBeDefined();
+    if (resolve && resolve.body.type === "ResolveApproval") {
+      expect(resolve.body.approval_id).toBe(approvalId);
+    }
+    // Ordering: the attach command was sent before the flushed decision.
+    const kinds = commands.map((c) => c.body.type);
+    expect(kinds.indexOf("AttachSession")).toBeLessThan(kinds.indexOf("ResolveApproval"));
+
+    client.stop();
+  });
+
+  it("re-queues a decision across a second connection that drops before attaching", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+
+    client.start();
+    await flush();
+    const first = sockets[0];
+    first.emit("connect");
+    await flush();
+
+    const approvalId = randomUUID();
+    client.resolveApproval(approvalId, "Approve");
+
+    // The connection drops before ever attaching. The decision must survive
+    // in the offline queue rather than being lost with the socket.
+    first.emit("close", false);
+    await flush();
+    expect(sockets.length).toBe(2);
+
+    const second = sockets[1];
+    second.emit("connect");
+    second.deliver(serverHelloPayload());
+    await flush();
+    second.deliver(catchupPayload());
+    await flush();
+
+    const resolve = sentCommands(second).find((c) => c.body.type === "ResolveApproval");
+    expect(resolve, "the decision must flush on the next successful attach").toBeDefined();
+    if (resolve && resolve.body.type === "ResolveApproval") {
+      expect(resolve.body.approval_id).toBe(approvalId);
+    }
+    client.stop();
+  });
+});
+
+// FP-5: queue overflow (256) previously dropped the OLDEST queued intent
+// unconditionally — possibly an approval decision — near-silently. The fix
+// never drops an approval decision: a non-approval is evicted first, and if
+// the queue is saturated with nothing but approvals, an incoming approval is
+// refused with a dedicated, visible signal instead of evicting one.
+describe("DaemonClient offline queue overflow policy (FP-5)", () => {
+  it("evicts the oldest non-approval intent to make room, never an approval", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const errors: string[] = [];
+    const approvalsDropped: string[] = [];
+    client.on("error", (e) => errors.push(e.message));
+    client.on("approvalDropped", ({ approvalId }) => approvalsDropped.push(approvalId));
+
+    const firstApprovalId = randomUUID();
+    const secondApprovalId = randomUUID();
+
+    // Fill the queue to exactly its bound: one approval up front, then
+    // non-approval StartRun intents for the rest.
+    client.resolveApproval(firstApprovalId, "Approve");
+    for (let i = 1; i < MAX_QUEUED_COMMANDS; i += 1) {
+      client.startRun(`objective ${i}`);
+    }
+
+    // One more approval overflows the queue by one command. Fix: evict the
+    // oldest NON-approval (a StartRun), never an approval.
+    client.resolveApproval(secondApprovalId, "Approve");
+
+    expect(approvalsDropped, "no approval was refused here").toHaveLength(0);
+    expect(errors, "exactly one eviction must be reported").toHaveLength(1);
+    expect(errors[0]).toContain("StartRun");
+    expect(errors[0]).not.toContain("ResolveApproval");
+
+    const commands = await connectAttachAndCollect(client, sockets);
+    const approvals = approvalIds(commands);
+    // Both approvals survived, in their original relative order.
+    expect(approvals).toEqual([firstApprovalId, secondApprovalId]);
+    // The queue never grew past its bound (one extra command is the
+    // AttachSession the client itself sends to complete the handshake).
+    const nonAttach = commands.filter((c) => c.body.type !== "AttachSession");
+    expect(nonAttach).toHaveLength(MAX_QUEUED_COMMANDS);
+
+    client.stop();
+  });
+
+  it("refuses a new approval, visibly, rather than evict an existing one once the queue is all approvals", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const errors: string[] = [];
+    const approvalsDropped: string[] = [];
+    client.on("error", (e) => errors.push(e.message));
+    client.on("approvalDropped", ({ approvalId }) => approvalsDropped.push(approvalId));
+
+    const queuedIds = Array.from({ length: MAX_QUEUED_COMMANDS }, () => randomUUID());
+    for (const id of queuedIds) {
+      client.resolveApproval(id, "Approve");
+    }
+
+    // The queue is now saturated with nothing but approvals. One more cannot
+    // be safely queued: refuse it, loudly, rather than silently evict an
+    // existing approval or grow past the bound.
+    const refusedId = randomUUID();
+    client.resolveApproval(refusedId, "Approve");
+
+    expect(approvalsDropped, "the refused approval must fire a visible signal").toEqual([
+      refusedId,
+    ]);
+    expect(errors.some((m) => m.includes(refusedId))).toBe(true);
+
+    const commands = await connectAttachAndCollect(client, sockets);
+    const approvals = approvalIds(commands);
+    // Every originally queued approval survived; the refused one never did,
+    // and the queue never grew past its bound.
+    expect(approvals).toEqual(queuedIds);
+    expect(approvals).not.toContain(refusedId);
+    expect(approvals).toHaveLength(MAX_QUEUED_COMMANDS);
+
+    client.stop();
+  });
+
+  it("drops an incoming non-approval intent, not an approval, when the queue is all approvals", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/does-not-matter.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const errors: string[] = [];
+    const approvalsDropped: string[] = [];
+    client.on("error", (e) => errors.push(e.message));
+    client.on("approvalDropped", (info) => approvalsDropped.push(info.approvalId));
+
+    const queuedIds = Array.from({ length: MAX_QUEUED_COMMANDS }, () => randomUUID());
+    for (const id of queuedIds) {
+      client.resolveApproval(id, "Approve");
+    }
+    client.startRun("one objective too many");
+
+    expect(approvalsDropped, "a non-approval overflow must never raise approvalDropped").toHaveLength(
+      0,
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("StartRun");
+
+    const commands = await connectAttachAndCollect(client, sockets);
+    expect(commands.some((c) => c.body.type === "StartRun")).toBe(false);
+    expect(approvalIds(commands)).toEqual(queuedIds);
+
     client.stop();
   });
 });
