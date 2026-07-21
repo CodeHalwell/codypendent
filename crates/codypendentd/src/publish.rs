@@ -445,14 +445,25 @@ async fn commit_on_docs_branch(
 /// commit sha, or the current `HEAD` when nothing changed.
 async fn commit_path(dir: &Path, path: &str, message: &str) -> Result<String, PublishExecError> {
     run_git(dir, &["add", "--", path]).await?;
-    let staged = run_git(dir, &["diff", "--cached", "--name-only"]).await?;
+    // Scoped to `path`: for `DocsBranchCommit`/`DocumentationPr` this is a
+    // fresh scratch worktree (clean index either way), but for
+    // `RepositoryFile` `dir` IS the primary working tree, which may carry
+    // unrelated staged changes at publish time. An unscoped
+    // `--cached --name-only` would report non-empty (and later commit
+    // everything staged) even when THIS path is unchanged — sweeping
+    // unrelated work into the publish commit and defeating the
+    // unchanged-content no-op. Scoping both the diff check and the commit
+    // itself to `path` keeps the committed change set exactly what the
+    // approval card showed (`changed_files = [path]`), never more, and never
+    // less.
+    let staged = run_git(dir, &["diff", "--cached", "--name-only", "--", path]).await?;
     if staged.trim().is_empty() {
         return Ok(run_git(dir, &["rev-parse", "HEAD"])
             .await?
             .trim()
             .to_string());
     }
-    run_git(dir, &["commit", "-q", "-m", message]).await?;
+    run_git(dir, &["commit", "-q", "-m", message, "--", path]).await?;
     Ok(run_git(dir, &["rev-parse", "HEAD"])
         .await?
         .trim()
@@ -1078,6 +1089,132 @@ mod tests {
         assert_eq!(
             second_published[0].git_commit,
             second_published[1].git_commit
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_file_commit_does_not_sweep_unrelated_staged_changes() {
+        // Regression test (review fix): `RepositoryFile` operates in the
+        // PRIMARY working tree, which may carry unrelated staged changes at
+        // publish time. The commit must contain exactly what the approval
+        // card promised (`changed_files = [path]`) — never more.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let publisher = build_publisher(pool.clone(), approvals.clone(), repo.clone(), dir.path());
+
+        // An unrelated file is staged BEFORE the publish runs — simulating a
+        // user mid-way through unrelated work in their own checkout.
+        std::fs::write(repo.join("secret.rs"), "let token = \"unrelated\";\n").unwrap();
+        git(&repo, &["add", "secret.rs"]);
+
+        let parked = publisher
+            .publish(publish_request(
+                document_id,
+                wire_target("docs/architecture.md"),
+            ))
+            .await
+            .expect("publish parks an approval");
+        resolve(
+            &pool,
+            &approvals,
+            parked.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+        let published = wait_for_publication_count(&pool, document_id, 1).await;
+        assert!(published[0].git_commit.is_some());
+
+        // The commit contains ONLY the published path.
+        let committed = git_output(
+            &repo,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        );
+        let committed: Vec<&str> = committed.lines().collect();
+        assert_eq!(
+            committed,
+            vec!["docs/architecture.md"],
+            "the commit must contain only the published path, not unrelated staged work: {committed:?}"
+        );
+
+        // The unrelated file remains staged (uncommitted), exactly as the
+        // user left it — the publish must not touch it at all.
+        let status = git_output(&repo, &["status", "--porcelain"]);
+        assert!(
+            status.contains("secret.rs"),
+            "the unrelated staged file must remain staged, untouched: {status}"
+        );
+        let head_files = git_output(&repo, &["show", "--name-only", "--format="]);
+        assert!(
+            !head_files.contains("secret.rs"),
+            "secret.rs must never appear in the publish commit: {head_files}"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_no_op_holds_even_with_unrelated_staged_changes() {
+        // Regression test (review fix): before the scoping fix, an unscoped
+        // `git diff --cached --name-only` was non-empty whenever ANYTHING was
+        // staged, defeating the unchanged-content no-op the moment the
+        // primary checkout had unrelated staged work.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let publisher = build_publisher(pool.clone(), approvals.clone(), repo.clone(), dir.path());
+
+        let first = publisher
+            .publish(publish_request(
+                document_id,
+                wire_target("docs/architecture.md"),
+            ))
+            .await
+            .unwrap();
+        resolve(
+            &pool,
+            &approvals,
+            first.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+        wait_for_publication_count(&pool, document_id, 1).await;
+        let head_after_first = git_output(&repo, &["rev-parse", "HEAD"]);
+
+        // Stage an unrelated file, THEN republish the SAME (unchanged) content.
+        std::fs::write(repo.join("wip.rs"), "// work in progress\n").unwrap();
+        git(&repo, &["add", "wip.rs"]);
+
+        let second = publisher
+            .publish(publish_request(
+                document_id,
+                wire_target("docs/architecture.md"),
+            ))
+            .await
+            .unwrap();
+        resolve(
+            &pool,
+            &approvals,
+            second.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+        wait_for_publication_count(&pool, document_id, 2).await;
+
+        assert_eq!(
+            git_output(&repo, &["rev-parse", "HEAD"]),
+            head_after_first,
+            "unchanged content must stay a no-op even with unrelated staged work present"
+        );
+        // The unrelated file is still staged, untouched by the no-op path.
+        let status = git_output(&repo, &["status", "--porcelain"]);
+        assert!(
+            status.contains("wip.rs"),
+            "the unrelated staged file must remain staged: {status}"
         );
     }
 
