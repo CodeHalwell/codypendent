@@ -182,21 +182,39 @@ impl WorkflowDriver {
             });
         }
 
+        // A run that is not `Pending`/`Running` is not this call's to advance
+        // (P5-D5). A `Paused` run awaits an explicit resume — which flips it to
+        // `Running` *before* calling here (see
+        // [`WorkflowConductor::prepare_resume`](crate::conductor::WorkflowConductor::prepare_resume))
+        // — and a terminal run (`Completed`/`Failed`/`Cancelled`) is finished.
+        // Without this guard, calling this function directly (bypassing the
+        // conductor's lifecycle checks — e.g. a stray/duplicate drive, or a
+        // future caller that does not know about pause/terminal states) would
+        // set the run `Running` unconditionally below, resurrecting it: a
+        // paused run would silently resume with no explicit ask, and a
+        // terminal run would flicker back to `Running` before landing on a
+        // terminal state again. A clean no-op reporting the run's CURRENT
+        // state is safe for every existing caller — the daemon host and this
+        // crate's own conductor never reach here with a run in one of these
+        // states except through the sanctioned resume path.
+        if !matches!(
+            snapshot.run.state,
+            WorkflowRunState::Pending | WorkflowRunState::Running
+        ) {
+            return Ok(snapshot.run.state);
+        }
+
         // Recover any node interrupted mid-execution by an earlier drive: it is
         // still `Running` in the store, so reset it to `Pending` to re-drive it
-        // exactly once (effects are idempotent — the resume contract).
+        // exactly once (effects are idempotent — the resume contract). Clears
+        // `agent_run_id`/cost explicitly (P5-D6b) rather than the COALESCE
+        // preserve semantics `transition_node` uses for its normal in-place
+        // transitions — the attempt being thrown away must never leave a stale
+        // link behind for a node that never re-reaches a real completion.
         for node in &snapshot.nodes {
             if node.state == NodeState::Running {
                 self.store
-                    .transition_node(
-                        pool,
-                        workflow_run_id,
-                        &node.node_id,
-                        NodeState::Pending,
-                        node.attempt,
-                        None,
-                        None,
-                    )
+                    .reset_interrupted_node(pool, workflow_run_id, &node.node_id, node.attempt)
                     .await?;
             }
         }
@@ -778,5 +796,133 @@ steps:
         assert!(pos("a") < pos("b"), "a completes before b");
         assert!(pos("a") < pos("c"), "a completes before c");
         assert!(pos("b") < pos("d") && pos("c") < pos("d"), "d joins last");
+    }
+
+    #[tokio::test]
+    async fn driving_a_paused_run_directly_is_a_no_op() {
+        // P5-D5: calling the library-level driver directly (bypassing the
+        // conductor's `prepare_resume`) on a `Paused` run must not resurrect it
+        // — a paused run awaits an explicit resume.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        store
+            .set_run_state(&pool, &run_id, WorkflowRunState::Paused)
+            .await
+            .unwrap();
+
+        let executor = ScriptedExecutor::default();
+        let final_state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            WorkflowRunState::Paused,
+            "reported unchanged, not resurrected to Running/Completed"
+        );
+        assert!(!executor.ran("a"), "a paused run must not execute any node");
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            snap.run.state,
+            WorkflowRunState::Paused,
+            "the persisted state is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn driving_a_terminal_run_directly_is_a_no_op() {
+        // P5-D5: likewise for every terminal state — driving an already-finished
+        // run directly must not flicker it back to `Running` before landing on
+        // a (possibly different) terminal state again.
+        for terminal in [
+            WorkflowRunState::Completed,
+            WorkflowRunState::Failed,
+            WorkflowRunState::Cancelled,
+        ] {
+            let (_tmp, pool) = temp_pool().await;
+            let compiled = compile_yaml(LINEAR).unwrap();
+            let store = WorkflowStore::new();
+            let run_id = store
+                .create_run(&pool, &compiled, None, &json!({}), None)
+                .await
+                .unwrap();
+            store.set_run_state(&pool, &run_id, terminal).await.unwrap();
+
+            let executor = ScriptedExecutor::default();
+            let final_state = WorkflowDriver::new()
+                .run(&pool, &run_id, &compiled, &executor)
+                .await
+                .unwrap();
+
+            assert_eq!(final_state, terminal, "{terminal:?} reported unchanged");
+            assert!(!executor.ran("a"), "{terminal:?} must not execute any node");
+            let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+            assert_eq!(
+                snap.run.state, terminal,
+                "{terminal:?} persisted state is untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_reset_explicitly_clears_a_stale_agent_run_id() {
+        // P5-D6b: the crash-recovery reset (a node left `Running` by an
+        // interrupted earlier drive) must explicitly clear `agent_run_id`/cost —
+        // not preserve them via `transition_node`'s COALESCE semantics — so a
+        // node whose reset attempt never reaches a real completion does not
+        // keep pointing at a stale agent run.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        // Simulate a node stuck `Running` from an earlier interrupted drive,
+        // carrying a stale agent_run_id/cost from that attempt (transition_node's
+        // COALESCE-preserve lets a Running transition carry a value forward).
+        store
+            .transition_node(
+                &pool,
+                &run_id,
+                "a",
+                NodeState::Running,
+                1,
+                Some("ghost-agent-run"),
+                Some(&json!({ "usd": 0.5 })),
+            )
+            .await
+            .unwrap();
+        store
+            .set_run_state(&pool, &run_id, WorkflowRunState::Running)
+            .await
+            .unwrap();
+
+        // Drive with an executor whose outcome for `a` carries no agent_run_id
+        // or cost (a node that "never re-reaches agent execution" this attempt).
+        let executor = ScriptedExecutor::default();
+        let final_state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+        assert_eq!(final_state, WorkflowRunState::Completed);
+
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        let a = snap.nodes.iter().find(|n| n.node_id == "a").unwrap();
+        assert_eq!(
+            a.agent_run_id, None,
+            "the crash-recovery reset must not leave the stale agent_run_id in place"
+        );
+        assert_eq!(
+            a.cost, None,
+            "the crash-recovery reset must not leave the stale cost in place"
+        );
     }
 }

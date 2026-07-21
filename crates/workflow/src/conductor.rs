@@ -186,21 +186,34 @@ impl WorkflowConductor {
         }
     }
 
-    /// Validate that a run may be resumed — that it is [`Paused`] — without
-    /// driving it, so the daemon can reply to a `ResumeWorkflow` command
-    /// *synchronously* (accepted / rejected) and then drive in the background.
-    /// Only a paused run may be resumed; a pending/running/terminal run is an
-    /// [`IllegalTransition`](ConductorError::IllegalTransition), so a resume never
-    /// double-drives a run that is already advancing.
+    /// Validate that a run may be resumed — that it is [`Paused`] — and flip it
+    /// to [`Running`](WorkflowRunState::Running), so the daemon can reply to a
+    /// `ResumeWorkflow` command *synchronously* (accepted / rejected) and then
+    /// drive in the background (mirrors [`prepare_retry`](Self::prepare_retry)'s
+    /// validate-then-mutate shape). Only a paused run may be resumed; a
+    /// pending/running/terminal run is an
+    /// [`IllegalTransition`](ConductorError::IllegalTransition), so a resume
+    /// never double-drives a run that is already advancing.
+    ///
+    /// The mutation matters, not only the validation: [`drive`](Self::drive) (the
+    /// library-level driver) refuses to touch anything but a
+    /// [`Pending`](WorkflowRunState::Pending)/`Running` run (P5-D5) — a paused
+    /// run must already have left `Paused` by the time `drive` sees it, or
+    /// driving it would be a clean no-op instead of the intended resume.
     ///
     /// [`Paused`]: WorkflowRunState::Paused
-    pub async fn ensure_resumable(
+    pub async fn prepare_resume(
         &self,
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<(), ConductorError> {
         match self.state(pool, workflow_run_id).await? {
-            WorkflowRunState::Paused => Ok(()),
+            WorkflowRunState::Paused => {
+                self.store
+                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Running)
+                    .await?;
+                Ok(())
+            }
             other => Err(ConductorError::IllegalTransition {
                 action: "resumed",
                 state: other.as_str(),
@@ -208,10 +221,10 @@ impl WorkflowConductor {
         }
     }
 
-    /// Resume a paused run: validate it is paused, then drive it onward from its
-    /// ready frontier (the driver flips it back to `running` as it starts). The
-    /// direct drive-to-completion form; the daemon instead pairs
-    /// [`ensure_resumable`](Self::ensure_resumable) with a backgrounded
+    /// Resume a paused run: validate it is paused (flipping it to `Running`),
+    /// then drive it onward from its ready frontier. The direct
+    /// drive-to-completion form; the daemon instead pairs
+    /// [`prepare_resume`](Self::prepare_resume) with a backgrounded
     /// [`drive`](Self::drive).
     pub async fn resume<E: NodeExecutor, O: NodeObserver>(
         &self,
@@ -220,7 +233,7 @@ impl WorkflowConductor {
         executor: &E,
         observer: &O,
     ) -> Result<WorkflowRunState, ConductorError> {
-        self.ensure_resumable(pool, workflow_run_id).await?;
+        self.prepare_resume(pool, workflow_run_id).await?;
         self.drive(pool, workflow_run_id, executor, observer).await
     }
 
@@ -260,12 +273,25 @@ impl WorkflowConductor {
     }
 
     /// Recompile the run's stored manifest into its graph, or a structured error
-    /// when the manifest is absent or no longer compiles.
+    /// when the run does not exist, the run exists but has no stored manifest, or
+    /// the manifest no longer compiles.
+    ///
+    /// [`WorkflowStore::manifest`] collapses "no such run" and "run exists with
+    /// no manifest" into the same `Ok(None)` (by its own contract — a recovery
+    /// pass never needs the distinction, since it only ever calls this on rows it
+    /// just enumerated). A **client-supplied** run id (e.g. `RetryWorkflowNode`
+    /// on a made-up id) is not so guaranteed, so this checks existence first
+    /// (P5-D6a): a nonexistent run is [`NotFound`](ConductorError::NotFound), kept
+    /// distinct from [`NoManifest`](ConductorError::NoManifest) so a client sees
+    /// "no such run" rather than the misleading "this run has no manifest".
     async fn recompile(
         &self,
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<CompiledWorkflow, ConductorError> {
+        if self.store.snapshot(pool, workflow_run_id).await?.is_none() {
+            return Err(ConductorError::NotFound(workflow_run_id.to_owned()));
+        }
         let manifest = self
             .store
             .manifest(pool, workflow_run_id)
@@ -422,6 +448,34 @@ steps:
             .await
             .unwrap_err();
         assert!(matches!(err, ConductorError::NoManifest(id) if id == run_id));
+    }
+
+    #[tokio::test]
+    async fn driving_or_retrying_a_nonexistent_run_is_not_found_not_no_manifest() {
+        // P5-D6a: a run that never existed must be reported distinctly from one
+        // that exists but has no stored manifest (the previous test) — both used
+        // to collapse into `NoManifest` because `WorkflowStore::manifest` returns
+        // `None` for either case.
+        let (_tmp, pool) = temp_pool().await;
+        let conductor = WorkflowConductor::new();
+
+        let err = conductor
+            .drive(&pool, "wfrun-does-not-exist", &FakeExecutor::default(), &())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConductorError::NotFound(id) if id == "wfrun-does-not-exist"),
+            "expected NotFound, got {err:?}"
+        );
+
+        let err = conductor
+            .prepare_retry(&pool, "wfrun-does-not-exist", "verify")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConductorError::NotFound(id) if id == "wfrun-does-not-exist"),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[tokio::test]

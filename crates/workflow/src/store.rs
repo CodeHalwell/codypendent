@@ -39,6 +39,19 @@ pub enum WorkflowStoreError {
     /// Resume refused: the compiled graph differs from the one the run started on.
     #[error("workflow graph changed since the run started (expected {expected}, found {found})")]
     GraphSignatureChanged { expected: String, found: String },
+    /// An idempotency key already started a run from a **different** compiled
+    /// workflow (P5-D2). The bare key is not sufficient proof of "the same
+    /// request": a client must not reuse a key across distinct manifests, so
+    /// this is a rejection, never a silent success pointing at the first run.
+    #[error(
+        "idempotency key {key} already started a different workflow \
+         (expected graph {expected}, found {found})"
+    )]
+    IdempotencyKeyReused {
+        key: String,
+        expected: String,
+        found: String,
+    },
 }
 
 /// The lifecycle state of a workflow run.
@@ -272,9 +285,15 @@ impl WorkflowStore {
     /// one — the durable equivalent of the command write path's idempotency.
     ///
     /// The run row is inserted `OR IGNORE`: on a duplicate the primary-key
-    /// (derived id) conflict is ignored, no second run or node set is created, and
-    /// the existing id is returned. SQLite serialises writes, so two concurrent
-    /// duplicate deliveries resolve to one run. Returns the run id in both cases.
+    /// (derived id) conflict is ignored, no second run or node set is created,
+    /// and — **since the bare key is not sufficient proof of "the same
+    /// request"** (P5-D2) — the already-stored run's graph signature is compared
+    /// against `compiled`'s. A match returns the existing id (the genuine
+    /// duplicate-delivery case); a mismatch means the same key was reused for a
+    /// **different** manifest and is rejected as
+    /// [`IdempotencyKeyReused`](WorkflowStoreError::IdempotencyKeyReused) rather
+    /// than silently resolving to the first run's id. SQLite serialises writes,
+    /// so two concurrent duplicate deliveries resolve to one run.
     pub async fn create_run_idempotent(
         &self,
         pool: &SqlitePool,
@@ -307,9 +326,22 @@ impl WorkflowStore {
         .rows_affected();
 
         // A duplicate delivery: the run (and its nodes) already exist from the
-        // first application. Nothing to insert — return the same id.
+        // first application. Compare its stored signature against the incoming
+        // compiled workflow's before treating this as a success (P5-D2).
         if inserted == 0 {
+            let existing_signature: String =
+                sqlx::query_scalar("SELECT graph_signature FROM workflow_runs WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
+            if existing_signature != signature {
+                return Err(WorkflowStoreError::IdempotencyKeyReused {
+                    key: idempotency_key.to_owned(),
+                    expected: existing_signature,
+                    found: signature,
+                });
+            }
             return Ok(id);
         }
 
@@ -697,6 +729,52 @@ impl WorkflowStore {
         tx.commit().await?;
 
         Ok(to_reset.into_iter().collect())
+    }
+
+    /// Reset a node interrupted mid-execution by an earlier, crashed drive back
+    /// to `Pending`, preserving its `attempt` (so a resumed retry-policy loop
+    /// does not restart the count — see [`WorkflowDriver`](crate::drive::WorkflowDriver)'s
+    /// resume contract) but **explicitly clearing** `agent_run_id`/`cost`/
+    /// `ended_at` rather than [`transition_node`](Self::transition_node)'s
+    /// COALESCE-preserve semantics (P5-D6b).
+    ///
+    /// `transition_node` deliberately *preserves* fields not supplied on an
+    /// in-place transition (e.g. a `Running` attempt does not know its final
+    /// cost yet) — that is the right contract for the normal lifecycle, but
+    /// wrong for THIS reset: a node whose in-flight attempt is being thrown
+    /// away must never carry forward a value tied to that abandoned attempt.
+    /// A node that never re-reaches a real completion after this reset must
+    /// not keep pointing at whatever agent run its previous attempt happened
+    /// to record.
+    pub async fn reset_interrupted_node(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<(), WorkflowStoreError> {
+        let affected = sqlx::query(
+            "UPDATE workflow_nodes SET state = 'pending', attempt = ?, agent_run_id = NULL, \
+             cost_json = NULL, ended_at = NULL \
+             WHERE workflow_run_id = ? AND node_id = ?",
+        )
+        .bind(i64::from(attempt))
+        .bind(workflow_run_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(WorkflowStoreError::NotFound(format!(
+                "{workflow_run_id}/{node_id}"
+            )));
+        }
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 }
 

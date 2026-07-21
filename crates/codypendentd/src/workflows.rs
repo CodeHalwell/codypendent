@@ -50,6 +50,19 @@ use codypendent_workflow::{
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+/// The per-run drive-lock registry a [`WorkflowConductorHost`] holds: one async
+/// lock per in-flight run id, so no two drives advance one run at once.
+///
+/// Exposed (rather than kept private to the host) so a builder that
+/// **reconfigures** a host — e.g.
+/// [`RuntimeExecutor::with_github`](crate::executor::RuntimeExecutor::with_github),
+/// which swaps the node executor after startup — can carry the SAME registry
+/// into the replacement via [`WorkflowConductorHost::with_drive_locks`] instead
+/// of starting a fresh, disconnected one (P5-D6c): rebuilding with a fresh map
+/// would silently defeat per-run serialization for any drive that started under
+/// the OLD host and is still in flight when the NEW host takes over.
+pub type DriveLockRegistry = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
 /// Creates, drives, recovers, and controls durable workflow runs over the daemon's
 /// pool, executing each node through the injected [`NodeExecutor`] `E`. Cheap to
 /// clone — a pool handle, the shared per-run drive locks, and the executor handle.
@@ -61,7 +74,7 @@ pub struct WorkflowConductorHost<E> {
     /// once. Shared across every clone of the host (and thus across the
     /// `WorkflowStarter` and `WorkflowLifecycle` seams the server pulls out), so
     /// start / resume / retry / recovery all serialize on the same lock per run.
-    drive_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    drive_locks: DriveLockRegistry,
 }
 
 // Manual `Clone` so the host clones regardless of whether `E: Clone` — only
@@ -79,15 +92,43 @@ impl<E> Clone for WorkflowConductorHost<E> {
 
 impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
     /// Build a host over the daemon's pool with the node executor to run each node
-    /// through. The workflow tables share the daemon's pool (the migrations are
-    /// workspace-wide).
+    /// through, and a **fresh** drive-lock registry. The workflow tables share the
+    /// daemon's pool (the migrations are workspace-wide).
+    ///
+    /// Use [`with_drive_locks`](Self::with_drive_locks) instead when
+    /// reconfiguring an EXISTING host (a new node executor over the same
+    /// running daemon) — this constructor is only safe for the very first host a
+    /// process builds, before any drive could have started (P5-D6c).
     pub fn new(pool: SqlitePool, node_executor: Arc<E>) -> Self {
+        Self::with_drive_locks(pool, node_executor, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Build a host sharing an **existing** drive-lock registry — e.g. when
+    /// reconfiguring the host with a different node executor after startup
+    /// (P5-D6c). Carrying the same registry forward (rather than minting a
+    /// fresh one, which [`new`](Self::new) does) means a drive already
+    /// serializing on a run id under the OLD host still serializes against the
+    /// NEW host's drives for that same run id.
+    pub fn with_drive_locks(
+        pool: SqlitePool,
+        node_executor: Arc<E>,
+        drive_locks: DriveLockRegistry,
+    ) -> Self {
         Self {
             pool,
             node_executor,
             conductor: WorkflowConductor::new(),
-            drive_locks: Arc::new(Mutex::new(HashMap::new())),
+            drive_locks,
         }
+    }
+
+    /// This host's shared per-run drive-lock registry, so a caller
+    /// reconfiguring the host (see [`with_drive_locks`](Self::with_drive_locks))
+    /// can carry it into the replacement instead of starting a fresh,
+    /// disconnected one (P5-D6c).
+    #[must_use]
+    pub fn drive_locks(&self) -> DriveLockRegistry {
+        self.drive_locks.clone()
     }
 
     /// Startup recovery: spawn a background drive for every non-terminal run, so a
@@ -220,7 +261,10 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
             // Create the durable run idempotently, keyed by the command's
             // idempotency key (a duplicate delivery resolves to the same run), and
             // record the manifest so recovery can recompile it. A store error may be
-            // transient (a busy database), so mark it retryable.
+            // transient (a busy database), so mark it retryable — EXCEPT a reused
+            // key under a different manifest (P5-D2), which is a client error (the
+            // same retry would fail again) surfaced under its own dotted code
+            // rather than the generic store-error.
             let run_id = WorkflowStore::new()
                 .create_run_idempotent(
                     &host.pool,
@@ -230,12 +274,17 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                     Some(&manifest),
                 )
                 .await
-                .map_err(|error| {
-                    CodypendentError::new(
+                .map_err(|error| match error {
+                    WorkflowStoreError::IdempotencyKeyReused { .. } => CodypendentError::new(
+                        "workflow.idempotency-mismatch",
+                        error.to_string(),
+                        false,
+                    ),
+                    other => CodypendentError::new(
                         "workflow.store-error",
-                        format!("could not create the workflow run: {error}"),
+                        format!("could not create the workflow run: {other}"),
                         true,
-                    )
+                    ),
                 })?;
 
             // Drive the created run to a terminal state in the background — but only
@@ -253,6 +302,15 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
     fn pause(&self, request: PauseWorkflowRequest) -> WorkflowLifecycleFuture<'_> {
         let host = self.clone();
         Box::pin(async move {
+            // Deliberately does NOT take the per-run drive lock (unlike
+            // `retry_node` below, P5-D3): pause only flips `workflow_runs.state`,
+            // which a live drive's in-flight node execution never writes back
+            // over (node rows are a disjoint set of columns), so there is no
+            // "in-flight executor overwrites the mutation" hazard here to close.
+            // Taking the lock would instead make `PauseWorkflow` block until the
+            // CURRENT drive fully finishes — breaking the cooperative contract
+            // ("the driver stops at the next scheduling boundary", not "once
+            // the whole run is already done").
             host.conductor
                 .pause(&host.pool, &request.workflow_run_id)
                 .await
@@ -263,10 +321,12 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
     fn resume(&self, request: ResumeWorkflowRequest) -> WorkflowLifecycleFuture<'_> {
         let host = self.clone();
         Box::pin(async move {
-            // Validate synchronously so the reply is an accurate accept/reject, then
-            // drive the resumed run onward in the background.
+            // Validate synchronously so the reply is an accurate accept/reject,
+            // flipping the run from Paused to Running (P5-D5 — the library-level
+            // driver refuses to touch anything but Pending/Running), then drive
+            // the resumed run onward in the background.
             host.conductor
-                .ensure_resumable(&host.pool, &request.workflow_run_id)
+                .prepare_resume(&host.pool, &request.workflow_run_id)
                 .await
                 .map_err(conductor_error_to_protocol)?;
             host.spawn_drive(request.workflow_run_id.clone());
@@ -277,12 +337,28 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
     fn retry_node(&self, request: RetryWorkflowNodeRequest) -> WorkflowLifecycleFuture<'_> {
         let host = self.clone();
         Box::pin(async move {
-            // Reset the node + its dependents synchronously (so an unknown node or a
-            // changed graph rejects), then drive the reset run in the background.
-            host.conductor
-                .prepare_retry(&host.pool, &request.workflow_run_id, &request.node_id)
-                .await
-                .map_err(conductor_error_to_protocol)?;
+            // Acquire the SAME per-run lock a live drive holds for its whole
+            // duration (P5-D3): without this, resetting the node here can race
+            // an in-flight `NodeExecutor::execute` call for that same node,
+            // whose eventual (stale) completion write lands straight over the
+            // reset via `transition_node`'s COALESCE-preserve semantics —
+            // silently discarding the retry. Acquiring the lock means a retry
+            // issued against an actively driving run *waits* for that drive to
+            // reach its next stopping point before the reset is applied: the
+            // reset is deferred, never lost.
+            let lock = host.run_lock(&request.workflow_run_id);
+            {
+                let _guard = lock.lock().await;
+                // Reset the node + its dependents (so an unknown node or a
+                // changed graph rejects), still holding the lock so nothing else
+                // can drive this run while the reset is in progress.
+                host.conductor
+                    .prepare_retry(&host.pool, &request.workflow_run_id, &request.node_id)
+                    .await
+                    .map_err(conductor_error_to_protocol)?;
+            }
+            // Drive the reset run in the background, after releasing the lock
+            // above (spawn_drive re-acquires it itself).
             host.spawn_drive(request.workflow_run_id.clone());
             Ok(())
         })
@@ -564,7 +640,207 @@ steps:
             })
             .await
             .expect_err("unknown run rejected");
-        // No manifest for a nonexistent run.
-        assert_eq!(error.code, "workflow.no-manifest");
+        // P5-D6a: a run that never existed is `not-found`, distinct from a run
+        // that exists but has no stored manifest (`workflow.no-manifest`).
+        assert_eq!(error.code, "workflow.not-found");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_the_same_idempotency_key_reused_for_a_different_manifest() {
+        // P5-D2: a client reusing an idempotency key for a DIFFERENT manifest
+        // must be rejected, not silently resolved to the first run's id.
+        let (_tmp, pool) = temp_pool().await;
+        let host = host_with(pool.clone(), FakeExecutor::default());
+
+        let first = host.start(start_request("cmd-shared-key")).await.unwrap();
+        wait_for_state(&pool, &first, WorkflowRunState::Completed).await;
+
+        // The SAME idempotency key, but a manifest with an extra step (a
+        // different graph signature).
+        let different_manifest = format!(
+            "{MANIFEST}  - id: extra\n    depends_on: [verify]\n    tool: repository.test\n"
+        );
+        let error = host
+            .start(StartWorkflowRequest {
+                manifest: different_manifest,
+                inputs: json!({ "pull_request": 7 }),
+                idempotency_key: "cmd-shared-key".to_owned(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect_err("a reused key with a different manifest must be rejected");
+        assert_eq!(error.code, "workflow.idempotency-mismatch");
+
+        // Only the first run exists.
+        assert_eq!(
+            WorkflowStore::new()
+                .list_incomplete_runs(&pool)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "the rejected duplicate created no second (incomplete) run"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfiguring_the_host_shares_the_drive_lock_registry() {
+        // P5-D6c: a builder that reconfigures the host (e.g.
+        // `RuntimeExecutor::with_github`, which swaps the node executor after
+        // startup) must carry the SAME per-run drive-lock registry into the
+        // replacement — rebuilding via `new` would mint a fresh, disconnected
+        // registry, so a drive in flight under the OLD host would not
+        // serialize against the NEW host's drives for the same run id.
+        let (_tmp, pool) = temp_pool().await;
+        let original = host_with(pool.clone(), FakeExecutor::default());
+        let shared_locks = original.drive_locks();
+
+        let reconfigured = WorkflowConductorHost::with_drive_locks(
+            pool,
+            Arc::new(FakeExecutor::default()),
+            shared_locks,
+        );
+
+        let lock_from_original = original.run_lock("run-x");
+        let lock_from_reconfigured = reconfigured.run_lock("run-x");
+        assert!(
+            Arc::ptr_eq(&lock_from_original, &lock_from_reconfigured),
+            "the reconfigured host must reuse the SAME per-run lock, not mint a fresh one"
+        );
+    }
+
+    /// An executor that blocks on `gate` the FIRST time it runs `gated_node`,
+    /// so a test can hold that node "in flight" (its store row `Running`, the
+    /// coroutine suspended inside `execute`) for as long as it wants — the
+    /// window P5-D3's race needs. Every subsequent call to `gated_node`
+    /// (e.g. after a retry re-drives it) completes immediately. Records every
+    /// node it ran (including repeats across drives).
+    struct GatedExecutor {
+        gated_node: String,
+        gate: Arc<tokio::sync::Notify>,
+        gated_once: std::sync::atomic::AtomicBool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl GatedExecutor {
+        fn new(gated_node: &str, gate: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                gated_node: gated_node.to_owned(),
+                gate,
+                gated_once: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls_for(&self, node: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| *id == node)
+                .count()
+        }
+    }
+
+    #[async_trait]
+    impl NodeExecutor for GatedExecutor {
+        async fn execute(&self, ctx: NodeContext<'_>) -> NodeOutcome {
+            self.calls.lock().unwrap().push(ctx.node.id.clone());
+            if ctx.node.id == self.gated_node
+                && !self
+                    .gated_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.gate.notified().await;
+            }
+            NodeOutcome::completed()
+        }
+    }
+
+    /// Poll until `node_id`'s store row reaches `target`, or panic — mirrors
+    /// [`wait_for_state`] but at node granularity.
+    async fn wait_for_node_state(
+        pool: &SqlitePool,
+        run_id: &str,
+        node_id: &str,
+        target: NodeState,
+    ) {
+        for _ in 0..200 {
+            let snap = WorkflowStore::new()
+                .snapshot(pool, run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if snap
+                .nodes
+                .iter()
+                .find(|n| n.node_id == node_id)
+                .map(|n| n.state)
+                == Some(target)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("node {node_id} never reached {target:?}");
+    }
+
+    #[tokio::test]
+    async fn retry_issued_during_a_live_drive_is_not_silently_lost() {
+        // P5-D3: retrying a node while its run is ACTIVELY driving must not be
+        // silently discarded by the in-flight executor's own completion write
+        // overwriting the reset. `inspect` is held mid-execution (its store row
+        // is `Running`, the executor coroutine suspended) while the retry is
+        // issued; the retry must survive — it takes hold once the current
+        // drive completes, and a fresh drive re-runs `inspect` (and its
+        // downstream `verify`) rather than leaving the run `Completed` from
+        // before the retry was ever asked for.
+        let (_tmp, pool) = temp_pool().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(GatedExecutor::new("inspect", gate.clone()));
+        let host = WorkflowConductorHost::new(pool.clone(), executor.clone());
+
+        let run_id = host.start(start_request("cmd-race")).await.unwrap();
+        wait_for_node_state(&pool, &run_id, "inspect", NodeState::Running).await;
+
+        // Issue the retry WHILE `inspect` is still gated — the drive holds the
+        // per-run lock the entire time it is blocked inside `execute`, so
+        // without the fix this would mutate the node rows immediately,
+        // racing the in-flight completion write.
+        let retry = tokio::spawn({
+            let host = host.clone();
+            let run_id = run_id.clone();
+            async move {
+                host.retry_node(RetryWorkflowNodeRequest {
+                    workflow_run_id: run_id,
+                    node_id: "inspect".to_owned(),
+                    client_id: ClientId::new(),
+                })
+                .await
+            }
+        });
+
+        // Let the gated drive proceed to completion.
+        gate.notify_one();
+        wait_for_state(&pool, &run_id, WorkflowRunState::Completed).await;
+
+        // The retry, having waited for the SAME per-run lock, now applies and
+        // drives again.
+        retry
+            .await
+            .expect("retry task did not panic")
+            .expect("retry accepted");
+        wait_for_state(&pool, &run_id, WorkflowRunState::Completed).await;
+
+        assert_eq!(
+            executor.calls_for("inspect"),
+            2,
+            "inspect re-executed after the retry — the reset was not lost"
+        );
+        assert_eq!(
+            executor.calls_for("verify"),
+            2,
+            "verify (inspect's downstream) also re-executed"
+        );
     }
 }

@@ -115,6 +115,56 @@ async fn create_run_idempotent_dedups_by_key() {
 }
 
 #[tokio::test]
+async fn create_run_idempotent_rejects_a_different_manifest_under_the_same_key() {
+    // P5-D2: the bare idempotency key is not sufficient proof of "the same
+    // request" — reusing it for a DIFFERENT manifest (a different graph
+    // signature) must be a rejection, never a silent success that returns the
+    // first run's id for unrelated work.
+    let (_tmp, pool) = temp_pool().await;
+    let store = WorkflowStore::new();
+    let compiled = compile_yaml(MANIFEST).unwrap();
+
+    let first = store
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None)
+        .await
+        .unwrap();
+
+    // Same key + same manifest still dedups (the genuine duplicate-delivery
+    // case), unaffected by the mismatch guard.
+    let same_again = store
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None)
+        .await
+        .unwrap();
+    assert_eq!(first, same_again, "same key + same manifest ⇒ same run id");
+
+    // Same key + a DIFFERENT manifest (an extra step changes the graph
+    // signature) must be rejected.
+    let changed_manifest =
+        format!("{MANIFEST}  - id: d\n    depends_on: [c]\n    tool: repository.test\n");
+    let changed = compile_yaml(&changed_manifest).unwrap();
+    assert_ne!(compiled.signature(), changed.signature());
+
+    let err = store
+        .create_run_idempotent(&pool, &changed, "cmd-mismatch", &json!({}), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkflowStoreError::IdempotencyKeyReused { .. }),
+        "expected IdempotencyKeyReused, got {err:?}"
+    );
+
+    // The rejected attempt created nothing: exactly one run, with its original
+    // three nodes (not the four the changed manifest would have seeded).
+    assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 1);
+    let snap = store.snapshot(&pool, &first).await.unwrap().unwrap();
+    assert_eq!(
+        snap.nodes.len(),
+        3,
+        "the rejected duplicate must not have added nodes"
+    );
+}
+
+#[tokio::test]
 async fn transitions_record_state_attempt_and_cost() {
     let (_tmp, pool) = temp_pool().await;
     let compiled = compile_yaml(MANIFEST).unwrap();
