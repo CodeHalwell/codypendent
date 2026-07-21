@@ -42,7 +42,10 @@ use crate::instance::InstanceRecord;
 use crate::ledger;
 use crate::projections;
 use crate::subscriptions::SubscriptionHub;
-use crate::workflows::{StartWorkflowRequest, WorkflowStarter};
+use crate::workflows::{
+    PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest, StartWorkflowRequest,
+    WorkflowLifecycle, WorkflowStarter,
+};
 
 /// Heartbeat cadence advertised in `ServerHello` and used to probe idle clients.
 const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
@@ -97,6 +100,11 @@ pub struct ServerState {
     /// `workflow.transport-unavailable`); the assembly injects a
     /// `codypendent-workflow`-backed implementation over the pool.
     pub starter: Option<Arc<dyn WorkflowStarter>>,
+    /// Pauses/resumes/retries an existing durable run from the corresponding
+    /// lifecycle commands (Phase 5 STEP 5.2). `None` in a lib-only / test embedding
+    /// (those commands are then rejected `workflow.transport-unavailable`); injected
+    /// together with `starter` by the assembly.
+    pub lifecycle: Option<Arc<dyn WorkflowLifecycle>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -174,6 +182,7 @@ pub async fn run_with_executor_on(
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
+    let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let documents = DocumentHub::new();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
@@ -221,6 +230,7 @@ pub async fn run_with_executor_on(
         mutator,
         leaser,
         starter,
+        lifecycle,
     });
 
     #[cfg(unix)]
@@ -860,6 +870,95 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // Workflow lifecycle control (pause / resume / retry-from-node),
+                // intercepted at the connection level like `StartWorkflow` — a
+                // workflow run lives outside the session ledger. Each requires the
+                // `Controller` role (matching agent-run cancel/pause/resume) and the
+                // assembly's `WorkflowLifecycle` seam; the seam performs the
+                // synchronous state change and drives the run onward in the
+                // background, so the reply is a fast accept/reject (Phase 5 STEP 5.2).
+                CommandBody::PauseWorkflow { workflow_run_id } => {
+                    if let Some(lifecycle) =
+                        workflow_control_seam(state, conn, writer, &request, "pause").await?
+                    {
+                        let reply = match lifecycle
+                            .pause(PauseWorkflowRequest {
+                                workflow_run_id: workflow_run_id.clone(),
+                                client_id: conn.client_id_or(request.client_id),
+                            })
+                            .await
+                        {
+                            Ok(()) => Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                        send(writer, &reply).await?;
+                    }
+                }
+                CommandBody::ResumeWorkflow { workflow_run_id } => {
+                    if let Some(lifecycle) =
+                        workflow_control_seam(state, conn, writer, &request, "resume").await?
+                    {
+                        let reply = match lifecycle
+                            .resume(ResumeWorkflowRequest {
+                                workflow_run_id: workflow_run_id.clone(),
+                                client_id: conn.client_id_or(request.client_id),
+                            })
+                            .await
+                        {
+                            Ok(()) => Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                        send(writer, &reply).await?;
+                    }
+                }
+                CommandBody::RetryWorkflowNode {
+                    workflow_run_id,
+                    node_id,
+                } => {
+                    if let Some(lifecycle) =
+                        workflow_control_seam(state, conn, writer, &request, "retry").await?
+                    {
+                        let reply = match lifecycle
+                            .retry_node(RetryWorkflowNodeRequest {
+                                workflow_run_id: workflow_run_id.clone(),
+                                node_id: node_id.clone(),
+                                client_id: conn.client_id_or(request.client_id),
+                            })
+                            .await
+                        {
+                            Ok(()) => Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                        send(writer, &reply).await?;
+                    }
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -1235,6 +1334,45 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
 }
 
 /// Frame one envelope onto the shared write half.
+/// The shared gate for a workflow-lifecycle command (pause / resume / retry): the
+/// `Controller` role is required and the assembly's `WorkflowLifecycle` seam must
+/// be wired. On either failure this frames the rejection onto `writer` and returns
+/// `None`; otherwise it returns the seam the caller drives the command through.
+/// `verb` names the action in the role-denied message.
+async fn workflow_control_seam<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    verb: &str,
+) -> anyhow::Result<Option<&'a Arc<dyn WorkflowLifecycle>>> {
+    if conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                format!("only a Controller may {verb} a workflow run"),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "workflow.transport-unavailable",
+                "workflow transport is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(lifecycle))
+}
+
 async fn send(writer: &SharedWriter, envelope: &Envelope) -> Result<(), FrameError> {
     let mut guard = writer.lock().await;
     write_envelope(&mut *guard, envelope).await

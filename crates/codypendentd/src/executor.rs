@@ -46,6 +46,7 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::scan;
+use crate::workflows::{AgentLoopNodeExecutor, WorkflowConductorHost};
 
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
@@ -74,6 +75,13 @@ pub struct RuntimeExecutor {
     /// discovered at startup (Phase 3 STEP 3.2). `None` leaves those tools
     /// unavailable and the run behaves exactly as before.
     github: Option<Arc<dyn GitHubApi>>,
+    /// The workflow-execution host: creates, drives, recovers, and controls durable
+    /// workflow runs (Phase 5 STEP 5.2). One shared host backs both the
+    /// [`WorkflowStarter`](codypendent_daemon::workflows::WorkflowStarter) and
+    /// [`WorkflowLifecycle`](codypendent_daemon::workflows::WorkflowLifecycle) seams
+    /// the server pulls out, so their per-run drive locks are the same registry —
+    /// a `PauseWorkflow` and the `StartWorkflow` drive it pauses serialize together.
+    workflow_host: WorkflowConductorHost<AgentLoopNodeExecutor>,
 }
 
 impl RuntimeExecutor {
@@ -90,6 +98,8 @@ impl RuntimeExecutor {
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
         let mut scanned = HashSet::new();
         scanned.insert(startup_repository);
+        let workflow_host =
+            WorkflowConductorHost::new(pool.clone(), Arc::new(AgentLoopNodeExecutor));
         Self {
             pool,
             paths,
@@ -98,7 +108,16 @@ impl RuntimeExecutor {
             scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
+            workflow_host,
         }
+    }
+
+    /// Startup recovery for durable workflow runs (Phase 5 STEP 5.2): spawn a drive
+    /// for every incomplete run so a crash-interrupted workflow resumes. Called from
+    /// `main` alongside [`relaunch_queued_runs`](Self::relaunch_queued_runs); the
+    /// drives run in the background, so this returns as soon as they are spawned.
+    pub async fn recover_workflows(&self) -> anyhow::Result<usize> {
+        Ok(self.workflow_host.recover().await?)
     }
 
     /// Inject the GitHub client (Phase 3 STEP 3.2). When set, the agent loop
@@ -586,11 +605,18 @@ impl RunExecutor for RuntimeExecutor {
     }
 
     fn workflow_starter(&self) -> Option<Arc<dyn codypendent_daemon::workflows::WorkflowStarter>> {
-        // Compile a `StartWorkflow` manifest and create a durable run over the
-        // daemon's pool (Phase 5 STEP 5.2). Driving the run is a later step.
-        Some(Arc::new(crate::workflows::WorkflowRunStarter::new(
-            self.pool.clone(),
-        )))
+        // Create a durable run from a `StartWorkflow` manifest and drive it to a
+        // terminal state in the background (Phase 5 STEP 5.2). Shares the one host,
+        // so its per-run drive locks match the lifecycle seam's.
+        Some(Arc::new(self.workflow_host.clone()))
+    }
+
+    fn workflow_lifecycle(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::workflows::WorkflowLifecycle>> {
+        // Pause/resume/retry an existing durable run over the same host (Phase 5
+        // STEP 5.2).
+        Some(Arc::new(self.workflow_host.clone()))
     }
 }
 

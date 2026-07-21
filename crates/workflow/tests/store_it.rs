@@ -31,13 +31,45 @@ async fn temp_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
 }
 
 #[tokio::test]
+async fn manifest_round_trips_and_is_none_when_absent() {
+    // The manifest is stored so a daemon can recompile-and-resume after a restart
+    // (STEP 5.2 startup recovery). A run created with one returns it verbatim; one
+    // created without returns None (recovery skips such a run).
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+
+    let with_manifest = store
+        .create_run(&pool, &compiled, None, &json!({}), Some(MANIFEST))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .manifest(&pool, &with_manifest)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(MANIFEST)
+    );
+
+    let without = store
+        .create_run(&pool, &compiled, None, &json!({}), None)
+        .await
+        .unwrap();
+    assert_eq!(store.manifest(&pool, &without).await.unwrap(), None);
+
+    // An unknown run id is also None, never an error.
+    assert_eq!(store.manifest(&pool, "nope").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn create_run_seeds_pending_nodes_in_topological_order() {
     let (_tmp, pool) = temp_pool().await;
     let compiled = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
 
     let id = store
-        .create_run(&pool, &compiled, Some("run-1"), &json!({}))
+        .create_run(&pool, &compiled, Some("run-1"), &json!({}), None)
         .await
         .unwrap();
 
@@ -59,11 +91,11 @@ async fn create_run_idempotent_dedups_by_key() {
     // Two creations with the same idempotency key resolve to one run (a duplicate
     // StartWorkflow delivery after a lost ack does not fork a second run).
     let first = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }))
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
         .await
         .unwrap();
     let second = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }))
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
         .await
         .unwrap();
     assert_eq!(first, second, "same key ⇒ same run id");
@@ -75,7 +107,7 @@ async fn create_run_idempotent_dedups_by_key() {
 
     // A different key is a different run.
     let other = store
-        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }))
+        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }), None)
         .await
         .unwrap();
     assert_ne!(first, other);
@@ -88,7 +120,7 @@ async fn transitions_record_state_attempt_and_cost() {
     let compiled = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -131,7 +163,7 @@ async fn resume_continues_from_the_first_incomplete_node() {
     let compiled = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -170,7 +202,7 @@ async fn resume_refuses_a_changed_graph_signature() {
     let original = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &original, None, &json!({}))
+        .create_run(&pool, &original, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -193,7 +225,7 @@ async fn retry_from_node_resets_the_node_and_everything_downstream() {
     let compiled = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -265,7 +297,7 @@ async fn retry_from_node_refuses_a_changed_graph_or_unknown_node() {
     let original = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &original, None, &json!({}))
+        .create_run(&pool, &original, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -317,7 +349,7 @@ async fn ready_nodes_is_the_parallel_frontier() {
     let compiled = compile_yaml(DIAMOND).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -376,7 +408,7 @@ async fn a_failed_dependency_blocks_the_dependent() {
     let compiled = compile_yaml(DIAMOND).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -428,7 +460,7 @@ async fn ready_nodes_refuses_a_changed_graph_signature() {
     let original = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &original, None, &json!({}))
+        .create_run(&pool, &original, None, &json!({}), None)
         .await
         .unwrap();
 
@@ -448,15 +480,15 @@ async fn list_incomplete_runs_returns_only_non_terminal_runs() {
 
     // Three runs: leave one pending, drive one to running, finish one.
     let pending = store
-        .create_run(&pool, &compiled, Some("pending"), &json!({}))
+        .create_run(&pool, &compiled, Some("pending"), &json!({}), None)
         .await
         .unwrap();
     let running = store
-        .create_run(&pool, &compiled, Some("running"), &json!({}))
+        .create_run(&pool, &compiled, Some("running"), &json!({}), None)
         .await
         .unwrap();
     let completed = store
-        .create_run(&pool, &compiled, Some("done"), &json!({}))
+        .create_run(&pool, &compiled, Some("done"), &json!({}), None)
         .await
         .unwrap();
     store
@@ -484,7 +516,7 @@ async fn run_state_transitions_persist() {
     let compiled = compile_yaml(MANIFEST).unwrap();
     let store = WorkflowStore::new();
     let id = store
-        .create_run(&pool, &compiled, None, &json!({}))
+        .create_run(&pool, &compiled, None, &json!({}), None)
         .await
         .unwrap();
 

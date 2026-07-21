@@ -131,6 +131,17 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => warn!(%error, "could not re-launch queued runs at startup"),
     }
 
+    // Resume any durable workflow run left non-terminal by a crash (Phase 5 STEP
+    // 5.2): recompile each from its stored manifest and drive it onward from where
+    // it stopped. Paused runs are left for an explicit resume. Fire-and-forget, so
+    // a slow workflow never stalls the socket server below; a run that cannot be
+    // recompiled is a no-op logged by its drive task.
+    match executor.recover_workflows().await {
+        Ok(0) => {}
+        Ok(n) => info!(recovered = n, "resumed incomplete workflow runs"),
+        Err(error) => warn!(%error, "could not resume workflow runs at startup"),
+    }
+
     // Optionally open the GitHub webhook listener (Phase 3 STEP 3.3). It is
     // disabled unless `<data_dir>/webhooks.toml` sets `enabled = true`, and even
     // then binds loopback by default. Deliveries are verified, deduplicated by
