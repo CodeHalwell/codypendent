@@ -842,6 +842,127 @@ fn plugin_diff_report(id: &str, diff: &codypendent_sandbox::PermissionDiff) -> S
     out
 }
 
+/// Resolve the trusted-publisher key store path
+/// (`<config_dir>/codypendent/trusted_publishers.toml`, the `models.toml`
+/// precedent). `CODYPENDENT_CONFIG_DIR` overrides the config root (test isolation),
+/// mirroring how `CODYPENDENT_DATA_DIR` overrides the data root.
+fn trusted_publishers_path() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CODYPENDENT_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join("trusted_publishers.toml"));
+    }
+    let dirs = directories::ProjectDirs::from("", "", "codypendent")
+        .context("cannot determine a config directory for the current user")?;
+    Ok(dirs.config_dir().join("trusted_publishers.toml"))
+}
+
+/// `codypendent plugin trust add <ID> <PUBLIC_KEY_B64>` (Phase 6 STEP 6.2): record
+/// a trusted publisher's ed25519 public key so signed plugins from that publisher
+/// verify against a real key. The key is validated before it is stored.
+pub fn plugin_trust_add(id: &str, public_key_b64: &str) -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    store
+        .add(id, public_key_b64)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    store
+        .save(&path)
+        .with_context(|| format!("writing trusted-publisher store {}", path.display()))?;
+    println!("Trusted publisher `{id}` added ({}).", path.display());
+    Ok(())
+}
+
+/// `codypendent plugin trust list` (Phase 6 STEP 6.2): print the trusted
+/// publishers and their public keys.
+pub fn plugin_trust_list() -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    if store.is_empty() {
+        println!(
+            "No trusted publishers ({}). Signed plugins from unknown publishers are refused.",
+            path.display()
+        );
+        return Ok(());
+    }
+    println!("Trusted publishers ({}):", path.display());
+    for (id, key) in store.list() {
+        println!("  {id}  {key}");
+    }
+    Ok(())
+}
+
+/// `codypendent plugin trust remove <ID>` (Phase 6 STEP 6.2): stop trusting a
+/// publisher. Exits non-zero if the publisher was not present.
+pub fn plugin_trust_remove(id: &str) -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    if !store.remove(id) {
+        anyhow::bail!("publisher `{id}` was not trusted");
+    }
+    store
+        .save(&path)
+        .with_context(|| format!("writing trusted-publisher store {}", path.display()))?;
+    println!("Trusted publisher `{id}` removed.");
+    Ok(())
+}
+
+/// `codypendent plugin verify <MANIFEST> <ARTIFACT>` (Phase 6 STEP 6.2): verify a
+/// plugin artifact against its manifest using the **trusted-publisher key store** —
+/// the real-keys install gate. Checksum + signature are checked, then the grant is
+/// evaluated (`install_disabled`). A signed plugin from an unknown publisher, a bad
+/// signature, or an unsigned plugin (unless `--allow-unsigned`) is **refused** with
+/// a non-zero exit, so this is the fail-closed pre-install verification a stateful
+/// `plugin install` builds on (persisting the installed record is daemon-wired
+/// follow-up work).
+pub fn plugin_verify(
+    manifest_file: &std::path::Path,
+    artifact_file: &std::path::Path,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let manifest = read_manifest(manifest_file)?;
+    let artifact = std::fs::read(artifact_file)
+        .with_context(|| format!("reading plugin artifact {}", artifact_file.display()))?;
+
+    let path = trusted_publishers_path()?;
+    let store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+
+    let unsigned = if allow_unsigned {
+        codypendent_sandbox::UnsignedPolicy::Allow
+    } else {
+        codypendent_sandbox::UnsignedPolicy::Deny
+    };
+    // The store is the resolver: an unknown publisher yields no key, so a signed
+    // plugin fails closed (default-deny unsigned already covers the unsigned case).
+    let publisher_key = store.key_for(&manifest.publisher);
+
+    // Full grant at install: the profile is derived from what the manifest requests.
+    let granted = codypendent_sandbox::CapabilitySet::from_spec(&manifest.capabilities);
+    let installed = codypendent_sandbox::InstalledPlugin::install_disabled(
+        manifest.clone(),
+        &artifact,
+        publisher_key.map(|k| k.as_slice()),
+        unsigned,
+        granted,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("{} @ {}: refused — {error}", manifest.id, manifest.version)
+    })?;
+
+    let trust = if installed.signed {
+        format!("signed by trusted publisher `{}`", manifest.publisher)
+    } else {
+        "unsigned (allowed by --allow-unsigned)".to_string()
+    };
+    println!(
+        "\u{2713} {} v{} verified — {trust}; installed disabled (inert until enabled).",
+        manifest.id, manifest.version,
+    );
+    Ok(())
+}
+
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
 fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) -> String {
     format!(

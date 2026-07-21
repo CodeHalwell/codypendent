@@ -13,6 +13,10 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+# The plugin/skill security boundary (Phase 6): skill `scripts/` execute through
+# the sandbox executor under a profile derived from the skill's `[permissions]`.
+# Acyclic — `codypendent-sandbox` depends on neither this crate nor the protocol.
+codypendent-sandbox = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

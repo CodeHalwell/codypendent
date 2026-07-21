@@ -12,10 +12,13 @@
 //! - **Unknown keys are rejected.** Every manifest struct carries
 //!   `#[serde(deny_unknown_fields)]`, so a stray top-level or nested key fails to
 //!   parse rather than being silently ignored.
-//! - **Scripts are not runnable in Phase 2.** A package that ships a non-empty
-//!   `scripts/` entrypoint is marked [`executable = false`](RegistryItem::executable)
-//!   so retrieval never selects a script-dependent behaviour before the Phase-6
-//!   sandbox exists.
+//! - **Skill behaviours are executable (STEP 6.4).** The Phase-2 restriction that
+//!   marked a script-bearing skill non-[`executable`](RegistryItem::executable) is
+//!   lifted now that the OS sandbox exists: skill `scripts/` run confined through
+//!   [`crate::skill_exec`] under a profile derived from the skill's
+//!   `[permissions]`. Registered skills are `executable = true`; the run itself is
+//!   still gated by the sandbox executor, which fails closed where no backend is
+//!   available.
 //!
 //! [`specs/skill.toml`]: ../../../docs/specs/skill.toml
 
@@ -192,8 +195,10 @@ pub enum ManifestError {
 /// The item's `content_hash` is taken over **all** files in `dir` (recursively,
 /// path-sorted for determinism), so any later file change without a version bump
 /// is detectable. `[permissions]` is flattened into [`CapabilityRequest`]s and
-/// the item's [`RiskClass`] derived from them. A non-empty `scripts/` entrypoint
-/// marks the item non-[`executable`](RegistryItem::executable).
+/// the item's [`RiskClass`] derived from them. Skill behaviours are
+/// [`executable`](RegistryItem::executable) (STEP 6.4): a skill's `scripts/` now
+/// run confined through [`crate::skill_exec`], so the Phase-2 non-executable flag
+/// no longer applies.
 pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestError> {
     let raw = std::fs::read_to_string(dir.join("skill.toml"))?;
     let manifest: SkillManifest = toml::from_str(&raw)?;
@@ -231,10 +236,11 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     let permissions = flatten_permissions(&manifest.permissions);
     let risk = RiskClass::from_permissions(&permissions);
 
-    // Scripts are recorded but not runnable until the Phase-6 sandbox: a package
-    // that ships a non-empty scripts/ dir is not executable, so retrieval can
-    // never select a script-dependent behaviour.
-    let executable = !scripts_present(dir, &manifest.entrypoints)?;
+    // STEP 6.4: the Phase-2 "scripts recorded but not runnable" restriction is
+    // lifted — the OS sandbox ([`crate::skill_exec`]) now confines skill scripts,
+    // so a skill's behaviour is executable. The sandbox executor still fails closed
+    // at run time where no backend is available.
+    let executable = true;
 
     let tier = if manifest.trust.publisher == LOCAL_PUBLISHER {
         TrustTier::FirstParty
@@ -339,19 +345,6 @@ fn flatten_permissions(permissions: &SkillPermissions) -> Vec<CapabilityRequest>
             .map(CapabilityRequest::Secret),
     );
     out
-}
-
-/// Whether the package declares a `scripts` entrypoint that exists and is a
-/// non-empty directory.
-fn scripts_present(dir: &Path, entrypoints: &SkillEntrypoints) -> Result<bool, ManifestError> {
-    let Some(scripts) = &entrypoints.scripts else {
-        return Ok(false);
-    };
-    let scripts_dir = dir.join(scripts);
-    if !scripts_dir.is_dir() {
-        return Ok(false);
-    }
-    Ok(std::fs::read_dir(&scripts_dir)?.next().is_some())
 }
 
 /// Map the manifest `status` string to a [`RegistryStatus`].

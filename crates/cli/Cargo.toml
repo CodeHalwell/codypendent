@@ -31,6 +31,9 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# Resolves the platform config dir for the trusted-publisher key store
+# (`<config_dir>/codypendent/trusted_publishers.toml`), the `models.toml` precedent.
+directories = { workspace = true }
 async-trait = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

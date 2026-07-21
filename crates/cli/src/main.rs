@@ -246,6 +246,43 @@ enum PluginCommand {
         /// The candidate update manifest.
         update: PathBuf,
     },
+    /// Verify a plugin artifact against its manifest using the trusted-publisher
+    /// key store — the real-keys install gate (Phase 6 STEP 6.2). A signed plugin
+    /// from an unknown publisher, a bad signature, or an unsigned plugin (unless
+    /// `--allow-unsigned`) is refused with a non-zero exit (fails closed).
+    Verify {
+        /// The plugin manifest (`plugin.toml`).
+        manifest: PathBuf,
+        /// The plugin artifact whose checksum/signature is verified.
+        artifact: PathBuf,
+        /// Permit an unsigned (checksum-only) plugin. Default posture denies it.
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Manage the trusted-publisher key store (Phase 6 STEP 6.2): the ed25519
+    /// public keys `plugin verify` checks signatures against.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// Trust a publisher: record its base64 ed25519 public key.
+    Add {
+        /// The publisher id (matched against a manifest's `publisher`).
+        id: String,
+        /// The publisher's ed25519 public key, base64-encoded (32 raw bytes).
+        public_key: String,
+    },
+    /// List the trusted publishers and their public keys.
+    List,
+    /// Stop trusting a publisher. Exits non-zero if it was not trusted.
+    Remove {
+        /// The publisher id to remove.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -367,6 +404,18 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Plugin { command } => match command {
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),
             PluginCommand::Diff { installed, update } => commands::plugin_diff(&installed, &update),
+            PluginCommand::Verify {
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => commands::plugin_verify(&manifest, &artifact, allow_unsigned),
+            PluginCommand::Trust { command } => match command {
+                TrustCommand::Add { id, public_key } => {
+                    commands::plugin_trust_add(&id, &public_key)
+                }
+                TrustCommand::List => commands::plugin_trust_list(),
+                TrustCommand::Remove { id } => commands::plugin_trust_remove(&id),
+            },
         },
         TopCommand::Acp { repo } => {
             let repo = match repo {
