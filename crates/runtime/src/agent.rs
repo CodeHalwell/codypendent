@@ -260,9 +260,18 @@ pub struct RunContext {
     pub objective: String,
     /// The mode preset, mapped to a [`ModeOverlay`] for policy enforcement.
     pub mode: AgentMode,
-    /// The repository root (`$REPOSITORY`).
+    /// The policy **read/search root** (`$REPOSITORY`) — the tree the agent reads
+    /// and searches. It is the SAME tree as [`worktree`](Self::worktree): the agent
+    /// operates entirely within one directory, so a write and its read-back hit the
+    /// same place (read-your-writes). For an isolated run that tree is the worktree
+    /// (a checkout at HEAD living outside the repository); for a read-only run it is
+    /// the repository root. This is NOT repository *identity* — the code graph,
+    /// curated memories, and GitHub target are attributed to the run's repository by
+    /// the executor, a concern kept distinct from this policy root.
     pub repository: PathBuf,
-    /// The run's writable worktree (`$WORKTREE`).
+    /// The run's writable **worktree** (`$WORKTREE`) — the write root and the
+    /// working directory for `shell.run`/`git.apply_patch`/`git.diff`. Equal to
+    /// [`repository`](Self::repository) so reads and writes target one tree.
     pub worktree: PathBuf,
     /// The GitHub repository this run targets (`owner/repo`), if GitHub is
     /// configured. The client handle lives on the runtime; this names the target.
@@ -953,7 +962,7 @@ impl FrameworkAgentRuntime {
                 })
             }
             ReadFile::NAME => {
-                let input = parse_read_file(args)?;
+                let input = parse_read_file(args, &run.worktree)?;
                 let action = ReadFile::proposed_action(&input);
                 Ok(Prepared {
                     action,
@@ -1466,11 +1475,23 @@ fn parse_command_request(args: &Value, worktree: &Path) -> Result<CommandRequest
     })
 }
 
-fn parse_read_file(args: &Value) -> Result<ReadFileInput, String> {
+fn parse_read_file(args: &Value, worktree: &Path) -> Result<ReadFileInput, String> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or("workspace.read_file requires a string `path`")?;
+    // A relative path resolves against the run's worktree — the tree the agent
+    // operates in — exactly as `shell.run`/`git.apply_patch` root their cwd. The
+    // read scope is that same tree, so a file the agent just wrote reads back
+    // (read-your-writes). Resolving against the daemon's process cwd (the old
+    // behaviour) pointed reads at neither tree. An absolute path is taken as given;
+    // the scope check still confines it.
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    };
     let range = args.get("range").and_then(Value::as_array).and_then(|r| {
         match (
             r.first().and_then(Value::as_u64),
@@ -1480,10 +1501,7 @@ fn parse_read_file(args: &Value) -> Result<ReadFileInput, String> {
             _ => None,
         }
     });
-    Ok(ReadFileInput {
-        path: PathBuf::from(path),
-        range,
-    })
+    Ok(ReadFileInput { path, range })
 }
 
 fn parse_search(args: &Value) -> Result<SearchInput, String> {

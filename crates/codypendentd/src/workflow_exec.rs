@@ -55,8 +55,8 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use crate::executor::{
-    artifact_sink, artifact_store, bind_run_worktree, load_model_registry, release_run_worktree,
-    resolve_github_repo, run_journal, run_writes_to_worktree,
+    artifact_sink, artifact_store, bind_run_worktree, load_model_registry, resolve_github_repo,
+    run_journal, run_writes_to_worktree, WorktreeReleaseGuard,
 };
 use crate::workflows::{DriveLockRegistry, WorkflowConductorHost};
 
@@ -247,9 +247,19 @@ impl AgentLoopNodeExecutor {
                 }
             };
 
-        // Drive the loop in the bound worktree, then release it regardless of
-        // outcome (the manager preserves any unmerged work as a patch artifact
-        // before teardown).
+        // Drive the loop in the bound worktree, then release it — the guard
+        // releases even if the loop unwinds (the manager preserves any unmerged
+        // work as a patch before teardown). The agent operates ENTIRELY within the
+        // bound tree (read root == write root == worktree), so a write and its
+        // read-back hit the same directory; the run's repository (`repository`, R)
+        // is passed only as the GitHub-target IDENTITY, never the policy read root.
+        let operating_tree = binding.worktree.clone();
+        let guard = WorktreeReleaseGuard::arm(
+            self.pool.clone(),
+            artifact_store(&self.paths),
+            manager,
+            binding,
+        );
         let disposition = self
             .drive_agent(
                 session_id,
@@ -257,11 +267,11 @@ impl AgentLoopNodeExecutor {
                 &objective,
                 mode,
                 &repository,
-                &binding.worktree,
+                &operating_tree,
                 driver.as_ref(),
             )
             .await;
-        release_run_worktree(&self.pool, &artifact_store(&self.paths), &manager, &binding).await;
+        guard.release().await;
 
         match disposition {
             Ok(RunDisposition::Completed { .. }) => {
@@ -351,9 +361,11 @@ impl AgentLoopNodeExecutor {
     /// Assemble the agent runtime (shared journal/sink/approvals/subscriptions, and
     /// the GitHub client + policy when configured) and drive it to a terminal
     /// disposition. The model registry is empty because `driver` is supplied
-    /// directly — the loop drives whatever driver it is handed. Splitting
-    /// `repository` (the `$REPOSITORY` read scope) from `worktree` (the `$WORKTREE`
-    /// write scope) is the point of T5, so the argument count is expected.
+    /// directly — the loop drives whatever driver it is handed.
+    ///
+    /// `worktree` is the tree the agent operates in; `repository` (`R`) is the
+    /// run's repository IDENTITY, used only to resolve the GitHub target. The two
+    /// are distinct concerns (T5), hence the argument count.
     #[allow(clippy::too_many_arguments)]
     async fn drive_agent(
         &self,
@@ -381,17 +393,22 @@ impl AgentLoopNodeExecutor {
         if let Some(github) = &self.github {
             runtime = runtime.with_github(github.clone());
         }
-        // `$REPOSITORY` (the read scope) stays the run's repository; `$WORKTREE`
-        // (the write scope) is the node's dedicated, isolated worktree — so the
-        // policy engine's scopes reflect the real allocated tree.
+        // The agent operates ENTIRELY within `worktree`: the policy read/search
+        // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH the
+        // worktree, so a write and its read-back hit the same tree (read-your-
+        // writes). An isolated worktree is a full checkout at HEAD living OUTSIDE
+        // the repository, so setting `$REPOSITORY` to the repo would leave the
+        // agent unable to read or search its own edits.
         let mut run = RunContext::new(
             session_id,
             run_id,
             objective.to_string(),
             mode,
-            repository.to_path_buf(),
+            worktree.to_path_buf(),
             worktree.to_path_buf(),
         );
+        // The GitHub target is repository IDENTITY (`R`), NOT the policy read root —
+        // a worktree shares R's remotes, but R is the stable slug source.
         if self.github.is_some() {
             if let Some(repo) = resolve_github_repo(repository).await {
                 run = run.with_github_repo(repo);
@@ -974,5 +991,93 @@ steps:
             .filter(|(_, _, s)| s == "orphaned")
             .collect();
         assert_eq!(orphaned.len(), 1);
+    }
+
+    /// The `workspace.read_file` outcome a workflow node's agent run recorded —
+    /// walked from the node's linked agent run to its session's events.
+    async fn node_read_file_outcome(
+        pool: &SqlitePool,
+        agent_run_id: &str,
+    ) -> codypendent_protocol::ToolOutcome {
+        use std::str::FromStr;
+        let session: String = sqlx::query_scalar("SELECT session_id FROM runs WHERE id = ?")
+            .bind(agent_run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let session = SessionId::from_str(&session).unwrap();
+        let events = ledger::load_events(pool, session).await.unwrap();
+        events
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::ToolCompleted { tool, outcome, .. } if tool == "workspace.read_file" => {
+                    Some(outcome.clone())
+                }
+                _ => None,
+            })
+            .expect("a workspace.read_file ToolCompleted event")
+    }
+
+    #[tokio::test]
+    async fn an_isolated_node_reads_its_worktree_not_the_repository_read_scope() {
+        // Fix-A wiring gate (read-your-writes): the executor must build the node's
+        // RunContext with the policy read root == the isolated WORKTREE (a checkout
+        // at HEAD living outside the repository), not the repository. A committed
+        // file is present in the worktree, so a relative read of it SUCCEEDS — with
+        // the pre-fix split (read root == repository, worktree outside it) that same
+        // read is policy-denied out-of-scope, so this test fails if fix A regresses.
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // The scripted agent reads README.md (committed by init_git_repo) back from
+        // its worktree via a RELATIVE path.
+        let factory = Arc::new(ScriptedDriverFactory {
+            steps: vec![
+                ModelStep::CallTool {
+                    tool: "workspace.read_file".to_string(),
+                    args: json!({ "path": "README.md" }),
+                },
+                ModelStep::Finish {
+                    summary: "read".to_string(),
+                },
+            ],
+        });
+        let executor = executor_with(&pool, &paths, factory, &repo);
+
+        let compiled = compile_yaml(AGENT_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-read",
+                &json!({}),
+                Some(AGENT_MANIFEST),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        // The node's agent read the committed file from its worktree — allowed,
+        // proving the executor wired read root == worktree (not the repository).
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_run_id = snapshot.nodes[0]
+            .agent_run_id
+            .clone()
+            .expect("the node links its agent run");
+        assert_eq!(
+            node_read_file_outcome(&pool, &agent_run_id).await,
+            codypendent_protocol::ToolOutcome::Succeeded,
+            "the isolated node must read back its own worktree; a repository read \
+             scope would deny the out-of-tree path"
+        );
     }
 }

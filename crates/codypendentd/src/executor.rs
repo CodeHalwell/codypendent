@@ -300,9 +300,7 @@ impl RuntimeExecutor {
         // repository through the [`WorktreeManager`], so its writes never touch
         // the shared checkout; a read-only mode (Explore/Ask/Plan/Review — writes
         // denied by policy) keeps running in the repository root, exactly as
-        // before. `$REPOSITORY` stays the run's repository (the read scope); only
-        // `$WORKTREE` moves to the allocated tree (the write scope), so the policy
-        // engine's scopes follow the real worktree.
+        // before.
         let manager = WorktreeManager::new();
         let binding = bind_run_worktree(
             &self.pool,
@@ -313,17 +311,31 @@ impl RuntimeExecutor {
         )
         .await?;
 
+        // The agent operates ENTIRELY within its bound tree: the policy read/search
+        // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH that tree,
+        // so a write and its read-back hit the same directory (read-your-writes).
+        // For an isolated run that tree is the worktree (a full checkout at HEAD,
+        // outside the repository, so `$REPOSITORY` = the repo would NOT cover it);
+        // for a read-only run it is the repository root. Repository IDENTITY (the
+        // code graph, curated memories, and the GitHub target) stays the run's
+        // repository `R`, resolved separately — in `spawn_run`'s scan and in the
+        // GitHub resolution below — never conflated with this policy read root.
+        let operating_tree = binding.worktree.clone();
+        let guard =
+            WorktreeReleaseGuard::arm(self.pool.clone(), self.artifacts(), manager, binding);
+
         let mut ctx = RunContext::new(
             launch.session_id,
             launch.run_id,
             launch.objective.clone(),
             launch.mode,
-            launch.repository.clone(),
-            binding.worktree.clone(),
+            operating_tree.clone(),
+            operating_tree,
         );
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
-        // so the `github.*` tools know their target. Only meaningful when a client
-        // is configured; a checkout with no GitHub origin leaves the tools inert.
+        // so the `github.*` tools know their target. Uses the repository IDENTITY
+        // (`R`), not the worktree read root. Only meaningful when a client is
+        // configured; a checkout with no GitHub origin leaves the tools inert.
         if self.github.is_some() {
             if let Some(repo) = resolve_github_repo(&launch.repository).await {
                 ctx = ctx.with_github_repo(repo);
@@ -341,15 +353,15 @@ impl RuntimeExecutor {
             Err(error) => warn!(%error, "could not load IDE context for the run"),
         }
 
-        // Drive the loop, then release the worktree regardless of outcome — the
-        // manager preserves any unmerged work as a patch artifact before teardown
-        // (a read-only run bound no worktree, so its release is a no-op).
+        // Drive the loop, then release the worktree — the guard releases it even if
+        // the loop unwinds (the manager preserves any unmerged work as a patch
+        // before teardown; a read-only run bound no worktree, so release is a no-op).
         let result = runtime
             .execute_run(&driver, ctx, token)
             .await
             .map(|_| ())
             .map_err(|e| format!("run failed: {e}"));
-        release_run_worktree(&self.pool, &self.artifacts(), &manager, &binding).await;
+        guard.release().await;
         result
     }
 
@@ -782,6 +794,76 @@ pub(crate) async fn release_run_worktree(
     }
 }
 
+/// Releases a run's bound worktree **even if the drive panics**. A plain
+/// post-await `release_run_worktree` is skipped when the agent loop unwinds,
+/// leaking the lease + worktree for the process lifetime — startup reconciliation
+/// cannot reclaim a directory that still exists. This guard closes that gap: the
+/// normal path calls [`release`](Self::release) (awaited, so a caller/test observes
+/// the released state synchronously); an unwind drops the guard while still armed,
+/// which schedules the async release on the current runtime — `Drop` cannot itself
+/// `await`, so a detached, best-effort task does the teardown while the runtime is
+/// alive. `force = false` semantics are unchanged (unmerged work is still
+/// preserved as a patch).
+pub(crate) struct WorktreeReleaseGuard {
+    pool: SqlitePool,
+    artifacts: ArtifactStore,
+    manager: WorktreeManager,
+    /// `Some` while armed; taken by a normal `release` or by `Drop` on unwind.
+    binding: Option<WorktreeBinding>,
+}
+
+impl WorktreeReleaseGuard {
+    /// Arm a guard over `binding`. Until [`release`](Self::release) runs, an
+    /// unwind schedules the release.
+    pub(crate) fn arm(
+        pool: SqlitePool,
+        artifacts: ArtifactStore,
+        manager: WorktreeManager,
+        binding: WorktreeBinding,
+    ) -> Self {
+        Self {
+            pool,
+            artifacts,
+            manager,
+            binding: Some(binding),
+        }
+    }
+
+    /// Normal teardown: release the worktree, awaiting completion, then disarm (so
+    /// `Drop` is a no-op). Consumes the guard.
+    pub(crate) async fn release(mut self) {
+        if let Some(binding) = self.binding.take() {
+            release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
+        }
+    }
+}
+
+impl Drop for WorktreeReleaseGuard {
+    fn drop(&mut self) {
+        // Fires only on the unwind path (a normal `release` already took the
+        // binding). `Drop` cannot await, so schedule the async release on the
+        // current runtime as a detached, best-effort task — enough not to leak on a
+        // panic while the runtime is still alive. A run-with-no-worktree binding
+        // needs no task at all.
+        if let Some(binding) = self.binding.take() {
+            if binding.lease.is_some() {
+                let pool = self.pool.clone();
+                let artifacts = self.artifacts.clone();
+                let manager = self.manager.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        release_run_worktree(&pool, &artifacts, &manager, &binding).await;
+                    });
+                } else {
+                    tracing::warn!(
+                        "WorktreeReleaseGuard dropped outside of active Tokio runtime; lease cleanup deferred to startup reconciliation"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The `repository` recorded on the StartRun command that created a queued run,
 /// if any. The commands table stores the applied outcome (`result_json`, with
 /// `created_run`) beside the body, so the originating command is found by the
@@ -1051,5 +1133,80 @@ mod tests {
         // Releasing an empty binding is a clean no-op (and leaves the repo intact).
         release_run_worktree(&pool, &artifacts, &manager, &binding).await;
         assert!(repo.exists());
+    }
+
+    #[tokio::test]
+    async fn release_guard_releases_the_worktree_on_the_normal_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+            .await
+            .unwrap();
+        let lease_id = binding.lease.unwrap();
+        let worktree = binding.worktree.clone();
+
+        WorktreeReleaseGuard::arm(pool.clone(), artifacts, manager, binding)
+            .release()
+            .await;
+
+        assert!(
+            !worktree.exists(),
+            "the normal release removes a clean worktree"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
+            .bind(lease_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn release_guard_releases_the_worktree_on_unwind() {
+        // A guard dropped while still armed (the panic path — `release` never ran)
+        // schedules the async release, so the lease still lands `released` and the
+        // clean worktree is removed: a panicking drive leaks nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+            .await
+            .unwrap();
+        let lease_id = binding.lease.unwrap();
+        let worktree = binding.worktree.clone();
+
+        // Drop the guard WITHOUT calling `release` — models an unwind through it.
+        drop(WorktreeReleaseGuard::arm(
+            pool.clone(),
+            artifacts,
+            manager,
+            binding,
+        ));
+
+        // The detached release runs on the current runtime; wait for it to land.
+        let mut released = false;
+        for _ in 0..200 {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
+                    .bind(lease_id.to_string())
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if state.as_deref() == Some("released") {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(released, "the unwind path releases the lease");
+        assert!(
+            !worktree.exists(),
+            "the unwind path removes the clean worktree"
+        );
     }
 }
