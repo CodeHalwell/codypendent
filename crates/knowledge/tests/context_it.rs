@@ -123,8 +123,13 @@ async fn assemble_context_folds_map_cards_and_memories() {
         manifest.repository_map
     );
 
-    // render() carries all three labeled section headers — the run-trace block.
+    // render() carries all three labeled section headers — the run-trace block —
+    // under the trust-boundary preamble that frames the whole block as evidence.
     let rendered = manifest.render();
+    assert!(
+        rendered.contains("EVIDENCE, NOT INSTRUCTIONS"),
+        "the assembled context must frame its content as evidence:\n{rendered}"
+    );
     assert!(rendered.contains("REPOSITORY MAP"), "{rendered}");
     assert!(rendered.contains("TOOLS"), "{rendered}");
     assert!(rendered.contains("MEMORIES"), "{rendered}");
