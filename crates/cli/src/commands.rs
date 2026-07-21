@@ -698,10 +698,10 @@ pub fn plugin_inspect(file: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// `codypendent plugin diff <INSTALLED> <UPDATE>` (Phase 6 STEP 6.1): parse both
-/// manifests, print the capability permission diff, and report whether the update
-/// expands permissions and so requires re-approval (exit criterion 2). Exits
-/// non-zero when the update expands permissions, so a caller (or CI) can gate on
-/// it.
+/// manifests, print the permission diff (capabilities **and** resource caps —
+/// P6-A), and report whether the update expands permissions and so requires
+/// re-approval (exit criterion 2). Exits non-zero when the update expands
+/// permissions, so a caller (or CI) can gate on it.
 pub fn plugin_diff(installed: &std::path::Path, update: &std::path::Path) -> anyhow::Result<()> {
     let installed_manifest = read_manifest(installed)?;
     let update_manifest = read_manifest(update)?;
@@ -712,9 +712,12 @@ pub fn plugin_diff(installed: &std::path::Path, update: &std::path::Path) -> any
             update_manifest.id
         );
     }
-    let old = codypendent_sandbox::CapabilitySet::from_spec(&installed_manifest.capabilities);
-    let new = codypendent_sandbox::CapabilitySet::from_spec(&update_manifest.capabilities);
-    let diff = old.diff_to(&new);
+    // diff_manifests() folds resource-cap changes in alongside the capability
+    // diff (P6-A) — a bare CapabilitySet::diff_to() here would miss a raised
+    // memory/cpu/wall/output cap entirely, since it has no resource data to
+    // compare, letting this CI re-approval gate print "safe" and exit 0 on
+    // exactly the update it exists to catch.
+    let diff = codypendent_sandbox::diff_manifests(&installed_manifest, &update_manifest);
     print!("{}", plugin_diff_report(&installed_manifest.id, &diff));
     if diff.expands_permissions() {
         // A widening update is not applied without re-approval — signal that with a
@@ -1103,6 +1106,24 @@ sandbox_profile = "network-client"
             "network = [\"api.github.com:443\", \"uploads.github.com:443\"]\nfilesystem_read = [\"/etc\"]",
         );
         std::fs::write(&update, expanded).unwrap();
+        let err = plugin_diff(&installed, &update).unwrap_err().to_string();
+        assert!(err.contains("re-approval required"), "got: {err}");
+    }
+
+    #[test]
+    fn diff_command_exits_nonzero_when_a_resource_cap_is_raised() {
+        // P6-A fix pass: identical capabilities, only the memory cap raised.
+        // plugin_diff() now routes through codypendent_sandbox::diff_manifests(),
+        // which folds resource-cap changes into the diff. Before that, this
+        // computed via a bare CapabilitySet diff that never saw resources,
+        // so it printed "no permission changes — safe to update" and exited
+        // 0 on exactly the update this CI gate exists to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.toml");
+        let update = dir.path().join("update.toml");
+        std::fs::write(&installed, GITHUB_MANIFEST).unwrap();
+        let raised = GITHUB_MANIFEST.replace("memory_mb = 256", "memory_mb = 4096");
+        std::fs::write(&update, raised).unwrap();
         let err = plugin_diff(&installed, &update).unwrap_err().to_string();
         assert!(err.contains("re-approval required"), "got: {err}");
     }

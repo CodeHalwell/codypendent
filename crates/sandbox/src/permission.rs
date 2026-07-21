@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::manifest::{CapabilitiesSpec, ResourcesSpec};
+use crate::manifest::{CapabilitiesSpec, PluginManifest, ResourcesSpec};
 
 /// A single, comparable capability a plugin holds. Each variant carries the
 /// concrete grant (a path, a `host:port`, a secret name) so two sets diff at the
@@ -169,16 +169,34 @@ impl fmt::Display for ResourceChange {
 /// and an update's. Only fields that actually differ are returned — an
 /// unchanged field renders no line and contributes no expansion, mirroring how
 /// [`CapabilitySet::diff_to`] only reports real deltas.
+///
+/// Both `ResourcesSpec`s are destructured **exhaustively** (every field named,
+/// no `..` rest pattern): adding a 5th resource cap to the manifest schema
+/// will fail to compile here until it is named below, so a future field can
+/// never silently bypass the P6-A fold-in the way memory/cpu/wall/output did
+/// before this diff existed.
 #[must_use]
 pub fn diff_resources(old: &ResourcesSpec, new: &ResourcesSpec) -> Vec<ResourceChange> {
+    let ResourcesSpec {
+        memory_mb: old_memory_mb,
+        cpu_seconds: old_cpu_seconds,
+        wall_seconds: old_wall_seconds,
+        maximum_output_mb: old_maximum_output_mb,
+    } = old;
+    let ResourcesSpec {
+        memory_mb: new_memory_mb,
+        cpu_seconds: new_cpu_seconds,
+        wall_seconds: new_wall_seconds,
+        maximum_output_mb: new_maximum_output_mb,
+    } = new;
     let fields: [(&'static str, u64, u64); 4] = [
-        ("memory_mb", old.memory_mb, new.memory_mb),
-        ("cpu_seconds", old.cpu_seconds, new.cpu_seconds),
-        ("wall_seconds", old.wall_seconds, new.wall_seconds),
+        ("memory_mb", *old_memory_mb, *new_memory_mb),
+        ("cpu_seconds", *old_cpu_seconds, *new_cpu_seconds),
+        ("wall_seconds", *old_wall_seconds, *new_wall_seconds),
         (
             "maximum_output_mb",
-            old.maximum_output_mb,
-            new.maximum_output_mb,
+            *old_maximum_output_mb,
+            *new_maximum_output_mb,
         ),
     ];
     fields
@@ -186,6 +204,25 @@ pub fn diff_resources(old: &ResourcesSpec, new: &ResourcesSpec) -> Vec<ResourceC
         .filter(|(_, old_v, new_v)| old_v != new_v)
         .map(|(field, old, new)| ResourceChange { field, old, new })
         .collect()
+}
+
+/// Compute the permission diff between two plugin manifests **directly** — the
+/// manifest-to-manifest comparison the CLI's `plugin diff` command needs (a
+/// bare pair of manifest files, with no live [`crate::lifecycle::InstalledPlugin`]
+/// / granted-capability state to compare against).
+///
+/// Folds in resource-cap changes (P6-A) via [`diff_resources`] exactly as
+/// [`crate::lifecycle::InstalledPlugin::diff_update`] does for the live
+/// lifecycle path, so both entry points detect a raised resource cap as an
+/// expansion — a raised cap can no longer slip past the CLI gate that
+/// `codypendent plugin diff` exists to enforce.
+#[must_use]
+pub fn diff_manifests(old: &PluginManifest, next: &PluginManifest) -> PermissionDiff {
+    let old_set = CapabilitySet::from_spec(&old.capabilities);
+    let next_set = CapabilitySet::from_spec(&next.capabilities);
+    let mut diff = old_set.diff_to(&next_set);
+    diff.resource_changes = diff_resources(&old.resources, &next.resources);
+    diff
 }
 
 /// The change in capabilities (and resource caps) between an installed
@@ -437,5 +474,92 @@ mod tests {
         let rendered = diff.render();
         assert!(rendered.contains("+ resources.memory_mb: 256 -> 512"));
         assert!(rendered.contains("- resources.wall_seconds: 120 -> 60"));
+    }
+
+    // --- P6-A fix pass: diff_manifests() is the CLI's manifest-to-manifest gate ---
+
+    fn manifest_with_memory(memory_mb: u64) -> PluginManifest {
+        let toml = format!(
+            r#"
+schema_version = 1
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+kind = "native-process"
+publisher = "codypendent-project"
+[runtime]
+command = "codypendent-plugin-github"
+[capabilities]
+network = ["api.github.com:443"]
+[resources]
+memory_mb = {memory_mb}
+cpu_seconds = 30
+wall_seconds = 60
+maximum_output_mb = 8
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+"#
+        );
+        crate::manifest::parse_manifest(&toml).expect("manifest parses")
+    }
+
+    #[test]
+    fn diff_manifests_reports_a_raised_resource_cap_as_an_expansion() {
+        // The exact P6-A defect at the CLI entry point: identical
+        // capabilities, only the memory cap raised. Before diff_manifests()
+        // folded in diff_resources(), a bare CapabilitySet::diff_to() here
+        // would report `is_identical()` and the CLI would exit 0.
+        let installed = manifest_with_memory(256);
+        let update = manifest_with_memory(4096);
+        let diff = diff_manifests(&installed, &update);
+        assert!(
+            diff.expands_permissions(),
+            "a raised resource cap must be an expansion"
+        );
+        assert_eq!(diff.render(), "+ resources.memory_mb: 256 -> 4096");
+    }
+
+    #[test]
+    fn diff_manifests_treats_a_lowered_resource_cap_as_a_narrowing() {
+        let installed = manifest_with_memory(4096);
+        let update = manifest_with_memory(256);
+        let diff = diff_manifests(&installed, &update);
+        assert!(!diff.expands_permissions());
+        assert!(!diff.is_identical());
+    }
+
+    #[test]
+    fn diff_manifests_matches_a_capability_expansion_like_capabilityset_diff_to() {
+        // diff_manifests() must still catch a plain capability expansion, not
+        // just resource caps — it composes CapabilitySet::diff_to(), it
+        // doesn't replace it.
+        let installed = manifest_with_memory(256);
+        let update = crate::manifest::parse_manifest(
+            r#"
+schema_version = 1
+id = "github"
+name = "GitHub"
+version = "0.2.0"
+kind = "native-process"
+publisher = "codypendent-project"
+[runtime]
+command = "codypendent-plugin-github"
+[capabilities]
+network = ["api.github.com:443", "uploads.github.com:443"]
+[resources]
+memory_mb = 256
+cpu_seconds = 30
+wall_seconds = 60
+maximum_output_mb = 8
+[security]
+checksum = "sha256:set-during-packaging"
+signature = "set-during-packaging"
+"#,
+        )
+        .expect("manifest parses");
+        let diff = diff_manifests(&installed, &update);
+        assert!(diff.expands_permissions());
+        assert_eq!(diff.render(), "+ network: uploads.github.com:443");
     }
 }
