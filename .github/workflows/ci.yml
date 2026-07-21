@@ -89,3 +89,30 @@ jobs:
         with:
           command: check
 
+  # VS Code extension (extensions/vscode): install, typecheck, lint, and the
+  # vitest suite. A separate job on its own Node toolchain — a failure here
+  # must never be entangled with the Rust jobs' disk/cache usage above, and
+  # this suite runs in well under a minute either way.
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # No .nvmrc/engines.node exists yet; 22 matches the extension's own
+          # @types/node ^22.5.0.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extensions/vscode/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+
