@@ -574,5 +574,7 @@ From the broader Codex comparison, sequencing notes that touch several phases:
 - [x] `cargo fmt --all -- --check` clean
 - [x] `cargo clippy --workspace --all-targets` clean
 - [x] `cargo test --workspace` green
-- [ ] `cargo deny check` / `cargo audit` clean or with dated exceptions
+- [x] `cargo deny check` clean (advisories/licenses/bans/sources) via `deny.toml`
+      + a CI `deny` job; three unmaintained-transitive advisories carried as dated
+      exceptions
 - [x] CI green on the release commit; working tree clean; migrations unchanged since first commit

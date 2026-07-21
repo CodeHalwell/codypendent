@@ -1,0 +1,72 @@
+# cargo-deny policy — the supply-chain gate for the "every-release hygiene"
+# checklist (`cargo deny check` clean, or with dated exceptions). Run locally with
+# `cargo deny check`; CI runs the same via EmbarkStudios/cargo-deny-action.
+#
+# The `advisories` check needs the RustSec advisory database (fetched from GitHub),
+# which CI has network for; a local run behind a restricted egress proxy may only
+# be able to run `cargo deny check bans licenses sources`.
+
+[graph]
+# Check the dependency graph for all targets, not just the host's, so a
+# platform-specific advisory or license is not missed.
+all-features = true
+
+[advisories]
+version = 2
+# Dated exceptions — each an unmaintained-crate advisory on a transitive dependency
+# we do not control and for which no safe upgrade exists. A real vulnerability (or a
+# yanked crate) still fails the gate; these are the "with dated exceptions" half of
+# the release checklist. Reviewed 2026-07-21; revisit when the upstream crate drops
+# the dependency.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via ratatui; no safe upgrade available" },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive dependency; no safe upgrade available" },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via heapless; no safe upgrade available" },
+]
+
+[licenses]
+version = 2
+# Exactly the permissive/BSD-family licenses present in the tree (verified with
+# `cargo deny list`). The workspace itself is MIT (see LICENSE); a dependency under
+# any license not listed here fails the gate until it is replaced or an explicit
+# exception is added. Copyleft licenses (GPL/LGPL) are deliberately absent — every
+# dependency that carries one is multi-licensed and satisfiable by a permissive
+# option here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+# Per-crate license clarifications go here when a crate's license is expressed in a
+# way the SPDX scanner cannot read on its own.
+exceptions = []
+
+[bans]
+# A duplicate major version of a crate bloats the tree; warn rather than fail so a
+# transitive-dependency clash does not block a release, but keep it visible.
+multiple-versions = "warn"
+# Allow wildcard (`*`) version requirements: the only wildcards here are the
+# workspace's own internal path dependencies (`codypendent-*`), which carry no
+# version by design. Every EXTERNAL dependency is version-pinned centrally in the
+# root `[workspace.dependencies]` and referenced as `{ workspace = true }`, so a
+# crate cannot introduce an unpinned external requirement even with this allowed.
+wildcards = "allow"
+deny = []
+skip = []
+
+[sources]
+# Every dependency must come from a known registry (crates.io) or an explicitly
+# allowed git source; an unknown source is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
