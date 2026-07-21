@@ -132,13 +132,57 @@ pub async fn set_run_state(
     Ok(())
 }
 
-/// The current [`RunState`] of a run, or `None` if there is no such run.
-pub async fn load_run_state(pool: &SqlitePool, run_id: RunId) -> anyhow::Result<Option<RunState>> {
+/// The current [`RunState`] of a run, or `None` if there is no such run. Takes
+/// a generic executor (not only the pool) so a caller can re-read the state
+/// **inside its own write transaction** — the FP-3 fix reads the fresh,
+/// under-the-write-lock state rather than trusting a read taken before that
+/// transaction began.
+pub async fn load_run_state(
+    exec: impl sqlx::SqliteExecutor<'_>,
+    run_id: RunId,
+) -> anyhow::Result<Option<RunState>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT state FROM runs WHERE id = ?")
         .bind(run_id.to_string())
-        .fetch_optional(pool)
+        .fetch_optional(exec)
         .await?;
     Ok(row.map(|(state,)| run_state_from_db(&state)))
+}
+
+/// Transition a run to `state` **only if** its CURRENT state is one of
+/// `legal_from` — a single atomic conditional `UPDATE`, never a separate
+/// read-then-write — so a transition whose legality was checked before the
+/// write transaction began cannot apply against a state that has since
+/// changed underneath it (FP-3: the run-state lifecycle commands' guard used
+/// to be check-then-act, validated outside the transaction that performed the
+/// write). Returns the number of rows affected: `1` if the transition applied,
+/// `0` if the run does not exist or its current state was not in `legal_from`
+/// — the caller distinguishes those two (rare, and about to reject either way)
+/// with a follow-up read.
+pub async fn set_run_state_if_legal(
+    exec: impl sqlx::SqliteExecutor<'_>,
+    run_id: RunId,
+    legal_from: &[RunState],
+    state: RunState,
+) -> Result<u64, sqlx::Error> {
+    if legal_from.is_empty() {
+        // No prior state makes this transition legal — nothing can match, so
+        // skip the round-trip (and avoid emitting `... WHERE state IN ()`,
+        // which is valid SQL but a wasted call).
+        return Ok(0);
+    }
+    let placeholders = legal_from
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("UPDATE runs SET state = ? WHERE id = ? AND state IN ({placeholders})");
+    let mut query = sqlx::query(&sql)
+        .bind(run_state_to_db(state))
+        .bind(run_id.to_string());
+    for from in legal_from {
+        query = query.bind(run_state_to_db(*from));
+    }
+    Ok(query.execute(exec).await?.rows_affected())
 }
 
 /// The session a run belongs to, or `None` if there is no such run. The write
