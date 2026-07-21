@@ -76,3 +76,16 @@ jobs:
         # in well under a minute locally.
         timeout-minutes: 15
         run: cargo test --workspace --all-features
+
+  # Supply-chain gate (every-release hygiene): advisories, licenses, bans, and
+  # sources per `deny.toml`. A separate lightweight job — it needs no build, only
+  # the lockfile and the RustSec advisory database the action fetches. Its dated
+  # advisory exceptions live in `deny.toml`.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+

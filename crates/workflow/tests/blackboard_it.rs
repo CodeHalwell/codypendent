@@ -19,7 +19,7 @@ steps:
 async fn seed_run(pool: &sqlx::SqlitePool) -> String {
     let compiled = compile_yaml(MANIFEST).unwrap();
     WorkflowStore::new()
-        .create_run(pool, &compiled, None, &json!({}))
+        .create_run(pool, &compiled, None, &json!({}), None)
         .await
         .unwrap()
 }

@@ -1,0 +1,12 @@
+-- Phase 5 (STEP 5.2): persist the workflow manifest with each run so a daemon can
+-- RECOMPILE the graph after a restart and resume-drive it. The 0010 schema stored
+-- only the graph *signature* (enough to refuse a changed graph) but not the graph
+-- itself, so a recovering daemon had no way to reconstruct the compiled workflow
+-- an in-flight run was executing. The manifest YAML is the source the compiler
+-- lowers into that graph; storing it makes startup recovery (list_incomplete_runs
+-- -> recompile -> resume) self-contained from the durable store alone.
+--
+-- Nullable and appended: a run created before this column existed reads NULL and
+-- is skipped by recovery (it has no manifest to recompile), never erroring. Every
+-- run created through the StartWorkflow seam records its manifest from now on.
+ALTER TABLE workflow_runs ADD COLUMN manifest_yaml TEXT;

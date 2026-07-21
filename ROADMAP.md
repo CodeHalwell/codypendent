@@ -53,10 +53,19 @@ the release gate is the
 > multi-agent orchestration, now advancing on three fronts. A model-free
 > **driver** (`WorkflowDriver` + a `NodeExecutor` seam) advances a run through the
 > ready frontier — resumable, node-level provenance recorded — proven end-to-end
-> with a fake executor. **Runs are creatable through the daemon**: a
-> `StartWorkflow` command compiles a manifest and creates a durable run via a
-> `WorkflowStarter` seam (assembly-implemented over `create_run`). And two
-> read-only **client surfaces** have landed — a TUI workflow-graph view over the
+> with a fake executor. **Runs are now driven, recovered, and controlled through
+> the daemon**: a `StartWorkflow` command compiles a manifest, creates a durable
+> run (its manifest persisted for recovery, migration 0011), and the assembly's
+> `WorkflowConductorHost` spawns the driver to advance it to a terminal state
+> under a per-run lock; a startup pass resumes every incomplete run after a crash;
+> and `Controller`-gated `PauseWorkflow`/`ResumeWorkflow`/`RetryWorkflowNode`
+> commands (reachable from `codypendent workflow run/pause/resume/retry`) drive the
+> conductor's cooperative-pause / resume / retry-from-node lifecycle. **Agent nodes
+> now execute the real agent loop** — `AgentLoopNodeExecutor` creates a session +
+> run and drives the loop to a disposition (tested with a `ScriptedDriver`, no
+> model) — with tool-node execution and blackboard-output harvest the remaining
+> leaf work. And two read-only **client surfaces** have landed — a TUI
+> workflow-graph view over the
 > compiled projection (per-node state / agent / worktree, grouped by workflow) and
 > a TUI blackboard view over the per-run artifact boards (kind / author /
 > confidence / evidence) — each fed by a CLI seam.
@@ -307,11 +316,43 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         run id (or
         `CommandRejected` when the manifest does not compile; a daemon without the
         seam rejects it `workflow.transport-unavailable`, an Observer is
-        role-denied). *Remaining for 5.2:* wiring the **driver** into that seam
-        behind a real `NodeExecutor` (so a created run actually advances), the
-        startup-recovery pass over the incomplete-runs list, node-lifecycle ledger
-        events over the observer, and the pause/resume/retry-from-node **commands**
-        that drive these store ops.
+        role-denied). **The daemon now drives, recovers, and controls those runs:**
+        a `WorkflowConductor` (in `codypendent-workflow`) recompiles a run's stored
+        **manifest** (persisted with the run by migration 0011) into its graph and
+        advances it through the `WorkflowDriver`; the assembly's
+        `WorkflowConductorHost` **spawns that drive fire-and-forget** right after
+        `StartWorkflow` creates the run — so a created run actually advances — under
+        a **per-run drive lock** so no two drives ever race one run. **Startup
+        recovery** resumes every incomplete run from where it stopped
+        (`recover_incomplete` over `list_incomplete_runs`; a `running` node
+        interrupted by a crash is reset and re-driven exactly once; a **paused** run
+        is left for an explicit resume). **Pause / resume / retry-from-node are real
+        commands** — `PauseWorkflow` / `ResumeWorkflow` / `RetryWorkflowNode`,
+        `Controller`-gated, intercepted like `StartWorkflow` and applied through a
+        daemon `WorkflowLifecycle` seam over the conductor: pause flips the run so
+        the driver stops **cooperatively** at the next scheduling boundary (drain
+        then stop), while resume/retry mutate synchronously (so the reply is an
+        accurate accept/reject) then drive in the background. All four are reachable
+        from the CLI (`codypendent workflow run/pause/resume/retry`). A
+        `NodeObserver` emits a node-lifecycle event per transition (surfaced in the
+        daemon log today). **Agent nodes now execute the real agent loop:**
+        `AgentLoopNodeExecutor` (in `codypendentd`) synthesizes an objective from the
+        node's role + declared outputs + run inputs, creates a session + run, drives
+        the agent loop to a terminal `RunDisposition` through the shared run plumbing
+        (journal / sink / policy / approvals), and maps it to the node's outcome —
+        recording the agent-run id the graph view links to. The model driver is built
+        through a `NodeModelDriverFactory` seam, so the whole agent-node path is tested
+        with a `ScriptedDriver` (no model, no network): a single-agent workflow drives
+        to completion, and a missing model fails the node cleanly rather than hanging.
+        *Remaining for 5.2:* **tool-node execution** (the manifest tool-name namespace
+        reconciled with the runtime tool registry + the per-node tool arguments the
+        compiled graph does not yet carry — a tool node fails cleanly and legibly
+        today), harvesting an agent node's declared `outputs` onto the run's blackboard
+        (the STEP 5.3 `blackboard.post` path, so agent nodes can build on each other),
+        node-level mode/permission resolution from an `agent.toml` profile (every agent
+        node runs in the permissive `Build` mode today, writes still approval-gated),
+        and the client-facing `Subscription::Workflow` stream that publishes the
+        observer's transitions (mirroring the document CRDT-sync stream).
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code
@@ -335,10 +376,15 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         posts artifacts). *Remaining for 5.3:* daemon read/write **commands** +
         subscription delivery over that surface (the write path an agent's
         `blackboard.post` tool drives).
-- [ ] Parallel worktrees; budgets; pause/resume/retry-from-node; independent review agent
+- [ ] Parallel worktrees; budgets; independent review agent — **pause / resume /
+      retry-from-node have landed** (conductor + `WorkflowLifecycle` commands +
+      CLI); parallel worktrees, budget enforcement, and the independent review
+      agent remain.
 
 **Exit:** multi-agent edits never share writable worktrees; workflow resumes
-after restart; node-level cost/provenance visible; single-agent baseline selectable.
+after restart ✅ (startup recovery drives every incomplete run); node-level
+cost/provenance visible ✅ (per-node records + observer); single-agent baseline
+selectable.
 
 ## Phase 6 — Plugin & multimodal ecosystem 🟡
 
@@ -538,5 +584,7 @@ From the broader Codex comparison, sequencing notes that touch several phases:
 - [x] `cargo fmt --all -- --check` clean
 - [x] `cargo clippy --workspace --all-targets` clean
 - [x] `cargo test --workspace` green
-- [ ] `cargo deny check` / `cargo audit` clean or with dated exceptions
+- [x] `cargo deny check` clean (advisories/licenses/bans/sources) via `deny.toml`
+      + a CI `deny` job; three unmaintained-transitive advisories carried as dated
+      exceptions
 - [x] CI green on the release commit; working tree clean; migrations unchanged since first commit

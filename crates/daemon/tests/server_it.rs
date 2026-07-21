@@ -672,6 +672,94 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
 }
 
 #[tokio::test]
+async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
+    // Phase 5 STEP 5.2: pause/resume/retry are intercepted like `StartWorkflow`, but
+    // controlling a run requires the `Controller` role (matching agent-run
+    // cancel/pause/resume). A Contributor is role-denied; a Controller gets past the
+    // gate but the daemon's own test server injects no lifecycle seam, so the command
+    // is rejected `workflow.transport-unavailable` rather than crashing the connection.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    // A Contributor may start a workflow but not control one → role-denied.
+    let contributor = ClientId::new();
+    let mut contrib_stream = connect(&paths).await;
+    handshake(&mut contrib_stream, contributor).await;
+    bind_role(
+        &mut contrib_stream,
+        contributor,
+        ClientRole::Contributor,
+        "contrib-life-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut contrib_stream,
+        &Envelope::request(
+            contributor,
+            Payload::Command(command(
+                CommandBody::PauseWorkflow {
+                    workflow_run_id: "wfrun-1".to_string(),
+                },
+                "pause-contributor",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied, got {other:?}"),
+    }
+
+    // A Controller gets past the role gate; all three lifecycle commands then hit
+    // the unwired transport.
+    let controller = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, controller).await;
+    bind_role(
+        &mut stream,
+        controller,
+        ClientRole::Controller,
+        "controller-life-att",
+    )
+    .await;
+    for (body, key) in [
+        (
+            CommandBody::PauseWorkflow {
+                workflow_run_id: "wfrun-1".to_string(),
+            },
+            "pause-controller",
+        ),
+        (
+            CommandBody::ResumeWorkflow {
+                workflow_run_id: "wfrun-1".to_string(),
+            },
+            "resume-controller",
+        ),
+        (
+            CommandBody::RetryWorkflowNode {
+                workflow_run_id: "wfrun-1".to_string(),
+                node_id: "verify".to_string(),
+            },
+            "retry-controller",
+        ),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(controller, Payload::Command(command(body, key))),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(error.code, "workflow.transport-unavailable");
+            }
+            other => panic!("expected transport-unavailable for {key}, got {other:?}"),
+        }
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn attaching_a_second_client_emits_presence() {
     // STEP 3.7: presence events let each attached client see who else is here.
     let tmp = tempfile::tempdir().unwrap();

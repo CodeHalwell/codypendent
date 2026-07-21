@@ -123,4 +123,18 @@ pub trait RunExecutor: Send + Sync {
     fn workflow_starter(&self) -> Option<std::sync::Arc<dyn crate::workflows::WorkflowStarter>> {
         None
     }
+
+    /// The assembly-provided [`WorkflowLifecycle`](crate::workflows::WorkflowLifecycle)
+    /// that pauses/resumes/retries an existing durable run from the corresponding
+    /// commands (Phase 5 STEP 5.2). Bundled with the executor like
+    /// [`workflow_starter`](RunExecutor::workflow_starter) — it names the
+    /// `codypendent-workflow` conductor and the pool, which only the assembly can.
+    /// The default `None` leaves those commands unwired: the executor-less server
+    /// and the daemon's own tests then reject them `workflow.transport-unavailable`,
+    /// exactly as `StartWorkflow` is rejected without a starter.
+    fn workflow_lifecycle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::workflows::WorkflowLifecycle>> {
+        None
+    }
 }

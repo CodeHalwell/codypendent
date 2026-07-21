@@ -263,6 +263,10 @@ pub struct ToolCard {
     pub name: String,
     pub summary: String,
     pub risk: RiskClass,
+    /// The item's provenance trust tier, carried onto the card so the assembled
+    /// context can mark a community/untrusted item's (author-controlled) summary as
+    /// lower-trust — the summary is evidence, not an instruction to obey.
+    pub tier: TrustTier,
 }
 
 impl ToolCard {
@@ -290,6 +294,7 @@ impl ToolCard {
             name: item.name.clone(),
             summary,
             risk: item.risk,
+            tier: item.trust.tier,
         }
     }
 }

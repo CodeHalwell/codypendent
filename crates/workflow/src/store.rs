@@ -65,6 +65,18 @@ impl WorkflowRunState {
         }
     }
 
+    /// Whether the run has reached a terminal state — completed, failed, or
+    /// cancelled — from which no further driving happens. A driver skips a
+    /// terminal run, so a stray drive request (e.g. a duplicate `StartWorkflow`
+    /// resolving to a finished run) is a clean no-op.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            WorkflowRunState::Completed | WorkflowRunState::Failed | WorkflowRunState::Cancelled
+        )
+    }
+
     fn parse(s: &str) -> Result<Self, WorkflowStoreError> {
         Ok(match s {
             "pending" => WorkflowRunState::Pending,
@@ -197,12 +209,21 @@ impl WorkflowStore {
     /// Create a durable run from a compiled workflow: the run row (state
     /// `pending`, stamped with the graph signature) plus a `pending` node row per
     /// compiled node, in one transaction. Returns the new workflow-run id.
+    ///
+    /// `manifest` is the workflow YAML the graph was compiled from, stored so a
+    /// daemon can **recompile and resume** the run after a restart (STEP 5.2
+    /// startup recovery). `None` records no manifest — the run is durable and
+    /// drivable in-process, but a recovery pass that reconstructs the graph from
+    /// the store cannot pick it up (it has nothing to recompile). The production
+    /// `StartWorkflow` seam always supplies one; a store-mechanics test that never
+    /// recovers may pass `None`.
     pub async fn create_run(
         &self,
         pool: &SqlitePool,
         compiled: &CompiledWorkflow,
         run_id: Option<&str>,
         inputs: &Value,
+        manifest: Option<&str>,
     ) -> Result<String, WorkflowStoreError> {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now().to_rfc3339();
@@ -212,8 +233,8 @@ impl WorkflowStore {
         sqlx::query(
             "INSERT INTO workflow_runs \
              (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
-              created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+              manifest_yaml, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
         )
         .bind(&id)
         .bind(&compiled.id)
@@ -221,6 +242,7 @@ impl WorkflowStore {
         .bind(&signature)
         .bind(run_id)
         .bind(serde_json::to_string(inputs)?)
+        .bind(manifest)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -259,6 +281,7 @@ impl WorkflowStore {
         compiled: &CompiledWorkflow,
         idempotency_key: &str,
         inputs: &Value,
+        manifest: Option<&str>,
     ) -> Result<String, WorkflowStoreError> {
         let id = deterministic_run_id(idempotency_key);
         let now = Utc::now().to_rfc3339();
@@ -268,14 +291,15 @@ impl WorkflowStore {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO workflow_runs \
              (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
-              created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?)",
+              manifest_yaml, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?)",
         )
         .bind(&id)
         .bind(&compiled.id)
         .bind(i64::from(compiled.version))
         .bind(&signature)
         .bind(serde_json::to_string(inputs)?)
+        .bind(manifest)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -459,6 +483,24 @@ impl WorkflowStore {
                 })
             })
             .collect()
+    }
+
+    /// The workflow manifest YAML a run was created from, if one was recorded
+    /// (STEP 5.2 startup recovery). `Ok(None)` means either the run does not exist
+    /// or it was created without a manifest (a store-mechanics test, or a run from
+    /// before the column existed) — a recovery pass skips such a run because there
+    /// is nothing to recompile. The daemon recompiles this YAML into the graph it
+    /// resume-drives.
+    pub async fn manifest(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Option<String>, WorkflowStoreError> {
+        let row = sqlx::query("SELECT manifest_yaml FROM workflow_runs WHERE id = ?")
+            .bind(workflow_run_id)
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("manifest_yaml")))
     }
 
     /// The full run + node snapshot, or `None` if the run does not exist.

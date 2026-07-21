@@ -179,6 +179,37 @@ enum WorkflowCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start a durable workflow run from a manifest (Phase 5 STEP 5.2). Ensures a
+    /// daemon, sends the manifest, and prints the new run id the daemon drives to a
+    /// terminal state in the background.
+    Run {
+        /// Path to the workflow manifest to run.
+        file: PathBuf,
+        /// The typed inputs the manifest declares, as a JSON value (e.g.
+        /// '{"pull_request": 7}'). Defaults to null.
+        #[arg(long)]
+        inputs: Option<String>,
+    },
+    /// Pause a running workflow run so its driver stops launching new nodes; resume
+    /// it later with `workflow resume` (Phase 5 STEP 5.2).
+    Pause {
+        /// The durable workflow-run id (as printed by `workflow run`).
+        workflow_run_id: String,
+    },
+    /// Resume a paused workflow run, driving it onward from where it stopped.
+    Resume {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+    },
+    /// Re-drive a workflow run from a chosen node (its transitive dependents reset
+    /// with it) — e.g. after fixing what made the node fail.
+    Retry {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+        /// The node id to re-drive from.
+        #[arg(long)]
+        node: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -295,6 +326,19 @@ async fn main() -> anyhow::Result<()> {
                 commands::workflow_validate(&file, agents.as_deref())
             }
             WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
+            WorkflowCommand::Run { file, inputs } => {
+                commands::workflow_run(&paths, &file, inputs).await
+            }
+            WorkflowCommand::Pause { workflow_run_id } => {
+                commands::workflow_pause(&paths, workflow_run_id).await
+            }
+            WorkflowCommand::Resume { workflow_run_id } => {
+                commands::workflow_resume(&paths, workflow_run_id).await
+            }
+            WorkflowCommand::Retry {
+                workflow_run_id,
+                node,
+            } => commands::workflow_retry(&paths, workflow_run_id, node).await,
         },
         TopCommand::Plugin { command } => match command {
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),

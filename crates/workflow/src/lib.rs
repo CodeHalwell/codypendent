@@ -24,14 +24,21 @@
 //! [`WorkflowDriver`](drive::WorkflowDriver) advances a run through the ready
 //! frontier, executing each node via a [`NodeExecutor`](drive::NodeExecutor)
 //! seam and recording every transition — resumable and model-free, so the whole
-//! lifecycle is tested with a fake executor. Role resolution ([`resolve`]) binds
-//! a manifest's short role to an `agent.toml` profile. Lowering node execution
-//! onto the real agent loop and wiring the driver + recovery into the daemon are
-//! the remaining steps, tracked in the roadmap.
+//! lifecycle is tested with a fake executor. [`conductor`] sits above the store
+//! and driver: a [`WorkflowConductor`](conductor::WorkflowConductor) recompiles a
+//! run's stored manifest so the daemon supplies only a run id, and composes the
+//! store operations into the run lifecycle — drive a created run, recover the
+//! incomplete runs after a restart, and pause/resume/retry a run — still
+//! daemon-free and model-free, so all of it is tested with a fake executor. Role
+//! resolution ([`resolve`]) binds a manifest's short role to an `agent.toml`
+//! profile. The daemon fills the [`NodeExecutor`](drive::NodeExecutor) seam with
+//! the real agent loop / tool layer and adds the transport; this crate owns the
+//! scheduling, recovery, and lifecycle logic.
 
 pub mod agent;
 pub mod blackboard;
 pub mod compile;
+pub mod conductor;
 pub mod db;
 pub mod drive;
 pub mod model;
@@ -50,6 +57,7 @@ pub use compile::{
     compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
     CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };
+pub use conductor::{ConductorError, RecoveryReport, WorkflowConductor};
 pub use drive::{NodeContext, NodeExecutor, NodeObserver, NodeOutcome, WorkflowDriver};
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,

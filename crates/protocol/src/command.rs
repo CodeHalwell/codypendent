@@ -147,6 +147,37 @@ pub enum CommandBody {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         inputs: serde_json::Value,
     },
+    /// Pause a running durable workflow run (Phase 5 STEP 5.2 lifecycle command).
+    ///
+    /// Like `StartWorkflow`, handled at the connection level (a workflow run lives
+    /// in its own durable store outside the session ledger): the daemon flips the
+    /// run to `paused` through its `WorkflowLifecycle` seam so a live driver stops
+    /// launching further nodes (cooperative pause — the in-flight wave finishes),
+    /// and the run waits for a `ResumeWorkflow`. Controlling a run is a
+    /// [`Controller`](crate::handshake::ClientRole::Controller) capability, so a
+    /// lesser role is denied; a terminal run is rejected `workflow.illegal-transition`;
+    /// a daemon without workflow transport rejects it `workflow.transport-unavailable`.
+    PauseWorkflow {
+        workflow_run_id: String,
+    },
+    /// Resume a paused durable workflow run (Phase 5 STEP 5.2). The daemon validates
+    /// the run is paused and drives it onward from its ready frontier in the
+    /// background, replying as soon as the resume is accepted. Only a paused run may
+    /// be resumed (else `workflow.illegal-transition`); role/transport gating matches
+    /// `PauseWorkflow`.
+    ResumeWorkflow {
+        workflow_run_id: String,
+    },
+    /// Re-drive a durable workflow run from a chosen node (Phase 5 STEP 5.2
+    /// retry-from-node). The daemon resets that node and everything transitively
+    /// downstream of it to `pending`, sets the run `running`, and drives in the
+    /// background. An unknown `node_id` (or a graph that changed under the run) is
+    /// rejected; role/transport gating matches `PauseWorkflow`.
+    RetryWorkflowNode {
+        workflow_run_id: String,
+        /// The node id to re-drive from (its transitive dependents reset with it).
+        node_id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -263,6 +294,16 @@ mod tests {
         round_trip(CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             inputs: serde_json::json!({ "pull_request": 42 }),
+        });
+        round_trip(CommandBody::PauseWorkflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        });
+        round_trip(CommandBody::ResumeWorkflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        });
+        round_trip(CommandBody::RetryWorkflowNode {
+            workflow_run_id: "wfrun-abc123".to_string(),
+            node_id: "verify".to_string(),
         });
     }
 

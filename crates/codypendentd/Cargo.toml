@@ -19,6 +19,7 @@ codypendent-knowledge = { workspace = true }
 codypendent-integrations = { workspace = true }
 codypendent-workflow = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

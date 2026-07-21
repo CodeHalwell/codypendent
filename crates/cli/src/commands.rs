@@ -498,6 +498,140 @@ pub fn workflow_show(file: &std::path::Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `codypendent workflow run <FILE> [--inputs <JSON>]` (Phase 5 STEP 5.2): start a
+/// durable workflow run. Ensures a daemon, sends `StartWorkflow`, and prints the
+/// new run id the daemon drives to a terminal state in the background. The manifest
+/// content (never a path) is what crosses the wire, and `--inputs` is parsed as a
+/// JSON value the manifest's typed inputs bind to.
+pub async fn workflow_run(
+    paths: &RuntimePaths,
+    file: &std::path::Path,
+    inputs: Option<String>,
+) -> anyhow::Result<()> {
+    let manifest = std::fs::read_to_string(file)
+        .with_context(|| format!("reading workflow manifest {}", file.display()))?;
+    let inputs = match inputs {
+        Some(text) => {
+            serde_json::from_str(&text).with_context(|| "parsing --inputs as a JSON value")?
+        }
+        None => serde_json::Value::Null,
+    };
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let run_id = workflow_run_over_connection(&mut conn, manifest, inputs).await?;
+    println!("workflow run started: {run_id}");
+    Ok(())
+}
+
+/// The connected core of [`workflow_run`]: handshake, bind the `Controller` role,
+/// send `StartWorkflow`, and return the new run id. Split out so a test can drive it
+/// against a mock server (like [`run_over_connection`]).
+pub async fn workflow_run_over_connection(
+    conn: &mut Connection,
+    manifest: String,
+    inputs: serde_json::Value,
+) -> anyhow::Result<String> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::StartWorkflow { manifest, inputs })
+        .await?;
+    match reply.payload {
+        Payload::WorkflowRunStarted {
+            workflow_run_id, ..
+        } => Ok(workflow_run_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("StartWorkflow rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to StartWorkflow: {other:?}"),
+    }
+}
+
+/// `codypendent workflow pause <RUN_ID>` (Phase 5 STEP 5.2).
+pub async fn workflow_pause(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    lifecycle_command(
+        paths,
+        CommandBody::PauseWorkflow { workflow_run_id },
+        "pause",
+    )
+    .await
+}
+
+/// `codypendent workflow resume <RUN_ID>` (Phase 5 STEP 5.2).
+pub async fn workflow_resume(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    lifecycle_command(
+        paths,
+        CommandBody::ResumeWorkflow { workflow_run_id },
+        "resume",
+    )
+    .await
+}
+
+/// `codypendent workflow retry <RUN_ID> --node <NODE>` (Phase 5 STEP 5.2).
+pub async fn workflow_retry(
+    paths: &RuntimePaths,
+    workflow_run_id: String,
+    node: String,
+) -> anyhow::Result<()> {
+    lifecycle_command(
+        paths,
+        CommandBody::RetryWorkflowNode {
+            workflow_run_id,
+            node_id: node,
+        },
+        "retry",
+    )
+    .await
+}
+
+/// Send one workflow lifecycle command to a *running* daemon (it does not start
+/// one — pausing/resuming/retrying only makes sense against live durable runs) and
+/// report whether it was accepted. `verb` names the action in the output/errors.
+async fn lifecycle_command(
+    paths: &RuntimePaths,
+    body: CommandBody,
+    verb: &str,
+) -> anyhow::Result<()> {
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+    let reply = conn.send_command(body).await?;
+    match reply.payload {
+        Payload::CommandAccepted { .. } => {
+            println!("workflow {verb} accepted");
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "workflow {verb} rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to workflow {verb}: {other:?}"),
+    }
+}
+
+/// Bind this connection to the `Controller` role, which starting and controlling a
+/// workflow requires. Roles bind at the connection level via an `AttachSession`
+/// (Chapter 03); a workflow lives outside any session, so we attach to a throwaway
+/// session id purely for the role — the daemon binds the role before it checks the
+/// session, so the expected `session-not-found` rejection is irrelevant and ignored.
+async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.send_command(CommandBody::AttachSession {
+        session_id: SessionId::new(),
+        last_seen_sequence: None,
+        subscriptions: vec![],
+        requested_role: ClientRole::Controller,
+    })
+    .await?;
+    Ok(())
+}
+
 /// A human, indented rendering of a compiled workflow graph. Pure, so it is tested
 /// directly. Nodes are listed in topological order; each shows its action and the
 /// execution-affecting settings that are set.

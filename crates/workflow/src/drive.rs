@@ -31,13 +31,25 @@
 //! failed node. Concurrent execution of the frontier (into isolated worktrees) is
 //! a later refinement; this driver runs the frontier sequentially in topological
 //! order, which is enough to prove the durable lifecycle.
+//!
+//! **Cooperative pause/cancel.** The driver re-reads the run's persisted state at
+//! each scheduling boundary, so a [`pause`](crate::WorkflowConductor::pause) or
+//! cancel that flipped the run to [`Paused`](WorkflowRunState::Paused) /
+//! [`Cancelled`](WorkflowRunState::Cancelled) mid-drive stops it launching further
+//! nodes; the driver returns that state without overwriting it, and a later
+//! [`resume`](crate::WorkflowConductor::resume) picks the run back up from the next
+//! ready node. The in-flight wave of the current round finishes first (drain then
+//! stop) — this is the lifecycle-command half of STEP 5.2, driven through the
+//! [`WorkflowConductor`](crate::WorkflowConductor).
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::compile::{CompiledNode, CompiledWorkflow};
-use crate::store::{NodeState, WorkflowRunState, WorkflowStore, WorkflowStoreError};
+use crate::store::{
+    ready_node_ids, NodeState, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+};
 
 /// The outcome of executing one node attempt.
 #[derive(Debug, Clone)]
@@ -193,14 +205,32 @@ impl WorkflowDriver {
             .set_run_state(pool, workflow_run_id, WorkflowRunState::Running)
             .await?;
 
-        // Advance the frontier until nothing can make progress. Each non-empty
-        // round drives every ready node to a terminal state, so the pending set
-        // strictly shrinks and the loop terminates.
+        // Advance the frontier until nothing can make progress — or until a
+        // concurrent `pause`/`cancel` (STEP 5.2 lifecycle commands) asks the driver
+        // to stop. Each round re-reads the run so a state the conductor flipped to
+        // `Paused`/`Cancelled` is observed at the next scheduling boundary: the
+        // driver stops launching new nodes and returns, leaving the run in that
+        // state for a later `resume` to continue from (the in-flight wave of the
+        // current round finishes first — a cooperative "drain then stop"). Each
+        // non-empty round drives every ready node to a terminal state, so the
+        // pending set strictly shrinks and the loop terminates.
+        //
+        // The snapshot taken here also feeds the pure `ready_node_ids` frontier, so
+        // this is one read per round, not two (the signature was already guarded
+        // above and the graph cannot change under a single drive).
         loop {
-            let ready = self
+            let snapshot = self
                 .store
-                .ready_nodes(pool, workflow_run_id, compiled)
-                .await?;
+                .snapshot(pool, workflow_run_id)
+                .await?
+                .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+            if matches!(
+                snapshot.run.state,
+                WorkflowRunState::Paused | WorkflowRunState::Cancelled
+            ) {
+                return Ok(snapshot.run.state);
+            }
+            let ready = ready_node_ids(compiled, &snapshot);
             if ready.is_empty() {
                 break;
             }
@@ -457,7 +487,7 @@ steps:
         let compiled = compile_yaml(LINEAR).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 
@@ -488,7 +518,7 @@ steps:
         let compiled = compile_yaml(LINEAR).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 
@@ -528,7 +558,7 @@ steps:
         let compiled = compile_yaml(manifest).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 
@@ -573,7 +603,7 @@ steps:
         let compiled = compile_yaml(manifest).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 
@@ -616,7 +646,7 @@ steps:
         let compiled = compile_yaml(LINEAR).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 
@@ -653,13 +683,76 @@ steps:
         assert!(second.ran("c"));
     }
 
+    /// An executor that flips its run to `Paused` as a chosen node's work
+    /// completes — modelling a `pause` command arriving mid-drive. It shares the
+    /// pool so it can perform the same `set_run_state` the conductor's `pause`
+    /// does, letting the driver's cooperative stop be exercised deterministically.
+    struct PauseAfterExecutor {
+        pool: SqlitePool,
+        pause_after: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl NodeExecutor for PauseAfterExecutor {
+        async fn execute(&self, ctx: NodeContext<'_>) -> NodeOutcome {
+            self.calls.lock().unwrap().push(ctx.node.id.clone());
+            if ctx.node.id == self.pause_after {
+                WorkflowStore::new()
+                    .set_run_state(&self.pool, ctx.workflow_run_id, WorkflowRunState::Paused)
+                    .await
+                    .expect("pause the run mid-drive");
+            }
+            NodeOutcome::completed()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pause_mid_drive_stops_the_frontier_and_preserves_progress() {
+        // Linear a→b→c. A pause lands as `a` completes; the driver must observe it
+        // at the next scheduling boundary and stop before `b`, leaving the run
+        // `Paused` (never overwritten to `Completed`/`Failed`) with `b`/`c` pending
+        // and resumable.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        let executor = PauseAfterExecutor {
+            pool: pool.clone(),
+            pause_after: "a".to_owned(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let final_state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, WorkflowRunState::Paused);
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(snap.run.state, WorkflowRunState::Paused);
+        let state = |id: &str| snap.nodes.iter().find(|n| n.node_id == id).unwrap().state;
+        assert_eq!(state("a"), NodeState::Completed);
+        assert_eq!(
+            state("b"),
+            NodeState::Pending,
+            "b must not start after pause"
+        );
+        assert_eq!(state("c"), NodeState::Pending);
+        let ran = executor.calls.lock().unwrap().clone();
+        assert_eq!(ran, vec!["a"], "only a ran before the pause took effect");
+    }
+
     #[tokio::test]
     async fn a_diamond_runs_both_branches_before_the_join() {
         let (_tmp, pool) = temp_pool().await;
         let compiled = compile_yaml(DIAMOND).unwrap();
         let store = WorkflowStore::new();
         let run_id = store
-            .create_run(&pool, &compiled, None, &json!({}))
+            .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
 

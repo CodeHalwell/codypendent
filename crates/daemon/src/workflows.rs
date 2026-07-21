@@ -45,12 +45,67 @@ pub type WorkflowStartFuture<'a> =
 ///
 /// Implemented by the assembly over `codypendent-workflow` — compile the manifest,
 /// then `WorkflowStore::create_run` on the daemon's pool — and injected alongside
-/// the [`RunExecutor`](crate::executor::RunExecutor). Driving the created run is a
-/// later step; this seam only makes runs durably creatable, so a client (or a
-/// future recovery pass) has a run row to advance.
+/// the [`RunExecutor`](crate::executor::RunExecutor). The assembly also **drives**
+/// the created run (fire-and-forget) so it advances to a terminal state; this seam
+/// returns as soon as the run is durably created.
 pub trait WorkflowStarter: Send + Sync {
     /// Compile `request`'s manifest and create a durable run, returning its id. A
     /// manifest that does not compile (or a store failure) is surfaced verbatim to
     /// the client as a `CommandRejected`; nothing is created.
     fn start(&self, request: StartWorkflowRequest) -> WorkflowStartFuture<'_>;
+}
+
+/// A client's request to pause a durable workflow run.
+#[derive(Debug, Clone)]
+pub struct PauseWorkflowRequest {
+    /// The durable workflow-run id (e.g. `wfrun-…`).
+    pub workflow_run_id: String,
+    /// The requesting client, for attribution.
+    pub client_id: ClientId,
+}
+
+/// A client's request to resume a paused durable workflow run.
+#[derive(Debug, Clone)]
+pub struct ResumeWorkflowRequest {
+    pub workflow_run_id: String,
+    pub client_id: ClientId,
+}
+
+/// A client's request to re-drive a durable workflow run from a chosen node.
+#[derive(Debug, Clone)]
+pub struct RetryWorkflowNodeRequest {
+    pub workflow_run_id: String,
+    /// The node id to re-drive from (its transitive dependents reset with it).
+    pub node_id: String,
+    pub client_id: ClientId,
+}
+
+/// The future a [`WorkflowLifecycle`] method returns: the synchronous outcome of
+/// the lifecycle mutation (the actual driving continues in the background), or a
+/// structured [`CodypendentError`] the server rejects with. Boxed so the trait
+/// stays object-safe, matching [`WorkflowStartFuture`].
+pub type WorkflowLifecycleFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for *controlling* an existing durable run — pause, resume,
+/// retry-from-node (Phase 5 STEP 5.2 lifecycle commands).
+///
+/// Implemented by the assembly over the `codypendent-workflow` conductor and
+/// injected alongside the [`RunExecutor`](crate::executor::RunExecutor). Each
+/// method performs its synchronous state change (validate + mutate) and — for
+/// resume/retry — spawns the drive in the background, so it returns as soon as the
+/// command is accepted or rejected. A run in a state that forbids the transition
+/// (a terminal run paused, a non-paused run resumed) is surfaced verbatim as a
+/// `CommandRejected`; nothing changes.
+pub trait WorkflowLifecycle: Send + Sync {
+    /// Pause a pending/running run (idempotent on an already-paused run; an error
+    /// on a terminal run). A live driver stops cooperatively.
+    fn pause(&self, request: PauseWorkflowRequest) -> WorkflowLifecycleFuture<'_>;
+    /// Resume a paused run: validate it is paused, then drive it onward in the
+    /// background. An error when the run is not paused.
+    fn resume(&self, request: ResumeWorkflowRequest) -> WorkflowLifecycleFuture<'_>;
+    /// Reset a run for a retry from `node_id` (that node + its transitive
+    /// dependents), then drive it onward in the background. An error on an unknown
+    /// node or a changed graph.
+    fn retry_node(&self, request: RetryWorkflowNodeRequest) -> WorkflowLifecycleFuture<'_>;
 }
