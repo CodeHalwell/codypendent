@@ -51,10 +51,35 @@ const MIN_INPUT_SCAN_BYTES: usize = 64 * 1024;
 /// scanned forever.
 const MAX_ESCAPE_SCAN: usize = 256;
 
+/// Unicode bidi-override control characters: LRE/RLE/PDF/LRO/RLO
+/// (U+202A–U+202E) and the directional-isolate controls LRI/RLI/FSI/PDI
+/// (U+2066–U+2069). These can reorder how surrounding text *renders* without
+/// changing its underlying bytes — the classic attack disguises a file's real
+/// extension (e.g. an RLO makes `cool\u{202E}exe.evil` display as
+/// `coolevil.exe`). Passing them through untouched would undercut the whole
+/// point of sanitizing untrusted output: a plugin/MCP server could spoof what
+/// the user appears to read even after "sanitization".
+fn is_bidi_override(c: char) -> bool {
+    matches!(u32::from(c), 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// Zero-width Unicode characters: ZWSP/ZWNJ/ZWJ (U+200B–U+200D), the word
+/// joiner (U+2060), and ZWNBSP/BOM-as-text (U+FEFF). These are invisible in a
+/// rendered terminal but present in the byte stream, so untrusted output could
+/// use them to hide characters inside otherwise-inspectable text (e.g.
+/// splitting a flagged word so a naive scan of the *rendered* text misses it).
+fn is_zero_width(c: char) -> bool {
+    matches!(u32::from(c), 0x200B..=0x200D | 0x2060 | 0xFEFF)
+}
+
 /// Sanitize untrusted `raw` output attributed to `origin`, capped to `max_bytes`.
 ///
 /// * Terminal control sequences are removed: C0 controls (except `\n` and `\t`),
 ///   the `\x1b` escape and the CSI/OSC sequences it introduces, and the DEL byte.
+/// * Unicode bidi-override and zero-width characters are removed (P6-B) — both
+///   classes can make rendered text lie about its own content without changing
+///   the underlying bytes, defeating a human or a naive scanner reading the
+///   "sanitized" output.
 /// * The result is truncated to `max_bytes` on a UTF-8 boundary.
 /// * Both the retained output and the total input scanned are bounded, so an
 ///   oversized stream can exhaust neither memory nor CPU.
@@ -92,6 +117,10 @@ pub fn sanitize_untrusted(origin: impl Into<String>, raw: &str, max_bytes: usize
             '\n' | '\t' => text.push(c),
             // Other C0 controls and DEL: drop.
             c if (c as u32) < 0x20 || c as u32 == 0x7f => stripped += 1,
+            // Bidi-override and zero-width characters (P6-B): drop. Both can make
+            // rendered text lie about its content (reordering, or hiding
+            // characters entirely) without changing the byte stream.
+            c if is_bidi_override(c) || is_zero_width(c) => stripped += 1,
             // Printable (including non-ASCII) content: keep.
             c => text.push(c),
         }
@@ -259,6 +288,42 @@ mod tests {
         );
         // Only a bounded prefix was scanned, not all 1,000,000 bytes.
         assert!(s.stripped_controls < 1_000_000);
+    }
+
+    #[test]
+    fn strips_bidi_override_characters() {
+        // RLO (right-to-left override, U+202E) can visually disguise a
+        // filename's real extension; PDF (U+202C) ends the override. LRE/RLE/
+        // LRO and the isolate controls (LRI/RLI/FSI/PDI) reorder rendering the
+        // same way, without changing the underlying bytes.
+        let raw = "invoice\u{202E}gpj.exe\u{202C}.pdf";
+        let s = sanitize_untrusted("mcp:evil", raw, 4096);
+        assert_eq!(s.text, "invoicegpj.exe.pdf");
+        assert!(!s.text.contains('\u{202E}'));
+        assert!(!s.text.contains('\u{202C}'));
+        assert_eq!(s.stripped_controls, 2);
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn strips_bidi_isolate_controls() {
+        // LRI/RLI/FSI/PDI (U+2066-U+2069) — the isolate family, distinct from
+        // the override family but the same spoof-UI risk.
+        let raw = "a\u{2066}b\u{2067}c\u{2068}d\u{2069}e";
+        let s = sanitize_untrusted("plugin:x", raw, 4096);
+        assert_eq!(s.text, "abcde");
+        assert_eq!(s.stripped_controls, 4);
+    }
+
+    #[test]
+    fn strips_zero_width_characters() {
+        // Zero-width chars are invisible in a rendered terminal but present in
+        // the byte stream — untrusted output could use them to hide characters
+        // inside otherwise-inspectable text (e.g. splitting a flagged word).
+        let raw = "pay\u{200B}pal\u{200C}.com\u{200D}\u{2060}\u{FEFF}";
+        let s = sanitize_untrusted("plugin:evil", raw, 4096);
+        assert_eq!(s.text, "paypal.com");
+        assert_eq!(s.stripped_controls, 5);
     }
 
     #[test]
