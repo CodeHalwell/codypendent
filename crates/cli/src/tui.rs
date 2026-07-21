@@ -34,14 +34,16 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use codypendent_knowledge::{
     db as knowledge_db, BlockContent, CapabilityRequest, CodeEdge, CodeRelation, CollaborationMode,
-    DocumentAuthor, DocumentBlock, DocumentStore, EvidenceKind, EvidenceRef, KnowledgeDocument,
-    MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem, RegistryItemKind,
-    RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
+    DocumentAuthor, DocumentBlock, DocumentReplica, DocumentStore, EvidenceKind, EvidenceRef,
+    KnowledgeDocument, MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem,
+    RegistryItemKind, RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus,
+    SuggestionStore, TrustTier,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Catchup, ClientId, ClientRole, CodeNodeId, Command, CommandBody,
-    CommandId, Envelope, Payload, RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
+    CommandId, DocumentEditLease, DocumentId, DocumentSync, Envelope, Payload, RepositoryId,
+    SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
@@ -133,6 +135,15 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     // and is skipped rather than failing the TUI.
     state.workflow = load_workflows(&repo);
 
+    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
+    // event loop seeds a document's client replica from it and re-reads the
+    // review rail's suggestions when a sync arrives. WAL mode lets this read
+    // concurrently with the daemon. `None` on failure — document editing then
+    // degrades to converging from live syncs alone (no seed, empty review rail).
+    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+        .await
+        .ok();
+
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
     let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
@@ -173,6 +184,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
         session_id,
         &repository,
         attach_watermark,
+        docs_pool.clone(),
     )
     .await;
 
@@ -183,6 +195,9 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     drop(out_tx);
     reader.abort();
     writer.abort();
+    if let Some(pool) = docs_pool {
+        pool.close().await;
+    }
     result
 }
 
@@ -202,6 +217,7 @@ async fn event_loop(
     session_id: SessionId,
     repository: &str,
     attach_watermark: u64,
+    docs_pool: Option<sqlx::SqlitePool>,
 ) -> anyhow::Result<()> {
     guard
         .terminal_mut()
@@ -221,7 +237,21 @@ async fn event_loop(
     let mut gap_buffer: Vec<SessionEvent> = Vec::new();
     let mut repairing = false;
 
+    // The client's live subscription set: seeded with the session views and grown
+    // with a `Document` subscription the first time an edit targets one, so a
+    // gap-repair re-attach preserves the documents this client is editing (Phase 4
+    // STEP 4.3).
+    let mut subscriptions = default_subscriptions();
+    // Per-open-document client replicas that consume the sync stream. Presence in
+    // the map also marks the document as already subscribed, so an edit
+    // subscribes + seeds it exactly once.
+    let mut replicas: HashMap<DocumentId, DocumentReplica> = HashMap::new();
+
     loop {
+        // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
+        // inside the `select!` arm, so the arm stashes it here and the loop body
+        // folds it just after.
+        let mut pending_sync: Option<Box<DocumentSync>> = None;
         let action = tokio::select! {
             signal = event_rx.recv() => match signal {
                 Some(ReaderSignal::Event(event)) => {
@@ -243,7 +273,7 @@ async fn event_loop(
                             CommandBody::AttachSession {
                                 session_id,
                                 last_seen_sequence: Some(last_seen),
-                                subscriptions: default_subscriptions(),
+                                subscriptions: subscriptions.clone(),
                                 requested_role: ClientRole::Controller,
                             },
                         );
@@ -259,6 +289,21 @@ async fn event_loop(
                 Some(ReaderSignal::Rejected { code, message }) => {
                     Action::Notice(format!("command rejected: {message} ({code})"))
                 }
+                // Phase 4 STEP 4.3 live document editing. A sync is merged after the
+                // select (it needs an async replica merge + suggestion re-read); the
+                // lease replies fold directly.
+                Some(ReaderSignal::DocumentSync(sync)) => {
+                    pending_sync = Some(sync);
+                    Action::NoOp
+                }
+                Some(ReaderSignal::DocumentLeaseGranted {
+                    document_id,
+                    lease_id,
+                }) => Action::DocumentLeaseGranted {
+                    document_id,
+                    lease_id,
+                },
+                Some(ReaderSignal::DocumentLeaseBlocked) => Action::DocumentLeaseBlocked,
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -281,7 +326,7 @@ async fn event_loop(
                                 CommandBody::AttachSession {
                                     session_id,
                                     last_seen_sequence: Some(last_seen),
-                                    subscriptions: default_subscriptions(),
+                                    subscriptions: subscriptions.clone(),
                                     requested_role: ClientRole::Controller,
                                 },
                             );
@@ -309,9 +354,41 @@ async fn event_loop(
             _ = ticker.tick() => Action::Tick,
         };
 
+        // Fold a merged document sync (its async merge could not run in the arm).
+        if let Some(sync) = pending_sync.take() {
+            if let Some(synced) =
+                merge_document_sync(&mut replicas, docs_pool.as_ref(), *sync).await
+            {
+                reduce(state, synced);
+            }
+        }
+
         reduce(state, action);
 
         for intent in state.drain_outbox() {
+            // The first edit on a document subscribes this client to its live sync
+            // stream (a re-attach carrying the grown subscription set) and seeds its
+            // replica, so the edit's own resulting sync — and every other writer's —
+            // comes back. Done before the edit command is sent.
+            if let Some(document_id) = doc_intent_target(&intent) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = replicas.entry(document_id)
+                {
+                    slot.insert(seed_replica(docs_pool.as_ref(), document_id).await);
+                    subscriptions.push(Subscription::Document { document_id });
+                    let attach = command_envelope(
+                        client_id,
+                        CommandBody::AttachSession {
+                            session_id,
+                            last_seen_sequence: Some(last_seen),
+                            subscriptions: subscriptions.clone(),
+                            requested_role: ClientRole::Controller,
+                        },
+                    );
+                    if out_tx.send(attach).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             let envelope =
                 command_envelope(client_id, intent_to_command(intent, session_id, repository));
             if out_tx.send(envelope).await.is_err() {
@@ -340,6 +417,18 @@ enum ReaderSignal {
     Rejected { code: String, message: String },
     /// A catch-up reply (from the loop's own gap-triggered re-attach).
     Catchup(Box<Catchup>),
+    /// A collaborative document's live CRDT sync (Phase 4 STEP 4.3). Boxed — it
+    /// carries opaque CRDT bytes and every other signal here is tiny. The loop
+    /// merges it into the document's client replica.
+    DocumentSync(Box<DocumentSync>),
+    /// The daemon granted an edit lease this client requested.
+    DocumentLeaseGranted {
+        document_id: DocumentId,
+        lease_id: String,
+    },
+    /// The daemon refused an edit lease: the block range is held by another writer
+    /// (`document.range-leased`) — surfaced as the presence-lite "blocked" signal.
+    DocumentLeaseBlocked,
     /// The daemon closed the connection.
     Closed,
 }
@@ -373,11 +462,35 @@ async fn read_loop(
                     }
                 }
                 Payload::CommandRejected(error) => {
-                    if event_tx
-                        .send(ReaderSignal::Rejected {
+                    // A refused edit lease drives the presence-lite "blocked"
+                    // indicator; every other rejection is a transient notice.
+                    let signal = if error.code == "document.range-leased" {
+                        ReaderSignal::DocumentLeaseBlocked
+                    } else {
+                        ReaderSignal::Rejected {
                             code: error.code,
                             message: error.message,
+                        }
+                    };
+                    if event_tx.send(signal).await.is_err() {
+                        break;
+                    }
+                }
+                Payload::DocumentLeaseGranted { grant, .. } => {
+                    if event_tx
+                        .send(ReaderSignal::DocumentLeaseGranted {
+                            document_id: grant.document_id,
+                            lease_id: grant.lease_id,
                         })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::DocumentSync(sync) => {
+                    if event_tx
+                        .send(ReaderSignal::DocumentSync(Box::new(sync)))
                         .await
                         .is_err()
                     {
@@ -466,7 +579,108 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::ResumeRun { run_id } => CommandBody::ResumeRun { run_id },
         Intent::CancelRun { run_id } => CommandBody::CancelRun { run_id },
         Intent::QueueSteering { run_id, text } => CommandBody::QueueSteering { run_id, text },
+        // Phase 4 STEP 4.3: document editing. Subscription to the document's sync
+        // stream is arranged separately (in the drain loop) before the first of
+        // these is sent, so the client sees its own edit's authoritative result.
+        Intent::AcquireDocumentLease {
+            document_id,
+            block_id,
+        } => CommandBody::AcquireDocumentLease {
+            lease: DocumentEditLease {
+                document_id,
+                block_id,
+            },
+            ttl_seconds: None,
+        },
+        Intent::ReleaseDocumentLease { lease_id } => CommandBody::ReleaseDocumentLease { lease_id },
+        Intent::MutateDocument {
+            document_id,
+            mutation,
+        } => CommandBody::MutateDocument {
+            document_id,
+            mutation,
+        },
     }
+}
+
+/// The document a doc-editing intent operates on, when it is one the harness must
+/// be subscribed to before sending (an edit needs to observe its own resulting
+/// sync). A release needs no subscription.
+fn doc_intent_target(intent: &Intent) -> Option<DocumentId> {
+    match intent {
+        Intent::AcquireDocumentLease { document_id, .. }
+        | Intent::MutateDocument { document_id, .. } => Some(*document_id),
+        _ => None,
+    }
+}
+
+/// Seed a document's client replica from its current persisted CRDT snapshot — the
+/// document read path (Phase 4 STEP 4.3). Falls back to an empty replica when the
+/// pool is absent or the read fails: an empty replica still converges on the first
+/// full-snapshot sync, so editing degrades gracefully rather than breaking.
+async fn seed_replica(pool: Option<&sqlx::SqlitePool>, document_id: DocumentId) -> DocumentReplica {
+    if let Some(pool) = pool {
+        match DocumentStore::new().load(pool, document_id).await {
+            Ok(Some(document)) => match document.crdt.snapshot() {
+                Ok(snapshot) => {
+                    match DocumentReplica::from_snapshot(&snapshot, document.revision) {
+                        Ok(replica) => return replica,
+                        Err(error) => {
+                            eprintln!("codypendent: could not seed a doc replica: {error}")
+                        }
+                    }
+                }
+                Err(error) => eprintln!("codypendent: could not read a doc snapshot: {error}"),
+            },
+            Ok(None) => {}
+            Err(error) => eprintln!("codypendent: could not load a document to seed: {error}"),
+        }
+    }
+    DocumentReplica::empty()
+}
+
+/// Merge one incoming [`DocumentSync`] into the document's replica and project the
+/// result into a reducer action: the block-structured editor view (from the merged
+/// replica) plus the review rail's pending suggestions (re-read from the store,
+/// since a suggestion rides the DB, not the CRDT bytes). `None` when the merge or
+/// projection fails.
+async fn merge_document_sync(
+    replicas: &mut HashMap<DocumentId, DocumentReplica>,
+    pool: Option<&sqlx::SqlitePool>,
+    sync: DocumentSync,
+) -> Option<Action> {
+    let document_id = sync.document_id;
+    let replica = replicas
+        .entry(document_id)
+        .or_insert_with(DocumentReplica::empty);
+    if let Err(error) = replica.merge(&sync) {
+        eprintln!("codypendent: could not merge a document sync: {error}");
+        return None;
+    }
+    let blocks: Vec<_> = match replica.blocks() {
+        Ok(blocks) => blocks.iter().map(block_view).collect(),
+        Err(error) => {
+            eprintln!("codypendent: could not project a merged document: {error}");
+            return None;
+        }
+    };
+    let revision = format!("r{}", replica.revision());
+    // Suggestions live in the DB (not the sync bytes); re-read them so a
+    // just-proposed or just-resolved suggestion shows in the review rail.
+    let suggestions = match pool {
+        Some(pool) => SuggestionStore::new()
+            .pending(pool, document_id)
+            .await
+            .map(|list| list.iter().map(suggestion_view).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Some(Action::DocumentSynced {
+        document_id,
+        revision,
+        blocks,
+        suggestions,
+    })
 }
 
 /// Wrap a command in a fresh, self-idempotent request envelope (the command id's
@@ -953,6 +1167,7 @@ fn memory_class_label(class: MemoryClass) -> &'static str {
 /// engine enforces (STEP 4.3).
 fn doc_card(document: &KnowledgeDocument, suggestions: &[Suggestion]) -> DocCard {
     DocCard {
+        document_id: document.id,
         title: document.title.clone(),
         scope: scope_label(&document.scope),
         status: document.status.as_str().to_owned(),
@@ -995,6 +1210,7 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
     };
     // Collapse to one line — the editor rail renders a block per row.
     DocBlockView {
+        id: block.id.clone(),
         kind,
         text: text.replace('\n', " "),
     }
@@ -1003,6 +1219,7 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
 /// Map a [`Suggestion`] into the review rail's [`DocSuggestionView`].
 fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
     DocSuggestionView {
+        id: suggestion.id.clone(),
         status: suggestion_status_label(suggestion.status).to_owned(),
         author: document_author_label(&suggestion.author),
         range: format!("{}..{}", suggestion.range_start, suggestion.range_end),
@@ -1520,6 +1737,72 @@ mod tests {
                 run_id,
                 text: "focus on the failing test".into(),
             }
+        );
+
+        // Phase 4 STEP 4.3 document-editing intents lower to their commands.
+        let document_id = codypendent_protocol::DocumentId::new();
+        assert_eq!(
+            intent_to_command(
+                Intent::AcquireDocumentLease {
+                    document_id,
+                    block_id: Some("b1".into()),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::AcquireDocumentLease {
+                lease: DocumentEditLease {
+                    document_id,
+                    block_id: Some("b1".into()),
+                },
+                ttl_seconds: None,
+            }
+        );
+        assert_eq!(
+            intent_to_command(
+                Intent::ReleaseDocumentLease {
+                    lease_id: "lease-1".into(),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::ReleaseDocumentLease {
+                lease_id: "lease-1".into(),
+            }
+        );
+        let mutation = codypendent_protocol::DocumentMutation::AcceptSuggestion {
+            suggestion_id: "s1".into(),
+        };
+        assert_eq!(
+            intent_to_command(
+                Intent::MutateDocument {
+                    document_id,
+                    mutation: mutation.clone(),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::MutateDocument {
+                document_id,
+                mutation,
+            }
+        );
+
+        // Only edit-bearing intents drive a subscription; a release does not.
+        assert_eq!(
+            doc_intent_target(&Intent::MutateDocument {
+                document_id,
+                mutation: codypendent_protocol::DocumentMutation::RejectSuggestion {
+                    suggestion_id: "s1".into(),
+                },
+            }),
+            Some(document_id)
+        );
+        assert_eq!(
+            doc_intent_target(&Intent::ReleaseDocumentLease {
+                lease_id: "lease-1".into(),
+            }),
+            None
         );
     }
 

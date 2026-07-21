@@ -22,7 +22,8 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    AppState, LayoutMode, Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    AppState, DocFocus, DocLeaseState, LayoutMode, Overlay, PatchSummary, RunView, ToolCard,
+    ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -669,6 +670,18 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, theme, query, *selected);
         }
+        // The block-edit prompt floats over the Docs browser it opened from, so the
+        // editor stays in view while the writer types the insertion.
+        Overlay::DocEdit { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                theme,
+                "Insert text into the focused block",
+                buffer,
+            );
+        }
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
@@ -1026,21 +1039,35 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
         ));
-        editor_lines.push(section("Editor rail", theme));
+        // The editor rail header carries the presence-lite lease indicator: whether
+        // this client holds / is acquiring / is blocked on a block lease.
+        let editing = state.doc_focus == DocFocus::Editor;
+        editor_lines.push(Line::from(vec![
+            section_span("Editor rail", theme),
+            Span::styled(
+                if editing { "  [focused]" } else { "" }.to_owned(),
+                Style::default().fg(theme.focus.active),
+            ),
+            lease_span(state, theme),
+        ]));
         if doc.blocks.is_empty() {
             editor_lines.push(Line::styled(
                 "  (empty document)",
                 Style::default().fg(theme.text.muted),
             ));
         }
-        for block in &doc.blocks {
+        for (idx, block) in doc.blocks.iter().enumerate() {
+            let focused = editing && idx == state.selected_block;
+            let marker = if focused { "› " } else { "  " };
+            let kind_style = if focused {
+                Style::default().fg(theme.focus.active)
+            } else {
+                Style::default().fg(theme.text.secondary)
+            };
             editor_lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<10}", block.kind), kind_style),
                 Span::styled(
-                    format!("  {:<10}", block.kind),
-                    Style::default().fg(theme.text.secondary),
-                ),
-                Span::styled(
-                    truncate(&block.text, 60),
+                    truncate(&block.text, 58),
                     Style::default().fg(theme.text.primary),
                 ),
             ]));
@@ -1064,16 +1091,30 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .style(Style::default().bg(theme.surface.overlay));
     let mut review_lines: Vec<Line> = Vec::new();
     if let Some(doc) = state.focused_doc() {
-        review_lines.push(section("Review rail (suggestions)", theme));
+        let reviewing = state.doc_focus == DocFocus::Review;
+        review_lines.push(Line::from(vec![
+            section_span("Review rail (suggestions)", theme),
+            Span::styled(
+                if reviewing { "  [focused]" } else { "" }.to_owned(),
+                Style::default().fg(theme.focus.active),
+            ),
+        ]));
         if doc.suggestions.is_empty() {
             review_lines.push(Line::styled(
                 "  no pending suggestions",
                 Style::default().fg(theme.text.muted),
             ));
         }
-        for suggestion in &doc.suggestions {
+        for (idx, suggestion) in doc.suggestions.iter().enumerate() {
+            let focused = reviewing && idx == state.selected_suggestion;
+            let bullet = if focused { "› " } else { "  • " };
+            let bullet_style = if focused {
+                Style::default().fg(theme.focus.active)
+            } else {
+                Style::default().fg(theme.status.info)
+            };
             review_lines.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(theme.status.info)),
+                Span::styled(bullet, bullet_style),
                 Span::styled(
                     format!("{} @ {} ", suggestion.author, suggestion.range),
                     Style::default().fg(theme.text.muted),
@@ -1093,7 +1134,7 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     review_lines.push(Line::raw(""));
     review_lines.push(Line::styled(
-        "  ↑/↓ select · G edges · Esc close",
+        "  Tab rail · ↑/↓ select · e edit · a/r accept/reject · Esc close",
         Style::default().fg(theme.text.muted),
     ));
     frame.render_widget(
@@ -1857,12 +1898,39 @@ fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 fn section(title: &str, theme: &Theme) -> Line<'static> {
-    Line::styled(
+    Line::from(section_span(title, theme))
+}
+
+/// The `section` heading as a [`Span`], for composing into a header line that also
+/// carries trailing status (e.g. the Docs editor-rail lease indicator).
+fn section_span(title: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(
         title.to_owned(),
         Style::default()
             .fg(theme.text.heading)
             .add_modifier(Modifier::UNDERLINED),
     )
+}
+
+/// The presence-lite edit-lease indicator for the Docs editor rail: whether this
+/// client holds, is acquiring, or is blocked on a block lease. Empty when there is
+/// no in-flight edit (the common read-only state).
+fn lease_span(state: &AppState, theme: &Theme) -> Span<'static> {
+    match state.doc_edit.as_ref().map(|edit| edit.lease) {
+        Some(DocLeaseState::Held) => Span::styled(
+            "  lease: held".to_owned(),
+            Style::default().fg(theme.status.success),
+        ),
+        Some(DocLeaseState::Acquiring) => Span::styled(
+            "  lease: acquiring…".to_owned(),
+            Style::default().fg(theme.status.warning),
+        ),
+        Some(DocLeaseState::Blocked) => Span::styled(
+            "  lease: blocked (another writer)".to_owned(),
+            Style::default().fg(theme.status.error),
+        ),
+        None => Span::raw(""),
+    }
 }
 
 fn risk_lines<'a>(risk: &'a Risk, theme: &Theme) -> Vec<Line<'a>> {
@@ -2509,6 +2577,7 @@ mod tests {
         use crate::state::{DocBlockView, DocCard, DocSuggestionView};
         let mut state = running_build_state();
         state.docs = vec![DocCard {
+            document_id: codypendent_protocol::DocumentId::new(),
             title: "Payments runbook".to_owned(),
             scope: "organization".to_owned(),
             status: "draft".to_owned(),
@@ -2516,15 +2585,18 @@ mod tests {
             revision: "r7".to_owned(),
             blocks: vec![
                 DocBlockView {
+                    id: "b1".to_owned(),
                     kind: "heading".to_owned(),
                     text: "Charging a customer".to_owned(),
                 },
                 DocBlockView {
+                    id: "b2".to_owned(),
                     kind: "paragraph".to_owned(),
                     text: "Call charge_customer with an idempotency key.".to_owned(),
                 },
             ],
             suggestions: vec![DocSuggestionView {
+                id: "s1".to_owned(),
                 status: "pending".to_owned(),
                 author: "agent".to_owned(),
                 range: "0..8".to_owned(),
