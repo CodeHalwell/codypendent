@@ -322,3 +322,20 @@ fn map_spawn(e: std::io::Error) -> ToolError {
         ToolError::Io(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GIT_TIMEOUT_SECS;
+    use crate::tools::ABSOLUTE_MAX_TIMEOUT;
+
+    /// `git.diff` and `git.apply_patch` both run under [`GIT_TIMEOUT_SECS`] via
+    /// `bounded_git` (C12: these tools previously had no timeout at all). Pin —
+    /// at compile time — that the bound is a real, finite ceiling within the
+    /// runtime's absolute wall-clock maximum, so neither can hang the agent loop
+    /// forever.
+    #[test]
+    fn git_tool_timeout_is_bounded() {
+        const { assert!(GIT_TIMEOUT_SECS > 0) };
+        const { assert!(GIT_TIMEOUT_SECS <= ABSOLUTE_MAX_TIMEOUT.as_secs()) };
+    }
+}

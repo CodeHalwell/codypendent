@@ -244,3 +244,60 @@ fn effective_timeout(requested: Duration, maximum_seconds: u64) -> Duration {
         bounded.min(Duration::from_secs(maximum_seconds))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_timeout, ABSOLUTE_MAX_TIMEOUT};
+    use std::time::Duration;
+
+    /// With no scope ceiling (`maximum_seconds == 0`) a modest request passes
+    /// through unchanged — the clamp only ever narrows.
+    #[test]
+    fn unset_ceiling_keeps_a_modest_request() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(30), 0),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// With no scope ceiling a model-supplied timeout is still bounded by the
+    /// absolute maximum — the fix that stops a `u64::MAX` request running
+    /// forever (C12).
+    #[test]
+    fn unset_ceiling_is_bounded_by_the_absolute_maximum() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(u64::MAX / 2), 0),
+            ABSOLUTE_MAX_TIMEOUT
+        );
+        assert_eq!(effective_timeout(Duration::MAX, 0), ABSOLUTE_MAX_TIMEOUT);
+    }
+
+    /// A scope ceiling below the request clamps the request down to it.
+    #[test]
+    fn scope_ceiling_clamps_a_larger_request() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(600), 60),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A request below the scope ceiling is left alone (never rounded up).
+    #[test]
+    fn request_below_ceiling_is_unchanged() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(10), 60),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Both bounds apply at once: the absolute maximum caps even a scope
+    /// ceiling that exceeds it, so no configuration can lift the hard ceiling.
+    #[test]
+    fn absolute_maximum_caps_an_over_large_scope_ceiling() {
+        let huge_ceiling = ABSOLUTE_MAX_TIMEOUT.as_secs() * 10;
+        assert_eq!(
+            effective_timeout(Duration::MAX, huge_ceiling),
+            ABSOLUTE_MAX_TIMEOUT
+        );
+    }
+}
