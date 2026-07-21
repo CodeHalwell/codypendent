@@ -17,7 +17,7 @@
 //! plugin's self-description.
 
 use crate::manifest::PluginManifest;
-use crate::permission::{CapabilitySet, PermissionDiff};
+use crate::permission::{diff_resources, CapabilitySet, PermissionDiff};
 use crate::verify::{verify_artifact, UnsignedPolicy, Verified, VerifyError};
 
 /// The trust tier a plugin's items enter the registry at. Semantic relevance
@@ -105,14 +105,7 @@ impl InstalledPlugin {
         // A grant may only narrow the manifest — reject any granted capability the
         // manifest did not request, so an undeclared capability can never reach the
         // sandbox profile through an over-broad grant.
-        let requested = CapabilitySet::from_spec(&manifest.capabilities);
-        for cap in granted.iter() {
-            if !requested.grants(cap) {
-                return Err(LifecycleError::GrantExceedsManifest {
-                    capability: cap.to_string(),
-                });
-            }
-        }
+        assert_granted_within_manifest(&manifest, &granted)?;
         let trust = if signed {
             TrustTier::Trusted
         } else {
@@ -171,10 +164,16 @@ impl InstalledPlugin {
 
     /// Compute the permission diff a candidate update would introduce, without
     /// applying it. The TUI renders this to the user at the decision point.
+    /// Folds in resource-cap changes (P6-A) alongside the capability diff — a
+    /// raised memory/cpu/wall/output cap is exactly as much an expansion as an
+    /// added capability, and must be visible in the same diff or it would
+    /// auto-apply unreviewed.
     #[must_use]
     pub fn diff_update(&self, next: &PluginManifest) -> PermissionDiff {
         let next_set = CapabilitySet::from_spec(&next.capabilities);
-        self.granted.diff_to(&next_set)
+        let mut diff = self.granted.diff_to(&next_set);
+        diff.resource_changes = diff_resources(&self.manifest.resources, &next.resources);
+        diff
     }
 
     /// **Update.** Verify the new artifact and apply the update **only if it does
@@ -219,7 +218,7 @@ impl InstalledPlugin {
         // Identical or narrowing: apply. The granted set follows the new manifest
         // intersected down to what it declares (a narrowing update drops grants).
         let next_set = CapabilitySet::from_spec(&next.capabilities);
-        self.apply_manifest(next, next_set, signed);
+        self.apply_manifest(next, next_set, signed)?;
         Ok(diff)
     }
 
@@ -242,11 +241,24 @@ impl InstalledPlugin {
         }
         let Verified { signed } = verify_artifact(&next, artifact, publisher_key, unsigned)?;
         let next_set = CapabilitySet::from_spec(&next.capabilities);
-        self.apply_manifest(next, next_set, signed);
+        self.apply_manifest(next, next_set, signed)?;
         Ok(())
     }
 
-    fn apply_manifest(&mut self, next: PluginManifest, granted: CapabilitySet, signed: bool) {
+    /// Apply a verified manifest as the plugin's new installed state. **Every**
+    /// path that installs or updates a grant funnels through here (P6-C), which
+    /// re-asserts the "granted ⊆ manifest-requested" subset invariant
+    /// structurally — not merely as a side effect of how `update`/
+    /// `approve_update` happen to compute their `granted` argument today. That
+    /// makes the guard robust to a future refactor that starts handing this
+    /// function an externally-supplied (and possibly over-broad) grant.
+    fn apply_manifest(
+        &mut self,
+        next: PluginManifest,
+        granted: CapabilitySet,
+        signed: bool,
+    ) -> Result<(), LifecycleError> {
+        assert_granted_within_manifest(&next, &granted)?;
         self.content_hash = next.security.checksum.trim().to_string();
         self.manifest = next;
         self.granted = granted;
@@ -261,6 +273,7 @@ impl InstalledPlugin {
         if self.state != LifecycleState::Enabled {
             self.state = LifecycleState::InstalledDisabled;
         }
+        Ok(())
     }
 
     /// Whether the plugin's tools are currently live (enabled and not revoked).
@@ -268,6 +281,32 @@ impl InstalledPlugin {
     pub fn is_active(&self) -> bool {
         self.state == LifecycleState::Enabled
     }
+}
+
+/// The shared guard (P6-C): assert that every capability in `granted` is one
+/// `manifest` actually requests — a grant may only *narrow* the manifest,
+/// never widen it, on **every** path that installs or updates a grant. Before
+/// this existed, the invariant held only because `update`/`approve_update`
+/// happened to derive their `granted` argument directly from the manifest
+/// itself (so it was trivially a subset); calling this from every such path —
+/// [`InstalledPlugin::install_disabled`] and [`InstalledPlugin::apply_manifest`]
+/// — makes the guarantee structural instead of an accident of today's call
+/// sites, so a future refactor that starts accepting a caller-supplied grant on
+/// update cannot silently reopen the hole (exit criterion 1: an undeclared
+/// capability can never reach the sandbox profile through an over-broad grant).
+fn assert_granted_within_manifest(
+    manifest: &PluginManifest,
+    granted: &CapabilitySet,
+) -> Result<(), LifecycleError> {
+    let requested = CapabilitySet::from_spec(&manifest.capabilities);
+    for cap in granted.iter() {
+        if !requested.grants(cap) {
+            return Err(LifecycleError::GrantExceedsManifest {
+                capability: cap.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -479,5 +518,98 @@ signature = "set-during-packaging"
         assert_eq!(p.state, LifecycleState::Revoked);
         assert!(!p.is_active());
         assert!(p.enabled_scope.is_none());
+    }
+
+    // --- P6-A: resource caps fold into the permission diff ---
+
+    #[test]
+    fn an_update_that_only_raises_a_resource_cap_is_blocked_as_an_expansion() {
+        // Same capabilities on both sides — but the update quietly asks for 8x
+        // the memory. Without folding resource caps into the diff, this would
+        // compute as `is_identical()` (capabilities unchanged) and auto-apply
+        // with no re-approval surface, even though the plugin can now consume
+        // far more memory than a human ever reviewed.
+        let mut p = install("0.1.0", &["api.github.com:443"]);
+        p.mark_smoke_tested().unwrap();
+        p.enable("repository").unwrap();
+        let (mut next, artifact) = manifest("0.2.0", &["api.github.com:443"]);
+        assert_eq!(
+            next.resources.memory_mb, 128,
+            "the manifest-omitted default"
+        );
+        next.resources.memory_mb = 1024;
+        let err = p
+            .update(next, &artifact, None, UnsignedPolicy::Allow)
+            .unwrap_err();
+        match err {
+            LifecycleError::UpdateExpandsPermissions { diff } => {
+                assert_eq!(diff, "+ resources.memory_mb: 128 -> 1024");
+            }
+            other => panic!("expected a resource-cap expansion block, got {other:?}"),
+        }
+        assert_eq!(p.state, LifecycleState::UpdateBlocked);
+        // The grant/manifest did NOT change — still the old, lower cap.
+        assert_eq!(p.manifest.resources.memory_mb, 128);
+    }
+
+    #[test]
+    fn an_update_that_lowers_a_resource_cap_auto_applies() {
+        let mut p = install("0.1.0", &["api.github.com:443"]);
+        let (mut next, artifact) = manifest("0.2.0", &["api.github.com:443"]);
+        next.resources.cpu_seconds = 10; // was 30 (the manifest-omitted default) — a narrower cap
+        let diff = p
+            .update(next, &artifact, None, UnsignedPolicy::Allow)
+            .expect("a lowered cap must not require re-approval");
+        assert!(!diff.expands_permissions());
+        assert_eq!(diff.resource_changes.len(), 1);
+        assert_eq!(
+            p.manifest.resources.cpu_seconds, 10,
+            "the lower cap applied"
+        );
+    }
+
+    // --- P6-C: the "granted ⊆ manifest-requested" invariant holds structurally ---
+
+    #[test]
+    fn apply_manifest_refuses_an_over_broad_grant_even_when_the_diff_would_auto_apply() {
+        // The new manifest requests the SAME capabilities as the old one, so the
+        // capability diff alone computes as auto-applicable (no expansion). But
+        // the grant handed to the shared apply path is over-broad relative to
+        // what the new manifest requests. The subset invariant must be
+        // re-asserted here regardless of what the diff says — today's public
+        // `update()`/`approve_update()` always derive their grant directly from
+        // the manifest (so this can't happen through them), but the guard must
+        // hold structurally for any future path into `apply_manifest`, not just
+        // by accident of how the current call sites are wired.
+        let mut p = install("0.1.0", &["api.github.com:443"]);
+        let (next, artifact) = manifest("0.2.0", &["api.github.com:443"]);
+        let verified =
+            crate::verify::verify_artifact(&next, &artifact, None, UnsignedPolicy::Allow).unwrap();
+        let over_broad = CapabilitySet::from_spec(&crate::manifest::CapabilitiesSpec {
+            filesystem_read: vec!["/etc/shadow".into()],
+            network: vec!["api.github.com:443".into()],
+            ..Default::default()
+        });
+        let err = p
+            .apply_manifest(next, over_broad, verified.signed)
+            .unwrap_err();
+        assert!(
+            matches!(err, LifecycleError::GrantExceedsManifest { .. }),
+            "got {err:?}"
+        );
+        // Nothing was applied — the plugin still carries its original manifest.
+        assert_eq!(p.manifest.version, "0.1.0");
+    }
+
+    #[test]
+    fn the_shared_guard_rejects_an_over_broad_grant_directly() {
+        let (m, _artifact) = manifest("0.1.0", &["api.github.com:443"]);
+        let over_broad = CapabilitySet::from_spec(&crate::manifest::CapabilitiesSpec {
+            secrets: vec!["undeclared-secret".into()],
+            network: vec!["api.github.com:443".into()],
+            ..Default::default()
+        });
+        let err = assert_granted_within_manifest(&m, &over_broad).unwrap_err();
+        assert!(matches!(err, LifecycleError::GrantExceedsManifest { .. }));
     }
 }

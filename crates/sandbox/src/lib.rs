@@ -42,7 +42,9 @@ pub use manifest::{
     parse_manifest, CapabilitiesSpec, ManifestError, PluginKind, PluginManifest, ResourcesSpec,
     RuntimeSpec, SecuritySpec, UpdateSpec, SUPPORTED_PLUGIN_SCHEMA_VERSION,
 };
-pub use permission::{Capability, CapabilitySet, PermissionDiff};
+pub use permission::{
+    diff_manifests, diff_resources, Capability, CapabilitySet, PermissionDiff, ResourceChange,
+};
 pub use profile::{SandboxProfile, ENV_ALLOWLIST};
 pub use sanitize::{sanitize_untrusted, Sanitized};
 pub use verify::{
