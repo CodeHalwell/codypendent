@@ -860,6 +860,90 @@ mod tests {
         assert_eq!(s.runs[0].state, RunState::Running);
     }
 
+    /// C13: every transcript-pushing reducer arm routes through `push_entry`,
+    /// so a run's transcript is bounded by `MAX_TRANSCRIPT_ENTRIES` regardless
+    /// of how many events arrive. The arms the fix converted from a direct
+    /// `transcript.push` — tool-started, tool-completed, steering, budget — are
+    /// each flooded past the cap here; a regression to a direct push (skipping
+    /// the trim) would let the transcript grow without bound.
+    #[test]
+    fn transcript_entries_respect_the_cap_in_every_formerly_direct_arm() {
+        let cap = crate::state::MAX_TRANSCRIPT_ENTRIES;
+        let over = cap + 37;
+
+        // Flood one arm with `over` events that each push a fresh transcript
+        // entry, and return the resulting transcript length.
+        let flood = |make: &dyn Fn(RunId, usize) -> Action| -> usize {
+            let mut s = AppState::new();
+            let run_id = RunId::new();
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: "diagnose".to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            for i in 0..over {
+                reduce(&mut s, make(run_id, i));
+            }
+            s.runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .unwrap()
+                .transcript
+                .len()
+        };
+
+        // tool-started with no preceding proposed card → the None (push) branch.
+        let tool_started = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::ToolStarted {
+                    run_id,
+                    tool: format!("tool.{i}"),
+                    args_digest: format!("d{i}"),
+                },
+            )
+        });
+        // tool-completed with no non-completed card → the None (push) branch.
+        let tool_completed = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::ToolCompleted {
+                    run_id,
+                    tool: format!("tool.{i}"),
+                    outcome: ToolOutcome::Succeeded,
+                    artifact: None,
+                },
+            )
+        });
+        // steering queued → a fresh (unapplied) Steering entry each time.
+        let steering =
+            flood(&|run_id, _i| ev(agent_actor(run_id), EventBody::SteeringQueued { run_id }));
+        // budget warning → a fresh Budget entry each time.
+        let budget = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::BudgetWarning {
+                    run_id,
+                    dimension: BudgetDimension::Cost,
+                    used: i as u64,
+                    limit: 100,
+                },
+            )
+        });
+
+        for (arm, len) in [
+            ("tool-started", tool_started),
+            ("tool-completed", tool_completed),
+            ("steering", steering),
+            ("budget", budget),
+        ] {
+            assert_eq!(len, cap, "{arm}: transcript must be trimmed to the cap");
+        }
+    }
+
     fn note_count(s: &AppState, run_id: RunId) -> usize {
         s.runs
             .iter()

@@ -11,7 +11,7 @@ use codypendent_knowledge::types::{
     EvidenceRef, MemoryClass, MemoryRecord, RetentionPolicy, Revision, Scope,
 };
 use codypendent_knowledge::{
-    db, extract_candidates, provenance_cards, CandidateMemory, Curation, MemoryStore,
+    db, extract_candidates, provenance_cards, CandidateMemory, Curation, MemoryError, MemoryStore,
 };
 use codypendent_protocol::{
     Actor, ArtifactId, ArtifactRef, DataClassification, EventBody, MemoryId, RepositoryId,
@@ -255,12 +255,18 @@ async fn supersession_returns_the_valid_record_per_revision() {
     let store = MemoryStore::new();
     let scope = Scope::Repository(RepositoryId::new());
 
+    // Ordered ("as of revision") queries require canonical sequence-form
+    // revisions (C11); the ledger-sequence form is what the observer records in
+    // production, so use it here too.
+    let rev1 = Revision::sequence(1);
+    let rev2 = Revision::sequence(2);
+
     // A: test command is `cargo test`, valid from rev1.
     let a = record(
         scope.clone(),
         MemoryClass::Procedural,
         "test command is cargo test",
-        "rev1",
+        &rev1.0,
     );
     store.insert(&pool, &a).await.unwrap();
 
@@ -269,18 +275,14 @@ async fn supersession_returns_the_valid_record_per_revision() {
         scope.clone(),
         MemoryClass::Procedural,
         "test command is cargo nextest run",
-        "rev2",
+        &rev2.0,
     );
     let stored_b = store.supersede(&pool, a.id, b.clone()).await.unwrap();
     assert!(stored_b.supersedes.contains(&a.id));
 
     // At rev1 the query returns A.
     let at_rev1 = store
-        .query(
-            &pool,
-            std::slice::from_ref(&scope),
-            Some(&Revision("rev1".to_string())),
-        )
+        .query(&pool, std::slice::from_ref(&scope), Some(&rev1))
         .await
         .unwrap();
     assert_eq!(at_rev1.len(), 1);
@@ -289,11 +291,7 @@ async fn supersession_returns_the_valid_record_per_revision() {
 
     // At rev2 the query returns B.
     let at_rev2 = store
-        .query(
-            &pool,
-            std::slice::from_ref(&scope),
-            Some(&Revision("rev2".to_string())),
-        )
+        .query(&pool, std::slice::from_ref(&scope), Some(&rev2))
         .await
         .unwrap();
     assert_eq!(at_rev2.len(), 1);
@@ -302,12 +300,67 @@ async fn supersession_returns_the_valid_record_per_revision() {
 
     // A is never deleted — it still exists, now with a valid_until stamp.
     let a_now = store.get(&pool, a.id).await.unwrap().unwrap();
-    assert_eq!(a_now.valid_until, Some(Revision("rev2".to_string())));
+    assert_eq!(a_now.valid_until, Some(rev2.clone()));
 
     // The current (no-revision) view shows only the live record, B.
     let live = store.query(&pool, &[scope], None).await.unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].id, b.id);
+}
+
+#[tokio::test]
+async fn ordered_query_rejects_a_non_sequence_revision() {
+    // C11: a git-SHA (or any non-sequence) revision reaching the `valid_from <= ?`
+    // text-range comparison would silently mis-rank. The store must refuse it
+    // with a typed error rather than return wrong rows.
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+
+    // Seed a live record whose valid_from is a real ledger sequence, and craft a
+    // SHA that would lexicographically sit *below* it — the exact input that
+    // used to drop a record that is genuinely valid at that point.
+    let a = record(
+        scope.clone(),
+        MemoryClass::Procedural,
+        "test command is cargo test",
+        &Revision::sequence(5).0,
+    );
+    store.insert(&pool, &a).await.unwrap();
+
+    for bad in [
+        "a1b2c3d4",
+        "deadbeef",
+        "rev1",
+        "0000000000000000000a",
+        "seq:42",
+    ] {
+        let err = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&Revision(bad.to_string())),
+            )
+            .await
+            .expect_err("a non-sequence revision must be rejected, not mis-compared");
+        assert!(
+            matches!(err, MemoryError::NonOrderableRevision(ref got) if got == bad),
+            "expected NonOrderableRevision({bad:?}), got {err:?}"
+        );
+    }
+
+    // The canonical sequence form of the same point is accepted and returns the
+    // record — proving the rejection is about form, not the query itself.
+    let ok = store
+        .query(
+            &pool,
+            std::slice::from_ref(&scope),
+            Some(&Revision::sequence(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.len(), 1);
+    assert_eq!(ok[0].id, a.id);
 }
 
 // --------------------------------------------------------------------------

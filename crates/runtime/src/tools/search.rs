@@ -197,3 +197,19 @@ struct RgText {
     #[serde(default)]
     text: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SEARCH_TIMEOUT_SECS;
+    use crate::tools::ABSOLUTE_MAX_TIMEOUT;
+
+    /// `workspace.search` runs ripgrep under [`SEARCH_TIMEOUT_SECS`] (C12: the
+    /// search tool previously had no timeout). Pin — at compile time — that the
+    /// bound is a real, finite ceiling within the runtime's absolute wall-clock
+    /// maximum.
+    #[test]
+    fn search_timeout_is_bounded() {
+        const { assert!(SEARCH_TIMEOUT_SECS > 0) };
+        const { assert!(SEARCH_TIMEOUT_SECS <= ABSOLUTE_MAX_TIMEOUT.as_secs()) };
+    }
+}

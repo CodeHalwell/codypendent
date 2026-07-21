@@ -180,3 +180,68 @@ async fn assemble_context_respects_memory_scope_isolation() {
         "another repository's memory must never leak into a System-scoped manifest"
     );
 }
+
+/// C10: the run-context assembler caps how many live memories it injects
+/// (`MAX_CONTEXT_MEMORIES`). With far more live, in-scope memories than the cap,
+/// the manifest must carry exactly the cap — the same budgeting the 2.3
+/// retrieval funnel enforces, now held on the run-context path so a long-lived
+/// repository's memory section cannot regrow unbounded.
+#[tokio::test]
+async fn assemble_context_caps_injected_memories() {
+    // Pinned value of the private `MAX_CONTEXT_MEMORIES` ceiling in
+    // `knowledge::context`; update both together if the ceiling ever changes.
+    const CONTEXT_MEMORY_CAP: usize = 32;
+
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    register_builtins(&pool).await.unwrap();
+
+    // Seed many more live, in-scope memories than the cap. Distinct statements
+    // keep the curator's dedup from collapsing them, so every one is live.
+    let store = MemoryStore::new();
+    let seeded = CONTEXT_MEMORY_CAP + 18;
+    for i in 0..seeded {
+        let candidate = CandidateMemory {
+            class: MemoryClass::Semantic,
+            scope: Some(Scope::System),
+            statement: format!("distinct durable fact number {i:03}"),
+            structured_value: None,
+            provenance: vec![EvidenceRef::Artifact {
+                artifact: artifact(),
+                source_path: Some("chronicle.json".to_string()),
+            }],
+            confidence: 0.9,
+            observed_at: Utc::now(),
+            valid_from: Revision("rev-1".to_string()),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        };
+        assert!(matches!(
+            store.curate(&pool, candidate).await.unwrap(),
+            Curation::Accepted(_)
+        ));
+    }
+
+    // All of them are genuinely live in the store (no dedup collapse) — so the
+    // cap below is the assembler's doing, not a storage artifact.
+    let live = store.query(&pool, &[Scope::System], None).await.unwrap();
+    assert_eq!(live.len(), seeded, "each distinct fact is a live memory");
+
+    let manifest = assemble_context(&pool, repo, "do the work", &[Scope::System])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        manifest.memories.len(),
+        CONTEXT_MEMORY_CAP,
+        "the assembler must inject exactly the memory cap, not every live memory"
+    );
+    // The cap selects a subset of the real memories; it never fabricates.
+    assert!(
+        manifest
+            .memories
+            .iter()
+            .all(|m| m.statement.starts_with("distinct durable fact number")),
+        "every injected memory is one of the seeded facts"
+    );
+}

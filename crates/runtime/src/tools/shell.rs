@@ -246,10 +246,11 @@ impl Shell {
 /// Whether a model-supplied environment variable name can hijack what the
 /// command actually executes: shared-library interposers (`LD_*`/`DYLD_*`),
 /// compiler/tool wrappers (`*_WRAPPER`), git's external-program hooks and
-/// injected config (`GIT_CONFIG*`), interpreter startup/option injection
-/// (`NODE_OPTIONS`, `PYTHON*`, `PERL5*`, `RUBYOPT`), shell startup files and
-/// `CDPATH`, and `PATH` (which redirects the child's own subprocess lookups
-/// even though the top-level program is resolved on the daemon's PATH).
+/// injected config (`GIT_CONFIG*`), interpreter startup/option/load-path
+/// injection (`NODE_OPTIONS`, `PYTHON*`, `PERL5*`, `RUBYOPT`/`RUBYLIB`), shell
+/// startup files and `CDPATH`, and `PATH` (which redirects the child's own
+/// subprocess lookups even though the top-level program is resolved on the
+/// daemon's PATH).
 fn is_denied_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
@@ -270,6 +271,7 @@ fn is_denied_env(name: &str) -> bool {
             | "PERL5OPT"
             | "PERL5LIB"
             | "RUBYOPT"
+            | "RUBYLIB"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("GIT_CONFIG")
@@ -430,4 +432,63 @@ async fn is_executable(path: &Path) -> bool {
         .await
         .map(|m| m.is_file())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_denied_env;
+
+    /// The execution-hijacking environment names the shell tool must refuse,
+    /// grouped by family. A gap here means an allow-listed interpreter can be
+    /// steered by a model-supplied variable past a benign-looking approval.
+    #[test]
+    fn denies_execution_hijacking_env_names() {
+        for name in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "RUSTC_WRAPPER",
+            "CC_WRAPPER",
+            "GIT_SSH_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "CDPATH",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONHOME",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            // FP-1: the Ruby load-path analogue of PERL5LIB/PYTHONPATH; a gap
+            // here let `RUBYLIB` prepend an attacker directory to an
+            // allow-listed `ruby`/`rake` invocation.
+            "RUBYLIB",
+        ] {
+            assert!(is_denied_env(name), "{name} must be denied");
+        }
+    }
+
+    /// The deny check is case-insensitive (env names are matched uppercased) so
+    /// a lower/mixed-case spelling cannot slip a denied variable through.
+    #[test]
+    fn deny_check_is_case_insensitive() {
+        assert!(is_denied_env("rubylib"));
+        assert!(is_denied_env("RubyLib"));
+        assert!(is_denied_env("ld_preload"));
+    }
+
+    /// A benign build/config variable is allowed — the list is a targeted
+    /// deny-list, not a blanket refusal.
+    #[test]
+    fn allows_ordinary_variables() {
+        for name in ["CARGO_TERM_COLOR", "RUST_LOG", "HOME", "MY_APP_CONFIG"] {
+            assert!(!is_denied_env(name), "{name} should be allowed");
+        }
+    }
 }
