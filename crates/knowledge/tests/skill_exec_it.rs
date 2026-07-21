@@ -49,6 +49,39 @@ fn write_skill_with_script(dir: &Path) {
     }
 }
 
+/// Like [`write_skill_with_script`] but with **no** `commands` permission, so the
+/// derived profile denies subprocess — a shebang script cannot launch its
+/// interpreter (fails closed).
+fn write_skill_without_subprocess(dir: &Path) {
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    let manifest = "schema_version = 1\n\
+         id = \"demo.nosub\"\n\
+         name = \"No Subprocess Demo\"\n\
+         version = \"0.1.0\"\n\
+         scope = \"repository\"\n\
+         status = \"active\"\n\
+         description = \"A skill whose shebang script must fail closed without subprocess.\"\n\
+         intents = [\"demo\"]\n\
+         \n\
+         [entrypoints]\n\
+         instructions = \"SKILL.md\"\n\
+         scripts = \"scripts/\"\n\
+         \n\
+         [trust]\n\
+         publisher = \"local-user\"\n\
+         signature_required = false\n";
+    std::fs::write(dir.join("skill.toml"), manifest).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "# No Subprocess\n").unwrap();
+    let script = "#!/bin/sh\nprintf 'SHOULD-NOT-LAUNCH\\n'\n";
+    let script_path = dir.join("scripts").join("run.sh");
+    std::fs::write(&script_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[test]
 fn a_script_bearing_skill_loads_as_executable() {
     let dir = tempfile::tempdir().unwrap();
@@ -107,6 +140,42 @@ fn skill_script_runs_sandboxed_and_output_is_captured_and_sanitized() {
         .stdout
         .as_evidence_block()
         .starts_with("[untrusted output from skill:demo.echo]"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_shebang_script_without_a_subprocess_grant_fails_closed() {
+    use codypendent_sandbox::executor::MacosSandbox;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_skill_without_subprocess(dir.path());
+    let item = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap();
+    let profile = profile_for_permissions("skill:demo.nosub", &item.permissions, 30);
+    // No `commands` permission ⇒ no subprocess ⇒ exec is scoped to the script image
+    // alone, so the `#!/bin/sh` interpreter is a different image and its exec is
+    // denied. The script cannot launch — this is the intended fail-closed behavior
+    // (we deliberately do NOT grant the interpreter exec, which would weaken it).
+    assert!(!profile.allow_subprocess);
+
+    let executor = MacosSandbox::new().expect("sandbox-exec available on macOS");
+    let outcome = run_script(
+        &executor,
+        dir.path(),
+        "scripts/run.sh",
+        Vec::new(),
+        &profile,
+    )
+    .expect("the run completes (the script is denied, not an executor error)");
+
+    assert!(
+        outcome.denied(),
+        "a shebang script without a subprocess grant must fail closed: {}",
+        outcome.audit_summary()
+    );
+    assert!(
+        !outcome.stdout.text.contains("SHOULD-NOT-LAUNCH"),
+        "the script must not have executed"
+    );
 }
 
 #[cfg(not(target_os = "macos"))]

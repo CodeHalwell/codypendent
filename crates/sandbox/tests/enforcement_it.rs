@@ -253,6 +253,18 @@ mod macos {
         // Honest about what it does NOT enforce (rlimits under Seatbelt).
         assert!(!report.enforces_rlimits);
         assert!(!report.degraded.is_empty());
+        // STEP 6.2.1 "document degraded mode loudly": the metadata-enumeration
+        // surface (bsd.sb lets a confined process `stat` any file, though not read
+        // its contents) and the best-effort process-group kill are named, not hidden.
+        let degraded = report.degraded.join(" | ").to_lowercase();
+        assert!(
+            degraded.contains("metadata"),
+            "the file-metadata enumeration surface must be surfaced: {degraded}"
+        );
+        assert!(
+            degraded.contains("process-group kill"),
+            "the best-effort process-group kill must be surfaced: {degraded}"
+        );
     }
 
     // A helper so the imports above are all exercised even if a case is trimmed.

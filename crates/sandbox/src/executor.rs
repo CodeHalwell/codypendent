@@ -345,8 +345,10 @@ impl SandboxExecutor for RefusingSandbox {
 ///
 /// The profile is **closed**: `(deny default)` denies everything, `(import
 /// "bsd.sb")` re-allows only the OS primitives a process needs to *start* (the
-/// dynamic loader, system frameworks, mach/sysctl basics — no user data), and then
-/// exactly the profile's grants are layered on:
+/// dynamic loader, system frameworks, mach/sysctl basics — no user-data
+/// *contents*; note that Apple's base profile does leave file **metadata**
+/// (`stat`: existence/size/mtime/mode) enumerable anywhere, surfaced in the
+/// [`CapabilityReport`]), and then exactly the profile's grants are layered on:
 ///
 /// * each `read_paths` entry → `(allow file-read* (subpath …))`;
 /// * each `write_paths` entry → `(allow file-read* file-write* (subpath …))`;
@@ -366,8 +368,10 @@ pub fn seatbelt_profile(profile: &SandboxProfile, target_program: &Path) -> Stri
     // Closed by default: files, network, mach, everything not re-allowed below.
     sb.push_str("(deny default)\n");
     // Re-allow ONLY process-startup essentials (loader, system frameworks, mach,
-    // sysctl). bsd.sb grants no access to user data — a planted secret outside the
-    // granted read paths stays denied (verified by the enforcement test).
+    // sysctl). bsd.sb grants no access to user-data *contents* — a planted secret
+    // outside the granted read paths stays unreadable (verified by the enforcement
+    // test). It DOES leave file metadata (`stat`) enumerable anywhere; that surface
+    // is named in the capability report rather than silently accepted.
     sb.push_str("(import \"bsd.sb\")\n");
     sb.push_str("(allow process-fork)\n");
     if profile.allow_subprocess {
@@ -790,6 +794,13 @@ impl SandboxExecutor for MacosSandbox {
                     .into(),
                 "network allowlist coarsened to outbound-IP (host:port granularity deferred to a broker)"
                     .into(),
+                "file METADATA (stat: existence/size/mtime/mode) is enumerable anywhere via Apple's \
+                 base profile (bsd.sb); file CONTENTS outside the granted read paths stay denied"
+                    .into(),
+                "process-group kill is best-effort: a subprocess that calls setsid()/setpgid() (only \
+                 reachable when allow_subprocess) can escape the group kill, though the direct child \
+                 is still killed"
+                    .into(),
             ],
         }
     }
@@ -903,6 +914,10 @@ impl SandboxExecutor for LinuxSandbox {
         let mut degraded = vec![
             "network allowlist coarsened: a non-empty allowlist shares the host network namespace \
              (host:port granularity deferred to a broker)"
+                .into(),
+            "process-group kill is best-effort: a subprocess that calls setsid()/setpgid() (only \
+             reachable when allow_subprocess) can escape the group kill, though the direct child \
+             is still killed"
                 .into(),
         ];
         if locate_on_path("prlimit").is_none() {

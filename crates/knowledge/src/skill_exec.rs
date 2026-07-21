@@ -28,7 +28,13 @@
 //! `$REPOSITORY` / `$WORKTREE` are not yet substituted — a documented follow-up;
 //! a non-absolute grant is simply ineffective at the OS layer, which fails closed,
 //! not open). The script's own directory is always granted read so the sandbox can
-//! read and execute the script itself.
+//! read the script file. **Executing** it is a separate grant: a script that runs
+//! through an interpreter (a `#!/bin/sh` shebang) needs a `commands` capability
+//! (which grants subprocess), because the sandbox scopes `exec` to the script
+//! image alone unless subprocess is allowed — so the interpreter is a different
+//! image and its `exec` is denied, and the script **fails closed** (it cannot
+//! launch at all). Granting the interpreter `exec` is deliberately *not* done, as
+//! that would weaken the sandbox.
 
 use std::path::Path;
 
@@ -122,11 +128,15 @@ pub fn profile_for_permissions(
 ///   `scripts/fix.sh`).
 /// * `profile` — the profile derived from the skill's permissions
 ///   ([`profile_for_permissions`]). The script's own directory is granted read
-///   automatically so the sandbox can read and execute it.
+///   automatically so the sandbox can read the script file. Note that a script
+///   launched via a shebang interpreter also needs a `commands` capability
+///   (subprocess); without it the interpreter's `exec` is denied and the script
+///   fails closed — see the module docs.
 ///
-/// Fails closed: a missing/non-executable script, a path escaping the package, or
-/// an unavailable/unsupported sandbox all refuse to run. Returns the sanitized,
-/// origin-labeled [`SandboxOutcome`].
+/// Fails closed: a missing/non-executable script, a path escaping the package, an
+/// unavailable/unsupported sandbox, or (for a shebang script) a missing subprocess
+/// grant all refuse to run or cannot launch. Returns the sanitized, origin-labeled
+/// [`SandboxOutcome`].
 ///
 /// [`Provenance::Package`]: crate::types::Provenance::Package
 pub fn run_script(
@@ -153,8 +163,10 @@ pub fn run_script(
         ));
     }
 
-    // Grant read on the package root so the sandbox can read+execute the script
-    // (and any bundled references it reads) and use the package as its cwd.
+    // Grant read on the package root so the sandbox can read the script file (and
+    // any bundled references it reads) and use the package as its cwd. This grants
+    // read, not exec: a shebang script still needs a `commands`/subprocess grant to
+    // launch its interpreter, else it fails closed.
     let mut confined = profile.clone();
     let root_str = root.to_string_lossy().into_owned();
     if !confined.read_paths.iter().any(|p| p == &root_str) {
