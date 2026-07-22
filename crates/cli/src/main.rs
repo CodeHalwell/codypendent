@@ -342,11 +342,15 @@ enum EvalCommand {
         /// `evals/tasks/core/`), or a path to it directly.
         #[arg(long, default_value = "core")]
         suite: String,
-        /// The model-policy name the cases declare they run under. Recorded in
-        /// the report; Phase 7 routing is not yet wired into `StartRun` (see
-        /// the roadmap), so this does not yet select a model — every case
-        /// runs under whatever the daemon's own `models.toml` resolves for its
-        /// mode.
+        /// The routing policy to select each case's model under (Phase 7's
+        /// "routing⇄eval composition"). Resolved via `codypendent-routing`
+        /// over the persisted model profiles, fail-closed: an unknown name or
+        /// a case with no eligible model stops `eval run` before any case
+        /// executes. The selection is recorded per case in the report
+        /// (`routed_model`); it does not yet pin the daemon's own `StartRun`
+        /// execution to that model (see `codypendent_cli::eval`'s module
+        /// doc). Absent: every case runs under the daemon's own default model
+        /// resolution, unchanged.
         #[arg(long)]
         policy: Option<String>,
         /// Where to write the `SuiteReport` JSON.

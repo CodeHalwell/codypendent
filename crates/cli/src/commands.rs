@@ -1224,12 +1224,25 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 // --- STEP 7.1: eval harness runner -------------------------------------------
 
 /// `codypendent eval run --suite <NAME> [--policy P] --report out.json`
-/// (Phase 7 STEP 7.1). Loads every case in the suite, runs each headlessly
-/// against its pinned fixture revision, scores it, and writes the aggregate
-/// [`codypendent_eval::SuiteReport`] to `--report`. `policy` is recorded on
-/// stdout only — Phase 7 routing is not yet wired into `StartRun` (see the
-/// roadmap's "routing⇄eval composition" note), so it does not yet select a
-/// model.
+/// (Phase 7 STEP 7.1; `--policy` closed by the "routing⇄eval composition"
+/// follow-up). Loads every case in the suite, runs each headlessly against
+/// its pinned fixture revision, scores it, and writes the aggregate
+/// [`codypendent_eval::SuiteReport`] to `--report`.
+///
+/// When `--policy P` is given, [`crate::eval::route_cases`] resolves EVERY
+/// case's model through `codypendent-routing` over the persisted
+/// `model_profiles`, fail-closed: an unrecognized policy name, an empty
+/// profile store, or a case the router refuses to route all stop this
+/// BEFORE any case runs, with a non-zero exit and a clear message — never a
+/// silent fallback to the default model for a policy that was explicitly
+/// requested. The resolved model is additively recorded per case in the
+/// report (see [`crate::eval::report_json_with_routing`]). This selects and
+/// validates the model; it does not yet pin the daemon's `StartRun`
+/// execution to it — `StartRun` carries no model field, so the run itself
+/// still resolves a model the way it always has (see `crate::eval`'s module
+/// doc for the full, honest scope of what "routes" means here today). When
+/// `--policy` is absent, behavior is byte-for-byte unchanged (the default
+/// model — the `eval-smoke` CI path).
 pub async fn eval_run(
     paths: &RuntimePaths,
     suite: &str,
@@ -1244,13 +1257,27 @@ pub async fn eval_run(
         suite_dir.display(),
         policy
             .as_deref()
-            .map(|p| format!(" (policy: {p}, not yet enforced)"))
+            .map(|p| format!(
+                " (policy: {p} — each case routed via Phase-7 routing, fail-closed; \
+                 selection recorded per case in the report)"
+            ))
             .unwrap_or_default()
     );
+
+    // Phase-7 routing⇄eval composition: resolve every case's model BEFORE any
+    // case runs, so a misconfigured `--policy` (unknown name, no measured
+    // profiles, or a case the router refuses) fails this command cleanly
+    // rather than letting some cases run unrouted. `None` when `--policy` is
+    // absent — the unchanged path every existing test/CI job exercises.
+    let routed = match policy.as_deref() {
+        Some(name) => Some(crate::eval::route_cases(paths, &cases, name).await?),
+        None => None,
+    };
+
     let fixture_root = crate::eval::fixture_root(&suite_dir, "tiny-crate")?;
     let suite_report = crate::eval::run_suite(paths, &cases, &fixture_root).await?;
 
-    let json = serde_json::to_string_pretty(&suite_report)?;
+    let json = crate::eval::report_json_with_routing(&suite_report, routed.as_deref())?;
     std::fs::write(report, json)
         .with_context(|| format!("writing suite report to {}", report.display()))?;
 
