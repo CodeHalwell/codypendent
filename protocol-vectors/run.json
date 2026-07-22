@@ -1,0 +1,182 @@
+{
+  "AgentMode_Ask": {
+    "type": "Ask"
+  },
+  "AgentMode_Build": {
+    "type": "Build"
+  },
+  "AgentMode_Explore": {
+    "type": "Explore"
+  },
+  "AgentMode_Plan": {
+    "type": "Plan"
+  },
+  "AgentMode_Review": {
+    "type": "Review"
+  },
+  "ApprovalDecision_Approve": {
+    "type": "Approve"
+  },
+  "ApprovalDecision_Reject": {
+    "type": "Reject"
+  },
+  "ApprovalScope_Once": {
+    "type": "Once"
+  },
+  "ApprovalScope_Pattern": {
+    "type": "Pattern"
+  },
+  "ApprovalScope_Repository": {
+    "type": "Repository"
+  },
+  "ApprovalScope_Run": {
+    "type": "Run"
+  },
+  "BudgetDimension_Cost": {
+    "type": "Cost"
+  },
+  "BudgetDimension_Tokens": {
+    "type": "Tokens"
+  },
+  "BudgetDimension_ToolCalls": {
+    "type": "ToolCalls"
+  },
+  "BudgetDimension_WallClock": {
+    "type": "WallClock"
+  },
+  "ProposedAction_BlackboardPost": {
+    "kind": "finding",
+    "type": "BlackboardPost",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "ProposedAction_BlackboardQuery": {
+    "type": "BlackboardQuery",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "ProposedAction_ExecuteCommand": {
+    "args": [
+      "test",
+      "--all-features"
+    ],
+    "cwd": "/home/user/project",
+    "environment": [
+      [
+        "RUST_BACKTRACE",
+        "1"
+      ],
+      [
+        "PATH",
+        "/usr/bin:/bin"
+      ]
+    ],
+    "program": "cargo",
+    "type": "ExecuteCommand"
+  },
+  "ProposedAction_GitCommit": {
+    "repository": "/home/user/project",
+    "type": "GitCommit"
+  },
+  "ProposedAction_GitHubMutation": {
+    "repository": "octocat/hello-world",
+    "summary": "create draft PR on octocat/hello-world",
+    "type": "GitHubMutation"
+  },
+  "ProposedAction_GitPush": {
+    "branch": "feature/fix-parser",
+    "remote": "origin",
+    "type": "GitPush"
+  },
+  "ProposedAction_NetworkRequest": {
+    "destination": "https://api.github.com",
+    "type": "NetworkRequest"
+  },
+  "ProposedAction_PublishDocument": {
+    "changed_files": [
+      "docs/architecture.md"
+    ],
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "git_action": "write docs/architecture.md in the working tree (approval-gated change set)",
+    "target": "repository file docs/architecture.md",
+    "type": "PublishDocument"
+  },
+  "ProposedAction_ReadFiles": {
+    "paths": [
+      "src/lib.rs",
+      "Cargo.toml"
+    ],
+    "type": "ReadFiles"
+  },
+  "ProposedAction_WritePatch": {
+    "patch": "80000000-0000-0000-0000-000000000001",
+    "type": "WritePatch"
+  },
+  "Risk": {
+    "level": {
+      "type": "Medium"
+    },
+    "reasons": [
+      "writes outside the worktree"
+    ]
+  },
+  "RiskLevel_Critical": {
+    "type": "Critical"
+  },
+  "RiskLevel_High": {
+    "type": "High"
+  },
+  "RiskLevel_Low": {
+    "type": "Low"
+  },
+  "RiskLevel_Medium": {
+    "type": "Medium"
+  },
+  "RunDisposition_Cancelled": {
+    "reason": "superseded by a newer run",
+    "type": "Cancelled"
+  },
+  "RunDisposition_Completed": {
+    "summary": "fixed the parser",
+    "type": "Completed"
+  },
+  "RunDisposition_Failed": {
+    "reason": "daemon restart",
+    "type": "Failed"
+  },
+  "RunState_Cancelled": {
+    "type": "Cancelled"
+  },
+  "RunState_Completed": {
+    "type": "Completed"
+  },
+  "RunState_Failed": {
+    "type": "Failed"
+  },
+  "RunState_Paused": {
+    "type": "Paused"
+  },
+  "RunState_Preparing": {
+    "type": "Preparing"
+  },
+  "RunState_Queued": {
+    "type": "Queued"
+  },
+  "RunState_Recovering": {
+    "type": "Recovering"
+  },
+  "RunState_Running": {
+    "type": "Running"
+  },
+  "RunState_WaitingForApproval": {
+    "type": "WaitingForApproval"
+  },
+  "RunState_WaitingForUserInput": {
+    "type": "WaitingForUserInput"
+  },
+  "ToolOutcome_Failed": {
+    "message": "exit 1",
+    "type": "Failed"
+  },
+  "ToolOutcome_Succeeded": {
+    "type": "Succeeded"
+  }
+}

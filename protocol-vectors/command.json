@@ -1,0 +1,214 @@
+{
+  "CommandBody_AcquireDocumentLease": {
+    "lease": {
+      "block_id": "b1",
+      "document_id": "70000000-0000-0000-0000-000000000001"
+    },
+    "ttl_seconds": 300,
+    "type": "AcquireDocumentLease"
+  },
+  "CommandBody_AdvancePromotion": {
+    "action": {
+      "regressed": false,
+      "type": "RunRegression"
+    },
+    "candidate_id": "cand-abc123",
+    "type": "AdvancePromotion"
+  },
+  "CommandBody_ApprovePromotion": {
+    "candidate_id": "cand-abc123",
+    "type": "ApprovePromotion"
+  },
+  "CommandBody_AttachSession": {
+    "last_seen_sequence": 42,
+    "requested_role": {
+      "type": "Approver"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "subscriptions": [
+      {
+        "type": "SessionSummary"
+      },
+      {
+        "type": "AgentActivity"
+      }
+    ],
+    "type": "AttachSession"
+  },
+  "CommandBody_CancelRun": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "CancelRun"
+  },
+  "CommandBody_CancelWorkflow": {
+    "type": "CancelWorkflow",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_CreateSession": {
+    "title": "fix the failing test",
+    "type": "CreateSession",
+    "workspace": "10000000-0000-0000-0000-000000000001"
+  },
+  "CommandBody_MutateDocument": {
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "mutation": {
+      "block_id": "b1",
+      "delete_len": 0,
+      "insert": "hello",
+      "op": "edit_text",
+      "position": 0
+    },
+    "type": "MutateDocument"
+  },
+  "CommandBody_PauseRun": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "PauseRun"
+  },
+  "CommandBody_PauseWorkflow": {
+    "type": "PauseWorkflow",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_ProposePromotion": {
+    "kind": "router",
+    "name": "tool-selection",
+    "requires_permission_review": false,
+    "type": "ProposePromotion",
+    "version": 12
+  },
+  "CommandBody_PublishDocument": {
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "target": {
+      "kind": "repository_file",
+      "path": "docs/architecture.md"
+    },
+    "type": "PublishDocument"
+  },
+  "CommandBody_QueueSteering": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "text": "focus on the parser",
+    "type": "QueueSteering"
+  },
+  "CommandBody_ReadBlackboard": {
+    "include_superseded": true,
+    "kind": "finding",
+    "type": "ReadBlackboard",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_ReadWorkflowRun": {
+    "type": "ReadWorkflowRun",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_ReleaseDocumentLease": {
+    "lease_id": "lease-1",
+    "type": "ReleaseDocumentLease"
+  },
+  "CommandBody_ResolveApproval": {
+    "approval_id": "50000000-0000-0000-0000-000000000001",
+    "decision": {
+      "type": "Approve"
+    },
+    "scope": {
+      "type": "Once"
+    },
+    "type": "ResolveApproval"
+  },
+  "CommandBody_ResumeRun": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "ResumeRun"
+  },
+  "CommandBody_ResumeWorkflow": {
+    "type": "ResumeWorkflow",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_RetryWorkflowNode": {
+    "node_id": "verify",
+    "type": "RetryWorkflowNode",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_RollbackPromotion": {
+    "candidate_id": "cand-abc123",
+    "type": "RollbackPromotion"
+  },
+  "CommandBody_StartRun": {
+    "mode": {
+      "type": "Build"
+    },
+    "objective": "diagnose the failing test",
+    "repository": "/home/user/project",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "StartRun"
+  },
+  "CommandBody_StartWorkflow_inline_manifest": {
+    "inputs": {
+      "pull_request": 42
+    },
+    "manifest": "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n",
+    "repository": "/home/user/project",
+    "type": "StartWorkflow"
+  },
+  "CommandBody_StartWorkflow_named_workflow": {
+    "inputs": {
+      "pull_request": 42
+    },
+    "manifest": "",
+    "repository": "/home/user/project",
+    "type": "StartWorkflow",
+    "workflow_id": "repair-github-check"
+  },
+  "CommandBody_SubmitUserInput": {
+    "mode": {
+      "type": "Build"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "text": "try again",
+    "type": "SubmitUserInput"
+  },
+  "CommandBody_UpdateIdeContext": {
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "UpdateIdeContext",
+    "update": {
+      "active_file": "src/lib.rs",
+      "diagnostics_revision": 7,
+      "dirty_buffers": [
+        {
+          "byte_length": 12,
+          "path": "src/lib.rs",
+          "sha256": "deadbeef"
+        }
+      ],
+      "open_files": [
+        "src/lib.rs",
+        "Cargo.toml"
+      ],
+      "selection": {
+        "path": "src/lib.rs",
+        "range": {
+          "end": {
+            "character": 4,
+            "line": 2
+          },
+          "start": {
+            "character": 0,
+            "line": 1
+          }
+        }
+      }
+    }
+  },
+  "PromotionAction_FinishCanary": {
+    "type": "FinishCanary"
+  },
+  "PromotionAction_ObserveCanary": {
+    "regressed": true,
+    "type": "ObserveCanary"
+  },
+  "PromotionAction_RunRegression": {
+    "regressed": false,
+    "type": "RunRegression"
+  },
+  "PromotionAction_StartCanary": {
+    "type": "StartCanary"
+  },
+  "PromotionAction_StartShadow": {
+    "type": "StartShadow"
+  }
+}

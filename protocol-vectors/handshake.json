@@ -1,0 +1,73 @@
+{
+  "ClientHello": {
+    "capabilities": {
+      "audio_capture": false,
+      "diff_view": true,
+      "editor_mutations": false,
+      "image_display": false,
+      "mouse": true,
+      "rich_text": true,
+      "true_color": true,
+      "unicode": true
+    },
+    "client_name": "codypendent-tui",
+    "client_version": "0.1.0",
+    "resume_token": "opaque-token",
+    "supported_protocols": [
+      {
+        "major": 1,
+        "minor": 1
+      }
+    ]
+  },
+  "ClientRole_Approver": {
+    "type": "Approver"
+  },
+  "ClientRole_Contributor": {
+    "type": "Contributor"
+  },
+  "ClientRole_Controller": {
+    "type": "Controller"
+  },
+  "ClientRole_Observer": {
+    "type": "Observer"
+  },
+  "ServerHello": {
+    "daemon_instance": "a0000000-0000-0000-0000-000000000001",
+    "daemon_version": "0.1.0",
+    "heartbeat_interval_ms": 15000,
+    "resume_token": "opaque",
+    "selected_protocol": {
+      "major": 1,
+      "minor": 1
+    }
+  },
+  "Subscription_AgentActivity": {
+    "type": "AgentActivity"
+  },
+  "Subscription_Blackboard": {
+    "type": "Blackboard",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "Subscription_BudgetState": {
+    "type": "BudgetState"
+  },
+  "Subscription_Document": {
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "type": "Document"
+  },
+  "Subscription_RepositoryStatus": {
+    "type": "RepositoryStatus"
+  },
+  "Subscription_RunTrace": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "RunTrace"
+  },
+  "Subscription_SessionSummary": {
+    "type": "SessionSummary"
+  },
+  "Subscription_Workflow": {
+    "type": "Workflow",
+    "workflow_run_id": "wfrun-abc123"
+  }
+}

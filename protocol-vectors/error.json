@@ -1,0 +1,37 @@
+{
+  "CodypendentError": {
+    "code": "policy.write-denied",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "details": {
+      "path": "/etc/passwd"
+    },
+    "message": "writes are denied in Explore mode",
+    "retryable": false,
+    "user_action": {
+      "type": "AdjustPolicy"
+    }
+  },
+  "ProtocolError": {
+    "code": "protocol.unsupported-payload",
+    "message": "unknown payload tag",
+    "retryable": false
+  },
+  "UserAction_AdjustPolicy": {
+    "type": "AdjustPolicy"
+  },
+  "UserAction_ContactSupport": {
+    "type": "ContactSupport"
+  },
+  "UserAction_GrantApproval": {
+    "type": "GrantApproval"
+  },
+  "UserAction_Reauthenticate": {
+    "type": "Reauthenticate"
+  },
+  "UserAction_ReconfigureModel": {
+    "type": "ReconfigureModel"
+  },
+  "UserAction_Retry": {
+    "type": "Retry"
+  }
+}

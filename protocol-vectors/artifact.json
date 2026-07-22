@@ -1,0 +1,23 @@
+{
+  "ArtifactRef": {
+    "byte_length": 128,
+    "id": "80000000-0000-0000-0000-000000000001",
+    "media_type": "text/x-diff",
+    "sensitivity": {
+      "type": "Internal"
+    },
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+  },
+  "DataClassification_Confidential": {
+    "type": "Confidential"
+  },
+  "DataClassification_Internal": {
+    "type": "Internal"
+  },
+  "DataClassification_Public": {
+    "type": "Public"
+  },
+  "DataClassification_Secret": {
+    "type": "Secret"
+  }
+}

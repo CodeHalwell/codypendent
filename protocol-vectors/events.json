@@ -1,0 +1,389 @@
+{
+  "Actor_Agent": {
+    "agent_id": "c0000000-0000-0000-0000-000000000001",
+    "model": "claude-sonnet-5",
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "Agent"
+  },
+  "Actor_Client": {
+    "client_id": "60000000-0000-0000-0000-000000000001",
+    "type": "Client"
+  },
+  "Actor_Human": {
+    "type": "Human",
+    "user_id": "dana"
+  },
+  "Actor_Integration": {
+    "integration_id": "github-app",
+    "type": "Integration"
+  },
+  "Actor_System": {
+    "type": "System"
+  },
+  "EventBody_ApprovalRequested_ExecuteCommand": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "action": {
+        "args": [
+          "test",
+          "--all-features"
+        ],
+        "cwd": "/home/user/project",
+        "environment": [
+          [
+            "RUST_BACKTRACE",
+            "1"
+          ],
+          [
+            "PATH",
+            "/usr/bin:/bin"
+          ]
+        ],
+        "program": "cargo",
+        "type": "ExecuteCommand"
+      },
+      "approval_id": "50000000-0000-0000-0000-000000000001",
+      "risk": {
+        "level": {
+          "type": "High"
+        },
+        "reasons": [
+          "writes outside the worktree",
+          "executes an external process"
+        ]
+      },
+      "type": "ApprovalRequested"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ApprovalResolved": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "approval_id": "50000000-0000-0000-0000-000000000001",
+      "decision": {
+        "type": "Approve"
+      },
+      "type": "ApprovalResolved"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_BudgetWarning": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "dimension": {
+        "type": "Tokens"
+      },
+      "limit": 100000,
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "BudgetWarning",
+      "used": 90000
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ClientPresenceChanged": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "client_id": "60000000-0000-0000-0000-000000000001",
+      "present": true,
+      "role": {
+        "type": "Contributor"
+      },
+      "type": "ClientPresenceChanged"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ModelStreamDelta": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "text": "thinking...",
+      "type": "ModelStreamDelta"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_NoteAppended": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "text": "first note",
+      "type": "NoteAppended"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_PatchProposed": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "artifact": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "changeset_id": "90000000-0000-0000-0000-000000000001",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "PatchProposed"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_RunCompleted": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "chronicle": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "disposition": {
+        "summary": "fixed",
+        "type": "Completed"
+      },
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "RunCompleted"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_RunStarted": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "mode": {
+        "type": "Build"
+      },
+      "objective": "diagnose",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "RunStarted"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_RunStateChanged": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "state": {
+        "type": "WaitingForApproval"
+      },
+      "type": "RunStateChanged"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_SessionClosed": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "type": "SessionClosed"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_SessionCreated": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "title": "fixture session",
+      "type": "SessionCreated"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_SteeringApplied": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "SteeringApplied"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_SteeringQueued": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "SteeringQueued"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ToolCompleted": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "artifact": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "outcome": {
+        "type": "Succeeded"
+      },
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "tool": "shell.run",
+      "type": "ToolCompleted"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ToolProposed": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "action": {
+        "paths": [
+          "src/lib.rs",
+          "Cargo.toml"
+        ],
+        "type": "ReadFiles"
+      },
+      "approval_id": "50000000-0000-0000-0000-000000000001",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "ToolProposed"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
+  "EventBody_ToolStarted": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "args_digest": "abc123",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "tool": "shell.run",
+      "type": "ToolStarted"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  }
+}

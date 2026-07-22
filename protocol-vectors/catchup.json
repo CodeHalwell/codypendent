@@ -1,0 +1,37 @@
+{
+  "Catchup_Events": {
+    "events": [
+      {
+        "actor": {
+          "agent_id": "c0000000-0000-0000-0000-000000000001",
+          "model": "claude-sonnet-5",
+          "run_id": "30000000-0000-0000-0000-000000000001",
+          "type": "Agent"
+        },
+        "body": {
+          "type": "SessionClosed"
+        },
+        "causation_id": "40000000-0000-0000-0000-000000000001",
+        "correlation_id": "b0000000-0000-0000-0000-000000000001",
+        "occurred_at": "2026-01-01T00:00:00Z",
+        "sequence": 9
+      }
+    ],
+    "from": 1,
+    "through": 1,
+    "type": "Events"
+  },
+  "Catchup_Snapshot": {
+    "projection": {
+      "active_runs": [
+        "30000000-0000-0000-0000-000000000001"
+      ],
+      "closed": false,
+      "last_sequence": 512,
+      "session_id": "20000000-0000-0000-0000-000000000001",
+      "title": "long session"
+    },
+    "through": 512,
+    "type": "Snapshot"
+  }
+}

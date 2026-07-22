@@ -1,0 +1,102 @@
+{
+  "WorkflowEvent_NodeTransitioned": {
+    "attempt": 1,
+    "cost": {
+      "tool_calls": 3,
+      "wall_time_secs": 12
+    },
+    "node_id": "inspect",
+    "state": {
+      "type": "Completed"
+    },
+    "type": "NodeTransitioned",
+    "warnings": [
+      "tool_calls at 4/5 (80%)"
+    ],
+    "workflow_run_id": "wfrun-abc"
+  },
+  "WorkflowEvent_RunPhaseChanged": {
+    "phase": {
+      "type": "Cancelled"
+    },
+    "type": "RunPhaseChanged",
+    "workflow_run_id": "wfrun-abc"
+  },
+  "WorkflowNodeState_Blocked": {
+    "type": "Blocked"
+  },
+  "WorkflowNodeState_Completed": {
+    "type": "Completed"
+  },
+  "WorkflowNodeState_Failed": {
+    "type": "Failed"
+  },
+  "WorkflowNodeState_Pending": {
+    "type": "Pending"
+  },
+  "WorkflowNodeState_Running": {
+    "type": "Running"
+  },
+  "WorkflowNodeState_Skipped": {
+    "type": "Skipped"
+  },
+  "WorkflowNodeState_WaitingApproval": {
+    "type": "WaitingApproval"
+  },
+  "WorkflowNodeView": {
+    "attempt": 1,
+    "cost": {
+      "tool_calls": 3,
+      "wall_time_secs": 12
+    },
+    "node_id": "inspect",
+    "state": {
+      "type": "Completed"
+    },
+    "warnings": [
+      "tool_calls at 4/5 (80%)"
+    ],
+    "workflow_run_id": "wfrun-abc"
+  },
+  "WorkflowRunPhase_Cancelled": {
+    "type": "Cancelled"
+  },
+  "WorkflowRunPhase_Completed": {
+    "type": "Completed"
+  },
+  "WorkflowRunPhase_Failed": {
+    "type": "Failed"
+  },
+  "WorkflowRunPhase_Paused": {
+    "type": "Paused"
+  },
+  "WorkflowRunPhase_Pending": {
+    "type": "Pending"
+  },
+  "WorkflowRunPhase_Running": {
+    "type": "Running"
+  },
+  "WorkflowRunSnapshot": {
+    "nodes": [
+      {
+        "attempt": 1,
+        "cost": {
+          "tool_calls": 3,
+          "wall_time_secs": 12
+        },
+        "node_id": "inspect",
+        "state": {
+          "type": "Completed"
+        },
+        "warnings": [
+          "tool_calls at 4/5 (80%)"
+        ],
+        "workflow_run_id": "wfrun-abc"
+      }
+    ],
+    "phase": {
+      "type": "Running"
+    },
+    "workflow_run_id": "wfrun-abc"
+  }
+}

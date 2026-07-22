@@ -1,0 +1,187 @@
+{
+  "Diagnostic": {
+    "message": "mismatched types",
+    "path": "src/lib.rs",
+    "range": {
+      "end": {
+        "character": 4,
+        "line": 2
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": {
+      "type": "Error"
+    },
+    "source": "rustc"
+  },
+  "DiagnosticSeverity_Error": {
+    "type": "Error"
+  },
+  "DiagnosticSeverity_Hint": {
+    "type": "Hint"
+  },
+  "DiagnosticSeverity_Information": {
+    "type": "Information"
+  },
+  "DiagnosticSeverity_Warning": {
+    "type": "Warning"
+  },
+  "DiffRequest": {
+    "left": "fn broken() {}",
+    "left_label": "HEAD",
+    "right": "fn fixed() {}",
+    "right_label": "proposed",
+    "title": "Codypendent change set c1"
+  },
+  "DirtyBufferDigest": {
+    "byte_length": 42,
+    "path": "src/lib.rs",
+    "sha256": "abc123"
+  },
+  "EditorSelection": {
+    "path": "src/lib.rs",
+    "range": {
+      "end": {
+        "character": 4,
+        "line": 2
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    }
+  },
+  "IdeContextUpdate": {
+    "active_file": "src/lib.rs",
+    "diagnostics_revision": 7,
+    "dirty_buffers": [
+      {
+        "byte_length": 42,
+        "path": "src/lib.rs",
+        "sha256": "abc123"
+      }
+    ],
+    "open_files": [
+      "src/lib.rs",
+      "Cargo.toml"
+    ],
+    "selection": {
+      "path": "src/lib.rs",
+      "range": {
+        "end": {
+          "character": 4,
+          "line": 2
+        },
+        "start": {
+          "character": 0,
+          "line": 1
+        }
+      }
+    }
+  },
+  "IdeRequest_ApplyEdit": {
+    "edit": {
+      "edits": [
+        {
+          "new_text": "fn fixed() {}",
+          "path": "src/lib.rs",
+          "range": {
+            "end": {
+              "character": 4,
+              "line": 2
+            },
+            "start": {
+              "character": 0,
+              "line": 1
+            }
+          }
+        }
+      ]
+    },
+    "type": "ApplyEdit"
+  },
+  "IdeRequest_RevealLocation": {
+    "location": {
+      "path": "src/lib.rs"
+    },
+    "type": "RevealLocation"
+  },
+  "IdeRequest_ShowDiff": {
+    "request": {
+      "left": "fn broken() {}",
+      "left_label": "HEAD",
+      "right": "fn fixed() {}",
+      "right_label": "proposed",
+      "title": "Codypendent change set c1"
+    },
+    "type": "ShowDiff"
+  },
+  "Location": {
+    "path": "src/lib.rs"
+  },
+  "Position": {
+    "character": 0,
+    "line": 1
+  },
+  "Range": {
+    "end": {
+      "character": 4,
+      "line": 2
+    },
+    "start": {
+      "character": 0,
+      "line": 1
+    }
+  },
+  "SourceProvenance_AgentWorktree": {
+    "type": "AgentWorktree"
+  },
+  "SourceProvenance_CommittedAt": {
+    "revision": "a1b2c3d",
+    "type": "CommittedAt"
+  },
+  "SourceProvenance_Filesystem": {
+    "type": "Filesystem"
+  },
+  "SourceProvenance_GeneratedPatch": {
+    "type": "GeneratedPatch"
+  },
+  "SourceProvenance_UnsavedIdeBuffer": {
+    "type": "UnsavedIdeBuffer"
+  },
+  "TextEdit": {
+    "new_text": "fn fixed() {}",
+    "path": "src/lib.rs",
+    "range": {
+      "end": {
+        "character": 4,
+        "line": 2
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    }
+  },
+  "WorkspaceEdit": {
+    "edits": [
+      {
+        "new_text": "fn fixed() {}",
+        "path": "src/lib.rs",
+        "range": {
+          "end": {
+            "character": 4,
+            "line": 2
+          },
+          "start": {
+            "character": 0,
+            "line": 1
+          }
+        }
+      }
+    ]
+  }
+}

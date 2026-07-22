@@ -1,0 +1,294 @@
+{
+  "Payload_BlackboardItems": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "items": [
+      {
+        "author": {
+          "node_id": "diagnose",
+          "role": "investigator"
+        },
+        "confidence": 0.8,
+        "evidence": [
+          {
+            "line": 42,
+            "path": "src/parse.rs"
+          }
+        ],
+        "id": "0192-item",
+        "kind": "finding",
+        "payload": {
+          "summary": "the parser drops trailing commas"
+        },
+        "revision": 1,
+        "workflow_run_id": "wfrun-abc"
+      }
+    ],
+    "type": "BlackboardItems"
+  },
+  "Payload_BlackboardPosted": {
+    "author": {
+      "node_id": "diagnose",
+      "role": "investigator"
+    },
+    "confidence": 0.8,
+    "evidence": [
+      {
+        "line": 42,
+        "path": "src/parse.rs"
+      }
+    ],
+    "id": "0192-item",
+    "kind": "finding",
+    "payload": {
+      "summary": "the parser drops trailing commas"
+    },
+    "revision": 1,
+    "type": "BlackboardPosted",
+    "workflow_run_id": "wfrun-abc"
+  },
+  "Payload_Catchup": {
+    "catchup": {
+      "events": [],
+      "from": 1,
+      "through": 3,
+      "type": "Events"
+    },
+    "type": "Catchup"
+  },
+  "Payload_ClientHello": {
+    "capabilities": {
+      "audio_capture": false,
+      "diff_view": true,
+      "editor_mutations": true,
+      "image_display": false,
+      "mouse": true,
+      "rich_text": true,
+      "true_color": true,
+      "unicode": true
+    },
+    "client_name": "codypendent-vscode",
+    "client_version": "0.1.0",
+    "resume_token": "resume-abc",
+    "supported_protocols": [
+      {
+        "major": 1,
+        "minor": 1
+      }
+    ],
+    "type": "ClientHello"
+  },
+  "Payload_Command": {
+    "body": {
+      "mode": {
+        "type": "Build"
+      },
+      "objective": "diagnose the failing test",
+      "repository": "/home/user/project",
+      "session_id": "20000000-0000-0000-0000-000000000001",
+      "type": "StartRun"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "expected_revision": 7,
+    "idempotency_key": "idem-1",
+    "type": "Command"
+  },
+  "Payload_CommandAccepted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "created_run": "30000000-0000-0000-0000-000000000001",
+    "sequence": 7,
+    "type": "CommandAccepted"
+  },
+  "Payload_CommandRejected": {
+    "code": "policy.write-denied",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "details": {
+      "path": "/etc/passwd"
+    },
+    "message": "writes are denied in Explore mode",
+    "retryable": false,
+    "type": "CommandRejected",
+    "user_action": {
+      "type": "AdjustPolicy"
+    }
+  },
+  "Payload_DaemonStatusRequest": {
+    "type": "DaemonStatusRequest"
+  },
+  "Payload_DaemonStatusResponse": {
+    "boot_count": 1,
+    "daemon_version": "0.1.0",
+    "database_path": "/home/user/.local/share/codypendent/codypendent.db",
+    "instance_id": "a0000000-0000-0000-0000-000000000001",
+    "pid": 4242,
+    "protocol_version": {
+      "major": 1,
+      "minor": 1
+    },
+    "session_count": 2,
+    "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
+    "started_at": "2026-01-01T00:00:00Z",
+    "type": "DaemonStatusResponse",
+    "uptime_seconds": 3600
+  },
+  "Payload_DocumentLeaseGranted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "grant": {
+      "block_id": "b3",
+      "document_id": "70000000-0000-0000-0000-000000000001",
+      "expires_at": "2026-01-01T00:00:00Z",
+      "lease_id": "lease-9"
+    },
+    "type": "DocumentLeaseGranted"
+  },
+  "Payload_DocumentPublishRequested": {
+    "approval_id": "50000000-0000-0000-0000-000000000001",
+    "changed_files": [
+      "docs/architecture.md"
+    ],
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "git_action": "write docs/architecture.md in the working tree (approval-gated change set)",
+    "target": "repository file docs/architecture.md",
+    "type": "DocumentPublishRequested"
+  },
+  "Payload_DocumentSync": {
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "revision": 5,
+    "type": "DocumentSync",
+    "update": [
+      1,
+      2,
+      3,
+      255
+    ]
+  },
+  "Payload_Error": {
+    "code": "protocol.unsupported-payload",
+    "message": "unknown payload tag",
+    "retryable": false,
+    "type": "Error"
+  },
+  "Payload_Event_ApprovalRequestedExecuteCommand": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "action": {
+        "args": [
+          "test",
+          "--all-features"
+        ],
+        "cwd": "/home/user/project",
+        "environment": [
+          [
+            "RUST_BACKTRACE",
+            "1"
+          ],
+          [
+            "PATH",
+            "/usr/bin:/bin"
+          ]
+        ],
+        "program": "cargo",
+        "type": "ExecuteCommand"
+      },
+      "approval_id": "50000000-0000-0000-0000-000000000001",
+      "risk": {
+        "level": {
+          "type": "High"
+        },
+        "reasons": [
+          "writes outside the worktree",
+          "executes an external process"
+        ]
+      },
+      "type": "ApprovalRequested"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9,
+    "type": "Event"
+  },
+  "Payload_Ping": {
+    "type": "Ping"
+  },
+  "Payload_Pong": {
+    "type": "Pong"
+  },
+  "Payload_PromotionProposed": {
+    "candidate_id": "cand-abc123",
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "PromotionProposed"
+  },
+  "Payload_ServerHello": {
+    "daemon_instance": "a0000000-0000-0000-0000-000000000001",
+    "daemon_version": "0.1.0",
+    "heartbeat_interval_ms": 15000,
+    "resume_token": "opaque",
+    "selected_protocol": {
+      "major": 1,
+      "minor": 1
+    },
+    "type": "ServerHello"
+  },
+  "Payload_Shutdown": {
+    "type": "Shutdown"
+  },
+  "Payload_ShutdownAck": {
+    "type": "ShutdownAck"
+  },
+  "Payload_WorkflowEvent": {
+    "event": {
+      "attempt": 1,
+      "cost": {
+        "tool_calls": 3,
+        "wall_time_secs": 12
+      },
+      "node_id": "inspect",
+      "state": {
+        "type": "Completed"
+      },
+      "type": "NodeTransitioned",
+      "warnings": [
+        "tool_calls at 4/5 (80%)"
+      ],
+      "workflow_run_id": "wfrun-abc"
+    },
+    "type": "WorkflowEvent"
+  },
+  "Payload_WorkflowRunSnapshot": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "snapshot": {
+      "nodes": [
+        {
+          "attempt": 1,
+          "cost": {
+            "tool_calls": 3,
+            "wall_time_secs": 12
+          },
+          "node_id": "inspect",
+          "state": {
+            "type": "Completed"
+          },
+          "warnings": [
+            "tool_calls at 4/5 (80%)"
+          ],
+          "workflow_run_id": "wfrun-abc"
+        }
+      ],
+      "phase": {
+        "type": "Running"
+      },
+      "workflow_run_id": "wfrun-abc123"
+    },
+    "type": "WorkflowRunSnapshot"
+  },
+  "Payload_WorkflowRunStarted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "WorkflowRunStarted",
+    "workflow_run_id": "wfrun-abc123"
+  }
+}
