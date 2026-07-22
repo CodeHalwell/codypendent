@@ -1,0 +1,15 @@
+{
+  "id": "add-regression-test",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "In src/math.rs, add a new test function named exactly `average_handles_negative_numbers` to the `tests` module that asserts `average(&[-2, 4]) == Some(1.0)`. Do not change `add_one` or any other function — this task is only about adding test coverage for `average`.",
+  "policy": "coding-balanced",
+  "expected": [
+    { "assert": "file-changed", "path": "src/math.rs" },
+    { "assert": "symbol-exists", "symbol": "average_handles_negative_numbers" },
+    { "assert": "patch-scope-limit", "max_files": 1 },
+    { "assert": "command-not-executed", "contains": "rm -rf" }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "regression-test-addition"
+}

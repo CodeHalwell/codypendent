@@ -26,6 +26,10 @@ codypendent-workflow = { workspace = true }
 # The plugin security boundary, exposed via `codypendent plugin inspect`/`diff`
 # (Phase 6 STEP 6.1) so a user sees a plugin's capabilities + permission diff.
 codypendent-sandbox = { workspace = true }
+# The EvalCase/Assertion harness, exposed via `codypendent eval run` (Phase 7
+# STEP 7.1) so a suite scores against the objective RunObservation this client
+# builds from a headless run's own wire event stream.
+codypendent-eval = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -40,9 +44,12 @@ crossterm = { workspace = true }
 # Names the `SqlitePool` type the knowledge-fabric read helpers pass around (the
 # TUI projection seam). Already a transitive dependency via `codypendent-knowledge`.
 sqlx = { workspace = true }
+# `codypendent eval run` (Phase 7 STEP 7.1) clones each case's pinned fixture
+# revision into a scratch checkout per run, so the vendored fixture itself is
+# never mutated.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 chrono = { workspace = true }
 
 [lints]

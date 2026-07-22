@@ -846,6 +846,221 @@ async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
 }
 
 #[tokio::test]
+async fn propose_and_advance_promotion_are_role_denied_then_transport_unavailable() {
+    // Phase 7 STEP 7.5: `ProposePromotion`/`AdvancePromotion` are intercepted at
+    // the connection level like `StartWorkflow` — open to any role but
+    // `Observer` (a draft may be authored by anyone, including an
+    // agent/grader). The daemon's own test server injects no gateway, so an
+    // authorized role's command is rejected `promotion.transport-unavailable`
+    // rather than crashing the connection.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let observer = ClientId::new();
+    let mut obs_stream = connect(&paths).await;
+    handshake(&mut obs_stream, observer).await;
+    bind_role(
+        &mut obs_stream,
+        observer,
+        ClientRole::Observer,
+        "obs-prom-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut obs_stream,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::ProposePromotion {
+                    kind: "router".to_string(),
+                    name: "tool-selection".to_string(),
+                    version: 1,
+                    requires_permission_review: false,
+                },
+                "prom-observer-propose",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied, got {other:?}"),
+    }
+    let reply = send_recv(
+        &mut obs_stream,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::AdvancePromotion {
+                    candidate_id: "cand-1".to_string(),
+                    action: codypendent_protocol::PromotionAction::StartShadow,
+                },
+                "prom-observer-advance",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied, got {other:?}"),
+    }
+
+    // A Contributor gets past the role gate but the transport is unwired.
+    let contributor = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, contributor).await;
+    bind_role(
+        &mut stream,
+        contributor,
+        ClientRole::Contributor,
+        "contrib-prom-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            contributor,
+            Payload::Command(command(
+                CommandBody::ProposePromotion {
+                    kind: "router".to_string(),
+                    name: "tool-selection".to_string(),
+                    version: 1,
+                    requires_permission_review: false,
+                },
+                "prom-contributor-propose",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "promotion.transport-unavailable");
+        }
+        other => panic!("expected transport-unavailable, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn approve_and_rollback_promotion_require_controller_then_transport_unavailable() {
+    // The human-approval gate (ADR-010, exit criterion 2): only a `Controller`
+    // may issue `ApprovePromotion`/`RollbackPromotion` — every other role
+    // (Observer here, and by construction every non-Controller role) is
+    // refused BEFORE the promotion seam is ever consulted, so an agent/system
+    // actor can never reach it through this connection (there is no wire
+    // field for a caller to supply an actor at all — see
+    // `codypendent_daemon::promotion`'s module doc). A Controller gets past the
+    // gate but the daemon's own test server injects no gateway, so the command
+    // is rejected `promotion.transport-unavailable` rather than crashing the
+    // connection.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    // Neither an Observer nor a Contributor (only Controller) may approve or
+    // roll back — this is stricter than `ProposePromotion`/`AdvancePromotion`.
+    for (role, key_prefix) in [
+        (ClientRole::Observer, "obs"),
+        (ClientRole::Contributor, "contrib"),
+        (ClientRole::Approver, "approver"),
+    ] {
+        let client_id = ClientId::new();
+        let mut stream = connect(&paths).await;
+        handshake(&mut stream, client_id).await;
+        bind_role(
+            &mut stream,
+            client_id,
+            role,
+            &format!("{key_prefix}-prom-att"),
+        )
+        .await;
+
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ApprovePromotion {
+                        candidate_id: "cand-1".to_string(),
+                    },
+                    &format!("{key_prefix}-approve"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => assert_eq!(
+                error.code, "protocol.role-denied",
+                "role {role:?} must not be able to approve a promotion"
+            ),
+            other => panic!("expected role-denied for {role:?}, got {other:?}"),
+        }
+
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::RollbackPromotion {
+                        candidate_id: "cand-1".to_string(),
+                    },
+                    &format!("{key_prefix}-rollback"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => assert_eq!(
+                error.code, "protocol.role-denied",
+                "role {role:?} must not be able to roll back a promotion"
+            ),
+            other => panic!("expected role-denied for {role:?}, got {other:?}"),
+        }
+    }
+
+    // A Controller gets past the role gate; both commands then hit the
+    // unwired transport (this test server injects no gateway).
+    let controller = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, controller).await;
+    bind_role(
+        &mut stream,
+        controller,
+        ClientRole::Controller,
+        "controller-prom-att",
+    )
+    .await;
+    for (body, key) in [
+        (
+            CommandBody::ApprovePromotion {
+                candidate_id: "cand-1".to_string(),
+            },
+            "controller-approve",
+        ),
+        (
+            CommandBody::RollbackPromotion {
+                candidate_id: "cand-1".to_string(),
+            },
+            "controller-rollback",
+        ),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(controller, Payload::Command(command(body, key))),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(error.code, "promotion.transport-unavailable");
+            }
+            other => panic!("expected transport-unavailable for {key}, got {other:?}"),
+        }
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn attaching_a_second_client_emits_presence() {
     // STEP 3.7: presence events let each attached client see who else is here.
     let tmp = tempfile::tempdir().unwrap();

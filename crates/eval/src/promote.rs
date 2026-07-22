@@ -44,6 +44,31 @@
 //! anywhere) can help. The library makes self-promotion *structurally* impossible
 //! for honest code and leaves *authentication* to the layer that can actually do
 //! it.
+//!
+//! # Hardening (P7-2, P7-5)
+//!
+//! Two properties the state machine now enforces that an earlier revision did
+//! not: [`Candidate::finish_canary`] refuses a canary with zero recorded
+//! observations ([`PromotionError::CanaryUnobserved`]) — a canary that observed
+//! nothing has no signal to have "passed" on, so it can never *silently* reach
+//! `ComparisonReady` unobserved; and [`Candidate::rollback`] threads the actual
+//! requesting [`Actor`] onto its [`PromotionRecord`] instead of hardcoding
+//! `"system"`, while [`Candidate::observe_canary`]'s auto-rollback still
+//! attributes `"system"` (with a reason) since nothing else triggered it. Neither
+//! change touches the one rule this module may never weaken: only
+//! [`Actor::Human`] reaches [`PromotionStage::Promoted`].
+//!
+//! # Persistence (STEP 7.5 daemon wiring)
+//!
+//! [`crate::store::PromotionStore`] persists candidates across restarts. It
+//! adds `sqlx` to this crate (mirroring `codypendent-workflow`'s own
+//! daemon-agnostic store — "daemon-free" here means *no dependency on
+//! `codypendent-daemon`*, not "no database"). The store is deliberately unable
+//! to provide a back door: every mutating method **loads** the persisted
+//! [`Candidate`], calls the **real** state-machine method on it, and persists
+//! the resulting value — there is no SQL path that writes `stage = 'promoted'`
+//! independent of a successful [`Candidate::approve`] call, mirroring how this
+//! module already keeps `Candidate`'s fields private.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,6 +99,24 @@ impl ArtifactKind {
             ArtifactKind::Workflow => "workflow",
             ArtifactKind::ModelProfile => "model-profile",
         }
+    }
+
+    /// Parse the wire name [`Self::as_str`] produces, e.g. for a daemon command
+    /// carrying an artifact kind as a plain `String` (the wire protocol stays
+    /// free of a dependency on this crate — see `codypendent_protocol::PromotionAction`).
+    /// `None` for anything else, so a caller can reject an unrecognized kind
+    /// rather than guessing at one.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "retrieval" => ArtifactKind::RetrievalWeights,
+            "skill" => ArtifactKind::Skill,
+            "prompt" => ArtifactKind::Prompt,
+            "router" => ArtifactKind::Router,
+            "workflow" => ArtifactKind::Workflow,
+            "model-profile" => ArtifactKind::ModelProfile,
+            _ => return None,
+        })
     }
 }
 
@@ -539,6 +582,21 @@ mod tests {
     fn artifact_version_renders_the_registry_id() {
         assert_eq!(artifact().to_string(), "router/tool-selection/12");
         assert_eq!(artifact().stem(), "router/tool-selection");
+    }
+
+    #[test]
+    fn every_artifact_kind_round_trips_through_its_wire_name() {
+        for kind in [
+            ArtifactKind::RetrievalWeights,
+            ArtifactKind::Skill,
+            ArtifactKind::Prompt,
+            ArtifactKind::Router,
+            ArtifactKind::Workflow,
+            ArtifactKind::ModelProfile,
+        ] {
+            assert_eq!(ArtifactKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ArtifactKind::parse("not-a-kind"), None);
     }
 
     #[test]

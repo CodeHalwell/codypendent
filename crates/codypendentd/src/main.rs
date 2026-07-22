@@ -12,6 +12,7 @@
 mod documents;
 mod executor;
 mod publish;
+mod promotion;
 mod scan;
 mod workflow_exec;
 mod workflows;

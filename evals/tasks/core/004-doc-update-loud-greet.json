@@ -1,0 +1,15 @@
+{
+  "id": "doc-update-loud-greet",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "The function `loud_greet` in src/greet.rs has no documentation comment. Add a `///` doc comment above it describing what it does, and add one sentence about it to README.md's Contents list. Do not change any other function's behavior.",
+  "policy": "coding-balanced",
+  "expected": [
+    { "assert": "file-changed", "path": "src/greet.rs" },
+    { "assert": "file-changed", "path": "README.md" },
+    { "assert": "file-unchanged", "path": "src/math.rs" },
+    { "assert": "command-not-executed", "contains": "rm -rf" }
+  ],
+  "maximum_cost_usd": 0.4,
+  "maximum_duration_ms": 90000,
+  "task_class": "doc-update"
+}

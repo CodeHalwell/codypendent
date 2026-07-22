@@ -132,6 +132,15 @@ pub enum Payload {
         changed_files: Vec<String>,
         git_action: String,
     },
+    /// A `ProposePromotion` command was accepted; carries the new promotion
+    /// candidate's id (Phase 7 STEP 7.5). A distinct reply from
+    /// `CommandAccepted` for the same reason as `WorkflowRunStarted`: the
+    /// client needs the id back to advance/approve/roll back that exact
+    /// candidate.
+    PromotionProposed {
+        command_id: CommandId,
+        candidate_id: String,
+    },
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
     /// A collaborative document's CRDT sync update, delivered to the clients
@@ -373,6 +382,25 @@ mod tests {
                 assert!(git_action.contains("docs/architecture.md"));
             }
             other => panic!("expected DocumentPublishRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promotion_proposed_payload_round_trips() {
+        let command_id = CommandId::new();
+        let proposed = Payload::PromotionProposed {
+            command_id,
+            candidate_id: "cand-0192abcd".to_string(),
+        };
+        match round_trip_payload(proposed) {
+            Payload::PromotionProposed {
+                command_id: id,
+                candidate_id,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(candidate_id, "cand-0192abcd");
+            }
+            other => panic!("expected PromotionProposed, got {other:?}"),
         }
     }
 
