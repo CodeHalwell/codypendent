@@ -119,6 +119,13 @@ const DEFAULT_MODEL_POLICY: &str = "hosted-default";
 /// on the inner agent-run row, so this stays the empty per-run budget.
 const AGENT_NODE_BUDGET_JSON: &str = "{}";
 
+/// How long a tool-node approval park stays live before the daemon's expiry sweep
+/// self-rejects it (MF-1). A parked tool node is woken promptly by cancellation,
+/// but an approval that is neither resolved nor cancelled must not pin a dead
+/// request in the approver queue forever — so the park requests a TTL rather than
+/// the `None` the agent-loop park uses. Matches the worktree lease TTL horizon.
+const WORKFLOW_APPROVAL_TTL_HOURS: i64 = 24;
+
 /// Everything a [`RepositoryTestRunner`] needs to run the repository's tests: the
 /// node's worktree and the policy-derived scopes + artifact sink that
 /// [`RepositoryTest::execute`] enforces and spills to.
@@ -362,6 +369,19 @@ impl WorkflowRunCancellations {
     /// a drive returns), so a cancelled run's sticky entry does not linger.
     pub(crate) fn finish(&self, workflow_run_id: &str) {
         self.lock().remove(workflow_run_id);
+    }
+
+    /// Whether `workflow_run_id` has been cancelled — reads the sticky `cancelled`
+    /// flag [`cancel`](Self::cancel) sets (MF-1). The tool-node approval park's
+    /// defence-in-depth re-check calls this at the write site, so a cancel that
+    /// raced the grant still aborts the durable effect. The flag OUTLIVES
+    /// [`deregister`](Self::deregister) (a cancelled run's entry lingers until
+    /// [`finish`](Self::finish)), so this stays truthful even after the park
+    /// deregistered its own handle.
+    pub(crate) fn is_cancelled(&self, workflow_run_id: &str) -> bool {
+        self.lock()
+            .get(workflow_run_id)
+            .is_some_and(|entry| entry.cancelled)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RunCancelState>> {
@@ -1175,6 +1195,16 @@ impl AgentLoopNodeExecutor {
                 self.fail_run(run_id, session_id, &objective, &reason).await;
                 NodeOutcome::failed(reason)
             }
+            Ok(ToolNodeResult::Cancelled) => {
+                // Cancelled while parked (MF-1): the node performed no effect (no
+                // GitHub write / patch+test). Fail the internal run cleanly and
+                // report a cancelled node failure — the driver records the node
+                // terminal, and the frontier loop, seeing the run `Cancelled`,
+                // returns without overwriting it. The node never reaches Completed.
+                let reason = format!("workflow.tool-cancelled: tool node `{}` was cancelled while parked for approval", ctx.node.id);
+                self.fail_run(run_id, session_id, &objective, &reason).await;
+                NodeOutcome::failed(reason)
+            }
             Err(reason) => {
                 let reason = format!("tool node `{}`: {reason}", ctx.node.id);
                 self.fail_run(run_id, session_id, &objective, &reason).await;
@@ -1304,10 +1334,16 @@ impl AgentLoopNodeExecutor {
                 .park_for_approval(ctx, session_id, run_id, action, reasons, Vec::new())
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(ParkOutcome::Approved) => {}
+                Ok(ParkOutcome::Rejected) => {
                     guard.release().await;
                     return Ok(ToolNodeResult::Rejected);
+                }
+                Ok(ParkOutcome::Cancelled) => {
+                    // Cancelled while parked (MF-1): release the worktree and stop —
+                    // do NOT apply the untrusted patch or run the tests.
+                    guard.release().await;
+                    return Ok(ToolNodeResult::Cancelled);
                 }
                 Err(error) => {
                     guard.release().await;
@@ -1531,9 +1567,19 @@ impl AgentLoopNodeExecutor {
             .park_for_approval(ctx, session_id, run_id, action, reasons, capabilities)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => return Ok(ToolNodeResult::Rejected),
+            Ok(ParkOutcome::Approved) => {}
+            Ok(ParkOutcome::Rejected) => return Ok(ToolNodeResult::Rejected),
+            Ok(ParkOutcome::Cancelled) => return Ok(ToolNodeResult::Cancelled),
             Err(error) => return Err(format!("approval failed: {error}")),
+        }
+
+        // Defence-in-depth (MF-1): a cancel that landed after the grant but before
+        // this durable write must still abort it — the cancel-stops-effects
+        // invariant the agent path upholds. `park_for_approval` already re-checks,
+        // but re-read the sticky cancelled flag at the write site so a cancel racing
+        // the already-returned grant cannot slip a GitHub mutation through.
+        if self.cancellations.is_cancelled(ctx.workflow_run_id) {
+            return Ok(ToolNodeResult::Cancelled);
         }
 
         match github.update_pull_request(&repo, number, &request).await {
@@ -1569,9 +1615,23 @@ impl AgentLoopNodeExecutor {
     /// Park a tool node on an approval on the SAME durable broker the agent loop
     /// parks on (STEP 5.2 approval waits): transition the workflow NODE to
     /// [`NodeState::WaitingApproval`] (the state the review noted had no producers),
-    /// request the approval, block on the decision, then transition the node back
-    /// to `Running` (the driver records the terminal state after execution).
-    /// Returns whether the approval was granted.
+    /// request the approval, then race the decision against the run's cancellation
+    /// token, transitioning the node back to `Running` on a decision (the driver
+    /// records the terminal state after execution).
+    ///
+    /// **Cancellation (MF-1).** Before waiting, the run's cancellation token is
+    /// registered in [`WorkflowRunCancellations`] and the wait is a `tokio::select!`
+    /// against it — mirroring the agent loop's approval-parking select and
+    /// [`drive_agent`](Self::drive_agent)'s register/deregister. Without this a
+    /// `CancelWorkflow` (which fires the run's handles, of which a parked tool node
+    /// had none) never woke the park: the drive blocked forever holding the per-run
+    /// lock, and a later grant could still drive the node to its durable write AFTER
+    /// the workflow was cancelled. On cancel the park returns
+    /// [`ParkOutcome::Cancelled`] and the node does NOT proceed to its effect. The
+    /// token is deregistered on EVERY exit (grant, reject, cancel, await error), and
+    /// a defence-in-depth re-check of the sticky cancelled flag turns a cancel that
+    /// raced the grant into `Cancelled` too. The request carries a TTL so an
+    /// abandoned approval self-expires rather than sitting in the queue forever.
     async fn park_for_approval(
         &self,
         ctx: &NodeContext<'_>,
@@ -1580,7 +1640,7 @@ impl AgentLoopNodeExecutor {
         action: ProposedAction,
         reasons: Vec<String>,
         capabilities: Vec<Capability>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ParkOutcome> {
         let store = WorkflowStore::new();
         store
             .transition_node(
@@ -1597,6 +1657,10 @@ impl AgentLoopNodeExecutor {
             level: RiskLevel::Medium,
             reasons,
         };
+        // A TTL so an abandoned park self-expires from the approver queue (the
+        // daemon's 30s expiry sweep rejects it), rather than the `None` the
+        // cancellation-woken agent-loop park uses (MF-1).
+        let expires_at = Utc::now() + chrono::Duration::hours(WORKFLOW_APPROVAL_TTL_HOURS);
         let approval_id = self
             .approvals
             .request(
@@ -1606,10 +1670,30 @@ impl AgentLoopNodeExecutor {
                 action,
                 risk,
                 capabilities,
-                None,
+                Some(expires_at),
             )
             .await?;
-        let decision = self.approvals.await_decision(approval_id).await?;
+
+        // Register the run's cancellation token and race the decision against it so
+        // a `CancelWorkflow` wakes the park promptly (MF-1). Deregistered on every
+        // exit path below — no leak in the sticky registry.
+        let (registration, token) = self.cancellations.register(ctx.workflow_run_id);
+        let decision = tokio::select! {
+            decision = self.approvals.await_decision(approval_id) => decision,
+            _ = token.cancelled() => {
+                // Cancelled while parked: drop the broker's waiter (only a consumed
+                // decision would otherwise remove it — a per-daemon-lifetime leak),
+                // deregister, and stop. The node performs no effect.
+                self.approvals.forget_waiter(approval_id);
+                self.cancellations.deregister(ctx.workflow_run_id, registration);
+                return Ok(ParkOutcome::Cancelled);
+            }
+        };
+        self.cancellations
+            .deregister(ctx.workflow_run_id, registration);
+        // Propagate an await error (e.g. the broker was torn down) after
+        // deregistering so no handle leaks on the error path.
+        let decision = decision?;
         store
             .transition_node(
                 &self.pool,
@@ -1621,7 +1705,17 @@ impl AgentLoopNodeExecutor {
                 None,
             )
             .await?;
-        Ok(decision == ApprovalDecision::Approve)
+        // Defence-in-depth: a cancel that raced the grant (fired after the decision
+        // won the select) must still not let the node reach its effect. The sticky
+        // cancelled flag survives deregister, so re-read it before returning Approve.
+        if self.cancellations.is_cancelled(ctx.workflow_run_id) {
+            return Ok(ParkOutcome::Cancelled);
+        }
+        Ok(if decision == ApprovalDecision::Approve {
+            ParkOutcome::Approved
+        } else {
+            ParkOutcome::Rejected
+        })
     }
 
     /// Post a tool node's declared `outputs` onto the run's blackboard from the
@@ -2078,6 +2172,21 @@ enum ToolNodeResult {
     Completed { test: Option<RepositoryTestOutcome> },
     /// The node parked for approval and the approval was rejected.
     Rejected,
+    /// The workflow was cancelled while the node was parked for approval (MF-1):
+    /// the node stops WITHOUT performing its effect (no GitHub write / patch+test),
+    /// upholding the cancel-stops-effects invariant the agent path already holds.
+    Cancelled,
+}
+
+/// The result of a tool node's approval park (the tool-node counterpart of the
+/// agent loop's approval-parking select). `Cancelled` is the MF-1 addition: a
+/// `CancelWorkflow` fired the run's cancellation token while the node was parked
+/// (or raced its grant), so the park returns WITHOUT the node proceeding to its
+/// (possibly durable) write.
+enum ParkOutcome {
+    Approved,
+    Rejected,
+    Cancelled,
 }
 
 /// Extract the pull-request number from a run's typed inputs: the `pull_request`
@@ -3719,6 +3828,384 @@ steps:
         assert!(
             github.updated.lock().unwrap().is_empty(),
             "a rejected publish never reaches GitHub"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Tool-node approval-park lifecycle: cancel + crash-recovery (MF-1 / MF-2)
+    // ----------------------------------------------------------------------
+
+    use codypendent_daemon::workflow_stream::WorkflowHub;
+    use codypendent_daemon::workflows::{CancelWorkflowRequest, WorkflowLifecycle};
+
+    /// A minimal single-node workflow whose one tool node is a GitHub mutation gated
+    /// on approval — so the node parks BEFORE its durable write, the exact seam MF-1
+    /// hardens. Its `pull_request` input feeds the default `number` binding.
+    const PUBLISH_ONLY_MANIFEST: &str = "\
+schema_version: 1
+id: publish-only
+version: 1
+inputs:
+  pull_request:
+    type: github_pull_request
+    required: true
+steps:
+  - id: publish
+    tool: github.update-pull-request
+    approval: always
+";
+
+    /// A minimal single-node `repository.test` workflow gated on approval — it parks
+    /// before running the suite, so MF-2's crash-recovery resume is exercised with no
+    /// GitHub dependency.
+    const GATED_TEST_MANIFEST: &str = "\
+schema_version: 1
+id: gated
+version: 1
+steps:
+  - id: check
+    tool: repository.test
+    approval: always
+";
+
+    /// Poll until `node_id`'s durable state reaches `target`, or panic — the
+    /// node-granularity twin of [`wait_for_run_state`]. A wedged drive (the MF-1 bug)
+    /// never advances the parked node, so this panics, failing the test.
+    async fn wait_for_node_state(
+        pool: &SqlitePool,
+        run_id: &str,
+        node_id: &str,
+        target: NodeState,
+    ) {
+        for _ in 0..500 {
+            let snap = WorkflowStore::new()
+                .snapshot(pool, run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if snap
+                .nodes
+                .iter()
+                .find(|n| n.node_id == node_id)
+                .map(|n| n.state)
+                == Some(target)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let snap = WorkflowStore::new()
+            .snapshot(pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        panic!(
+            "node {node_id} never reached {target:?}; last {:?}",
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == node_id)
+                .map(|n| n.state)
+        );
+    }
+
+    /// Build a host + tool-node executor sharing ONE cancellation registry, exactly
+    /// as the assembly's `build_workflow_host` wires them (`with_streaming`), so the
+    /// host's cancel seam fires the token the tool-node park races against (MF-1). A
+    /// test host built via `WorkflowConductorHost::new` alone would give the host and
+    /// the executor DISTINCT registries, and a cancel would never reach the park.
+    fn shared_cancel_host(
+        pool: &SqlitePool,
+        paths: &RuntimePaths,
+        repo: &Path,
+        github: Option<Arc<dyn GitHubApi>>,
+        broker: ApprovalBroker,
+    ) -> (
+        WorkflowConductorHost<AgentLoopNodeExecutor>,
+        WorkflowRunCancellations,
+    ) {
+        let cancellations = WorkflowRunCancellations::default();
+        let executor = AgentLoopNodeExecutor::new(
+            pool.clone(),
+            paths.clone(),
+            SubscriptionHub::new(),
+            broker,
+            github,
+            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            repo.to_path_buf(),
+            BlackboardHub::new(),
+            cancellations.clone(),
+        )
+        .with_test_runner(ScriptedRepositoryTestRunner::new(vec![true]));
+        let host = WorkflowConductorHost::new(pool.clone(), Arc::new(executor))
+            .with_streaming(WorkflowHub::new(), cancellations.clone());
+        (host, cancellations)
+    }
+
+    #[tokio::test]
+    async fn cancel_while_a_tool_node_is_parked_unblocks_the_drive_and_never_writes() {
+        // MF-1: a tool node parked on an approval must observe a `CancelWorkflow` —
+        // the cancel fires the run's token, waking the park's `select!` — so the drive
+        // UNBLOCKS (releases the per-run lock), the run ends `Cancelled`, the parked
+        // node never reaches `Completed`, and the GitHub write never runs even if a
+        // grant lands after the cancel. Before MF-1 the park ignored the token: the
+        // drive wedged forever holding the lock, and a later grant drove the durable
+        // write AFTER cancellation.
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo_with_origin(tmp.path(), "repo");
+        let github: Arc<FakeGitHub> = Arc::new(FakeGitHub::default());
+        let broker = ApprovalBroker::new();
+        let (host, cancellations) =
+            shared_cancel_host(&pool, &paths, &repo, Some(github.clone()), broker.clone());
+
+        let run_id = host
+            .start(StartWorkflowRequest {
+                manifest: PUBLISH_ONLY_MANIFEST.to_owned(),
+                workflow_id: None,
+                inputs: json!({ "pull_request": 7 }),
+                idempotency_key: "cmd-cancel-park".to_owned(),
+                repository: Some(repo.to_string_lossy().into_owned()),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("start");
+
+        // Wait for `publish` to park on its approval.
+        wait_for_node_state(&pool, &run_id, "publish", NodeState::WaitingApproval).await;
+
+        // Cancel while parked — fires the run's token through the SHARED registry.
+        host.cancel(CancelWorkflowRequest {
+            workflow_run_id: run_id.clone(),
+            client_id: ClientId::new(),
+        })
+        .await
+        .expect("cancel accepted");
+
+        // The park wakes: the parked node reaches a terminal state (never Completed).
+        // With the MF-1 bug it would stay WaitingApproval forever and this panics.
+        wait_for_node_state(&pool, &run_id, "publish", NodeState::Failed).await;
+
+        // The drive fully drained and released the per-run lock: the host drops the
+        // run's cancellation entry via `finish()` ONLY after the drive returns, so the
+        // sticky flag clearing proves the drive unblocked (a wedged drive never
+        // reaches `finish()` — the direct "the per-run lock is released" signal).
+        for _ in 0..500 {
+            if !cancellations.is_cancelled(&run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !cancellations.is_cancelled(&run_id),
+            "the drive never drained — the per-run lock is still held (MF-1)"
+        );
+
+        // The run ended Cancelled and the parked node never reached Completed.
+        let snap = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.run.state, WorkflowRunState::Cancelled);
+        assert_ne!(
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == "publish")
+                .unwrap()
+                .state,
+            NodeState::Completed,
+            "the parked node never reached Completed"
+        );
+
+        // No write on cancel — and a grant delivered AFTER the cancel still never
+        // drives it (the run is terminal; the write-site re-check backstops any race).
+        assert!(
+            github.updated.lock().unwrap().is_empty(),
+            "no GitHub write on cancel"
+        );
+        let pending: Option<String> =
+            sqlx::query_scalar("SELECT id FROM approvals WHERE state = 'pending' LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        if let Some(id) = pending {
+            broker
+                .resolve(
+                    &pool,
+                    ApprovalId::from_str(&id).unwrap(),
+                    ApprovalDecision::Approve,
+                    ApprovalScope::Once,
+                    "late".to_string(),
+                )
+                .await
+                .ok();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            github.updated.lock().unwrap().is_empty(),
+            "a grant delivered after the cancel must NOT drive the durable write (MF-1)"
+        );
+
+        // Compose (MF-1 + MF-2): a restart over a cancelled run must NOT re-drive it —
+        // `recover` leaves terminal runs alone, so the run stays Cancelled.
+        let spawned = host.recover().await.unwrap();
+        assert_eq!(
+            spawned, 0,
+            "a cancelled run is terminal — recovery never re-drives it"
+        );
+        assert_eq!(
+            WorkflowStore::new()
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run
+                .state,
+            WorkflowRunState::Cancelled,
+            "the run stays Cancelled after a restart (cancel-then-restart composes)"
+        );
+    }
+
+    /// Seed a run whose single tool node is durably `WaitingApproval` with the run
+    /// `Running` — the exact durable state a daemon crash mid-park leaves — then
+    /// return its id. The in-memory broker waiter is intentionally absent (a restart
+    /// lost it), so recovery must re-park against a fresh broker.
+    async fn seed_parked_run(pool: &SqlitePool, repo: &Path, key: &str) -> String {
+        let compiled = compile_yaml(GATED_TEST_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                pool,
+                &compiled,
+                key,
+                &json!({}),
+                Some(GATED_TEST_MANIFEST),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+        WorkflowStore::new()
+            .transition_node(
+                pool,
+                &run_id,
+                "check",
+                NodeState::WaitingApproval,
+                1,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        WorkflowStore::new()
+            .set_run_state(pool, &run_id, WorkflowRunState::Running)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    #[tokio::test]
+    async fn a_restart_re_parks_a_waiting_approval_tool_node_and_completes_on_grant() {
+        // MF-2: a daemon restart re-driving a still-`Running` run whose tool node is
+        // durably `WaitingApproval` must RESUME it (reset → Pending → re-park against
+        // the restarted broker), not strand it. Before MF-2 the recovery reset loop
+        // skipped WaitingApproval, the frontier came up empty, and the terminal
+        // computation wrote `Failed` — silently discarding a pending approval on ANY
+        // restart. Here the resumed park is granted, so the run completes.
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let run_id = seed_parked_run(&pool, &repo, "cmd-mf2-grant").await;
+
+        // A FRESH broker + executor (the in-memory waiter is lost on restart), driven
+        // over the same durable store — the `recover_drives_a_pending_run_left_by_a_crash`
+        // pattern at the tool-node-park altitude.
+        let broker = ApprovalBroker::new();
+        let runner = ScriptedRepositoryTestRunner::new(vec![true]);
+        let executor = tool_executor(
+            &pool,
+            &paths,
+            &repo,
+            None,
+            runner.clone(),
+            broker.clone(),
+            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+        );
+
+        let drive = {
+            let (executor, pool, run_id) = (executor.clone(), pool.clone(), run_id.clone());
+            tokio::spawn(async move {
+                WorkflowConductor::new()
+                    .drive(&pool, &run_id, &executor, &())
+                    .await
+            })
+        };
+        // The reset re-parks: a NEW pending approval appears; grant it.
+        resolve_next_approval(&pool, &broker, ApprovalDecision::Approve).await;
+        let state = drive.await.unwrap().unwrap();
+
+        assert_eq!(
+            state,
+            WorkflowRunState::Completed,
+            "a restart re-parks the WaitingApproval node and, on grant, completes (MF-2) — never Failed"
+        );
+        let snap = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == "check")
+                .unwrap()
+                .state,
+            NodeState::Completed
+        );
+        assert_eq!(
+            runner.call_count(),
+            1,
+            "the resumed park ran the suite exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_re_parks_a_waiting_approval_tool_node_and_fails_on_reject() {
+        // MF-2 (reject arm): the resumed park honours a REJECT — the node fails and
+        // the run fails legibly, distinct from the pre-fix silent `Failed` (which
+        // discarded the pending decision without ever re-asking).
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let run_id = seed_parked_run(&pool, &repo, "cmd-mf2-reject").await;
+
+        let broker = ApprovalBroker::new();
+        let runner = ScriptedRepositoryTestRunner::new(vec![true]);
+        let executor = tool_executor(
+            &pool,
+            &paths,
+            &repo,
+            None,
+            runner.clone(),
+            broker.clone(),
+            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+        );
+
+        let drive = {
+            let (executor, pool, run_id) = (executor.clone(), pool.clone(), run_id.clone());
+            tokio::spawn(async move {
+                WorkflowConductor::new()
+                    .drive(&pool, &run_id, &executor, &())
+                    .await
+            })
+        };
+        resolve_next_approval(&pool, &broker, ApprovalDecision::Reject).await;
+        let state = drive.await.unwrap().unwrap();
+
+        assert_eq!(
+            state,
+            WorkflowRunState::Failed,
+            "a rejected resumed park fails the run (MF-2 reject arm)"
+        );
+        assert_eq!(
+            runner.call_count(),
+            0,
+            "a rejected park never ran the suite"
         );
     }
 

@@ -333,16 +333,25 @@ impl WorkflowDriver {
         //   resume contract), CLEARING `agent_run_id`/cost explicitly (P5-D6b)
         //   rather than the COALESCE preserve `transition_node` uses — the attempt
         //   being thrown away must never leave a stale link behind;
+        // * a `WaitingApproval` node (a tool node parked on the in-memory approval
+        //   broker) is likewise RESUMABLE: the broker's waiter is lost on a daemon
+        //   restart, so a still-`Running` run left with a parked node would
+        //   otherwise strand — an empty frontier, then a `Failed` terminal that
+        //   discards all completed work (MF-2). Reset it exactly like `Running` so
+        //   it re-enters the frontier and re-drives the park once against the
+        //   restarted broker. This is safe/idempotent because the park happens
+        //   BEFORE the node's effect (the GitHub write / patch+test), so a parked
+        //   node has performed no external effect to repeat;
         // * a `Blocked` node paused the run on a budget exhaustion, so reset it to
         //   `Pending` to re-evaluate on this (resume) drive, PRESERVING its
         //   measured cost + block reason so the executor's pre-gate re-blocks
         //   against the same durable budget consumption without re-running the
         //   work (the "resume re-evaluates, still exhausted → re-blocks" loop).
         //
-        // Both were previously invisible; each now reports to the observer (P5-D4).
+        // All were previously invisible; each now reports to the observer (P5-D4).
         for node in &snapshot.nodes {
             match node.state {
-                NodeState::Running => {
+                NodeState::Running | NodeState::WaitingApproval => {
                     self.store
                         .reset_interrupted_node(pool, workflow_run_id, &node.node_id, node.attempt)
                         .await?;
