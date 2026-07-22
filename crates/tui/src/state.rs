@@ -525,8 +525,14 @@ pub struct WorkflowNodeCard {
     /// The blackboard artifact kinds the node declares to produce, pre-rendered
     /// (comma-joined, or `"—"`).
     pub outputs: String,
-    /// The node's recorded cost, pre-rendered (`"—"` until a run records one).
+    /// The node's MEASURED cost, pre-rendered (e.g. `"12s · 3 tool calls"`, or
+    /// `"—"` until a durable run records one). Only measured dimensions appear —
+    /// never a fabricated token/USD figure (Phase 5 T8).
     pub cost: String,
+    /// The node's latest failure or budget-block reason when a durable run
+    /// recorded one (P5-D4), else `"—"`. Surfaced in the node detail so a
+    /// `failed`/`blocked` node explains itself.
+    pub error: String,
 }
 
 /// A blackboard artifact projected for the blackboard view (Phase 5 STEP 5.3).

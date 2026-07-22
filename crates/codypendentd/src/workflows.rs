@@ -36,6 +36,7 @@
 //! node through the agent loop.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use codypendent_daemon::workflows::{
@@ -44,11 +45,13 @@ use codypendent_daemon::workflows::{
 };
 use codypendent_protocol::CodypendentError;
 use codypendent_workflow::{
-    compile_yaml, ConductorError, NodeExecutor, NodeObserver, NodeState, WorkflowConductor,
-    WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    compile_yaml, BudgetWarning, ConductorError, NodeExecutor, NodeObserver, NodeState,
+    WorkflowConductor, WorkflowRunState, WorkflowStore, WorkflowStoreError,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
+
+use crate::workflow_exec::load_agent_profiles;
 
 /// The per-run drive-lock registry a [`WorkflowConductorHost`] holds: one async
 /// lock per in-flight run id, so no two drives advance one run at once.
@@ -259,6 +262,52 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 )
             })?;
 
+            // Role → profile validation (T8), scoped to a MULTI-agent workflow
+            // whose run repository HAS profiles configured: every agent role must
+            // resolve, else a reviewer-style role would silently fall back to the
+            // permissive `Build` mode at execution instead of its structurally
+            // read-only profile (STEP 5.4.1 independence is structural, not
+            // prompted). The conservative matrix shipped (see the T8 report):
+            //
+            //   * no profiles directory (empty set) → the single-agent baseline
+            //     (`Build`/`hosted-default`) stays selectable; NO rejection here,
+            //     even for a multi-agent workflow — the defaults apply uniformly;
+            //   * a single-agent (or tool-only) workflow → NOT validated here; an
+            //     unresolved role fails legibly at execution (never a silent
+            //     default), so a single agent stays selectable;
+            //   * a multi-agent workflow WITH profiles configured → every agent
+            //     role must resolve, else this rejects before the run starts.
+            //
+            // A malformed/ambiguous profile is a real misconfiguration, surfaced
+            // here for a multi-agent workflow rather than deferred to a node
+            // failure mid-run.
+            if let Some(repo) = repository.as_deref() {
+                if compiled.agent_node_count() >= 2 {
+                    let profiles = load_agent_profiles(Path::new(repo)).map_err(|reason| {
+                        CodypendentError::new("workflow.invalid-agent-profile", reason, false)
+                    })?;
+                    if !profiles.is_empty() {
+                        let unresolved = profiles.unresolved_roles(&compiled);
+                        if !unresolved.is_empty() {
+                            let detail = unresolved
+                                .iter()
+                                .map(|r| format!("step `{}` \u{2192} role `{}`", r.step, r.role))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(CodypendentError::new(
+                                "workflow.unresolved-role",
+                                format!(
+                                    "multi-agent workflow has {} unresolved agent role(s) against \
+                                     the repository's .codypendent/agents: {detail}",
+                                    unresolved.len()
+                                ),
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Create the durable run idempotently, keyed by the command's
             // idempotency key (a duplicate delivery resolves to the same run), and
             // record the manifest so recovery can recompile it. A store error may be
@@ -406,6 +455,43 @@ impl NodeObserver for LoggingNodeObserver {
             state = state.as_str(),
             attempt,
             "workflow node transition"
+        );
+    }
+
+    fn on_budget_warning(&self, node_id: &str, warning: BudgetWarning, attempt: u32) {
+        // A budget dimension crossed 80% (the node stayed within budget). Today
+        // this lands in the daemon log the way transitions do; the client-facing
+        // stream (T9) will carry it to attached clients.
+        warn!(
+            run = %self.run_id,
+            node = %node_id,
+            attempt,
+            scope = warning.scope.as_str(),
+            dimension = warning.dimension.as_str(),
+            used = warning.used,
+            limit = warning.limit,
+            "workflow node budget warning (80%)"
+        );
+    }
+
+    fn on_attempt_failed(&self, node_id: &str, attempt: u32, error: &str) {
+        // The per-attempt history of a retried failure (the durable `error` column
+        // keeps only the terminal reason — P5-D4).
+        warn!(
+            run = %self.run_id,
+            node = %node_id,
+            attempt,
+            %error,
+            "workflow node attempt failed (will retry)"
+        );
+    }
+
+    fn on_recovery_reset(&self, node_id: &str, attempt: u32) {
+        info!(
+            run = %self.run_id,
+            node = %node_id,
+            attempt,
+            "workflow node reset for recovery/resume"
         );
     }
 }

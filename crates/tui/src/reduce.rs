@@ -2190,6 +2190,7 @@ mod tests {
             depends_on: "—".to_owned(),
             outputs: "test_result".to_owned(),
             cost: "—".to_owned(),
+            error: "—".to_owned(),
         }
     }
 

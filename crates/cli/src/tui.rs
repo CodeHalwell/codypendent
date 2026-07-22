@@ -161,11 +161,18 @@ pub async fn run(
     state.docs = projections.docs;
     state.edges = projections.edges;
     state.blackboard = projections.blackboard;
-    // Phase 5 STEP 5.2: seed the workflow-graph view by compiling the
-    // repository's declared workflow manifests. This reads files, not the
-    // knowledge db, so it is a standalone projection; a malformed manifest logs
-    // and is skipped rather than failing the TUI.
-    state.workflow = load_workflows(&repo);
+    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests, then overlay each workflow's
+    // LATEST durable run — its per-node live state, measured cost, and
+    // failure/block reason — from the knowledge db (WAL allows a concurrent read
+    // alongside the daemon). A malformed manifest logs and is skipped; a db-open
+    // failure degrades to the compiled (pre-run) view — neither fails the TUI.
+    {
+        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+            .await
+            .ok();
+        state.workflow = load_workflows(&repo, overlay_pool.as_ref()).await;
+    }
 
     // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
     // event loop seeds a document's client replica from it and re-reads the
@@ -1496,10 +1503,14 @@ const MAX_WORKFLOW_NODES: usize = 500;
 /// Manifests are compiled in sorted filename order for a deterministic view; an
 /// unreadable or non-compiling manifest logs to stderr and is skipped, so one
 /// broken file drops only its own workflow — never the others, and never the
-/// TUI. Nodes keep their compiled topological order. State/cost are the pre-run
-/// values (`pending` / `—`); overlaying a durable run's live per-node
-/// state/cost lands with the daemon-side workflow executor.
-fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
+/// TUI. Nodes keep their compiled topological order.
+///
+/// When `pool` is present, each workflow's LATEST durable run overlays its
+/// per-node live state, MEASURED cost, and failure/block reason (Phase 5 T8 /
+/// P5-D4) onto the compiled defaults; `None` (or no run yet) shows the pre-run
+/// values (`pending` / `—`). Read failures degrade to the compiled view, never
+/// fail the TUI.
+async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<WorkflowNodeCard> {
     let dir = repo.join(".codypendent").join("workflows");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -1542,11 +1553,17 @@ fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
         match codypendent_workflow::compile_yaml(&yaml) {
             Ok(compiled) => {
                 let label = format!("{} v{}", compiled.id, compiled.version);
+                // Overlay the latest durable run's per-node state/cost/error, when
+                // one exists and a pool is available.
+                let records = match pool {
+                    Some(pool) => latest_run_node_records(pool, &compiled.id).await,
+                    None => HashMap::new(),
+                };
                 cards.extend(
                     compiled
                         .nodes
                         .iter()
-                        .map(|node| workflow_node_card(&label, node)),
+                        .map(|node| workflow_node_card(&label, node, records.get(&node.id))),
                 );
             }
             Err(error) => {
@@ -1568,17 +1585,94 @@ fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
     cards
 }
 
+/// The most recent durable run's node records for `workflow_id`, keyed by node id
+/// — the overlay [`load_workflows`] applies so the graph view shows a run's live
+/// state, MEASURED cost, and failure/block reason. An empty map when no run exists
+/// or a read fails: the view then shows the compiled defaults, never a stale one.
+async fn latest_run_node_records(
+    pool: &sqlx::SqlitePool,
+    workflow_id: &str,
+) -> HashMap<String, codypendent_workflow::WorkflowNodeRecord> {
+    let run_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs WHERE workflow_id = ? \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(workflow_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(run_id) = run_id else {
+        return HashMap::new();
+    };
+    match codypendent_workflow::WorkflowStore::new()
+        .snapshot(pool, &run_id)
+        .await
+    {
+        Ok(Some(snapshot)) => snapshot
+            .nodes
+            .into_iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// Render a node's MEASURED cost JSON into a human string for the graph view
+/// (Phase 5 T8). Only the dimensions actually measured are shown — wall time and
+/// tool calls — so the column never displays a fabricated token/USD figure. An
+/// empty or unrecognized cost shape renders `"—"` (nothing was measured).
+fn render_node_cost(cost: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(secs) = cost
+        .get("wall_time_secs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        parts.push(format!("{secs}s"));
+    }
+    if let Some(calls) = cost.get("tool_calls").and_then(serde_json::Value::as_u64) {
+        parts.push(format!(
+            "{calls} tool call{}",
+            if calls == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        "\u{2014}".to_owned()
+    } else {
+        parts.join(" \u{b7} ")
+    }
+}
+
 /// Map one [`CompiledNode`](codypendent_workflow::CompiledNode) into the view's
 /// [`WorkflowNodeCard`], pre-rendering every field to a human string. `workflow`
-/// is the owning workflow's `id vN` label the view groups by. State/cost are the
-/// pre-run values a compiled (not-yet-run) graph carries.
+/// is the owning workflow's `id vN` label the view groups by.
+///
+/// `record` is the node's durable run record when a run of this workflow exists:
+/// its live state, MEASURED cost (T8), and failure/block reason (P5-D4) overlay
+/// the compiled node's pre-run defaults (`pending` / `—` / `—`). This is the seam
+/// that turns the forever-`—` cost column and the reasonless `failed`/`blocked`
+/// node into real values.
 fn workflow_node_card(
     workflow: &str,
     node: &codypendent_workflow::CompiledNode,
+    record: Option<&codypendent_workflow::WorkflowNodeRecord>,
 ) -> WorkflowNodeCard {
     use codypendent_workflow::{ApprovalPolicy, NodeAction, WorkspaceMode};
 
     let dash = || "\u{2014}".to_owned(); // "—"
+
+    // Live state / measured cost / failure reason from a durable run record, else
+    // the compiled node's pre-run defaults.
+    let state = record.map_or_else(
+        || "pending".to_owned(),
+        |record| record.state.as_str().to_owned(),
+    );
+    let cost = record
+        .and_then(|record| record.cost.as_ref())
+        .map_or_else(dash, render_node_cost);
+    let error = record
+        .and_then(|record| record.error.clone())
+        .unwrap_or_else(dash);
     let (kind, action, agent, model_policy) = match &node.action {
         NodeAction::Agent {
             role,
@@ -1637,9 +1731,7 @@ fn workflow_node_card(
         id: node.id.clone(),
         action,
         kind,
-        // A compiled-but-not-yet-run node is pending; a durable run record
-        // overlays a live state here once the executor lands.
-        state: "pending".to_owned(),
+        state,
         agent,
         model_policy,
         workspace,
@@ -1647,8 +1739,8 @@ fn workflow_node_card(
         retry,
         depends_on: join(&node.depends_on),
         outputs: join(&node.outputs),
-        // No run has recorded a cost against a compiled-only node.
-        cost: dash(),
+        cost,
+        error,
     }
 }
 
@@ -2137,7 +2229,7 @@ steps:
         let cards: Vec<_> = compiled
             .nodes
             .iter()
-            .map(|node| workflow_node_card(&label, node))
+            .map(|node| workflow_node_card(&label, node, None))
             .collect();
 
         let patch = cards.iter().find(|c| c.id == "patch").expect("patch node");
@@ -2152,9 +2244,10 @@ steps:
         );
         assert_eq!(patch.workspace, "isolated worktree");
         assert_eq!(patch.approval, "before write");
-        // A compiled-but-not-yet-run node is pending with no recorded cost.
+        // A compiled-but-not-yet-run node (no record) is pending with no cost/error.
         assert_eq!(patch.state, "pending");
         assert_eq!(patch.cost, "\u{2014}");
+        assert_eq!(patch.error, "\u{2014}");
         assert_eq!(patch.depends_on, "\u{2014}"); // no dependencies
         assert_eq!(patch.outputs, "proposed_patch");
 
@@ -2172,13 +2265,49 @@ steps:
         assert_eq!(verify.depends_on, "patch");
     }
 
+    /// The T8 seam: a durable node record overlays the compiled defaults — the
+    /// graph view renders the node's live state, MEASURED cost (only measured
+    /// dimensions), and failure/block reason (P5-D4). This is what turns the
+    /// forever-`—` cost column and the reasonless block into real values.
     #[test]
-    fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
+    fn workflow_node_card_renders_a_durable_records_cost_state_and_error() {
+        use codypendent_workflow::{NodeState, WorkflowNodeRecord};
+        let compiled = codypendent_workflow::compile_yaml(TEST_MANIFEST).expect("compiles");
+        let label = format!("{} v{}", compiled.id, compiled.version);
+        let node = compiled.node("verify").expect("verify node");
+
+        // A blocked record carrying a measured cost + a budget-block reason.
+        let record = WorkflowNodeRecord {
+            node_id: "verify".to_owned(),
+            state: NodeState::Blocked,
+            agent_run_id: None,
+            attempt: 1,
+            topo_order: node.topo_order,
+            cost: Some(serde_json::json!({ "wall_time_secs": 12, "tool_calls": 3 })),
+            error: Some("workflow.budget-exceeded: node budget for `tool_calls`".to_owned()),
+        };
+        let card = workflow_node_card(&label, node, Some(&record));
+        assert_eq!(card.state, "blocked");
+        assert_eq!(card.cost, "12s \u{b7} 3 tool calls");
+        assert!(card.error.contains("budget"), "error: {}", card.error);
+
+        // A cost with only a tool-call count renders just that (singular form),
+        // never a fabricated wall-time or token/USD figure.
+        assert_eq!(
+            render_node_cost(&serde_json::json!({ "tool_calls": 1 })),
+            "1 tool call"
+        );
+        // An unrecognized / empty cost shape renders "—" (nothing was measured).
+        assert_eq!(render_node_cost(&serde_json::json!({})), "\u{2014}");
+    }
+
+    #[tokio::test]
+    async fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
 
         // No workflows directory → an empty view, not an error.
-        assert!(load_workflows(repo).is_empty());
+        assert!(load_workflows(repo, None).await.is_empty());
 
         let dir = repo.join(".codypendent").join("workflows");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2193,7 +2322,7 @@ steps:
         // A non-manifest file is ignored by extension.
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let cards = load_workflows(repo);
+        let cards = load_workflows(repo, None).await;
         assert_eq!(
             cards.len(),
             2,

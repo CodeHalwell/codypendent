@@ -30,3 +30,36 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     sqlx::migrate!("../../migrations").run(&pool).await?;
     Ok(pool)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Migration 0013 (T8) applies on a FRESH db and on an EXISTING one (re-open):
+    /// the append-only `workflow_nodes.error` column resolves, and re-running the
+    /// migrator against a db already at head is an idempotent no-op.
+    #[tokio::test]
+    async fn migration_0013_adds_the_node_error_column_on_fresh_and_existing_dbs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wf.db");
+
+        // Fresh db: every migration through 0013 applies. Naming the new `error`
+        // column in a query proves 0013 ran (a missing column is a SQL error).
+        let pool = open(&path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(error) FROM workflow_nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        pool.close().await;
+
+        // Existing db (the same file, now at head): the migrator sees 0013 already
+        // recorded and applies nothing new — append-only, idempotent.
+        let pool = open(&path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(error) FROM workflow_nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}

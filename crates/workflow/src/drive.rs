@@ -46,6 +46,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+use crate::budget::BudgetWarning;
 use crate::compile::{CompiledNode, CompiledWorkflow};
 use crate::store::{
     ready_node_ids, NodeState, WorkflowRunState, WorkflowStore, WorkflowStoreError,
@@ -55,25 +56,38 @@ use crate::store::{
 #[derive(Debug, Clone)]
 pub enum NodeOutcome {
     /// The node's work succeeded. `agent_run_id` links an agent node to its run
-    /// row; `cost` is the node's recorded spend (opaque JSON), both surfaced by
-    /// the graph view.
+    /// row; `cost` is the node's **measured** spend (only the dimensions the
+    /// executor actually measured — see [`crate::budget::NodeCost`]), both
+    /// surfaced by the graph view. `warnings` lists any budget dimension that
+    /// crossed 80% while charging this node — the driver relays each to the
+    /// [`NodeObserver`] so a client (today, the daemon log) learns a run nears a
+    /// ceiling. Success is never withheld for a warning; a warning only informs.
     Completed {
         agent_run_id: Option<String>,
         cost: Option<Value>,
+        warnings: Vec<BudgetWarning>,
     },
     /// The node's work failed. The driver retries per the node's policy and, once
     /// attempts are exhausted, marks the node `Failed`. `error` is carried for the
-    /// caller's diagnostics.
+    /// caller's diagnostics and persisted on the node's durable `error` column.
     Failed { error: String },
+    /// The node exhausted a budget dimension: the executor charged its measured
+    /// cost and a node slice or the workflow envelope was exceeded. The driver
+    /// records the node `Blocked` (with `error` naming the dimension and `cost`
+    /// the measured spend) and **pauses the run** for a human decision — an
+    /// overrun is never silent. A block is NOT retried (retrying re-spends against
+    /// the same exhausted budget); a later `ResumeWorkflow` re-evaluates it.
+    Blocked { error: String, cost: Option<Value> },
 }
 
 impl NodeOutcome {
-    /// A bare success with no recorded cost or agent-run id.
+    /// A bare success with no recorded cost, agent-run id, or budget warning.
     #[must_use]
     pub fn completed() -> Self {
         NodeOutcome::Completed {
             agent_run_id: None,
             cost: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -82,6 +96,16 @@ impl NodeOutcome {
     pub fn failed(error: impl Into<String>) -> Self {
         NodeOutcome::Failed {
             error: error.into(),
+        }
+    }
+
+    /// A budget block carrying its dimension reason and the measured cost that
+    /// tipped the node over.
+    #[must_use]
+    pub fn blocked(error: impl Into<String>, cost: Option<Value>) -> Self {
+        NodeOutcome::Blocked {
+            error: error.into(),
+            cost,
         }
     }
 }
@@ -111,9 +135,33 @@ pub trait NodeExecutor: Send + Sync {
 /// daemon fills to emit `WorkflowNodeTransitioned` ledger events. A no-op
 /// implementation is provided for `()`, so a caller that does not observe passes
 /// `&()`.
+///
+/// Beyond durable state transitions, the driver reports three kinds of progress
+/// that are *not* durable node state (they are history, not the latest fact), so
+/// they surface here rather than in the store: a **budget warning** (a dimension
+/// crossed 80%), an **intermediate retry failure** (a failed attempt the node
+/// will retry — the durable `error` column keeps only the latest/terminal
+/// reason, so the per-attempt history goes here), and a **recovery reset** (a
+/// node left `Running`/`Blocked` by an interrupted drive, reset to re-drive).
+/// All three have default no-op bodies, so an existing observer (and `()`) is
+/// unaffected; the daemon's logging observer overrides them.
 pub trait NodeObserver: Send + Sync {
     /// Called after the driver records `node_id` entering `state` on `attempt`.
     fn on_transition(&self, node_id: &str, state: NodeState, attempt: u32);
+
+    /// A budget dimension crossed 80% while charging `node_id` on `attempt`
+    /// (the node stayed within budget — this is a warning, not a block).
+    fn on_budget_warning(&self, _node_id: &str, _warning: BudgetWarning, _attempt: u32) {}
+
+    /// An intermediate attempt of `node_id` failed with `error` and will be
+    /// retried (the node is not yet `Failed`). The durable `error` column keeps
+    /// only the latest/terminal reason, so this per-attempt reason is history.
+    fn on_attempt_failed(&self, _node_id: &str, _attempt: u32, _error: &str) {}
+
+    /// `node_id` was reset from a non-terminal `Running`/`Blocked` state left by
+    /// an interrupted earlier drive, so it re-drives from `attempt` (P5-D4: the
+    /// recovery reset was previously invisible to the observer).
+    fn on_recovery_reset(&self, _node_id: &str, _attempt: u32) {}
 }
 
 impl NodeObserver for () {
@@ -204,18 +252,36 @@ impl WorkflowDriver {
             return Ok(snapshot.run.state);
         }
 
-        // Recover any node interrupted mid-execution by an earlier drive: it is
-        // still `Running` in the store, so reset it to `Pending` to re-drive it
-        // exactly once (effects are idempotent — the resume contract). Clears
-        // `agent_run_id`/cost explicitly (P5-D6b) rather than the COALESCE
-        // preserve semantics `transition_node` uses for its normal in-place
-        // transitions — the attempt being thrown away must never leave a stale
-        // link behind for a node that never re-reaches a real completion.
+        // Recover any node left non-terminal by an earlier drive so it re-enters
+        // the ready frontier (the scheduler only surfaces `Pending` nodes):
+        //
+        // * a `Running` node was interrupted mid-execution (a crash), so reset it
+        //   to `Pending` to re-drive exactly once (effects are idempotent — the
+        //   resume contract), CLEARING `agent_run_id`/cost explicitly (P5-D6b)
+        //   rather than the COALESCE preserve `transition_node` uses — the attempt
+        //   being thrown away must never leave a stale link behind;
+        // * a `Blocked` node paused the run on a budget exhaustion, so reset it to
+        //   `Pending` to re-evaluate on this (resume) drive, PRESERVING its
+        //   measured cost + block reason so the executor's pre-gate re-blocks
+        //   against the same durable budget consumption without re-running the
+        //   work (the "resume re-evaluates, still exhausted → re-blocks" loop).
+        //
+        // Both were previously invisible; each now reports to the observer (P5-D4).
         for node in &snapshot.nodes {
-            if node.state == NodeState::Running {
-                self.store
-                    .reset_interrupted_node(pool, workflow_run_id, &node.node_id, node.attempt)
-                    .await?;
+            match node.state {
+                NodeState::Running => {
+                    self.store
+                        .reset_interrupted_node(pool, workflow_run_id, &node.node_id, node.attempt)
+                        .await?;
+                    observer.on_recovery_reset(&node.node_id, node.attempt);
+                }
+                NodeState::Blocked => {
+                    self.store
+                        .reset_blocked_node(pool, workflow_run_id, &node.node_id)
+                        .await?;
+                    observer.on_recovery_reset(&node.node_id, node.attempt);
+                }
+                _ => {}
             }
         }
 
@@ -392,7 +458,11 @@ impl WorkflowDriver {
                 })
                 .await;
             match outcome {
-                NodeOutcome::Completed { agent_run_id, cost } => {
+                NodeOutcome::Completed {
+                    agent_run_id,
+                    cost,
+                    warnings,
+                } => {
                     self.store
                         .transition_node(
                             pool,
@@ -405,14 +475,54 @@ impl WorkflowDriver {
                         )
                         .await?;
                     observer.on_transition(&node.id, NodeState::Completed, attempt);
+                    // Relay any 80%-threshold budget warnings the executor raised
+                    // while charging this node — a client (today, the daemon log)
+                    // learns the run nears a ceiling. Success is not withheld.
+                    for warning in warnings {
+                        observer.on_budget_warning(&node.id, warning, attempt);
+                    }
                     return Ok(());
                 }
-                // A retryable failure: honour the declared backoff, then bump the
-                // attempt and re-drive (the store records the new attempt on the
-                // next `Running` transition). The backoff keeps a transiently
-                // failing tool/service from being hammered when the manifest asked
-                // for a delay; a zero backoff (the default) waits not at all.
-                NodeOutcome::Failed { .. } if attempt < max_attempts => {
+                // A budget exhaustion: the executor charged the node's measured
+                // cost and a slice/envelope was exceeded. Record the block (state,
+                // measured cost, dimension reason) and pause the run — the frontier
+                // loop observes `Paused` at its next boundary and stops launching
+                // nodes, leaving the run resumable for a human decision. A block is
+                // never retried (that would re-spend the same exhausted budget).
+                NodeOutcome::Blocked { error, cost } => {
+                    self.store
+                        .transition_node_with_error(
+                            pool,
+                            workflow_run_id,
+                            &node.id,
+                            NodeState::Blocked,
+                            attempt,
+                            None,
+                            cost.as_ref(),
+                            Some(&error),
+                        )
+                        .await?;
+                    observer.on_transition(&node.id, NodeState::Blocked, attempt);
+                    // Pause only from `Running` (a concurrent cancel must win): the
+                    // conditional write never clobbers a state that already moved.
+                    self.store
+                        .set_run_state_if_legal(
+                            pool,
+                            workflow_run_id,
+                            &[WorkflowRunState::Running],
+                            WorkflowRunState::Paused,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                // A retryable failure: report the intermediate reason to the
+                // observer (the durable `error` column keeps only the latest, so
+                // per-attempt history is the observer's), honour the declared
+                // backoff, then bump the attempt and re-drive (the store records
+                // the new attempt on the next `Running` transition). A zero backoff
+                // (the default) waits not at all.
+                NodeOutcome::Failed { error } if attempt < max_attempts => {
+                    observer.on_attempt_failed(&node.id, attempt, &error);
                     if node.retry.backoff_seconds > 0 {
                         tokio::time::sleep(std::time::Duration::from_secs(
                             node.retry.backoff_seconds,
@@ -421,9 +531,12 @@ impl WorkflowDriver {
                     }
                     attempt += 1;
                 }
-                NodeOutcome::Failed { .. } => {
+                // Attempts exhausted: mark the node `Failed`, persisting the final
+                // reason on its durable `error` column (P5-D4 — the reason was
+                // previously dropped at the driver).
+                NodeOutcome::Failed { error } => {
                     self.store
-                        .transition_node(
+                        .transition_node_with_error(
                             pool,
                             workflow_run_id,
                             &node.id,
@@ -431,6 +544,7 @@ impl WorkflowDriver {
                             attempt,
                             None,
                             None,
+                            Some(&error),
                         )
                         .await?;
                     observer.on_transition(&node.id, NodeState::Failed, attempt);
@@ -499,10 +613,15 @@ mod tests {
         }
     }
 
-    /// Records the transition sequence so a test can assert lifecycle order.
+    /// Records the transition sequence — and the three non-transition observer
+    /// events (budget warning, intermediate attempt failure, recovery reset) — so
+    /// a test can assert lifecycle order and that the P5-D4 gaps now report.
     #[derive(Default)]
     struct RecordingObserver {
         seen: Mutex<Vec<(String, NodeState, u32)>>,
+        warnings: Mutex<Vec<(String, crate::budget::BudgetWarning, u32)>>,
+        attempt_failures: Mutex<Vec<(String, u32, String)>>,
+        recovery_resets: Mutex<Vec<(String, u32)>>,
     }
 
     impl NodeObserver for RecordingObserver {
@@ -511,6 +630,33 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((node_id.to_owned(), state, attempt));
+        }
+
+        fn on_budget_warning(
+            &self,
+            node_id: &str,
+            warning: crate::budget::BudgetWarning,
+            attempt: u32,
+        ) {
+            self.warnings
+                .lock()
+                .unwrap()
+                .push((node_id.to_owned(), warning, attempt));
+        }
+
+        fn on_attempt_failed(&self, node_id: &str, attempt: u32, error: &str) {
+            self.attempt_failures.lock().unwrap().push((
+                node_id.to_owned(),
+                attempt,
+                error.to_owned(),
+            ));
+        }
+
+        fn on_recovery_reset(&self, node_id: &str, attempt: u32) {
+            self.recovery_resets
+                .lock()
+                .unwrap()
+                .push((node_id.to_owned(), attempt));
         }
     }
 
@@ -570,6 +716,7 @@ steps:
             vec![NodeOutcome::Completed {
                 agent_run_id: Some("run-b".to_owned()),
                 cost: Some(json!({ "usd": 0.02 })),
+                warnings: Vec::new(),
             }],
         );
         let final_state = WorkflowDriver::new()
@@ -1018,6 +1165,232 @@ steps:
             WorkflowRunState::Paused,
             "the run must still be Paused, never clobbered back to Running"
         );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_outcome_records_the_node_blocked_and_pauses_the_run() {
+        // A budget block: the executor returns `Blocked`, so the driver records
+        // the node `Blocked` (with its measured cost + reason) and pauses the run
+        // — never overwritten to Failed, and never retried.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        // `b` blocks on budget with a recorded cost; even with attempts:2 it must
+        // NOT retry (a block re-spends the same exhausted budget).
+        let manifest = "\
+schema_version: 1
+id: linear
+version: 1
+steps:
+  - id: a
+    tool: repository.test
+  - id: b
+    depends_on: [a]
+    tool: repository.test
+    retry:
+      attempts: 2
+  - id: c
+    depends_on: [b]
+    tool: repository.test
+";
+        let compiled = compile_yaml(manifest).unwrap();
+        let store2 = WorkflowStore::new();
+        let run_id2 = store2
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        struct BlockingExecutor {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl NodeExecutor for BlockingExecutor {
+            async fn execute(&self, ctx: NodeContext<'_>) -> NodeOutcome {
+                if ctx.node.id == "b" {
+                    *self.calls.lock().unwrap() += 1;
+                    NodeOutcome::blocked(
+                        "workflow.budget-exceeded: node budget for `tool_calls` exceeded",
+                        Some(json!({ "wall_time_secs": 1, "tool_calls": 9 })),
+                    )
+                } else {
+                    NodeOutcome::completed()
+                }
+            }
+        }
+        let executor = BlockingExecutor {
+            calls: Mutex::new(0),
+        };
+        let observer = RecordingObserver::default();
+        let final_state = WorkflowDriver::new()
+            .run_observed(&pool, &run_id2, &compiled, &executor, &observer)
+            .await
+            .unwrap();
+        let _ = run_id; // the first run is only a fixture for the shared pool
+
+        assert_eq!(
+            final_state,
+            WorkflowRunState::Paused,
+            "a budget block pauses the run for a human decision"
+        );
+        assert_eq!(
+            *executor.calls.lock().unwrap(),
+            1,
+            "a block is never retried, even under attempts:2"
+        );
+        let snap = store2.snapshot(&pool, &run_id2).await.unwrap().unwrap();
+        let b = snap.nodes.iter().find(|n| n.node_id == "b").unwrap();
+        assert_eq!(b.state, NodeState::Blocked);
+        assert!(
+            b.error.as_deref().unwrap_or_default().contains("budget"),
+            "the block reason is persisted: {:?}",
+            b.error
+        );
+        assert_eq!(
+            b.cost,
+            Some(json!({ "wall_time_secs": 1, "tool_calls": 9 })),
+            "the measured cost that tipped the node over is recorded"
+        );
+        // `c` (b's dependent) never ran — the run paused before it.
+        assert_eq!(
+            snap.nodes.iter().find(|n| n.node_id == "c").unwrap().state,
+            NodeState::Pending
+        );
+        // The block reached the observer as a Blocked transition.
+        assert!(observer
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, state, _)| id == "b" && *state == NodeState::Blocked));
+    }
+
+    #[tokio::test]
+    async fn an_intermediate_retry_failure_is_reported_to_the_observer() {
+        // P5-D4: a failed attempt that will be retried was previously invisible.
+        // It now reports to the observer (attempt + reason), while the durable
+        // `error` column keeps only the terminal reason (here, none — it succeeds).
+        let manifest = "\
+schema_version: 1
+id: flaky
+version: 1
+steps:
+  - id: a
+    tool: repository.test
+    retry:
+      attempts: 2
+";
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(manifest).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        let executor = ScriptedExecutor::default().with(
+            "a",
+            vec![
+                NodeOutcome::failed("transient boom"),
+                NodeOutcome::completed(),
+            ],
+        );
+        let observer = RecordingObserver::default();
+        let state = WorkflowDriver::new()
+            .run_observed(&pool, &run_id, &compiled, &executor, &observer)
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        {
+            let failures = observer.attempt_failures.lock().unwrap();
+            assert_eq!(failures.len(), 1, "the one intermediate failure reported");
+            assert_eq!(failures[0].0, "a");
+            assert_eq!(failures[0].1, 1, "reported at attempt 1");
+            assert!(failures[0].2.contains("transient"));
+        }
+
+        // The node completed, so its durable error column is clear (latest wins).
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(snap.nodes[0].error, None);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_failure_persists_its_reason_and_reports_no_intermediate() {
+        // The final (exhausted) failure persists its reason on the node's durable
+        // `error` column, and a single-attempt failure reports NO intermediate
+        // failure (there is no retry).
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+
+        let executor = ScriptedExecutor::default().with("b", vec![NodeOutcome::failed("boom")]);
+        let observer = RecordingObserver::default();
+        let state = WorkflowDriver::new()
+            .run_observed(&pool, &run_id, &compiled, &executor, &observer)
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Failed);
+
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        let b = snap.nodes.iter().find(|n| n.node_id == "b").unwrap();
+        assert_eq!(b.state, NodeState::Failed);
+        assert_eq!(
+            b.error.as_deref(),
+            Some("boom"),
+            "the terminal failure reason is persisted (P5-D4)"
+        );
+        assert!(
+            observer.attempt_failures.lock().unwrap().is_empty(),
+            "a single-attempt failure is terminal, not an intermediate retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovery_reset_is_reported_to_the_observer() {
+        // P5-D4: a node left `Running` by an interrupted drive is reset to
+        // re-drive — previously invisible, now an observer event.
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(LINEAR).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        // Simulate a crash: `a` stuck Running at attempt 1, the run left Running.
+        store
+            .transition_node(&pool, &run_id, "a", NodeState::Running, 1, None, None)
+            .await
+            .unwrap();
+        store
+            .set_run_state(&pool, &run_id, WorkflowRunState::Running)
+            .await
+            .unwrap();
+
+        let observer = RecordingObserver::default();
+        let state = WorkflowDriver::new()
+            .run_observed(
+                &pool,
+                &run_id,
+                &compiled,
+                &ScriptedExecutor::default(),
+                &observer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        let resets = observer.recovery_resets.lock().unwrap();
+        assert_eq!(resets.len(), 1, "the interrupted node's reset reported");
+        assert_eq!(resets[0], ("a".to_owned(), 1));
     }
 
     #[tokio::test]

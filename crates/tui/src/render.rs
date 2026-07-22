@@ -1379,6 +1379,11 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         lines.push(field("approval", &node.approval, theme.text.secondary));
         lines.push(field("retry", &node.retry, theme.text.secondary));
         lines.push(field("cost", &node.cost, theme.text.secondary));
+        // The durable failure/block reason, when a run recorded one (P5-D4) —
+        // shown in the mode's error color so a blocked/failed node explains itself.
+        if node.error != "\u{2014}" {
+            lines.push(field("error", &node.error, theme.status.error));
+        }
         lines.push(Line::raw(""));
         lines.push(section("Graph", theme));
         lines.push(field("depends on", &node.depends_on, theme.text.secondary));
@@ -2779,6 +2784,7 @@ mod tests {
                 depends_on: "\u{2014}".to_owned(),
                 outputs: "proposed_patch".to_owned(),
                 cost: "\u{2014}".to_owned(),
+                error: "\u{2014}".to_owned(),
             },
             WorkflowNodeCard {
                 workflow: "repair-github-check v1".to_owned(),
@@ -2794,6 +2800,7 @@ mod tests {
                 depends_on: "patch".to_owned(),
                 outputs: "test_result".to_owned(),
                 cost: "\u{2014}".to_owned(),
+                error: "\u{2014}".to_owned(),
             },
         ];
         reduce(&mut state, Action::OpenWorkflow);

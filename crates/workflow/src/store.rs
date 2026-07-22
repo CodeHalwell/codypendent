@@ -174,6 +174,11 @@ pub struct WorkflowNodeRecord {
     pub attempt: u32,
     pub topo_order: usize,
     pub cost: Option<Value>,
+    /// The latest failure or budget-block reason (P5-D4, migration 0013), or
+    /// `None` when the node's latest state is a success or it never failed. A
+    /// client surfaces this in the node detail so a `failed`/`blocked` node
+    /// explains itself.
+    pub error: Option<String>,
 }
 
 /// A run plus its node records, in topological order.
@@ -438,7 +443,9 @@ impl WorkflowStore {
     /// `started_at` the first time it runs and setting `ended_at` to the terminal
     /// time — or **clearing it** when the node is not terminal, so a node retried
     /// back to `Running` never carries a stale end timestamp. `agent_run_id` and
-    /// `cost` are recorded when provided (and otherwise left as they were).
+    /// `cost` are recorded when provided (and otherwise left as they were). Leaves
+    /// the durable failure reason untouched (a successful transition clears it —
+    /// see [`transition_node_with_error`](Self::transition_node_with_error)).
     #[allow(clippy::too_many_arguments)]
     pub async fn transition_node(
         &self,
@@ -450,6 +457,41 @@ impl WorkflowStore {
         agent_run_id: Option<&str>,
         cost: Option<&Value>,
     ) -> Result<(), WorkflowStoreError> {
+        self.transition_node_with_error(
+            pool,
+            workflow_run_id,
+            node_id,
+            state,
+            attempt,
+            agent_run_id,
+            cost,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`transition_node`](Self::transition_node), but also records the
+    /// node's durable failure/block reason (P5-D4, migration 0013). The reason
+    /// column follows "latest reason wins": a transition to `Completed` (a
+    /// success) **clears** it, so a node that failed, retried, and then completed
+    /// carries no stale reason; any other transition sets `error` when a reason is
+    /// supplied and otherwise preserves whatever reason was there (so a park
+    /// round-trip through `WaitingApproval`/`Running` does not wipe a pending
+    /// reason). A `Failed` or `Blocked` transition supplies the reason; the
+    /// per-attempt history of an intermediate retry failure is the observer's,
+    /// not this column's.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition_node_with_error(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+        state: NodeState,
+        attempt: u32,
+        agent_run_id: Option<&str>,
+        cost: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<(), WorkflowStoreError> {
         let now = Utc::now().to_rfc3339();
         let cost_json = match cost {
             Some(value) => Some(serde_json::to_string(value)?),
@@ -457,11 +499,15 @@ impl WorkflowStore {
         };
         let started = (state == NodeState::Running).then(|| now.clone());
         let ended = state.is_terminal().then(|| now.clone());
+        // A completed node has, by definition, no failure reason — clear it. Every
+        // other state sets the supplied reason or preserves the existing one.
+        let clears_error = state == NodeState::Completed;
 
         let affected = sqlx::query(
             "UPDATE workflow_nodes SET state = ?, attempt = ?, \
              agent_run_id = COALESCE(?, agent_run_id), \
              cost_json = COALESCE(?, cost_json), \
+             error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, \
              started_at = COALESCE(started_at, ?), \
              ended_at = ? \
              WHERE workflow_run_id = ? AND node_id = ?",
@@ -470,6 +516,8 @@ impl WorkflowStore {
         .bind(i64::from(attempt))
         .bind(agent_run_id)
         .bind(cost_json)
+        .bind(clears_error)
+        .bind(error)
         .bind(started)
         .bind(ended)
         .bind(workflow_run_id)
@@ -634,7 +682,7 @@ impl WorkflowStore {
         };
 
         let node_rows = sqlx::query(
-            "SELECT node_id, state, agent_run_id, attempt, topo_order, cost_json \
+            "SELECT node_id, state, agent_run_id, attempt, topo_order, cost_json, error \
              FROM workflow_nodes WHERE workflow_run_id = ? ORDER BY topo_order ASC, node_id ASC",
         )
         .bind(workflow_run_id)
@@ -652,6 +700,7 @@ impl WorkflowStore {
                     Some(json) => Some(serde_json::from_str(&json)?),
                     None => None,
                 },
+                error: row.get("error"),
             });
         }
         Ok(Some(WorkflowRunSnapshot { run, nodes }))
@@ -800,6 +849,45 @@ impl WorkflowStore {
         tx.commit().await?;
 
         Ok(to_reset.into_iter().collect())
+    }
+
+    /// Reset a node left `Blocked` by a budget exhaustion back to `Pending` so it
+    /// re-enters the ready frontier on a resume drive (the scheduler surfaces only
+    /// `Pending` nodes), **preserving** its measured `cost`, block `error`,
+    /// `attempt`, and `agent_run_id` — the exact opposite of
+    /// [`reset_interrupted_node`](Self::reset_interrupted_node)'s clear.
+    ///
+    /// The preserved cost is what lets the executor's budget pre-gate re-block the
+    /// node against the same durable workflow consumption WITHOUT re-running its
+    /// work (so a resume that did not raise the budget re-blocks and re-pauses,
+    /// never re-spending or double-counting). Only `ended_at` is cleared (the node
+    /// is live again). A no-op for a node that is not `blocked`.
+    pub async fn reset_blocked_node(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+    ) -> Result<(), WorkflowStoreError> {
+        let affected = sqlx::query(
+            "UPDATE workflow_nodes SET state = 'pending', ended_at = NULL \
+             WHERE workflow_run_id = ? AND node_id = ? AND state = 'blocked'",
+        )
+        .bind(workflow_run_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(WorkflowStoreError::NotFound(format!(
+                "{workflow_run_id}/{node_id}"
+            )));
+        }
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 
     /// Reset a node interrupted mid-execution by an earlier, crashed drive back

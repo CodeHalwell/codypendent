@@ -38,6 +38,7 @@
 pub mod agent;
 pub mod binding;
 pub mod blackboard;
+pub mod budget;
 pub mod compile;
 pub mod conductor;
 pub mod db;
@@ -54,6 +55,10 @@ pub use agent::{
 pub use binding::{bind_with, normalize_tool_name, scan_input_refs};
 pub use blackboard::{
     BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
+};
+pub use budget::{
+    BudgetDimension, BudgetExceeded, BudgetLimits, BudgetScope, BudgetVerdict, BudgetWarning,
+    NodeCost,
 };
 pub use compile::{
     compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
