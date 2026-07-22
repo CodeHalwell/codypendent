@@ -273,6 +273,8 @@ pub async fn run_over_connection<W: Write>(
             // shared daemon does not store its memories under its own directory
             // (issue #6 item 1).
             repository: Some(repository.to_owned()),
+            // The headless `run` path pins no model; the daemon resolves/routes.
+            model: None,
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {

@@ -930,6 +930,11 @@ fn submit_prompt(state: &mut AppState) {
                 state.outbox.push(Intent::StartRun {
                     objective,
                     mode: state.default_mode,
+                    // Pin the operator's chosen model (STEP MP2). Session-default:
+                    // `pending_model` is NOT cleared here, so one pick applies to
+                    // this run and every subsequent one until the operator changes
+                    // it in the `/model` picker.
+                    model: state.pending_model.clone(),
                 });
             }
         }
@@ -968,8 +973,11 @@ fn submit_prompt(state: &mut AppState) {
                 run_palette_command(state, entry.command);
             }
         }
-        // Enter stages the focused model (advisory this task — MP2 wires it
-        // to actually pin the next run's model) and emits a status notice.
+        // Enter stages the focused model on `pending_model` and emits a status
+        // notice. `pending_model` now PINS the model for the run(s) the operator
+        // starts (STEP MP2 wired it through `Intent::StartRun` → the `StartRun`
+        // command's `model` field); as a session default it applies to this run
+        // and every subsequent one until changed here.
         // Re-derives the filtered list from the overlay's own `query` /
         // `selected` (mirroring the palette arm above) rather than trusting
         // `selected_model`: that field's `.unwrap_or(0)` fallback (see `nav`
@@ -1004,6 +1012,9 @@ fn submit_prompt(state: &mut AppState) {
                     state.outbox.push(Intent::StartRun {
                         objective: text,
                         mode: state.default_mode,
+                        // Carry the pinned model (STEP MP2); session-default, so
+                        // it is not cleared and applies to subsequent runs too.
+                        model: state.pending_model.clone(),
                     });
                 }
             }
@@ -1681,7 +1692,48 @@ mod tests {
             vec![Intent::StartRun {
                 objective: "fix the test".to_owned(),
                 mode: AgentMode::Build,
+                // No model was staged, so the run carries no pin.
+                model: None,
             }]
+        );
+    }
+
+    #[test]
+    fn starting_a_run_after_staging_a_model_carries_the_pin() {
+        // STEP MP2: a model picked in the `/model` popup pins the model for the
+        // run the operator then starts — the staged `pending_model` flows into
+        // the `StartRun` intent. Session-default: the pin also survives on
+        // `pending_model` for subsequent runs (it is not cleared on submit).
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("local-qwen", "openai-compatible"),
+            model_card("hosted-gpt", "openai-compatible"),
+        ];
+        open_model_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // focus "hosted-gpt"
+        reduce(&mut s, Action::InputSubmit); // stage it on pending_model
+        assert_eq!(s.pending_model, Some(ModelId("hosted-gpt".to_owned())));
+
+        // Start a run via the NewRun overlay.
+        reduce(&mut s, Action::NewRun);
+        for c in "fix the test".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::StartRun {
+                objective: "fix the test".to_owned(),
+                mode: AgentMode::Build,
+                model: Some(ModelId("hosted-gpt".to_owned())),
+            }],
+            "the staged model pins the started run"
+        );
+        assert_eq!(
+            s.pending_model,
+            Some(ModelId("hosted-gpt".to_owned())),
+            "session-default: the pin persists for subsequent runs"
         );
     }
 

@@ -275,6 +275,7 @@ mod tests {
                 objective: "fix it".to_string(),
                 mode: AgentMode::Build,
                 repository: None,
+                model: None,
             },
         });
         match round_trip_payload(command) {

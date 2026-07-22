@@ -333,6 +333,55 @@ impl RoutingCoordinator {
         }
     }
 
+    /// Validate an operator-**pinned** model (STEP MP2) against the
+    /// classification hard filter — the non-negotiable security boundary a pin
+    /// must never bypass.
+    ///
+    /// - **Routing OFF** (the default): `Ok(())`. No routing security filter is
+    ///   active, so the pin selects the model under the existing
+    ///   classification-blind Phase-1 posture — no worse than today.
+    /// - **Routing ON:** the pin must clear the SAME classification /
+    ///   off-device ceiling the router itself applies (built from the run's
+    ///   classification, or the operator-declared fail-closed config ceiling).
+    ///   An ineligible pin — a hosted model for classified data, or a model with
+    ///   no benchmarked profile proving it runs on-device — is **refused**
+    ///   ([`RoutingSeamError::Refused`]), exactly like a routing refusal, so the
+    ///   run fails CLOSED rather than leaking off-device. A pin overrides the
+    ///   router's *quality* judgment, never this *security* constraint.
+    pub async fn validate_pin(
+        &self,
+        mode: AgentMode,
+        node_kind: &str,
+        objective: &str,
+        estimated_input_tokens: u64,
+        run_classification: Option<DataClassification>,
+        pinned: &ModelId,
+    ) -> Result<(), RoutingSeamError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let profiles = self.eligible_profiles().await?;
+        let node = self.build_task_node(
+            mode,
+            node_kind,
+            objective,
+            estimated_input_tokens,
+            run_classification,
+        );
+        let router = Router::new(&profiles, &self.config.policy);
+        if router.model_passes_classification(pinned, &node) {
+            Ok(())
+        } else {
+            Err(RoutingSeamError::Refused(format!(
+                "pinned model {pinned} may not process this run's data \
+                 (classification {:?}): it is a hosted/off-device model above the \
+                 policy's ceiling, or it has no benchmarked profile proving it runs \
+                 on-device — run `codypendent models bench {pinned}` or pin a local model",
+                node.data_classification
+            )))
+        }
+    }
+
     /// Escalate after an objective validation failure: advance the policy's
     /// escalation chain to the next eligible tier past `from`, re-routing the
     /// SAME node. The returned [`RoutingTransition`] is stamped
@@ -877,6 +926,179 @@ mod tests {
             matches!(err, RoutingSeamError::Refused(_)),
             "classified data with no eligible model fails closed, got {err:?}"
         );
+    }
+
+    // -- Pinned-model classification safety (STEP MP2) ----------------------
+
+    #[tokio::test]
+    async fn validate_pin_off_by_default_allows_any_model() {
+        // Routing OFF (the default): a pin is honored under the classification-
+        // blind Phase-1 posture — no security filter is active, so even a hosted
+        // model id validates with no stored profiles at all. No worse than today.
+        let (_dir, pool) = pool().await;
+        let coord = RoutingCoordinator::new(pool, RoutingConfig::default());
+        assert!(!coord.enabled());
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the payload",
+                4_000,
+                None,
+                &ModelId("hosted-anything".into()),
+            )
+            .await
+            .expect("routing OFF accepts any pin");
+    }
+
+    #[tokio::test]
+    async fn validate_pin_refuses_a_hosted_model_for_classified_data_fail_closed() {
+        // THE pinned-model leak test (STEP MP2): with routing ON, a run whose
+        // classification exceeds the policy's off-device ceiling must REFUSE a
+        // pinned HOSTED model. A pin overrides the router's *quality* judgment but
+        // never the classification hard filter — fail closed, exactly like a
+        // routing refusal, rather than run the classified data off-device. Same
+        // config as `secret_data_never_selects_a_hosted_model_through_the_seam`.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[
+                (
+                    "https://hosted/v1",
+                    profile("hosted-strong", ModelLocation::Hosted, 0.99, 0.001),
+                ),
+                (
+                    "http://localhost/v1",
+                    profile("local", ModelLocation::Local, 0.75, 0.010),
+                ),
+            ],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Internal),
+            data_classification: DataClassification::Secret,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        let err = coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the secret payload",
+                4_000,
+                None,
+                &ModelId("hosted-strong".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RoutingSeamError::Refused(_)),
+            "a hosted pin for Secret data fails closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_pin_allows_a_local_model_for_classified_data() {
+        // The counterpart: a LOCAL pinned model serves the same Secret data — it
+        // never leaves the device, so the classification filter admits it.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "http://localhost/v1",
+                profile("local", ModelLocation::Local, 0.75, 0.010),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Internal),
+            data_classification: DataClassification::Secret,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the secret payload",
+                4_000,
+                None,
+                &ModelId("local".into()),
+            )
+            .await
+            .expect("a local pin serves classified data on-device");
+    }
+
+    #[tokio::test]
+    async fn validate_pin_refuses_an_unprofiled_model_when_routing_on() {
+        // With routing ON, a pin the profile store has never benchmarked cannot be
+        // proven on-device, so it fails closed — the operator must bench it (or pin
+        // a known-local model). This keeps an unknown pin from bypassing the
+        // security filter under the (opt-in) routing posture.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "http://localhost/v1",
+                profile("local", ModelLocation::Local, 0.75, 0.010),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            data_classification: DataClassification::Internal,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        let err = coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "fix the bug",
+                4_000,
+                None,
+                &ModelId("never-benched".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RoutingSeamError::Refused(_)),
+            "an unprofiled pin fails closed under routing, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_pin_allows_a_hosted_model_when_the_policy_permits() {
+        // A pin is not blanket-refused under routing: when the run's classification
+        // is within the policy's off-device ceiling, a hosted pin is admitted (the
+        // pin's whole point is to override the router's *quality* choice, which is
+        // fine once the security filter is satisfied).
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "https://hosted/v1",
+                profile("hosted", ModelLocation::Hosted, 0.90, 0.005),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            data_classification: DataClassification::Internal,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "fix the bug",
+                4_000,
+                None,
+                &ModelId("hosted".into()),
+            )
+            .await
+            .expect("a hosted pin within the off-device ceiling is allowed");
     }
 
     #[tokio::test]

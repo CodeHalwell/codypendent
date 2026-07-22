@@ -198,6 +198,10 @@ pub enum Intent {
     StartRun {
         objective: String,
         mode: codypendent_protocol::AgentMode,
+        /// The model the operator pinned via the `/model` picker (STEP MP2),
+        /// carried so the started run executes on exactly that model. `None`
+        /// lets the daemon resolve/route the model as before.
+        model: Option<codypendent_protocol::ModelId>,
     },
     /// Resolve a pending approval.
     ResolveApproval {

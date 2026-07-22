@@ -794,7 +794,11 @@ fn spawn_input_thread(tx: mpsc::Sender<CrosstermEvent>, running: Arc<AtomicBool>
 /// become protocol.
 fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) -> CommandBody {
     match intent {
-        Intent::StartRun { objective, mode } => CommandBody::StartRun {
+        Intent::StartRun {
+            objective,
+            mode,
+            model,
+        } => CommandBody::StartRun {
             session_id,
             objective,
             mode,
@@ -802,6 +806,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             // shared daemon does not store its memories under its own directory
             // (issue #6 item 1).
             repository: Some(repository.to_owned()),
+            // Carry the operator's pinned model (STEP MP2) onto the wire; `None`
+            // lets the daemon resolve/route as before.
+            model,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -2090,7 +2097,9 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codypendent_protocol::{AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, RunId};
+    use codypendent_protocol::{
+        AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ModelId, RunId,
+    };
 
     #[test]
     fn intents_map_to_the_matching_command_bodies() {
@@ -2103,6 +2112,8 @@ mod tests {
                 Intent::StartRun {
                     objective: "diagnose".into(),
                     mode: AgentMode::Build,
+                    // A pinned model (STEP MP2) must flow onto the command.
+                    model: Some(ModelId("hosted-gpt".into())),
                 },
                 session_id,
                 repository,
@@ -2112,6 +2123,7 @@ mod tests {
                 objective: "diagnose".into(),
                 mode: AgentMode::Build,
                 repository: Some(repository.to_owned()),
+                model: Some(ModelId("hosted-gpt".into())),
             }
         );
 

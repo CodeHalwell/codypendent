@@ -361,7 +361,7 @@ export type CommandBody =
       requested_role: ClientRole;
     }
   | { type: "SubmitUserInput"; session_id: Uuid; text: string; mode: AgentMode }
-  | { type: "StartRun"; session_id: Uuid; objective: string; mode: AgentMode; repository?: string }
+  | { type: "StartRun"; session_id: Uuid; objective: string; mode: AgentMode; repository?: string; model?: string }
   | {
       type: "ResolveApproval";
       approval_id: Uuid;

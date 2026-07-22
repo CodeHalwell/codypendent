@@ -39,7 +39,7 @@ use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, AgentMode, DataClassification, EventBody, RepositoryId, RunId, SessionId,
+    Actor, AgentMode, DataClassification, EventBody, ModelId, RepositoryId, RunId, SessionId,
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
@@ -306,20 +306,22 @@ impl RuntimeExecutor {
                 warn!(run = %id, "skipping a queued run with an unparseable id");
                 continue;
             };
-            // Recover the run's own repository from its originating StartRun
-            // command (issue #6 item 1): relaunching against the daemon's cwd
+            // Recover the run's own repository AND pinned model from its
+            // originating StartRun command: relaunching against the daemon's cwd
             // would attribute a multi-checkout run's context and memories to the
-            // wrong repository. Fall back to the cwd exactly as the live path
-            // does for an older client that sent none.
-            let repository = queued_run_repository(&self.pool, &id)
-                .await
-                .unwrap_or_else(|| fallback.clone());
+            // wrong repository (issue #6 item 1), and dropping the pin would let a
+            // crash-relaunched run resolve/route a different model than the
+            // operator chose (STEP MP2). Fall back to the cwd exactly as the live
+            // path does for an older client that sent no repository.
+            let (repository, model) = queued_run_overrides(&self.pool, &id).await;
+            let repository = repository.unwrap_or_else(|| fallback.clone());
             self.spawn_run(RunLaunch {
                 session_id,
                 run_id,
                 objective,
                 mode: projections::agent_mode_from_db(&mode),
                 repository,
+                model,
             });
             relaunched += 1;
         }
@@ -352,44 +354,75 @@ impl RuntimeExecutor {
     /// the caller must fail it cleanly.
     async fn execute(&self, launch: &RunLaunch, token: CancellationToken) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
-        // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When routing is
-        // enabled the router picks the model from the measured profile store and
-        // the decision is recorded in the run trace; when it is disabled (the
-        // default, and the state in every existing test — none writes a
-        // `routing.toml`) this returns `None` and the model is resolved exactly
-        // as before. A refusal (classified data with no eligible model) fails the
-        // run CLOSED here rather than leaking off-device through the
-        // classification-blind Phase-1 resolver.
-        let routed = self
-            .routing
-            .select(
-                launch.mode,
-                "agent",
-                &launch.objective,
-                estimate_input_tokens(&launch.objective),
-                // `RunLaunch` carries no per-run classification, so the coordinator
-                // falls back to its operator-declared, fail-closed ceiling. Deriving
-                // a real per-run classification is a documented follow-up.
-                None,
-            )
-            .await
-            .map_err(|e| format!("routing refused to place this run: {e}"))?;
-        let model_id = match routed {
-            Some(selection) => {
-                if let Err(error) = self
-                    .routing
-                    .record_decision(launch.session_id, launch.run_id, &selection.decision)
+        let model_id = match &launch.model {
+            // A model PINNED by the operator via the `/model` picker (STEP MP2):
+            // run on exactly it — but a pin must NEVER bypass the classification
+            // hard filter. When routing is ENABLED, validate the pin against the
+            // run's classification / off-device ceiling and FAIL CLOSED (refuse,
+            // like a routing refusal) if it is ineligible (e.g. a hosted model
+            // pinned for classified data); when routing is OFF the pin selects the
+            // model under the existing classification-blind Phase-1 posture — no
+            // worse than today. A pin overrides the router's *quality* judgment,
+            // never its *security* constraint.
+            Some(pinned) => {
+                self.routing
+                    .validate_pin(
+                        launch.mode,
+                        "agent",
+                        &launch.objective,
+                        estimate_input_tokens(&launch.objective),
+                        // No per-run classification yet (mirrors the routed path
+                        // below); the coordinator falls back to its fail-closed
+                        // config ceiling. A documented follow-up.
+                        None,
+                        pinned,
+                    )
                     .await
-                {
-                    warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
-                }
-                selection.model().clone()
+                    .map_err(|e| format!("routing refused the pinned model: {e}"))?;
+                pinned.clone()
             }
+            // No pin: the Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When
+            // routing is enabled the router picks the model from the measured
+            // profile store and the decision is recorded in the run trace; when it
+            // is disabled (the default, and the state in every existing test — none
+            // writes a `routing.toml`) this returns `None` and the model is
+            // resolved exactly as before. A refusal (classified data with no
+            // eligible model) fails the run CLOSED here rather than leaking
+            // off-device through the classification-blind Phase-1 resolver.
             None => {
-                resolve_model(&registry, &policy, launch.mode)
+                let routed = self
+                    .routing
+                    .select(
+                        launch.mode,
+                        "agent",
+                        &launch.objective,
+                        estimate_input_tokens(&launch.objective),
+                        // `RunLaunch` carries no per-run classification, so the
+                        // coordinator falls back to its operator-declared,
+                        // fail-closed ceiling. Deriving a real per-run
+                        // classification is a documented follow-up.
+                        None,
+                    )
                     .await
-                    .map_err(|e| format!("no model configured: {e}"))?
-                    .id
+                    .map_err(|e| format!("routing refused to place this run: {e}"))?;
+                match routed {
+                    Some(selection) => {
+                        if let Err(error) = self
+                            .routing
+                            .record_decision(launch.session_id, launch.run_id, &selection.decision)
+                            .await
+                        {
+                            warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
+                        }
+                        selection.model().clone()
+                    }
+                    None => {
+                        resolve_model(&registry, &policy, launch.mode)
+                            .await
+                            .map_err(|e| format!("no model configured: {e}"))?
+                            .id
+                    }
+                }
             }
         };
         info!(run_id = %launch.run_id, model = %model_id, "resolved model; executing run");
@@ -1042,14 +1075,17 @@ impl Drop for WorktreeReleaseGuard {
     }
 }
 
-/// The `repository` recorded on the StartRun command that created a queued run,
-/// if any. The commands table stores the applied outcome (`result_json`, with
-/// `created_run`) beside the body, so the originating command is found by the
-/// run id it created.
-async fn queued_run_repository(
+/// The per-run overrides recorded on the `StartRun` command that created a
+/// queued run — its `repository` and pinned `model`, if any. The commands table
+/// stores the applied outcome (`result_json`, with `created_run`) beside the
+/// body, so the originating command is found by the run id it created.
+/// Recovering both in one read lets a crash-relaunched run keep its repository
+/// identity (issue #6 item 1) AND its operator-pinned model (STEP MP2), instead
+/// of silently resolving/routing a different model on restart.
+async fn queued_run_overrides(
     pool: &sqlx::SqlitePool,
     run_id: &str,
-) -> Option<std::path::PathBuf> {
+) -> (Option<std::path::PathBuf>, Option<ModelId>) {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT body FROM commands \
          WHERE status = 'applied' AND json_extract(result_json, '$.created_run') = ?",
@@ -1057,14 +1093,16 @@ async fn queued_run_repository(
     .bind(run_id)
     .fetch_optional(pool)
     .await
-    .ok()?;
-    let (body_json,) = row?;
-    let body: codypendent_protocol::CommandBody = serde_json::from_str(&body_json).ok()?;
-    match body {
-        codypendent_protocol::CommandBody::StartRun { repository, .. } => {
-            repository.map(std::path::PathBuf::from)
-        }
-        _ => None,
+    .ok()
+    .flatten();
+    let Some((body_json,)) = row else {
+        return (None, None);
+    };
+    match serde_json::from_str::<codypendent_protocol::CommandBody>(&body_json) {
+        Ok(codypendent_protocol::CommandBody::StartRun {
+            repository, model, ..
+        }) => (repository.map(std::path::PathBuf::from), model),
+        _ => (None, None),
     }
 }
 

@@ -830,8 +830,9 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 /// two-column list+detail view (the [`render_skills`] template) — the
 /// selectable models on the left (current run's serving model marked), and a
 /// detail panel for the focused model's provider/location/cost/context on the
-/// right. Selecting a row stages it on [`AppState::pending_model`] (advisory
-/// only this task — MP2 wires it to actually pin the next run's model). Colors
+/// right. Selecting a row stages it on [`AppState::pending_model`], which PINS
+/// the model for the run(s) the operator starts (STEP MP2 — a session default:
+/// one pick applies to this run and every subsequent one until changed). Colors
 /// are Theme tokens only (RULE 7).
 fn render_model_picker(
     frame: &mut Frame,

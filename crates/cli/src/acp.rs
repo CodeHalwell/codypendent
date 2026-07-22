@@ -119,6 +119,8 @@ impl AcpBackend for DaemonAcpBackend {
             objective: text.to_string(),
             mode: AgentMode::Build,
             repository: Some(self.repo.to_string_lossy().into_owned()),
+            // The ACP bridge pins no model; the daemon resolves/routes as usual.
+            model: None,
         })
         .await
         .map_err(|e| AcpError::Backend(e.to_string()))?;

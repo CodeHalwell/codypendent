@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use codypendent_protocol::{AgentMode, RunId, SessionId};
+use codypendent_protocol::{AgentMode, ModelId, RunId, SessionId};
 
 /// Everything the executor needs to start one run. Built by the server from the
 /// accepted `StartRun` command body (session/objective/mode) plus the run id the
@@ -38,6 +38,14 @@ pub struct RunLaunch {
     pub mode: AgentMode,
     /// The repository root the run operates against.
     pub repository: PathBuf,
+    /// The model the operator **pinned** for this run via the `/model` picker
+    /// (STEP MP2), carried from the accepted `StartRun`. `Some(id)` makes the
+    /// executor run on exactly that model — subject to the classification hard
+    /// filter (a pinned hosted model for classified data is refused when routing
+    /// is on, never run off-device). `None` lets the executor resolve/route the
+    /// model exactly as before. Mirrors [`repository`](RunLaunch::repository) as
+    /// an optional per-run override.
+    pub model: Option<ModelId>,
 }
 
 /// The daemon's seam for actually *executing* an accepted run.

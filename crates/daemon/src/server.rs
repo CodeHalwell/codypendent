@@ -1467,6 +1467,7 @@ async fn handle_request(
                                     objective,
                                     mode,
                                     repository,
+                                    model,
                                 } = &command.body
                                 {
                                     executor.spawn_run(RunLaunch {
@@ -1487,6 +1488,12 @@ async fn handle_request(
                                                     std::path::PathBuf::from(".")
                                                 })
                                             }),
+                                        // Carry the operator's pinned model (STEP
+                                        // MP2) into the run; `None` lets the
+                                        // executor resolve/route as before. The
+                                        // classification hard filter still governs
+                                        // a pin at execution time.
+                                        model: model.clone(),
                                     });
                                 }
                             }

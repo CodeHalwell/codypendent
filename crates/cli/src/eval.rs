@@ -225,6 +225,8 @@ pub async fn run_case_over_connection(
             objective: case.prompt.clone(),
             mode: AgentMode::Build,
             repository: Some(repository.to_string_lossy().into_owned()),
+            // The eval harness pins no model; the daemon resolves/routes as usual.
+            model: None,
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {
