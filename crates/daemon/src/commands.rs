@@ -783,6 +783,12 @@ impl CommandProcessor {
                 if let Some(conflict) = err.downcast_ref::<RevisionConflict>() {
                     return Err(revision_conflict(conflict.expected, conflict.actual));
                 }
+                // A run-state transition rejected by the atomic conditional
+                // write (FP-3) — likewise a structured protocol rejection, not
+                // an infrastructure failure; the tx rolled back.
+                if let Some(rejected) = err.downcast_ref::<RunTransitionRejected>() {
+                    return Err(rejected.0.clone());
+                }
                 // A concurrent duplicate delivery won the race to insert the
                 // `commands` row (its `UNIQUE(idempotency_key)`/PK tripped). That
                 // is not `internal.command-apply-failed`: the winner already
@@ -930,7 +936,44 @@ impl CommandProcessor {
                 .await?;
             }
             ProjectionOp::SetRunState { run_id, state } => {
-                projections::set_run_state(&mut *tx, run_id, state).await?;
+                // Assert the CURRENT state is legal for this transition via a
+                // single conditional UPDATE, not a separate read-then-write
+                // (FP-3): `validate()`'s pre-transaction read can go stale
+                // between two concurrent lifecycle commands on the same run —
+                // e.g. a `CancelRun` and a `PauseRun` both reading `Running`
+                // and both passing that check — so the write itself
+                // re-asserts the prior state and only applies when it still
+                // holds. `BEGIN IMMEDIATE` above means whichever of two
+                // racing commands reaches this point SECOND sees the FIRST
+                // one's already-committed state, so an invalid transition
+                // (e.g. a `Cancelled` run flipped back to `Paused`) can never
+                // commit.
+                let legal_from = legal_prior_states(&command.body, run_id);
+                let affected =
+                    projections::set_run_state_if_legal(&mut *tx, run_id, &legal_from, state)
+                        .await?;
+                if affected == 0 {
+                    // Not legal from the run's CURRENT state (re-read fresh,
+                    // under this transaction's write lock) — either
+                    // `validate()`'s earlier read was stale (a concurrent
+                    // command committed first) or the run no longer exists.
+                    // Reject with the same structured error `validate()` would
+                    // have produced; the whole transaction rolls back (nothing
+                    // applied).
+                    let current = projections::load_run_state(&mut *tx, run_id).await?;
+                    let rejection = match current {
+                        Some(fresh_state) => validate_run_transition(
+                            &command.body,
+                            run_id,
+                            fresh_state,
+                        )
+                        .expect_err(
+                            "a state excluded from legal_prior_states must fail validate_run_transition",
+                        ),
+                        None => run_not_found(run_id),
+                    };
+                    return Err(RunTransitionRejected(rejection).into());
+                }
             }
         }
 
@@ -1129,6 +1172,31 @@ fn validate_run_transition(
     }
 }
 
+/// The [`RunState`]s from which `body`'s transition is legal, as a set the
+/// write path can assert atomically via
+/// [`projections::set_run_state_if_legal`] (FP-3). Derived directly from
+/// [`validate_run_transition`] (evaluated against every known state) rather
+/// than duplicating its rule as a second, hand-maintained list — so the two
+/// can never drift apart.
+fn legal_prior_states(body: &CommandBody, run_id: RunId) -> Vec<RunState> {
+    const ALL_STATES: [RunState; 10] = [
+        RunState::Queued,
+        RunState::Preparing,
+        RunState::Running,
+        RunState::WaitingForApproval,
+        RunState::WaitingForUserInput,
+        RunState::Paused,
+        RunState::Recovering,
+        RunState::Completed,
+        RunState::Failed,
+        RunState::Cancelled,
+    ];
+    ALL_STATES
+        .into_iter()
+        .filter(|&state| validate_run_transition(body, run_id, state).is_ok())
+        .collect()
+}
+
 fn approval_not_found(approval_id: codypendent_protocol::ApprovalId) -> CodypendentError {
     CodypendentError::new(
         "approval.not-found",
@@ -1180,6 +1248,23 @@ impl std::fmt::Display for RevisionConflict {
 }
 
 impl std::error::Error for RevisionConflict {}
+
+/// A run-state lifecycle transition that failed re-validation *inside* the
+/// write transaction (FP-3) — carried out of [`commit`](CommandProcessor::commit)
+/// as a downcastable error, exactly like [`RevisionConflict`], so
+/// [`run_transaction`](CommandProcessor::run_transaction) can surface the SAME
+/// structured [`CodypendentError`] `validate_run_transition`/`run_not_found`
+/// would have produced, rather than a generic internal error.
+#[derive(Debug)]
+struct RunTransitionRejected(CodypendentError);
+
+impl std::fmt::Display for RunTransitionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.message)
+    }
+}
+
+impl std::error::Error for RunTransitionRejected {}
 
 /// The highest event sequence for a session, read inside the caller's tx (so it
 /// reflects appends made earlier in the same transaction). `None` for a session
@@ -1726,6 +1811,141 @@ mod tests {
             .await
             .expect_err("cancelling an already-cancelled run must be rejected");
         assert_eq!(err.code, "run.invalid-transition");
+    }
+
+    #[tokio::test]
+    async fn set_run_state_if_legal_refuses_a_transition_past_a_stale_prior_state() {
+        // FP-3, a direct store-level pin of the atomic conditional write: the
+        // guard must refuse to apply a transition once the run's CURRENT state
+        // is no longer in the legal set — even though, at some earlier moment
+        // (mirroring a stale pre-transaction `validate()` read), it would have
+        // been legal. This is the primitive that closes the check-then-act
+        // race without needing to orchestrate real concurrency.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "create").await;
+        let run = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                    },
+                    "start",
+                ),
+            )
+            .await
+            .unwrap()
+            .created_run
+            .unwrap();
+
+        // The run is `Queued` (StartRun's initial projection) — both Cancel and
+        // Pause are legal from Queued.
+        let cancel_legal = legal_prior_states(&CommandBody::CancelRun { run_id: run }, run);
+        let pause_legal = legal_prior_states(&CommandBody::PauseRun { run_id: run }, run);
+
+        // The first write (the WINNING racer) succeeds and lands the run in a
+        // state (`Cancelled`) from which Pause is no longer legal.
+        let affected =
+            projections::set_run_state_if_legal(&pool, run, &cancel_legal, RunState::Cancelled)
+                .await
+                .unwrap();
+        assert_eq!(affected, 1, "the first (winning) transition applies");
+
+        // The second write (the LOSING racer, whose `legal_from` was computed
+        // against the STALE `Queued` read) must now be refused: the run's
+        // ACTUAL current state (`Cancelled`) is not in `pause_legal`.
+        let affected =
+            projections::set_run_state_if_legal(&pool, run, &pause_legal, RunState::Paused)
+                .await
+                .unwrap();
+        assert_eq!(affected, 0, "the second (losing) transition must not apply");
+
+        // The run is still `Cancelled` — never resurrected to `Paused`.
+        assert_eq!(
+            projections::load_run_state(&pool, run).await.unwrap(),
+            Some(RunState::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_validation_is_now_stale_cannot_commit() {
+        // FP-3, deterministic reproduction of the exact race window (rather
+        // than relying on real thread scheduling to interleave two `apply()`
+        // calls, which is inherently non-deterministic — a `tokio::join!`
+        // version of this test was tried and only reproduced the bug on
+        // roughly half of runs even on a multi-threaded runtime): a command
+        // whose `validate()` already passed (against the run's state at read
+        // time) reaches its write stage — modeled here by calling the private
+        // write-path method directly, exactly the state a command is in
+        // between `validate()` returning `Ok` and `commit()` running — but by
+        // then a DIFFERENT command has already taken the run to a state from
+        // which this one is no longer legal. The write itself must refuse,
+        // not blindly apply what an earlier read decided.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "create").await;
+        let run = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                    },
+                    "start",
+                ),
+            )
+            .await
+            .unwrap()
+            .created_run
+            .unwrap();
+
+        // The WINNING command commits first, taking the run terminal.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(CommandBody::CancelRun { run_id: run }, "winner-cancel"),
+            )
+            .await
+            .expect("cancel applies");
+        assert_eq!(
+            projections::load_run_state(&pool, run).await.unwrap(),
+            Some(RunState::Cancelled)
+        );
+
+        // The LOSING command reaches its write stage as if its OWN `validate()`
+        // had already passed against the run's PRE-cancellation state (calling
+        // the write-path method directly skips `apply()`'s own validate call,
+        // modeling exactly that moment).
+        let pause_command = command(CommandBody::PauseRun { run_id: run }, "loser-pause");
+        let err = processor
+            .apply_run_state(
+                &pool,
+                &ctx(ClientRole::Controller),
+                &pause_command,
+                run,
+                RunState::Paused,
+            )
+            .await
+            .expect_err("the write must re-validate against the CURRENT state and refuse");
+        assert_eq!(err.code, "run.invalid-transition");
+
+        // The run is still `Cancelled` — never resurrected to `Paused`.
+        assert_eq!(
+            projections::load_run_state(&pool, run).await.unwrap(),
+            Some(RunState::Cancelled)
+        );
     }
 
     #[tokio::test]

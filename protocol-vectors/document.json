@@ -1,0 +1,75 @@
+{
+  "DocumentEditLease": {
+    "block_id": "b1",
+    "document_id": "70000000-0000-0000-0000-000000000001"
+  },
+  "DocumentLeaseGrant": {
+    "block_id": "b1",
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "expires_at": "2026-01-01T00:00:00Z",
+    "lease_id": "lease-1"
+  },
+  "DocumentMutation_AcceptSuggestion": {
+    "op": "accept_suggestion",
+    "suggestion_id": "s1"
+  },
+  "DocumentMutation_Annotate": {
+    "op": "annotate",
+    "suggestion": {
+      "block_id": "b1",
+      "range_end": 3,
+      "range_start": 0,
+      "rationale": "clearer",
+      "replacement": "new"
+    }
+  },
+  "DocumentMutation_Delete": {
+    "block_id": "b1",
+    "op": "delete"
+  },
+  "DocumentMutation_EditText": {
+    "block_id": "b1",
+    "delete_len": 1,
+    "insert": "x",
+    "op": "edit_text",
+    "position": 2
+  },
+  "DocumentMutation_Insert": {
+    "block_id": "b1",
+    "content": {
+      "text": "hi",
+      "type": "paragraph"
+    },
+    "index": 0,
+    "op": "insert"
+  },
+  "DocumentMutation_RejectSuggestion": {
+    "op": "reject_suggestion",
+    "suggestion_id": "s1"
+  },
+  "DocumentSync": {
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "revision": 7,
+    "update": [
+      1,
+      2,
+      3,
+      255
+    ]
+  },
+  "PublishTarget_DocsBranchCommit": {
+    "branch": "docs/publish",
+    "kind": "docs_branch_commit",
+    "path": "docs/architecture.md"
+  },
+  "PublishTarget_DocumentationPr": {
+    "branch": "docs/publish",
+    "kind": "documentation_pr",
+    "path": "docs/architecture.md",
+    "title": "Publish: Architecture"
+  },
+  "PublishTarget_RepositoryFile": {
+    "kind": "repository_file",
+    "path": "docs/architecture.md"
+  }
+}

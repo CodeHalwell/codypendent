@@ -273,10 +273,32 @@ impl PolicyEngine {
             ProposedAction::GitCommit { .. } => self.eval_git(GitOp::Commit, ctx),
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
             ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
+            ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
+                self.eval_blackboard()
+            }
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
             )),
+        }
+    }
+
+    /// A blackboard post/query (Phase 5 STEP 5.3) is always permitted: it targets
+    /// only the workflow run's OWN typed-artifact channel — not the filesystem, the
+    /// repository, or any remote — and the `blackboard.*` tools are offered solely
+    /// inside a workflow node's agent run. It grants no capability (the tool needs
+    /// no path/command/network scope) and is recorded purely so the board access is
+    /// traced like any other tool call. Writes that DO escape the run (files, git,
+    /// GitHub) keep their existing approval gates; this does not widen them.
+    fn eval_blackboard(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.blackboard-allowed",
+                "a workflow blackboard access targets only the run's own artifact channel",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
         }
     }
 
@@ -498,12 +520,24 @@ fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> Pat
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
+    build_path_scope_with_home(roots, deny, ctx, home.as_deref())
+}
 
+/// The pure core of [`build_path_scope`], with the home directory resolved by
+/// the caller so the poisoning behaviour is testable without touching the
+/// process environment. `home = None` models a daemon started with no
+/// resolvable home.
+fn build_path_scope_with_home(
+    roots: &[String],
+    deny: &[String],
+    ctx: &EvalContext,
+    home: Option<&Path>,
+) -> PathScope {
     let canonical = |expanded: String| scope::canonicalize_lenient(Path::new(&expanded));
 
     let mut denies = Vec::with_capacity(deny.len());
     for entry in deny {
-        match expand_vars(entry, ctx, home.as_deref()) {
+        match expand_vars(entry, ctx, home) {
             Some(expanded) => denies.push(canonical(expanded)),
             None => {
                 tracing::error!(
@@ -519,7 +553,7 @@ fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> Pat
     let expanded_roots = roots
         .iter()
         .filter_map(|entry| {
-            let expanded = expand_vars(entry, ctx, home.as_deref());
+            let expanded = expand_vars(entry, ctx, home);
             if expanded.is_none() {
                 // A dropped root only narrows the scope; still worth a loud note.
                 tracing::warn!(entry, "policy root dropped: $HOME is unknown");
@@ -564,6 +598,66 @@ mod tests {
 
     fn ctx(repo: &Path, worktree: &Path) -> EvalContext {
         EvalContext::new(repo, worktree)
+    }
+
+    /// S4: a DENY entry that cannot be expanded (here `$HOME/.ssh` with no
+    /// resolvable home) must POISON the whole scope — no roots, so every path
+    /// classifies out of scope and both reads and writes are refused — rather
+    /// than being silently dropped, which would run with a *weaker* policy than
+    /// configured (fail-open on a deny is the exact hole this closes).
+    #[test]
+    fn unexpandable_deny_poisons_the_scope() {
+        let dir = tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = ctx(&repo, &repo);
+
+        // Roots that would normally allow the repository, plus a home-relative
+        // deny the stripped environment cannot expand.
+        let roots = vec!["$REPOSITORY".to_string()];
+        let deny = vec!["$HOME/.ssh".to_string()];
+
+        let scope = build_path_scope_with_home(&roots, &deny, &ctx, None);
+
+        // Poisoned: no roots survived, so the deny could never be dropped.
+        assert!(
+            scope.roots.is_empty(),
+            "an unresolvable deny must leave no allowed roots"
+        );
+        // A path that would be allowed under a healthy scope is now out of scope.
+        assert_ne!(
+            scope.classify(&repo.join("src.rs")),
+            ScopeVerdict::Allowed,
+            "every path must be refused while the deny is unresolvable"
+        );
+    }
+
+    /// The contrast: with a resolvable home the same inputs build a *healthy*
+    /// scope — the repository root is allowed and the `.ssh` deny is honoured —
+    /// so the poisoning above is caused by the unresolvable deny, not the inputs.
+    #[test]
+    fn resolvable_home_builds_a_healthy_scope() {
+        let dir = tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        let home = tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let ctx = ctx(&repo, &repo);
+
+        let roots = vec!["$REPOSITORY".to_string()];
+        let deny = vec!["$HOME/.ssh".to_string()];
+
+        let scope = build_path_scope_with_home(&roots, &deny, &ctx, Some(&home));
+
+        assert!(!scope.roots.is_empty(), "the repository root must survive");
+        assert_eq!(
+            scope.classify(&repo.join("src.rs")),
+            ScopeVerdict::Allowed,
+            "an in-repository path is allowed under a healthy scope"
+        );
+        assert_eq!(
+            scope.classify(&home.join(".ssh").join("id_rsa")),
+            ScopeVerdict::Denied,
+            "the resolved $HOME/.ssh deny is honoured"
+        );
     }
 
     #[test]

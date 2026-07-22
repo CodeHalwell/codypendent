@@ -20,8 +20,15 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub struct StartWorkflowRequest {
     /// The workflow manifest YAML (its content, never a path — the daemon does not
-    /// read an arbitrary client-named file).
+    /// read an arbitrary client-named file). Empty when [`workflow_id`](Self::workflow_id)
+    /// names a workflow the assembly resolves from its own sources instead.
     pub manifest: String,
+    /// A named workflow to resolve from the assembly's sources (embedded
+    /// built-ins + the user config directory + the run repository's
+    /// `.codypendent/workflows`) rather than compiling an inline `manifest` — the
+    /// `/fix-ci` path. When `Some`, the [`WorkflowStarter`] resolves it (enforcing
+    /// the registry's version-stability + shadowing rules) and ignores `manifest`.
+    pub workflow_id: Option<String>,
     /// The typed inputs the manifest declares (opaque JSON to the daemon; the
     /// store records them with the run).
     pub inputs: Value,
@@ -30,6 +37,12 @@ pub struct StartWorkflowRequest {
     /// seam creates the run idempotently — the same key resolves to the same run
     /// rather than a second one.
     pub idempotency_key: String,
+    /// The canonical repository root the run's agent nodes operate on (Phase 5
+    /// T5). Persisted with the durable run so a per-node isolated worktree is
+    /// carved from the right checkout — and so recovery drives it there after a
+    /// restart. `None` (an older client that sends none) leaves the node executor
+    /// to fall back to the daemon's startup repository root.
+    pub repository: Option<String>,
     /// The identity of the starting client, for attribution.
     pub client_id: ClientId,
 }
@@ -80,6 +93,13 @@ pub struct RetryWorkflowNodeRequest {
     pub client_id: ClientId,
 }
 
+/// A client's request to cancel a durable workflow run (T9).
+#[derive(Debug, Clone)]
+pub struct CancelWorkflowRequest {
+    pub workflow_run_id: String,
+    pub client_id: ClientId,
+}
+
 /// The future a [`WorkflowLifecycle`] method returns: the synchronous outcome of
 /// the lifecycle mutation (the actual driving continues in the background), or a
 /// structured [`CodypendentError`] the server rejects with. Boxed so the trait
@@ -108,4 +128,11 @@ pub trait WorkflowLifecycle: Send + Sync {
     /// dependents), then drive it onward in the background. An error on an unknown
     /// node or a changed graph.
     fn retry_node(&self, request: RetryWorkflowNodeRequest) -> WorkflowLifecycleFuture<'_>;
+    /// Cancel a run (T9): a cooperative drain (a live driver stops launching further
+    /// nodes), every still-`Pending` node becomes `Skipped`, any in-flight node's
+    /// agent run is interrupted through the same cancellation machinery `CancelRun`
+    /// uses, and the run lands `Cancelled` (terminal — no resume). Idempotent on an
+    /// already-cancelled run; an error (`workflow.illegal-transition`) on a
+    /// completed/failed run.
+    fn cancel(&self, request: CancelWorkflowRequest) -> WorkflowLifecycleFuture<'_>;
 }

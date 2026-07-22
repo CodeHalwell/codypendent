@@ -37,9 +37,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codypendent_cli::{commands, tui};
+use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{AgentMode, SessionId};
+use codypendent_protocol::{AgentMode, DocumentId, SessionId};
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +48,16 @@ use codypendent_protocol::{AgentMode, SessionId};
     about = "Codypendent — the local-first agentic developer environment"
 )]
 struct Cli {
+    /// Force a theme for the interactive TUI, overriding automatic terminal
+    /// detection (`NO_COLOR`/`COLORTERM`/`TERM`) and any `CODYPENDENT_THEME`
+    /// env var — a manual override always wins (STEP 6.6). Accepts a
+    /// built-in variant (`dark`, `light`, `high-contrast`, `color-blind-safe`,
+    /// `ansi256`, `ansi16`, `monochrome`) or the id of a theme pack loaded
+    /// from `<data-dir>/themes/<id>.toml`. Only meaningful for the bare
+    /// `codypendent` invocation, which is the only one that renders a
+    /// themed UI.
+    #[arg(long)]
+    theme: Option<String>,
     /// With no subcommand, `codypendent` opens the interactive TUI attached to
     /// the current repository's session (STEP 1.12).
     #[command(subcommand)]
@@ -101,6 +111,40 @@ enum TopCommand {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Investigate and repair a failed GitHub check on a pull request (`/fix-ci`).
+    /// Runs the declarative `repair-github-check` workflow — the supervised
+    /// investigator → implementer → independent-reviewer flow — through the
+    /// daemon; every GitHub write parks for approval (Phase 5 STEP 5.1.4).
+    FixCi {
+        /// The pull-request number whose failing check to repair.
+        #[arg(long)]
+        pr: u64,
+        /// Repository the repair runs against (its agent nodes each get an
+        /// isolated worktree). Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Publish a collaborative document to Git (Phase 4 STEP 4.4).
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
+    /// Run the evaluation harness against a fixture suite (Phase 7 STEP 7.1).
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+    /// Measure and manage model profiles for the router (Phase 7 STEP 7.2).
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+    /// Drive a learnable artifact through the evaluation-gated promotion
+    /// pipeline (Phase 7 STEP 7.5) — nothing promotes itself (ADR-010).
+    Promote {
+        #[command(subcommand)]
+        command: PromoteCommand,
     },
     /// Inspect plugin manifests and their permissions (Phase 6).
     Plugin {
@@ -189,6 +233,11 @@ enum WorkflowCommand {
         /// '{"pull_request": 7}'). Defaults to null.
         #[arg(long)]
         inputs: Option<String>,
+        /// Repository the workflow's agent nodes operate on (each writing node is
+        /// carved its own isolated worktree from it). Defaults to the current
+        /// directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Pause a running workflow run so its driver stops launching new nodes; resume
     /// it later with `workflow resume` (Phase 5 STEP 5.2).
@@ -210,6 +259,185 @@ enum WorkflowCommand {
         #[arg(long)]
         node: String,
     },
+    /// Cancel a workflow run (Phase 5 T9): a cooperative drain — the driver stops
+    /// launching new nodes, any in-flight node's agent run is interrupted, remaining
+    /// pending nodes are skipped, and the run lands cancelled (terminal — no resume).
+    Cancel {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+    },
+    /// Watch a workflow run's live node lifecycle (Phase 5 T9): prints the run's
+    /// current snapshot (each node's state, cost, and any failure/block reason), then
+    /// streams each node transition and run-phase change until the run reaches a
+    /// terminal state (or the stream is interrupted).
+    Watch {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    /// Publish a document's current revision to a Git target (Phase 4 STEP
+    /// 4.4). Prints the computed plan (target / changed files / resulting Git
+    /// action) and prompts for confirmation, then sends `PublishDocument`;
+    /// ensures a daemon, parks a durable approval, and resolves it with the
+    /// confirmed decision. Nothing is written until the approval resolves —
+    /// on approval, the daemon executes the plan in the background and this
+    /// prints the resulting commit once recorded.
+    Publish {
+        /// The document to publish.
+        document: DocumentId,
+        /// Where to publish it.
+        #[arg(long, value_enum)]
+        target: PublishTargetArg,
+        /// The repo-relative path to write. Defaults to a slug of the
+        /// document's title under `docs/`.
+        #[arg(long)]
+        path: Option<String>,
+        /// The docs branch (`docs-branch`/`doc-pr` targets only). Defaults to
+        /// `docs/publish`.
+        #[arg(long)]
+        branch: Option<String>,
+        /// The pull-request title (`doc-pr` target only). Defaults to
+        /// `Publish: <document title>`.
+        #[arg(long)]
+        title: Option<String>,
+        /// Skip the confirmation prompt and approve immediately.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `codypendent docs publish --target <TARGET>`: which Git target STEP 4.4.2
+/// describes. Mirrors `codypendent_knowledge::PublishTarget`'s three variants
+/// with CLI-friendly names.
+#[derive(Clone, Copy, ValueEnum)]
+enum PublishTargetArg {
+    /// Write the rendered Markdown to a repository file in the working tree.
+    RepoFile,
+    /// Commit the rendered Markdown to a dedicated docs branch.
+    DocsBranch,
+    /// Open a documentation pull request via the GitHub write path.
+    DocPr,
+}
+
+impl From<PublishTargetArg> for commands::PublishTargetKind {
+    fn from(arg: PublishTargetArg) -> Self {
+        match arg {
+            PublishTargetArg::RepoFile => commands::PublishTargetKind::RepoFile,
+            PublishTargetArg::DocsBranch => commands::PublishTargetKind::DocsBranch,
+            PublishTargetArg::DocPr => commands::PublishTargetKind::DocPr,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum EvalCommand {
+    /// Execute an `evals/tasks/` suite headlessly over the JSONL client and
+    /// write a `SuiteReport` (Phase 7 STEP 7.1). Ensures a daemon; each case
+    /// starts its own run against its pinned fixture repository.
+    Run {
+        /// The suite directory under `evals/tasks/` (e.g. `core` for
+        /// `evals/tasks/core/`), or a path to it directly.
+        #[arg(long, default_value = "core")]
+        suite: String,
+        /// The model-policy name the cases declare they run under. Recorded in
+        /// the report; Phase 7 routing is not yet wired into `StartRun` (see
+        /// the roadmap), so this does not yet select a model — every case
+        /// runs under whatever the daemon's own `models.toml` resolves for its
+        /// mode.
+        #[arg(long)]
+        policy: Option<String>,
+        /// Where to write the `SuiteReport` JSON.
+        #[arg(long)]
+        report: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// Benchmark a local model configured in `models.toml` and persist its
+    /// measured profile (Phase 7 STEP 7.2.2): tokens/sec, time-to-first-token,
+    /// warm-up, memory, context limit, structured-output reliability, tool-call
+    /// accuracy, and a small coding-eval score. The router reads these MEASURED
+    /// numbers (never vibes). Also caches the first-use capability probe.
+    Bench {
+        /// The `models.toml` model id to benchmark (its `base_url` is the
+        /// endpoint the profile + probe are keyed under).
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromoteCommand {
+    /// Draft a candidate for the promotion pipeline (Phase 7 STEP 7.5). Prints
+    /// the new candidate id.
+    Propose {
+        /// The artifact kind: `retrieval`, `skill`, `prompt`, `router`,
+        /// `workflow`, or `model-profile`.
+        #[arg(long)]
+        kind: String,
+        /// The artifact's name (e.g. `tool-selection`).
+        #[arg(long)]
+        name: String,
+        /// The version being proposed.
+        #[arg(long)]
+        version: u32,
+        /// Mark this candidate as synthesized (e.g. by a skill-clustering
+        /// pipeline): it must pass permission review before it may enter
+        /// evaluation.
+        #[arg(long)]
+        requires_permission_review: bool,
+    },
+    /// Advance a candidate through the offline-regression / shadow / canary
+    /// legs of the pipeline. `--regressed` supplies the caller's verdict for
+    /// the `regression`/`observe-canary` steps (default: no regression); this
+    /// command *records* a result, it does not compute one — see the report's
+    /// notes on what live shadow/canary traffic capture still needs.
+    Advance {
+        /// The candidate id (as printed by `promote propose`).
+        candidate_id: String,
+        /// Which transition to attempt.
+        #[arg(long, value_enum)]
+        step: PromoteStepArg,
+        /// The regression/canary verdict for `regression`/`observe-canary`
+        /// (ignored by the other steps).
+        #[arg(long)]
+        regressed: bool,
+    },
+    /// **Approve and promote a candidate** (ADR-010: requires the `Controller`
+    /// role, which this local-first socket maps to a human operator — an
+    /// agent/system-initiated approval is refused structurally).
+    Approve { candidate_id: String },
+    /// Manually roll back a promoted candidate to its predecessor version.
+    Rollback { candidate_id: String },
+}
+
+/// `codypendent promote advance --step <STEP>`.
+#[derive(Clone, Copy, ValueEnum)]
+enum PromoteStepArg {
+    Regression,
+    Shadow,
+    Canary,
+    ObserveCanary,
+    FinishCanary,
+}
+
+impl PromoteStepArg {
+    /// Map this CLI-facing step (plus the `--regressed` verdict, which only
+    /// `Regression`/`ObserveCanary` consume) onto the wire [`PromotionAction`](
+    /// codypendent_protocol::PromotionAction).
+    fn into_wire(self, regressed: bool) -> codypendent_protocol::PromotionAction {
+        use codypendent_protocol::PromotionAction;
+        match self {
+            PromoteStepArg::Regression => PromotionAction::RunRegression { regressed },
+            PromoteStepArg::Shadow => PromotionAction::StartShadow,
+            PromoteStepArg::Canary => PromotionAction::StartCanary,
+            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary { regressed },
+            PromoteStepArg::FinishCanary => PromotionAction::FinishCanary,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -230,6 +458,43 @@ enum PluginCommand {
         installed: PathBuf,
         /// The candidate update manifest.
         update: PathBuf,
+    },
+    /// Verify a plugin artifact against its manifest using the trusted-publisher
+    /// key store — the real-keys install gate (Phase 6 STEP 6.2). A signed plugin
+    /// from an unknown publisher, a bad signature, or an unsigned plugin (unless
+    /// `--allow-unsigned`) is refused with a non-zero exit (fails closed).
+    Verify {
+        /// The plugin manifest (`plugin.toml`).
+        manifest: PathBuf,
+        /// The plugin artifact whose checksum/signature is verified.
+        artifact: PathBuf,
+        /// Permit an unsigned (checksum-only) plugin. Default posture denies it.
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Manage the trusted-publisher key store (Phase 6 STEP 6.2): the ed25519
+    /// public keys `plugin verify` checks signatures against.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// Trust a publisher: record its base64 ed25519 public key.
+    Add {
+        /// The publisher id (matched against a manifest's `publisher`).
+        id: String,
+        /// The publisher's ed25519 public key, base64-encoded (32 raw bytes).
+        public_key: String,
+    },
+    /// List the trusted publishers and their public keys.
+    List,
+    /// Stop trusting a publisher. Exits non-zero if it was not trusted.
+    Remove {
+        /// The publisher id to remove.
+        id: String,
     },
 }
 
@@ -281,9 +546,14 @@ enum EventsFormat {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = RuntimePaths::resolve()?;
+    // `--theme` wins over `CODYPENDENT_THEME`; an empty value from either
+    // source falls through to the other (see `theme_select::resolve_theme_override`
+    // for why each source must be filtered before combining them).
+    let theme_override =
+        theme_select::resolve_theme_override(cli.theme, std::env::var("CODYPENDENT_THEME").ok());
     let Some(command) = cli.command else {
         // Bare `codypendent`: open the TUI for the current directory's repo.
-        return tui::run(&paths, std::env::current_dir()?).await;
+        return tui::run(&paths, std::env::current_dir()?, theme_override).await;
     };
     match command {
         TopCommand::Daemon { command } => match command {
@@ -326,8 +596,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::workflow_validate(&file, agents.as_deref())
             }
             WorkflowCommand::Show { file, json } => commands::workflow_show(&file, json),
-            WorkflowCommand::Run { file, inputs } => {
-                commands::workflow_run(&paths, &file, inputs).await
+            WorkflowCommand::Run { file, inputs, repo } => {
+                let repo = match repo {
+                    Some(repo) => repo,
+                    None => std::env::current_dir()?,
+                };
+                commands::workflow_run(&paths, &file, inputs, repo).await
             }
             WorkflowCommand::Pause { workflow_run_id } => {
                 commands::workflow_pause(&paths, workflow_run_id).await
@@ -339,10 +613,80 @@ async fn main() -> anyhow::Result<()> {
                 workflow_run_id,
                 node,
             } => commands::workflow_retry(&paths, workflow_run_id, node).await,
+            WorkflowCommand::Cancel { workflow_run_id } => {
+                commands::workflow_cancel(&paths, workflow_run_id).await
+            }
+            WorkflowCommand::Watch { workflow_run_id } => {
+                commands::workflow_watch(&paths, workflow_run_id).await
+            }
+        },
+        TopCommand::FixCi { pr, repo } => {
+            let repo = match repo {
+                Some(repo) => repo,
+                None => std::env::current_dir()?,
+            };
+            commands::fix_ci(&paths, pr, repo).await
+        }
+        TopCommand::Docs { command } => match command {
+            DocsCommand::Publish {
+                document,
+                target,
+                path,
+                branch,
+                title,
+                yes,
+            } => {
+                commands::docs_publish(&paths, document, target.into(), path, branch, title, yes)
+                    .await
+            }
+        },
+        TopCommand::Eval { command } => match command {
+            EvalCommand::Run {
+                suite,
+                policy,
+                report,
+            } => commands::eval_run(&paths, &suite, policy, &report).await,
+        },
+        TopCommand::Models { command } => match command {
+            ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
+        },
+        TopCommand::Promote { command } => match command {
+            PromoteCommand::Propose {
+                kind,
+                name,
+                version,
+                requires_permission_review,
+            } => {
+                commands::promote_propose(&paths, kind, name, version, requires_permission_review)
+                    .await
+            }
+            PromoteCommand::Advance {
+                candidate_id,
+                step,
+                regressed,
+            } => commands::promote_advance(&paths, candidate_id, step.into_wire(regressed)).await,
+            PromoteCommand::Approve { candidate_id } => {
+                commands::promote_approve(&paths, candidate_id).await
+            }
+            PromoteCommand::Rollback { candidate_id } => {
+                commands::promote_rollback(&paths, candidate_id).await
+            }
         },
         TopCommand::Plugin { command } => match command {
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),
             PluginCommand::Diff { installed, update } => commands::plugin_diff(&installed, &update),
+            PluginCommand::Verify {
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => commands::plugin_verify(&manifest, &artifact, allow_unsigned),
+            PluginCommand::Trust { command } => match command {
+                TrustCommand::Add { id, public_key } => {
+                    commands::plugin_trust_add(&id, &public_key)
+                }
+                TrustCommand::List => commands::plugin_trust_list(),
+                TrustCommand::Remove { id } => commands::plugin_trust_remove(&id),
+            },
         },
         TopCommand::Acp { repo } => {
             let repo = match repo {

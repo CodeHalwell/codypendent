@@ -7,9 +7,9 @@
 //! The reducer ([`crate::reduce::reduce`]) is the only place that reads an
 //! `Action`, and it performs no I/O.
 
-use codypendent_protocol::{ApprovalScope, RunId, SessionEvent};
+use codypendent_protocol::{ApprovalScope, DocumentId, DocumentMutation, RunId, SessionEvent};
 
-use crate::state::Pane;
+use crate::state::{DocBlockView, DocSuggestionView, Pane};
 
 /// A semantic action the reducer folds into [`crate::state::AppState`].
 ///
@@ -108,6 +108,57 @@ pub enum Action {
     /// a workflow run, with author, confidence, evidence, and payload summary.
     OpenBlackboard,
 
+    // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
+    /// Begin editing the focused block in the Docs editor rail (`e`): opens the
+    /// block-edit prompt. Submitting it acquires the block lease and, on the grant,
+    /// sends the mutation.
+    EditDoc,
+    /// A merged replica update, projected by the CLI harness after it folded an
+    /// incoming `DocumentSync` into the document's client replica and re-read its
+    /// pending suggestions. Replaces the matching card's blocks/suggestions/revision
+    /// so the editor reflects the authoritative result. The whole CRDT merge stays
+    /// in the harness (which owns the Loro replica); the reducer folds the ready
+    /// projection.
+    DocumentSynced {
+        document_id: DocumentId,
+        /// The document's revision after the sync, pre-rendered (e.g. `"r8"`).
+        revision: String,
+        blocks: Vec<DocBlockView>,
+        suggestions: Vec<DocSuggestionView>,
+    },
+    /// The daemon granted the edit lease this client requested — the reply the
+    /// harness forwards from `Payload::DocumentLeaseGranted`. Marks the in-flight
+    /// edit *held* and releases its queued mutation.
+    DocumentLeaseGranted {
+        document_id: DocumentId,
+        lease_id: String,
+    },
+    /// The daemon refused the edit lease: the block range is held by another writer
+    /// (`document.range-leased`). Marks the in-flight edit *blocked* and surfaces a
+    /// visible notice — the presence-lite "someone else is editing" signal.
+    DocumentLeaseBlocked,
+
+    /// A live workflow node transition, projected by the CLI harness after it folded
+    /// an incoming `Payload::WorkflowEvent` (Phase 5 T9). Overlays the matching
+    /// workflow-graph card's live `state` / `cost` / `error` (each pre-rendered by the
+    /// harness), so the graph view's `node_state_color` branches come alive as the run
+    /// advances. The whole subscription/rendering stays in the harness (which owns the
+    /// socket); the reducer folds the ready projection by node id — idempotent
+    /// overwrite, so an overlap between the snapshot baseline and the live stream is a
+    /// harmless re-write.
+    WorkflowNodeUpdated {
+        /// The node (step) id to overlay — matches [`WorkflowNodeCard::id`].
+        node_id: String,
+        /// The node's live state, pre-rendered (e.g. `running` / `completed` /
+        /// `skipped`).
+        state: String,
+        /// The node's measured cost, pre-rendered (e.g. `"12s · 3 tool calls"`), or
+        /// `"—"` when none.
+        cost: String,
+        /// The node's failure/block reason, pre-rendered, or `"—"` when none.
+        error: String,
+    },
+
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
     /// Flip between the chat single-column and the workspace panes (`F2`).
@@ -164,5 +215,24 @@ pub enum Intent {
     QueueSteering {
         run_id: codypendent_protocol::RunId,
         text: String,
+    },
+
+    // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
+    /// Acquire (or renew) the edit lease over a document block before mutating it.
+    /// The harness ensures it is subscribed to the document's sync stream first,
+    /// then sends `AcquireDocumentLease`.
+    AcquireDocumentLease {
+        document_id: DocumentId,
+        /// The block to lease (`None` = a whole-document structural lease).
+        block_id: Option<String>,
+    },
+    /// Release a held document lease by its id.
+    ReleaseDocumentLease { lease_id: String },
+    /// Apply a semantic mutation to a document (a direct edit, a proposed edit, or
+    /// an accept/reject of a suggestion). The daemon's collaboration mode decides
+    /// whether a content edit applies directly or lands as a suggestion.
+    MutateDocument {
+        document_id: DocumentId,
+        mutation: DocumentMutation,
     },
 }

@@ -8,14 +8,14 @@
 //! below exercise.
 
 use codypendent_protocol::{
-    Actor, ApprovalDecision, ApprovalScope, BudgetDimension, EventBody, ProposedAction,
-    RunDisposition, RunState, SessionEvent,
+    Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
+    EventBody, ProposedAction, RunDisposition, RunState, SessionEvent,
 };
 
 use crate::action::{Action, Intent};
 use crate::state::{
-    AppState, Overlay, Pane, PatchSummary, PendingApproval, RunView, ToolCard, ToolStatus,
-    TranscriptEntry,
+    AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, Overlay, Pane,
+    PatchSummary, PendingApproval, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -49,7 +49,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
 
-        Action::CyclePane => state.focus = state.focus.next(),
+        // In the Docs overlay `Tab` cycles the tree / editor / review rail focus;
+        // elsewhere it cycles the (vestigial) pane focus.
+        Action::CyclePane => {
+            if matches!(state.overlay, Overlay::Docs) {
+                state.doc_focus = state.doc_focus.next();
+            } else {
+                state.focus = state.focus.next();
+            }
+        }
         Action::FocusPane(pane) => state.focus = pane,
         Action::SelectPrev => nav(state, -1),
         Action::SelectNext => nav(state, 1),
@@ -65,8 +73,24 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ConfirmCancel => confirm_cancel(state),
         Action::Steer => begin_steering(state),
 
-        Action::Approve(scope) => resolve_focused(state, ApprovalDecision::Approve, scope),
-        Action::Reject => resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once),
+        // `a`/`r` resolve a document suggestion when the Docs review rail is
+        // focused (going through the same `MutateDocument` accept/reject the daemon
+        // gates on the Approver/Controller role); otherwise they resolve a pending
+        // approval, exactly as before.
+        Action::Approve(scope) => {
+            if matches!(state.overlay, Overlay::Docs) {
+                resolve_focused_suggestion(state, true);
+            } else {
+                resolve_focused(state, ApprovalDecision::Approve, scope);
+            }
+        }
+        Action::Reject => {
+            if matches!(state.overlay, Overlay::Docs) {
+                resolve_focused_suggestion(state, false);
+            } else {
+                resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
+            }
+        }
 
         Action::InputChar(c) => input_char(state, c),
         Action::InputPaste(text) => edit_prompt(state, move |buf| buf.push_str(&text)),
@@ -91,9 +115,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::OpenSource => open_source(state),
 
         Action::OpenDocs => {
-            state.overlay = match state.overlay {
-                Overlay::Docs => Overlay::None,
-                _ => Overlay::Docs,
+            if matches!(state.overlay, Overlay::Docs) {
+                // Closing the browser releases any block lease this client holds.
+                release_doc_lease(state);
+                state.overlay = Overlay::None;
+            } else {
+                state.overlay = Overlay::Docs;
             }
         }
         Action::OpenEdges => {
@@ -132,8 +159,57 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::Detach => state.should_detach = true,
-        Action::Dismiss => state.overlay = Overlay::None,
+        Action::Dismiss => {
+            // Leaving the Docs browser releases any block lease this client holds.
+            if matches!(state.overlay, Overlay::Docs) {
+                release_doc_lease(state);
+            }
+            state.overlay = Overlay::None;
+        }
+
+        // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
+        Action::EditDoc => begin_doc_edit(state),
+        Action::DocumentSynced {
+            document_id,
+            revision,
+            blocks,
+            suggestions,
+        } => apply_document_sync(state, document_id, revision, blocks, suggestions),
+        Action::DocumentLeaseGranted {
+            document_id,
+            lease_id,
+        } => on_lease_granted(state, document_id, lease_id),
+        Action::DocumentLeaseBlocked => on_lease_blocked(state),
+
+        // --- Workflow-graph live overlay (Phase 5 T9) ---
+        Action::WorkflowNodeUpdated {
+            node_id,
+            state: node_state,
+            cost,
+            error,
+        } => apply_workflow_node_update(state, &node_id, node_state, cost, error),
+
         Action::NoOp => {}
+    }
+}
+
+/// Overlay a live workflow node transition onto the graph-view cards (Phase 5 T9):
+/// every card matching `node_id` takes the transition's pre-rendered `state` / `cost`
+/// / `error`, so the view reflects the run advancing instead of the forever-`pending`
+/// pre-run placeholders. Idempotent overwrite (a re-delivered transition writes the
+/// same values), keyed by node id — the fold the CLI harness feeds after folding a
+/// `Payload::WorkflowEvent`.
+fn apply_workflow_node_update(
+    state: &mut AppState,
+    node_id: &str,
+    node_state: String,
+    cost: String,
+    error: String,
+) {
+    for card in state.workflow.iter_mut().filter(|card| card.id == node_id) {
+        card.state = node_state.clone();
+        card.cost = cost.clone();
+        card.error = error.clone();
     }
 }
 
@@ -459,7 +535,24 @@ fn nav(state: &mut AppState, delta: i32) {
             return;
         }
         Overlay::Docs => {
-            step(&mut state.selected_doc, state.docs.len(), delta);
+            match state.doc_focus {
+                // The tree drives the document selection (the default rail, so this
+                // is the pre-editing behaviour). A different document resets the
+                // block/suggestion cursors so they never point past the new lists.
+                DocFocus::Tree => {
+                    step(&mut state.selected_doc, state.docs.len(), delta);
+                    state.selected_block = 0;
+                    state.selected_suggestion = 0;
+                }
+                DocFocus::Editor => {
+                    let len = state.focused_doc().map_or(0, |d| d.blocks.len());
+                    step(&mut state.selected_block, len, delta);
+                }
+                DocFocus::Review => {
+                    let len = state.focused_doc().map_or(0, |d| d.suggestions.len());
+                    step(&mut state.selected_suggestion, len, delta);
+                }
+            }
             return;
         }
         Overlay::Edges => {
@@ -627,9 +720,139 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
     }
 }
 
+// --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
+
+/// Begin editing the focused block: open the block-edit prompt. Only meaningful
+/// with the editor rail focused and a block under the cursor.
+fn begin_doc_edit(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
+        return;
+    }
+    if let Some(block_id) = state.focused_block().map(|block| block.id.clone()) {
+        state.overlay = Overlay::DocEdit {
+            block_id,
+            buffer: String::new(),
+        };
+    }
+}
+
+/// Acquire `block_id`'s edit lease and queue `mutation` to fire once the daemon
+/// grants it. Releases any lease this client already holds first, so switching to
+/// a new block never orphans the old lease.
+fn start_doc_edit(
+    state: &mut AppState,
+    document_id: DocumentId,
+    block_id: Option<String>,
+    mutation: DocumentMutation,
+) {
+    release_doc_lease(state);
+    state.doc_edit = Some(DocEdit {
+        document_id,
+        block_id: block_id.clone(),
+        lease: DocLeaseState::Acquiring,
+        lease_id: None,
+        pending: Some(mutation),
+    });
+    state.outbox.push(Intent::AcquireDocumentLease {
+        document_id,
+        block_id,
+    });
+}
+
+/// The daemon granted the requested lease: mark the edit held and fire its queued
+/// mutation exactly once. Ignores a grant for a document that is no longer the
+/// in-flight edit (e.g. the browser was closed before it arrived).
+fn on_lease_granted(state: &mut AppState, document_id: DocumentId, lease_id: String) {
+    let mutation = match state.doc_edit.as_mut() {
+        Some(edit) if edit.document_id == document_id => {
+            edit.lease = DocLeaseState::Held;
+            edit.lease_id = Some(lease_id);
+            edit.pending.take()
+        }
+        _ => return,
+    };
+    if let Some(mutation) = mutation {
+        state.outbox.push(Intent::MutateDocument {
+            document_id,
+            mutation,
+        });
+    }
+}
+
+/// The daemon refused the lease (`document.range-leased`): mark the edit blocked,
+/// drop its queued mutation, and surface the presence-lite notice.
+fn on_lease_blocked(state: &mut AppState) {
+    if let Some(edit) = state.doc_edit.as_mut() {
+        edit.lease = DocLeaseState::Blocked;
+        edit.pending = None;
+    }
+    state.notice = Some((
+        "block is being edited by another writer".to_owned(),
+        state.tick + 25,
+    ));
+}
+
+/// Release a held block lease (if any). Only a *held* lease carries an id to
+/// release; an acquiring or blocked one just clears.
+fn release_doc_lease(state: &mut AppState) {
+    if let Some(edit) = state.doc_edit.take() {
+        if let Some(lease_id) = edit.lease_id {
+            state.outbox.push(Intent::ReleaseDocumentLease { lease_id });
+        }
+    }
+}
+
+/// Accept (`accept = true`) or reject the focused suggestion in the review rail,
+/// through the daemon's `MutateDocument` accept/reject (role-gated there — a
+/// resolution needs no edit lease). Only fires with the review rail focused and a
+/// suggestion under the cursor.
+fn resolve_focused_suggestion(state: &mut AppState, accept: bool) {
+    if state.doc_focus != DocFocus::Review {
+        return;
+    }
+    let Some(document_id) = state.focused_doc().map(|doc| doc.document_id) else {
+        return;
+    };
+    let Some(suggestion_id) = state.focused_suggestion().map(|s| s.id.clone()) else {
+        return;
+    };
+    let mutation = if accept {
+        DocumentMutation::AcceptSuggestion { suggestion_id }
+    } else {
+        DocumentMutation::RejectSuggestion { suggestion_id }
+    };
+    state.outbox.push(Intent::MutateDocument {
+        document_id,
+        mutation,
+    });
+}
+
+/// Fold a merged replica update (already projected by the harness) into the
+/// matching card, replacing its blocks, suggestions, and revision so the editor
+/// reflects the authoritative result, then re-clamp the rail cursors.
+fn apply_document_sync(
+    state: &mut AppState,
+    document_id: DocumentId,
+    revision: String,
+    blocks: Vec<DocBlockView>,
+    suggestions: Vec<DocSuggestionView>,
+) {
+    let Some(card) = state.docs.iter_mut().find(|d| d.document_id == document_id) else {
+        return;
+    };
+    card.revision = revision;
+    card.blocks = blocks;
+    card.suggestions = suggestions;
+    let blocks_len = card.blocks.len();
+    let suggestions_len = card.suggestions.len();
+    clamp(&mut state.selected_block, blocks_len);
+    clamp(&mut state.selected_suggestion, suggestions_len);
+}
+
 fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
     match &mut state.overlay {
         Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
+        Overlay::DocEdit { buffer, .. } => edit(buffer),
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
@@ -656,12 +879,15 @@ fn input_char(state: &mut AppState, c: char) {
     edit_prompt(state, |buf| buf.push(c));
 }
 
-/// `Esc`: clear the composer draft in the base view, or close the active overlay.
+/// `Esc`: clear the composer draft in the base view, return the block-edit prompt
+/// to the Docs browser it opened from, or close whatever other overlay is active.
 fn input_cancel(state: &mut AppState) {
-    if matches!(state.overlay, Overlay::None) {
-        state.composer.clear();
-    } else {
-        state.overlay = Overlay::None;
+    match state.overlay {
+        Overlay::None => state.composer.clear(),
+        // Abandoning the block-edit prompt returns to the browser, not the base
+        // view (no lease was taken yet — the acquire only fires on submit).
+        Overlay::DocEdit { .. } => state.overlay = Overlay::Docs,
+        _ => state.overlay = Overlay::None,
     }
 }
 
@@ -686,6 +912,27 @@ fn submit_prompt(state: &mut AppState) {
             let run_id = state.selected_run().map(|r| r.run_id);
             if let (false, Some(run_id)) = (text.is_empty(), run_id) {
                 state.outbox.push(Intent::QueueSteering { run_id, text });
+            }
+        }
+        // Submit the block-edit prompt: acquire the block's lease and queue the
+        // insertion to fire once it is granted. `mem::take` left the overlay
+        // `None`; restore the Docs browser so the reflected sync lands in view.
+        Overlay::DocEdit { block_id, buffer } => {
+            state.overlay = Overlay::Docs;
+            let text = buffer.trim().to_owned();
+            let document_id = state.focused_doc().map(|doc| doc.document_id);
+            if let (false, Some(document_id)) = (text.is_empty(), document_id) {
+                // Insert the typed text at the start of the block. A pure insertion
+                // (delete_len 0) needs no knowledge of the block's current length —
+                // in Edit mode it applies directly, in Suggest mode the daemon turns
+                // it into a suggestion over the empty range [0,0).
+                let mutation = DocumentMutation::EditText {
+                    block_id: block_id.clone(),
+                    position: 0,
+                    delete_len: 0,
+                    insert: text,
+                };
+                start_doc_edit(state, document_id, Some(block_id), mutation);
             }
         }
         // `mem::take` already closed the palette (left `None`); run the
@@ -788,6 +1035,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
         ProposedAction::NetworkRequest { destination } => format!("NetworkConnect ({destination})"),
         ProposedAction::GitCommit { repository } => format!("GitCommit ({repository})"),
         ProposedAction::GitPush { remote, branch } => format!("GitPush ({remote} {branch})"),
+        ProposedAction::PublishDocument { target, .. } => format!("GitCommit ({target})"),
         _ => "unsupported capability".to_owned(),
     }
 }
@@ -858,6 +1106,90 @@ mod tests {
             }),
         );
         assert_eq!(s.runs[0].state, RunState::Running);
+    }
+
+    /// C13: every transcript-pushing reducer arm routes through `push_entry`,
+    /// so a run's transcript is bounded by `MAX_TRANSCRIPT_ENTRIES` regardless
+    /// of how many events arrive. The arms the fix converted from a direct
+    /// `transcript.push` — tool-started, tool-completed, steering, budget — are
+    /// each flooded past the cap here; a regression to a direct push (skipping
+    /// the trim) would let the transcript grow without bound.
+    #[test]
+    fn transcript_entries_respect_the_cap_in_every_formerly_direct_arm() {
+        let cap = crate::state::MAX_TRANSCRIPT_ENTRIES;
+        let over = cap + 37;
+
+        // Flood one arm with `over` events that each push a fresh transcript
+        // entry, and return the resulting transcript length.
+        let flood = |make: &dyn Fn(RunId, usize) -> Action| -> usize {
+            let mut s = AppState::new();
+            let run_id = RunId::new();
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: "diagnose".to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            for i in 0..over {
+                reduce(&mut s, make(run_id, i));
+            }
+            s.runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .unwrap()
+                .transcript
+                .len()
+        };
+
+        // tool-started with no preceding proposed card → the None (push) branch.
+        let tool_started = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::ToolStarted {
+                    run_id,
+                    tool: format!("tool.{i}"),
+                    args_digest: format!("d{i}"),
+                },
+            )
+        });
+        // tool-completed with no non-completed card → the None (push) branch.
+        let tool_completed = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::ToolCompleted {
+                    run_id,
+                    tool: format!("tool.{i}"),
+                    outcome: ToolOutcome::Succeeded,
+                    artifact: None,
+                },
+            )
+        });
+        // steering queued → a fresh (unapplied) Steering entry each time.
+        let steering =
+            flood(&|run_id, _i| ev(agent_actor(run_id), EventBody::SteeringQueued { run_id }));
+        // budget warning → a fresh Budget entry each time.
+        let budget = flood(&|run_id, i| {
+            ev(
+                agent_actor(run_id),
+                EventBody::BudgetWarning {
+                    run_id,
+                    dimension: BudgetDimension::Cost,
+                    used: i as u64,
+                    limit: 100,
+                },
+            )
+        });
+
+        for (arm, len) in [
+            ("tool-started", tool_started),
+            ("tool-completed", tool_completed),
+            ("steering", steering),
+            ("budget", budget),
+        ] {
+            assert_eq!(len, cap, "{arm}: transcript must be trimmed to the cap");
+        }
     }
 
     fn note_count(s: &AppState, run_id: RunId) -> usize {
@@ -1487,16 +1819,19 @@ mod tests {
 
     fn doc(title: &str) -> crate::state::DocCard {
         crate::state::DocCard {
+            document_id: codypendent_protocol::DocumentId::new(),
             title: title.to_owned(),
             scope: "organization".to_owned(),
             status: "draft".to_owned(),
             mode: "suggest".to_owned(),
             revision: "r3".to_owned(),
             blocks: vec![crate::state::DocBlockView {
+                id: "b1".to_owned(),
                 kind: "heading".to_owned(),
                 text: title.to_owned(),
             }],
             suggestions: vec![crate::state::DocSuggestionView {
+                id: "s1".to_owned(),
                 status: "pending".to_owned(),
                 author: "agent".to_owned(),
                 range: "0..4".to_owned(),
@@ -1554,6 +1889,306 @@ mod tests {
         assert_eq!(s.selected_doc, 0);
     }
 
+    // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
+
+    /// Open the Docs browser focused on the review rail (Tree → Editor → Review).
+    fn docs_on_review(docs: Vec<crate::state::DocCard>) -> AppState {
+        let mut s = AppState::new();
+        s.docs = docs;
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor
+        reduce(&mut s, Action::CyclePane); // Review
+        s
+    }
+
+    #[test]
+    fn tab_cycles_the_docs_rail_focus() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.doc_focus, DocFocus::Tree);
+        reduce(&mut s, Action::CyclePane);
+        assert_eq!(s.doc_focus, DocFocus::Editor);
+        reduce(&mut s, Action::CyclePane);
+        assert_eq!(s.doc_focus, DocFocus::Review);
+        reduce(&mut s, Action::CyclePane);
+        assert_eq!(s.doc_focus, DocFocus::Tree);
+    }
+
+    #[test]
+    fn docs_editor_rail_nav_moves_the_block_cursor_not_the_tree() {
+        let mut s = AppState::new();
+        let mut card = doc("a");
+        card.blocks.push(crate::state::DocBlockView {
+            id: "b2".to_owned(),
+            kind: "paragraph".to_owned(),
+            text: "second".to_owned(),
+        });
+        s.docs = vec![card, doc("b")];
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        assert_eq!(s.selected_doc, 0);
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_block, 1, "the block cursor moves");
+        assert_eq!(s.selected_doc, 0, "the tree selection stays put");
+    }
+
+    #[test]
+    fn edit_doc_opens_the_block_edit_prompt_for_the_focused_block() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::EditDoc);
+        match &s.overlay {
+            Overlay::DocEdit { block_id, buffer } => {
+                assert_eq!(block_id, "b1");
+                assert!(buffer.is_empty());
+            }
+            other => panic!("expected the block-edit prompt, got {other:?}"),
+        }
+        // Outside the editor rail, `e` is inert.
+        let mut t = AppState::new();
+        t.docs = vec![doc("a")];
+        reduce(&mut t, Action::OpenDocs); // Tree focus
+        reduce(&mut t, Action::EditDoc);
+        assert_eq!(t.overlay, Overlay::Docs);
+    }
+
+    #[test]
+    fn submitting_a_block_edit_acquires_the_lease_and_queues_the_mutation() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::EditDoc);
+        for c in "hi".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        // The prompt closed back to the browser and a lease was requested.
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AcquireDocumentLease {
+                document_id,
+                block_id: Some("b1".to_owned()),
+            }]
+        );
+        // The mutation is queued (not yet sent) and the lease is being acquired.
+        let edit = s.doc_edit.as_ref().expect("an edit is in flight");
+        assert_eq!(edit.lease, DocLeaseState::Acquiring);
+        assert_eq!(
+            edit.pending,
+            Some(DocumentMutation::EditText {
+                block_id: "b1".to_owned(),
+                position: 0,
+                delete_len: 0,
+                insert: "hi".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_block_edit_submits_nothing() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane);
+        reduce(&mut s, Action::EditDoc);
+        reduce(&mut s, Action::InputSubmit); // empty buffer
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert!(s.outbox.is_empty());
+        assert!(s.doc_edit.is_none());
+    }
+
+    #[test]
+    fn a_lease_grant_marks_held_and_fires_the_queued_mutation() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane);
+        reduce(&mut s, Action::EditDoc);
+        reduce(&mut s, Action::InputChar('x'));
+        reduce(&mut s, Action::InputSubmit);
+        let _ = s.drain_outbox(); // the AcquireDocumentLease intent
+
+        reduce(
+            &mut s,
+            Action::DocumentLeaseGranted {
+                document_id,
+                lease_id: "lease-1".to_owned(),
+            },
+        );
+
+        let edit = s.doc_edit.as_ref().expect("still tracking the edit");
+        assert_eq!(edit.lease, DocLeaseState::Held);
+        assert_eq!(edit.lease_id.as_deref(), Some("lease-1"));
+        assert!(edit.pending.is_none(), "the queued mutation was fired");
+        assert_eq!(
+            s.outbox,
+            vec![Intent::MutateDocument {
+                document_id,
+                mutation: DocumentMutation::EditText {
+                    block_id: "b1".to_owned(),
+                    position: 0,
+                    delete_len: 0,
+                    insert: "x".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lease_rejection_blocks_the_edit_and_shows_a_notice() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane);
+        reduce(&mut s, Action::EditDoc);
+        reduce(&mut s, Action::InputChar('x'));
+        reduce(&mut s, Action::InputSubmit);
+        let _ = s.drain_outbox();
+
+        reduce(&mut s, Action::DocumentLeaseBlocked);
+
+        let edit = s.doc_edit.as_ref().expect("still tracking the edit");
+        assert_eq!(edit.lease, DocLeaseState::Blocked);
+        assert!(edit.pending.is_none(), "the queued mutation was dropped");
+        assert!(s.outbox.is_empty(), "nothing is sent for a blocked lease");
+        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
+        assert!(
+            notice.contains("another writer"),
+            "the range-leased notice must be visible: {notice}"
+        );
+        // Correlation to `document_id` is implicit: the client holds one in-flight
+        // edit at a time, so a range-leased rejection is for that edit.
+        assert_eq!(edit.document_id, document_id);
+    }
+
+    #[test]
+    fn accepting_the_focused_suggestion_emits_an_accept_mutation() {
+        let mut s = docs_on_review(vec![doc("a")]);
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        assert_eq!(
+            s.outbox,
+            vec![Intent::MutateDocument {
+                document_id,
+                mutation: DocumentMutation::AcceptSuggestion {
+                    suggestion_id: "s1".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn rejecting_the_focused_suggestion_emits_a_reject_mutation() {
+        let mut s = docs_on_review(vec![doc("a")]);
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::Reject);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::MutateDocument {
+                document_id,
+                mutation: DocumentMutation::RejectSuggestion {
+                    suggestion_id: "s1".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn suggestion_resolution_needs_the_review_rail_focused() {
+        // On the tree rail, `a`/`r` resolve nothing (and, with the Docs overlay up,
+        // they never touch a pending approval either).
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs); // Tree focus
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        reduce(&mut s, Action::Reject);
+        assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_document_sync_replaces_the_matching_cards_content() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a"), doc("b")];
+        let target = s.docs[1].document_id;
+        s.selected_doc = 1;
+        s.selected_block = 5; // stale cursor, must be re-clamped
+        reduce(
+            &mut s,
+            Action::DocumentSynced {
+                document_id: target,
+                revision: "r9".to_owned(),
+                blocks: vec![crate::state::DocBlockView {
+                    id: "b1".to_owned(),
+                    kind: "paragraph".to_owned(),
+                    text: "merged".to_owned(),
+                }],
+                suggestions: vec![],
+            },
+        );
+        assert_eq!(s.docs[1].revision, "r9");
+        assert_eq!(s.docs[1].blocks[0].text, "merged");
+        assert!(s.docs[1].suggestions.is_empty());
+        assert_eq!(s.selected_block, 0, "the block cursor was re-clamped");
+        // The other card is untouched.
+        assert_eq!(s.docs[0].revision, "r3");
+    }
+
+    #[test]
+    fn a_document_sync_for_an_unknown_document_is_inert() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(
+            &mut s,
+            Action::DocumentSynced {
+                document_id: codypendent_protocol::DocumentId::new(),
+                revision: "r9".to_owned(),
+                blocks: vec![],
+                suggestions: vec![],
+            },
+        );
+        assert_eq!(s.docs[0].revision, "r3", "no card matched, nothing changed");
+    }
+
+    #[test]
+    fn closing_the_docs_browser_releases_a_held_lease() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane);
+        reduce(&mut s, Action::EditDoc);
+        reduce(&mut s, Action::InputChar('x'));
+        reduce(&mut s, Action::InputSubmit);
+        reduce(
+            &mut s,
+            Action::DocumentLeaseGranted {
+                document_id,
+                lease_id: "lease-7".to_owned(),
+            },
+        );
+        let _ = s.drain_outbox();
+
+        // Closing the browser (toggle `D`, or `Esc`) releases the held lease.
+        reduce(&mut s, Action::OpenDocs);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.doc_edit.is_none());
+        assert_eq!(
+            s.outbox,
+            vec![Intent::ReleaseDocumentLease {
+                lease_id: "lease-7".to_owned(),
+            }]
+        );
+    }
+
     #[test]
     fn edge_navigation_moves_selection_within_the_inspector() {
         let mut s = AppState::new();
@@ -1583,6 +2218,7 @@ mod tests {
             depends_on: "—".to_owned(),
             outputs: "test_result".to_owned(),
             cost: "—".to_owned(),
+            error: "—".to_owned(),
         }
     }
 
@@ -1624,6 +2260,57 @@ mod tests {
         }
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::Workflow);
+    }
+
+    #[test]
+    fn a_live_workflow_transition_overlays_the_matching_graph_card() {
+        // T9: a live node transition folds into the graph view — the forever-`pending`
+        // placeholder becomes the run's real state/cost/error, so `node_state_color`'s
+        // non-pending branches come alive. Only the matching node id is touched.
+        let mut s = AppState::new();
+        s.workflow = vec![node("inspect"), node("verify")];
+
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "inspect".to_owned(),
+                state: "completed".to_owned(),
+                cost: "12s · 3 tool calls".to_owned(),
+                error: "—".to_owned(),
+            },
+        );
+
+        let inspect = s.workflow.iter().find(|c| c.id == "inspect").unwrap();
+        assert_eq!(inspect.state, "completed");
+        assert_eq!(inspect.cost, "12s · 3 tool calls");
+        assert_eq!(inspect.error, "—");
+        // The other node is untouched by the transition.
+        let verify = s.workflow.iter().find(|c| c.id == "verify").unwrap();
+        assert_eq!(verify.state, "pending");
+
+        // A failing transition carries its reason, and the fold is idempotent — a
+        // re-delivered transition writes the same values (overlap is harmless).
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "verify".to_owned(),
+                state: "failed".to_owned(),
+                cost: "—".to_owned(),
+                error: "the test command exited 1".to_owned(),
+            },
+        );
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "verify".to_owned(),
+                state: "failed".to_owned(),
+                cost: "—".to_owned(),
+                error: "the test command exited 1".to_owned(),
+            },
+        );
+        let verify = s.workflow.iter().find(|c| c.id == "verify").unwrap();
+        assert_eq!(verify.state, "failed");
+        assert_eq!(verify.error, "the test command exited 1");
     }
 
     fn item(kind: &str) -> crate::state::BlackboardItemCard {

@@ -13,12 +13,16 @@ pub mod server;
 // Phase 1
 pub mod approvals;
 pub mod artifacts;
+pub mod blackboard;
 pub mod commands;
 pub mod documents;
 pub mod executor;
+pub mod model_profiles;
 pub mod policy;
 pub mod projections;
+pub mod promotion;
 pub mod recovery;
 pub mod subscriptions;
+pub mod workflow_stream;
 pub mod workflows;
 pub mod worktrees;

@@ -91,11 +91,11 @@ async fn create_run_idempotent_dedups_by_key() {
     // Two creations with the same idempotency key resolve to one run (a duplicate
     // StartWorkflow delivery after a lost ack does not fork a second run).
     let first = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     let second = store
-        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-42", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     assert_eq!(first, second, "same key ⇒ same run id");
@@ -107,11 +107,113 @@ async fn create_run_idempotent_dedups_by_key() {
 
     // A different key is a different run.
     let other = store
-        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }), None)
+        .create_run_idempotent(&pool, &compiled, "cmd-99", &json!({ "x": 1 }), None, None)
         .await
         .unwrap();
     assert_ne!(first, other);
     assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn create_run_idempotent_records_and_reads_back_the_repository() {
+    // Phase 5 T5: the repository a run's agent nodes operate on is recorded at
+    // creation and read back by the node executor, so recovery carves each
+    // node's isolated worktree from the right checkout. A run created without a
+    // repository reads back `None` (the node executor then falls back to the
+    // daemon's startup repository root).
+    let (_tmp, pool) = temp_pool().await;
+    let store = WorkflowStore::new();
+    let compiled = compile_yaml(MANIFEST).unwrap();
+
+    let bound = store
+        .create_run_idempotent(
+            &pool,
+            &compiled,
+            "cmd-repo",
+            &json!({}),
+            Some(MANIFEST),
+            Some("/home/user/project"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.repository(&pool, &bound).await.unwrap().as_deref(),
+        Some("/home/user/project"),
+        "the recorded repository is read back verbatim"
+    );
+
+    let unbound = store
+        .create_run_idempotent(
+            &pool,
+            &compiled,
+            "cmd-norepo",
+            &json!({}),
+            Some(MANIFEST),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.repository(&pool, &unbound).await.unwrap(),
+        None,
+        "a run created without a repository reads back None"
+    );
+
+    // A run that does not exist is None, not an error.
+    assert_eq!(
+        store.repository(&pool, "wfrun-missing").await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn create_run_idempotent_rejects_a_different_manifest_under_the_same_key() {
+    // P5-D2: the bare idempotency key is not sufficient proof of "the same
+    // request" — reusing it for a DIFFERENT manifest (a different graph
+    // signature) must be a rejection, never a silent success that returns the
+    // first run's id for unrelated work.
+    let (_tmp, pool) = temp_pool().await;
+    let store = WorkflowStore::new();
+    let compiled = compile_yaml(MANIFEST).unwrap();
+
+    let first = store
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None, None)
+        .await
+        .unwrap();
+
+    // Same key + same manifest still dedups (the genuine duplicate-delivery
+    // case), unaffected by the mismatch guard.
+    let same_again = store
+        .create_run_idempotent(&pool, &compiled, "cmd-mismatch", &json!({}), None, None)
+        .await
+        .unwrap();
+    assert_eq!(first, same_again, "same key + same manifest ⇒ same run id");
+
+    // Same key + a DIFFERENT manifest (an extra step changes the graph
+    // signature) must be rejected.
+    let changed_manifest =
+        format!("{MANIFEST}  - id: d\n    depends_on: [c]\n    tool: repository.test\n");
+    let changed = compile_yaml(&changed_manifest).unwrap();
+    assert_ne!(compiled.signature(), changed.signature());
+
+    let err = store
+        .create_run_idempotent(&pool, &changed, "cmd-mismatch", &json!({}), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkflowStoreError::IdempotencyKeyReused { .. }),
+        "expected IdempotencyKeyReused, got {err:?}"
+    );
+
+    // The rejected attempt created nothing: exactly one run, with its original
+    // three nodes (not the four the changed manifest would have seeded).
+    assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 1);
+    let snap = store.snapshot(&pool, &first).await.unwrap().unwrap();
+    assert_eq!(
+        snap.nodes.len(),
+        3,
+        "the rejected duplicate must not have added nodes"
+    );
 }
 
 #[tokio::test]
@@ -533,4 +635,145 @@ async fn run_state_transitions_persist() {
         .await
         .unwrap_err();
     assert!(matches!(err, WorkflowStoreError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn set_run_state_if_legal_only_applies_from_the_given_states() {
+    // The general-purpose primitive behind the P5-D5 lost-pause fix: a
+    // conditional UPDATE that applies only when the run's CURRENT state is
+    // one of `legal_from`, mirroring the daemon's FP-3
+    // `projections::set_run_state_if_legal`.
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}), None)
+        .await
+        .unwrap();
+
+    // The run is Pending — a transition legal only from Completed/Failed
+    // must not apply.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Completed, WorkflowRunState::Failed],
+            WorkflowRunState::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 0, "an illegal prior state must not apply");
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Pending,
+        "the run is untouched"
+    );
+
+    // Pending IS in the legal set — the transition applies.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Pending, WorkflowRunState::Running],
+            WorkflowRunState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "a legal prior state must apply");
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Running
+    );
+
+    // Applying it AGAIN now fails: the run is Running, no longer Pending, and
+    // the (fixed) legal set from the previous call no longer matches once we
+    // narrow it back to just Pending — proving the check is against the
+    // CURRENT state, not a cached one.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Pending],
+            WorkflowRunState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+
+    // An empty `legal_from` can never match anything.
+    let affected = store
+        .set_run_state_if_legal(&pool, &id, &[], WorkflowRunState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Running,
+        "still Running — neither call above touched it"
+    );
+}
+
+#[tokio::test]
+async fn the_terminal_write_cas_does_not_clobber_a_concurrently_cancelled_run() {
+    // T9 review Finding A: the driver's terminal-state write (end of `run_observed`)
+    // is a CAS gated on the run still being `Running`, so a `CancelWorkflow` — already
+    // accepted, the client told OK — that commits `Cancelled` in the window between
+    // the frontier loop's last read and the terminal write is NOT clobbered back to
+    // `Completed`/`Failed`. This exercises the exact primitive `run_observed` uses in
+    // exactly that scenario (the break→write window has no in-driver hook to inject
+    // at, so the CAS is proven directly, and the pre-fix unconditional write is shown
+    // to clobber for contrast).
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}), None)
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Running)
+        .await
+        .unwrap();
+
+    // A concurrent, already-accepted cancel commits `Cancelled` (as
+    // `WorkflowConductor::cancel` does), racing the driver's about-to-run terminal
+    // write.
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Cancelled)
+        .await
+        .unwrap();
+
+    // The driver's terminal write — now a CAS gated on `Running` — affects 0 rows and
+    // leaves the run `Cancelled`: the accepted cancel wins.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Running],
+            WorkflowRunState::Completed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        affected, 0,
+        "the terminal write must not apply once the run has left Running"
+    );
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Cancelled,
+        "the accepted cancel survives the terminal write"
+    );
+
+    // Contrast — the pre-fix UNCONDITIONAL write is the bug: a plain `set_run_state`
+    // WOULD clobber `Cancelled` → `Completed`, silently reverting the accepted cancel.
+    // The CAS above is exactly what closes this.
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Completed,
+        "an unconditional write clobbers Cancelled — the behaviour the CAS prevents"
+    );
 }

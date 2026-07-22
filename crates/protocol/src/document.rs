@@ -60,6 +60,34 @@ pub struct SuggestionInput {
     pub rationale: Option<String>,
 }
 
+/// Where a document publish writes (Phase 4 STEP 4.4). Wire mirror of
+/// `codypendent-knowledge`'s `PublishTarget` domain type — the protocol crate
+/// cannot name the knowledge crate, so this carries the same three targets
+/// across the wire and the `codypendentd` assembly converts one into the
+/// other before computing the plan. Internally tagged with a
+/// [`PublishTarget::Unknown`] fallback so a target a newer peer added
+/// deserializes and is rejected structurally rather than crashing the peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PublishTarget {
+    /// Write the rendered Markdown to a repository file via an approval-gated
+    /// change set on the working tree.
+    RepositoryFile { path: String },
+    /// Commit the rendered Markdown to a dedicated docs branch, worktree-safe
+    /// (the primary checkout is never touched).
+    DocsBranchCommit { branch: String, path: String },
+    /// Open (or update) a documentation pull request via the Phase 3 GitHub
+    /// write path.
+    DocumentationPr {
+        branch: String,
+        path: String,
+        title: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 /// A CRDT sync message for a `Document` subscription: opaque Loro update or
 /// snapshot bytes plus the document it belongs to. Receivers merge `update` into
 /// their local replica; senders emit it after applying a mutation. Opaque so the
@@ -73,8 +101,14 @@ pub struct DocumentSync {
     /// Opaque CRDT bytes. Serialized on the wire as a JSON array of byte values
     /// (see the [`byte_vec`] module) — the framing layer emits plain
     /// `serde_json`, so there is no base64 step; a client sends the raw bytes and
-    /// they round-trip as numbers. Large documents are exchanged as incremental
-    /// updates rather than full snapshots to stay under the frame-size bound.
+    /// they round-trip as numbers. Every sync currently carries a **full CRDT
+    /// snapshot** (`ExportMode::Snapshot`), not an incremental delta — the client
+    /// replica relies on this (an empty or lagged replica converges on the next
+    /// sync, and re-importing a snapshot is an idempotent no-op). If a future
+    /// change sends deltas to stay under the frame-size bound, the client replica
+    /// (`knowledge::docs::DocumentReplica`) must be updated in lockstep, or a
+    /// replica missing a delta's causal dependencies would silently fail to
+    /// converge.
     #[serde(with = "byte_vec")]
     pub update: Vec<u8>,
 }
@@ -108,9 +142,10 @@ pub struct DocumentLeaseGrant {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Serialize `Vec<u8>` as a JSON array of numbers (portable, no extra deps). The
-/// framing layer already bounds frame size, so document snapshots that would be
-/// large are exchanged as incremental updates, not full snapshots.
+/// Serialize `Vec<u8>` as a JSON array of numbers (portable, no extra deps).
+/// `DocumentSync.update` currently carries a full CRDT snapshot on every sync
+/// (see that field's docs); the framing layer bounds frame size, so a very large
+/// document is a known future scaling limit, not something deltas solve today.
 mod byte_vec {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -215,5 +250,35 @@ mod tests {
         assert!(!json.contains("block_id"));
         let parsed: DocumentLeaseGrant = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.block_id, None);
+    }
+
+    fn round_trip_target(target: PublishTarget) {
+        let json = serde_json::to_string(&target).expect("serialize");
+        let parsed: PublishTarget = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(target, parsed);
+    }
+
+    #[test]
+    fn every_publish_target_round_trips() {
+        round_trip_target(PublishTarget::RepositoryFile {
+            path: "docs/architecture.md".into(),
+        });
+        round_trip_target(PublishTarget::DocsBranchCommit {
+            branch: "docs/publish".into(),
+            path: "docs/architecture.md".into(),
+        });
+        round_trip_target(PublishTarget::DocumentationPr {
+            branch: "docs/publish".into(),
+            path: "docs/architecture.md".into(),
+            title: "Publish: Architecture".into(),
+        });
+    }
+
+    #[test]
+    fn unknown_publish_target_kind_deserializes_to_unknown() {
+        let parsed: PublishTarget =
+            serde_json::from_value(serde_json::json!({ "kind": "teleport_repository" }))
+                .expect("unknown kind must parse, not error");
+        assert!(matches!(parsed, PublishTarget::Unknown));
     }
 }

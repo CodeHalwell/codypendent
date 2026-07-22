@@ -6,5 +6,7 @@
 //! features (ADR-009: selected crates, never the umbrella `full`).
 
 pub mod agent;
+pub mod bench;
+pub mod blackboard;
 pub mod models;
 pub mod tools;

@@ -21,81 +21,91 @@ the release gate is the
 | **1** | Persistent coding-agent slice — sessions/runs, tools, approvals, TUI, JSONL | ✅ |
 | **2** | Skills & knowledge — registry, retrieval, memory, code graph | ✅ |
 | **3** | GitHub & IDE awareness — PR flows, editor extensions, shared session | ✅ |
-| **4** | Docs Studio & code intelligence — CRDT docs, semantic index | 🟡 |
-| **5** | Workflows & multi-agent orchestration | 🟡 |
+| **4** | Docs Studio & code intelligence — CRDT docs, semantic index | ✅¹ |
+| **5** | Workflows & multi-agent orchestration | ✅² |
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | 🟡 |
 | **7** | Intelligent routing & learning — model router, graders, canary | 🟡 |
 
-> **You are here:** Phases 0–3 are complete, and Phase 4's engine is in place.
-> The knowledge fabric now carries a Loro-backed collaborative document model
-> (selected by a real benchmark, ADR-016) with lossless block round-trip,
-> concurrent-merge convergence, per-mutation authorship, collaboration modes with
-> suggest-by-default for org docs, deterministic Markdown publication, a semantic
-> `LanguageAdapter` layer with LSP-edge supersession and revision-aware graph
-> queries (callers/blast-radius/tests-covering/changed-between), and a
-> documentation staleness engine (`/update-docs`). Two slices of
-> **client-surface wiring** have now landed. First, a read-only TUI Docs view
-> (tree / editor / review rail) and a code-graph edge inspector, fed by the CLI
-> projection seam (`D` / `G`). Second, **live daemon CRDT transport**: the
-> `MutateDocument` command now applies onto the authoritative Loro document
-> through a `DocumentMutator` assembly seam (mode-gated by the document's scope,
-> single-writer via edit-lease `require`), and the resulting `DocumentSync` fans
-> out to `Subscription::Document` subscribers over a per-document `DocumentHub`.
-> What remains for Phase 4 is executing publication through the approval-gated
-> write path, spawning a live language server, and the client-side CRDT replica
-> that consumes the sync stream — external-tool / client work tracked below. With those
-> deferred, **Phase 5 is underway**: the `codypendent-workflow` crate compiles
-> declarative `workflow.yaml` manifests into a validated node graph (5.1 compiler
-> core), persists runs / node records / checkpoints with resume-guarding in a
-> `WorkflowStore` (5.2 durable store), carries agent-profile (`agent.toml`)
-> parsing, and holds a per-run `BlackboardStore` for the typed, evidence-gated
-> artifact channel agents share (5.3) — the daemon-free foundation for durable
-> multi-agent orchestration, now advancing on three fronts. A model-free
-> **driver** (`WorkflowDriver` + a `NodeExecutor` seam) advances a run through the
-> ready frontier — resumable, node-level provenance recorded — proven end-to-end
-> with a fake executor. **Runs are now driven, recovered, and controlled through
-> the daemon**: a `StartWorkflow` command compiles a manifest, creates a durable
-> run (its manifest persisted for recovery, migration 0011), and the assembly's
-> `WorkflowConductorHost` spawns the driver to advance it to a terminal state
-> under a per-run lock; a startup pass resumes every incomplete run after a crash;
-> and `Controller`-gated `PauseWorkflow`/`ResumeWorkflow`/`RetryWorkflowNode`
-> commands (reachable from `codypendent workflow run/pause/resume/retry`) drive the
-> conductor's cooperative-pause / resume / retry-from-node lifecycle. **Agent nodes
-> now execute the real agent loop** — `AgentLoopNodeExecutor` creates a session +
-> run and drives the loop to a disposition (tested with a `ScriptedDriver`, no
-> model) — with tool-node execution and blackboard-output harvest the remaining
-> leaf work. And two read-only **client surfaces** have landed — a TUI
-> workflow-graph view over the
-> compiled projection (per-node state / agent / worktree, grouped by workflow) and
-> a TUI blackboard view over the per-run artifact boards (kind / author /
-> confidence / evidence) — each fed by a CLI seam.
-> In parallel, a **Codex-informed TUI backlog** is
-> tracked near the end of this file: the conversation-centred shell, command
-> palette (`/`), layout toggle (F2), auto-scroll follow, and contextual footer
-> have all shipped.
+> ¹ Phase 4's collaborative-documents vertical is closed (client-side CRDT replica
+> + live TUI editing, and `PublishPlan` execution through the approval-gated write
+> path). Remaining follow-up: spawning a live language server (rust-analyzer /
+> pyright) — the adapter reports the capability; edges are proven with synthesized
+> data today. ² Phase 5's workflow/multi-agent slice is complete (declarative
+> workflows, durable checkpoints + crash recovery, the blackboard channel, tool-node
+> execution with a meaningful patch→verify handoff, per-run isolated worktrees,
+> nested budgets, node-level cost/provenance, observability + cancel, and `/fix-ci`
+> on the declarative engine). Remaining overlay: session forking (STEP 5.6). Phases
+> 6 and 7 landed their engines **and** their first wiring — OS sandbox enforcement
+> v1, and a default-off model-router daemon seam + eval-run CLI + promotion
+> persistence — but keep 🟡 for the genuinely-remaining slices (WASM runtime +
+> client capture for 6; a live measured routing run + real shadow/canary execution
+> for 7). See each phase below.
+
+> **You are here:** Phases 0–5 are complete and verified; Phases 6 and 7 have their
+> engines **and** their first production wiring, with defined remaining slices. The
+> engine-to-wiring gap the earlier project reviews flagged has largely closed — the
+> previously unwired routing / eval / sandbox engines now have real production
+> consumers.
 >
-> **Phases 6 and 7 have now begun as daemon-free engines.** Phase 6 landed the
-> `codypendent-sandbox` crate — the plugin **security boundary**: `plugin.toml`
-> parsing, sha256+ed25519 verification under a default-deny unsigned policy, the
-> capability **permission-diff** that gates a widening update on re-approval, a
-> **closed** `SandboxProfile` derived from the granted capabilities (the decision
-> layer the OS/WASM sandbox will enforce), the install→verify→enable→update→revoke
-> lifecycle, and untrusted-output sanitization — plus the Chapter 10 multimodal
-> `InputEnvelope`/`InputBlock` model (original media never replaced by a summary;
-> a remote-transcription classification gate) and six semantic-token theme
-> variants with a data-only theme-pack loader that refuses execution permissions.
-> Phase 7 landed the **router** (`codypendent-routing`): a version-stamped task
-> classifier, the Chapter 09 pipeline with **security hard-filters before utility**
-> (classified data never routes to a hosted provider), cheapest-above-threshold
-> selection, cascading escalation that preserves artifacts, and the five
-> eval-route arms + release gate — and the **learning loop** (`codypendent-eval`):
-> the `EvalCase`/`Assertion` harness, execution-grounded trace graders,
-> deterministic failure clustering, a growing regression suite, and the
-> shadow→canary→**human-approval**→rollback promotion pipeline that structurally
-> forbids self-promotion (only an `Actor::Human` can promote). What remains for
-> both phases is the daemon wiring, the persisted migrations/profiles, the OS/WASM
-> sandbox enforcement, and the live capture/measurement paths — the engines are in
-> place and unit-tested.
+> **Phase 4 — docs vertical closed.** On top of the Loro-backed document engine
+> (ADR-016; concurrent-merge convergence, per-mutation authorship, suggest-by-default
+> for org docs, deterministic Markdown, the semantic `LanguageAdapter` + revision-aware
+> graph queries, the staleness engine) the client + write paths now exist: a
+> **client-side CRDT replica** consumes the `DocumentSync` stream for live TUI editing
+> (seeded from the authoritative snapshot, idempotent merge — proven with two-client
+> socket convergence), and **`PublishPlan` executes through the approval-gated write
+> path** (repository file / docs branch / documentation PR), parking a durable approval
+> that shows target + changed files + git action before any write. Remaining follow-up:
+> spawning a live language server (rust-analyzer / pyright).
+>
+> **Phase 5 — complete.** Declarative `workflow.yaml` → validated graph → durable
+> runs / node records / checkpoints with crash recovery; the model-free
+> `WorkflowDriver`; daemon create / drive / recover / **pause·resume·retry·cancel**;
+> agent nodes on the real agent loop **and tool nodes** executing through the runtime
+> tool layer (namespace-normalized, argument-bound, approval-parked — every GitHub
+> write gated); the **blackboard** typed-artifact channel (server-derived authorship,
+> evidence-required, per-run isolation, `post`/`query` tools + read command +
+> subscription); **per-run isolated worktrees** with read-your-writes coherence
+> (concurrent writers never share a tree); **nested budgets** (workflow→node, 80%
+> warning, block-on-exceed, resume without re-spend) with **role→profile enforcement**
+> (a reviewer is read-only by *policy*, not prompt) and **measured** node cost;
+> workflow **observability** (a `WorkflowEvent` stream + live TUI graph) and durable
+> failure reasons. The **patch→verify handoff** makes the flagship `repair-github-check`
+> workflow genuinely verify a fix (the implementer's diff becomes an artifact; verify
+> applies it into its own worktree under approval before testing), and **`/fix-ci` now
+> runs that declarative workflow** (the hard-coded prompt template is gone),
+> resolved from an embedded built-in shadowable by `.codypendent/workflows`. Remaining
+> overlay: session forking (STEP 5.6). The Codex-informed **conversation-centred TUI
+> shell** (palette, layout toggle, auto-scroll, contextual footer, live theming) has
+> shipped.
+>
+> **Phase 6 — sandbox enforcement v1 landed (🟡 overall).** Beyond the `codypendent-sandbox`
+> decision layer (signed-manifest verification, permission-diff, closed `SandboxProfile`,
+> multimodal input model, themes), a real **OS enforcement** executor now consumes a
+> profile — genuine macOS Seatbelt confinement (verified by real filesystem/network
+> denial tests), a Linux bubblewrap arg-generator, fail-closed elsewhere — plus a
+> **trusted-publisher key store** wired into verification and **sandboxed skill-script
+> execution**. Remaining: the WASM/wasmtime component runtime, the hook engine,
+> client capture (voice/clipboard), and the setup assistant.
+>
+> **Phase 7 — routing + eval + promotion wired (🟡 overall).** The router
+> (`codypendent-routing`) now has a **daemon seam** (default-OFF; when enabled, the
+> classification hard-filter fails closed so classified data never reaches a hosted
+> provider), a persisted `model_profiles` store (migration 0014), a local **bench**
+> harness, and first-use capability probes. The learning loop (`codypendent-eval`) has
+> a **`codypendent eval run` CLI** + a runnable fixture corpus + CI smoke, and the
+> **promotion pipeline is persisted** (migration 0015) and driven through daemon
+> commands with the ADR-010 human-approval gate (nothing promotes itself). Remaining:
+> a live *measured* routing run + live escalation re-drive, and real shadow/canary
+> execution + eval-export scrubbing (the mechanisms and gates are real; the live
+> measurement paths are the remaining slice).
+>
+> This state was reached by the **roadmap-completion effort** (branch
+> `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
+> backlog, each implemented → independently reviewed → fixed → re-verified, closed by
+> a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
+> `-D warnings`, `cargo test --workspace` = 1051 tests, `cargo deny`, VS Code
+> extension typecheck/lint/test).
 
 ---
 
@@ -200,7 +210,7 @@ Code extension's codec/discovery/reconnect pass 30 vitest tests. `fmt` / `clippy
 --all-features -D warnings` / `test --workspace` green; `extensions/vscode`
 typecheck/lint/test green.
 
-## Phase 4 — Docs Studio & richer code intelligence 🟡
+## Phase 4 — Docs Studio & richer code intelligence ✅
 
 Engine complete and tested in `codypendent-knowledge` + `codypendent-protocol`;
 client-surface wiring is the remaining slice.
@@ -215,8 +225,8 @@ client-surface wiring is the remaining slice.
 **Deferred to a client-wiring follow-up (not blocking the engine):**
 
 - [x] TUI Docs view (tree / editor / review rail) and the graph-edge inspector — read-only render over the existing document + code-graph data, wired through the CLI projection seam and reached from the command palette (in the conversation shell the bare `D`/`G` keys compose text; they act only once a browser overlay is open); the inspector surfaces each edge's relation + confidence + evidence + revision (exit criterion 4). Live editing is the next bullet
-- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Lease-acquire (now wired):* `CommandBody::AcquireDocumentLease`/`ReleaseDocumentLease` are intercepted at the connection level like `MutateDocument` and applied through a daemon `DocumentLeaser` seam (bundled onto the `RunExecutor`, implemented in the assembly over the same `DocumentLeaseStore`), so a client takes a real block-range lease before editing and is recognised as that writer when its mutation runs `require`; the reply is a `Payload::DocumentLeaseGranted` carrying the minted lease id + expiry, an Observer is role-denied, and a conflicting holder is `document.range-leased`. *Remaining:* the client-side CRDT replica that consumes the sync stream
-- [ ] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path
+- [x] Live daemon CRDT-sync transport for the `Document` subscription + block-range edit-lease enforcement — *engines:* (a) `apply_mutation` maps a protocol `DocumentMutation` onto the authoritative CRDT + suggestion store under the collaboration-mode gate (Edit applies directly; Suggest/Co-author/Maintain route to the review rail; Ask/Review deny; accept/reject resolve) and returns the `DocumentSync` (`Payload::DocumentSync` carries it on the wire); (b) `DocumentLeaseStore` (migration 0009) enforces **one writer per block-range** — a whole-document lease conflicts with any block lease both ways, leases expire and are reclaimed lazily, the same writer renews, and `require()` is the pre-mutation guard. *Transport (now wired):* `MutateDocument` is intercepted at the connection level (like `AttachSession`/`UpdateIdeContext`, since documents live outside the session ledger) and applied through a daemon `DocumentMutator` seam — implemented in the `codypendentd` assembly over `apply_mutation` (mode derived from the document's **scope** via a lightweight `DocumentStore::scope` read) with lease `require` enforced first; the resulting `DocumentSync` fans out to `Subscription::Document` subscribers over a per-document `DocumentHub` (idempotent CRDT merge ⇒ no watermark needed). *Lease-acquire (now wired):* `CommandBody::AcquireDocumentLease`/`ReleaseDocumentLease` are intercepted at the connection level like `MutateDocument` and applied through a daemon `DocumentLeaser` seam (bundled onto the `RunExecutor`, implemented in the assembly over the same `DocumentLeaseStore`), so a client takes a real block-range lease before editing and is recognised as that writer when its mutation runs `require`; the reply is a `Payload::DocumentLeaseGranted` carrying the minted lease id + expiry, an Observer is role-denied, and a conflicting holder is `document.range-leased`. *Now wired:* the client-side CRDT replica (`DocumentReplica`) consumes the sync stream for live TUI editing — seeded from the authoritative snapshot, idempotent merge (proven by two-client socket convergence + range-lease exclusion + byte-exact suggest-mode accept)
+- [x] Executing a `PublishPlan` through the approval-gated change set / Phase 3 GitHub write path (repository-file / docs-branch / documentation-PR targets; the plan's target + changed files + git action park a durable approval before any write; `(revision ↔ commit)` publication record persisted)
 - [ ] Spawning a live language server (rust-analyzer/pyright) and folding its resolved edges (the adapter reports the capability; supersession is proven with synthesized edges)
 
 **Exit:** concurrent edits merge ✅; document snapshot reproducible ✅; symbol
@@ -224,7 +234,7 @@ changes flag affected docs with evidence ✅; graph edges expose evidence +
 revision ✅ (data model + read-only TUI inspector render). ADR-016 recorded ✅;
 suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
 
-## Phase 5 — Workflow & multi-agent orchestration 🟡
+## Phase 5 — Workflow & multi-agent orchestration ✅
 
 - [ ] Declarative workflows; durable checkpoint storage; supervisor/specialist delegation; blackboard
   - [x] **5.1 (compiler core)** `codypendent-workflow` crate: the declarative
@@ -344,15 +354,15 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         through a `NodeModelDriverFactory` seam, so the whole agent-node path is tested
         with a `ScriptedDriver` (no model, no network): a single-agent workflow drives
         to completion, and a missing model fails the node cleanly rather than hanging.
-        *Remaining for 5.2:* **tool-node execution** (the manifest tool-name namespace
-        reconciled with the runtime tool registry + the per-node tool arguments the
-        compiled graph does not yet carry — a tool node fails cleanly and legibly
-        today), harvesting an agent node's declared `outputs` onto the run's blackboard
-        (the STEP 5.3 `blackboard.post` path, so agent nodes can build on each other),
-        node-level mode/permission resolution from an `agent.toml` profile (every agent
-        node runs in the permissive `Build` mode today, writes still approval-gated),
-        and the client-facing `Subscription::Workflow` stream that publishes the
-        observer's transitions (mirroring the document CRDT-sync stream).
+        *Completing 5.2 (all landed):* **tool-node execution** through the runtime
+        tool layer (manifest tool names normalized `-`→`_` against the registry; a
+        `repository.test` tool + per-tool argument binding with `${{ inputs.… }}`
+        interpolation; every GitHub write approval-parked); harvesting an agent
+        node's declared `outputs` onto the run's blackboard (agent nodes build on
+        each other); node-level **mode/permission resolution from `agent.toml`**
+        (the reviewer role read-only by policy); and the client-facing
+        `Subscription::Workflow` stream (a `WorkflowEvent` node-transition + run-phase
+        stream + a live TUI graph + `CancelWorkflow`).
   - [x] **5.3 (blackboard)** the `BlackboardStore` (migration 0010's
         `blackboard_items` table): the typed, attributed artifact channel agents
         share *within* a workflow run — findings, hypotheses, decisions, code
@@ -373,24 +383,39 @@ suggest-by-default enforced ✅; `fmt`/`clippy`/`test` green ✅.
         summary, dimming a superseded item. It is fed by a CLI seam that queries
         each incomplete run's board over the shared pool and renders the opaque
         JSON payload/author/evidence to human strings (empty until the executor
-        posts artifacts). *Remaining for 5.3:* daemon read/write **commands** +
-        subscription delivery over that surface (the write path an agent's
-        `blackboard.post` tool drives).
-- [ ] Parallel worktrees; budgets; independent review agent — **pause / resume /
-      retry-from-node have landed** (conductor + `WorkflowLifecycle` commands +
-      CLI); parallel worktrees, budget enforcement, and the independent review
-      agent remain.
+        posts artifacts — now populated in production). *Completing 5.3 (landed):*
+        the `blackboard.post`/`blackboard.query` registry tools (server-derived
+        authorship + evidence-required, offered only inside a workflow run), a
+        `ReadBlackboard` daemon command, and per-run `Subscription::Blackboard`
+        delivery — so agents coordinate only through the typed board.
+- [x] Parallel worktrees; budgets; independent review agent — all landed.
+      **Pause / resume / retry-from-node / cancel** (conductor + `WorkflowLifecycle`
+      commands + CLI). **Per-run isolated worktrees** (T5): every writing node gets
+      its own tree carved from the run's repository — two concurrent writers never
+      share one, and read-your-writes holds within a node. **Nested budgets** (T8):
+      workflow→node over wall-time + tool-calls, an 80% `BudgetWarning`, `Blocked`
+      + a cooperative pause on exceed, resume without re-spend. **Independent
+      review agent** (T8): a step's `agent.toml` `mode` is enforced by the *policy*
+      engine, so a `review`-mode reviewer is structurally denied writes (not merely
+      prompted) — the ADR-008 structural independence.
+- [x] **STEP 5.6 note:** session forking (`ForkSession{checkpoint}`) remains as the
+      one Fleet-adjacent overlay not built; the rest of Phase 5 is complete.
 
-**Exit:** multi-agent edits never share writable worktrees; workflow resumes
-after restart ✅ (startup recovery drives every incomplete run); node-level
-cost/provenance visible ✅ (per-node records + observer); single-agent baseline
-selectable.
+**Exit:** multi-agent edits never share writable worktrees ✅ (per-run isolated
+worktrees, concurrent-writer test); workflow resumes after restart ✅ (startup
+recovery drives every incomplete run, incl. re-parking a node left `WaitingApproval`);
+node-level cost/provenance visible ✅ (measured per-node records + `WorkflowEvent`
+stream + live TUI graph); single-agent baseline selectable ✅; `/fix-ci` runs the
+declarative `repair-github-check` engine ✅; budget exhaustion blocks visibly ✅.
 
 ## Phase 6 — Plugin & multimodal ecosystem 🟡
 
-The security-decision engines have landed as daemon-free crates; the OS/WASM
-*enforcement* that consumes their profiles, and the live client capture paths,
-are the remaining wiring.
+The security-decision engines landed as daemon-free crates, and **OS enforcement
+v1 now consumes their profiles**: a real macOS Seatbelt executor (verified by
+filesystem/network denial tests), a Linux bubblewrap arg-generator, fail-closed
+elsewhere; a trusted-publisher key store wired into verification; and sandboxed
+skill-script execution. The **WASM/wasmtime** runtime, the hook engine, and the
+live client-capture paths (voice/clipboard) are the remaining wiring.
 
 - [x] **6.1 (plugin manifests, verification, lifecycle, permission-diff)** — the
       new `codypendent-sandbox` crate (the manual's "crate justified by a
@@ -452,9 +477,17 @@ never silently changes (pending).
 
 ## Phase 7 — Intelligent routing & learning 🟡
 
-The routing and learning **engines** have landed as two daemon-free crates
-(`codypendent-routing`, `codypendent-eval`); the daemon wiring, the persisted
-profiles/migrations, and the fixture task corpus are the remaining slice.
+The routing and learning engines landed as two daemon-free crates, and their
+**first daemon wiring** is now in place: a **default-off routing seam** (when
+enabled, the classification hard-filter fails closed — classified data never
+reaches a hosted provider), a persisted `model_profiles` store (migration 0014) +
+a local `models bench` harness + first-use capability probes; a **`codypendent
+eval run` CLI** + a runnable fixture corpus + CI smoke; and the **persisted
+promotion pipeline** (migration 0015) driven through daemon commands with the
+ADR-010 human-approval gate. The remaining slice is the **live measured paths**:
+a real routing run over the eval suite + live escalation re-drive, and real
+shadow/canary execution + eval-export scrubbing (the mechanisms + gates are real
+and tested; only the live measurement is deferred).
 
 - [x] **7.1 (eval harness core)** — `codypendent-eval`'s `case` module: the
       Chapter 16 `EvalCase`/`Assertion` model (tests-pass, file changed/unchanged,

@@ -169,8 +169,11 @@ pub async fn stream_forever<W: Write>(conn: &mut Connection, out: &mut W) -> any
 
 /// The run a run-scoped event belongs to, if any. Mirrors
 /// `crates/daemon/src/server.rs`'s private `event_run_id` (duplicated rather
-/// than shared: the CLI must not depend on `codypendent-daemon`).
-fn event_run_id(body: &EventBody) -> Option<RunId> {
+/// than shared: the CLI must not depend on `codypendent-daemon`). `pub(crate)`
+/// (rather than private) so `crate::eval`'s suite runner can reuse the exact
+/// same run-ownership rule `stream_until_terminal` uses, instead of a second
+/// copy drifting from this one within the same crate.
+pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
     match body {
         EventBody::RunStarted { run_id, .. }
         | EventBody::RunStateChanged { run_id, .. }

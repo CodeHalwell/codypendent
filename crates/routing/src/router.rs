@@ -88,7 +88,7 @@ pub struct RoutingDecision {
 
 /// A record of an escalation transition (Chapter 09 mid-session switching): the
 /// old/new model, the objective reason, how context carried over, and the cost
-/// impact — and that artifacts were preserved (not restarted).
+/// impact — and whether artifacts were preserved (not restarted).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingTransition {
     pub from: ModelId,
@@ -99,8 +99,16 @@ pub struct RoutingTransition {
     pub context_transformation: String,
     /// The change in expected cost from old to new model (USD; may be negative).
     pub cost_impact_usd: f64,
-    /// Escalation preserves the task's artifacts and state — always `true`.
-    pub artifacts_preserved: bool,
+    /// Whether the task's artifacts and state were preserved across the
+    /// escalation (not restarted). The router's *decision* to escalate always
+    /// intends this — [`Router::escalate`] re-executes the same [`TaskNode`],
+    /// never a fresh workflow — but whether that intent held during a real run
+    /// is an execution-time fact the router cannot observe: it never executes
+    /// anything (STEP 7.3's executor seam is unbuilt, P7-4). `None` means "not
+    /// yet reported"; only the executor that actually ran the escalation can
+    /// honestly report `Some(_)`. This field must never be fabricated as
+    /// `Some(true)` by the router itself.
+    pub artifacts_preserved: Option<bool>,
 }
 
 /// A routing failure.
@@ -210,7 +218,17 @@ impl<'a> Router<'a> {
 
     /// Escalate after an objective validation failure: advance the policy's
     /// escalation chain to the next eligible tier past `from`, re-routing the same
-    /// node with its artifacts preserved.
+    /// node (never restarting the workflow).
+    ///
+    /// **Cycle-proof (P7-1):** the chain is walked anchored at the *last*
+    /// occurrence of `from` (`rposition`, not `position`), not the first. A
+    /// well-formed chain has unique ids (rejected otherwise at
+    /// [`crate::policy::RoutingPolicy::validate`]), so this makes no difference
+    /// for one — but if a duplicate id ever reaches the router regardless (a
+    /// policy constructed in-process without going through validation), this
+    /// guarantees each successive call anchors at a strictly greater chain index
+    /// than the last, so repeated escalation can never revisit an earlier index
+    /// and cycle; it only ever exhausts.
     pub fn escalate(
         &self,
         from: &ModelId,
@@ -220,7 +238,7 @@ impl<'a> Router<'a> {
         let chain = &self.policy.escalation_chain;
         let pos = chain
             .iter()
-            .position(|m| m == from)
+            .rposition(|m| m == from)
             .ok_or_else(|| RoutingError::NotInChain { from: from.clone() })?;
 
         // The first tier after `from` that resolves to an eligible profile.
@@ -245,7 +263,10 @@ impl<'a> Router<'a> {
                 next.id, next.execution.edit_protocol
             ),
             cost_impact_usd: decision.expected_cost_usd - from_cost,
-            artifacts_preserved: true,
+            // P7-4: the router never executes anything, so it cannot observe
+            // whether artifacts were actually preserved — only the (unbuilt)
+            // executor can report that. `None` here, never a fabricated `true`.
+            artifacts_preserved: None,
         };
         decision.reason = SelectionReason::Escalated;
         Ok((decision, transition))
@@ -709,9 +730,12 @@ mod tests {
         assert_eq!(transition.from, ModelId("local-default".into()));
         assert_eq!(transition.to, ModelId("hosted-default".into()));
         assert_eq!(transition.reason, "tests still failing");
-        assert!(
-            transition.artifacts_preserved,
-            "escalation preserves artifacts"
+        // P7-4: the router cannot observe whether artifacts were actually
+        // preserved during a real run — it never executes anything — so it must
+        // not fabricate a claim. `None` ("not yet reported"), never `Some(true)`.
+        assert_eq!(
+            transition.artifacts_preserved, None,
+            "the router must not fabricate an artifacts-preserved claim; only the executor can report it"
         );
         assert!(!transition.context_transformation.is_empty());
         // local ($0) → hosted ($0.01/1k * 10k = $0.10): a positive cost impact.
@@ -762,6 +786,83 @@ mod tests {
             .escalate(&ModelId("local-default".into()), "still failing", &n)
             .unwrap_err();
         assert!(matches!(err, RoutingError::EscalationExhausted { .. }));
+    }
+
+    // --- P7-1: escalation is cycle-proof and terminates ---
+
+    #[test]
+    fn escalation_on_a_legal_unique_id_chain_terminates_at_the_end() {
+        let models = vec![
+            model("t1", ModelLocation::Hosted, 0.85, 0.010, 700.0, 200_000),
+            model("t2", ModelLocation::Hosted, 0.85, 0.010, 700.0, 200_000),
+            model("t3", ModelLocation::Hosted, 0.85, 0.010, 700.0, 200_000),
+        ];
+        let mut policy = RoutingPolicy::balanced();
+        policy.escalation_chain = vec![
+            ModelId("t1".into()),
+            ModelId("t2".into()),
+            ModelId("t3".into()),
+        ];
+        let router = Router::new(&models, &policy);
+        let n = node(DataClassification::Internal);
+        let (d1, _) = router
+            .escalate(&ModelId("t1".into()), "x", &n)
+            .expect("t1 -> t2");
+        assert_eq!(d1.model, ModelId("t2".into()));
+        let (d2, _) = router.escalate(&d1.model, "x", &n).expect("t2 -> t3");
+        assert_eq!(d2.model, ModelId("t3".into()));
+        let err = router.escalate(&d2.model, "x", &n).unwrap_err();
+        assert!(
+            matches!(err, RoutingError::EscalationExhausted { .. }),
+            "escalation off the end of the chain terminates rather than looping"
+        );
+    }
+
+    #[test]
+    fn escalation_is_cycle_proof_even_with_a_duplicate_id_in_the_chain() {
+        // A chain with a duplicate id should never reach a real Router (it's
+        // rejected by `RoutingPolicy::validate`) — but this pins the router's
+        // OWN defense-in-depth: even if one does (e.g. a policy built in-process
+        // without going through validation, as this test deliberately does),
+        // repeated escalation must make monotonic progress and terminate, never
+        // cycle. Chain: [a, b, a], both eligible. Under the old `position()` (=
+        // first-match) anchor, escalating from "a" always resumes searching
+        // right after the FIRST "a" (index 0) no matter how far the chain has
+        // actually advanced, so repeated escalation oscillates a -> b -> a -> b
+        // forever. Anchoring at the LAST match instead guarantees each call's
+        // anchor index is strictly greater than the last.
+        let models = vec![
+            model("a", ModelLocation::Hosted, 0.85, 0.010, 700.0, 200_000),
+            model("b", ModelLocation::Hosted, 0.85, 0.010, 700.0, 200_000),
+        ];
+        let mut policy = RoutingPolicy::balanced();
+        policy.escalation_chain = vec![
+            ModelId("a".into()),
+            ModelId("b".into()),
+            ModelId("a".into()),
+        ];
+        let router = Router::new(&models, &policy);
+        let n = node(DataClassification::Internal);
+
+        let mut current = ModelId("a".into());
+        let mut hops = 0usize;
+        loop {
+            match router.escalate(&current, "still failing", &n) {
+                Ok((decision, _transition)) => {
+                    current = decision.model;
+                    hops += 1;
+                    // The chain has 3 entries; escalation can never legitimately
+                    // take more hops than that without either exhausting or
+                    // erroring. If this bound is exceeded, the loop is cycling.
+                    assert!(
+                        hops <= policy.escalation_chain.len(),
+                        "escalation cycled instead of terminating"
+                    );
+                }
+                Err(RoutingError::EscalationExhausted { .. }) => break,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
     }
 
     #[test]

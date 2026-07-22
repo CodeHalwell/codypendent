@@ -1,0 +1,12 @@
+{
+  "ClientCapabilities": {
+    "audio_capture": false,
+    "diff_view": true,
+    "editor_mutations": true,
+    "image_display": false,
+    "mouse": true,
+    "rich_text": true,
+    "true_color": true,
+    "unicode": true
+  }
+}

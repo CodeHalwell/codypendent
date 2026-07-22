@@ -22,32 +22,40 @@
 //! integration tests use.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
+use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
+use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
+use codypendent_daemon::worktrees::WorktreeManager;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{Actor, DataClassification, EventBody, RepositoryId, RunId, SessionId};
+use codypendent_protocol::{
+    Actor, AgentMode, DataClassification, EventBody, RepositoryId, RunId, SessionId,
+};
 use codypendent_runtime::agent::{
-    cancellation, ApprovalRequest, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
-    FrameworkModelDriver, RunContext, RunJournal,
+    cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
+    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal,
 };
 use codypendent_runtime::models::{load_models, resolve_model, ModelPolicy, ModelRegistry};
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
+use crate::blackboard::WorkflowBlackboardReader;
+use crate::promotion::PromotionStoreGateway;
+use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
-use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor};
-use crate::workflows::WorkflowConductorHost;
+use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
+use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
 
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
@@ -55,6 +63,13 @@ use crate::workflows::WorkflowConductorHost;
 pub struct RuntimeExecutor {
     pool: SqlitePool,
     paths: RuntimePaths,
+    /// The daemon's startup repository root (its working directory at launch).
+    /// Carried so the workflow node executor can fall back to it for a run that
+    /// recorded no repository (an older client), resolved once here rather than
+    /// from a wandering `current_dir()` at node-execution time (Phase 5 T5,
+    /// P5-D1). A single-agent run never needs it — its `RunLaunch` always carries
+    /// a repository (the server fills the daemon's cwd when a client sends none).
+    startup_repository_root: PathBuf,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
     /// Repositories already folded into the code graph this process's lifetime.
@@ -83,6 +98,43 @@ pub struct RuntimeExecutor {
     /// the server pulls out, so their per-run drive locks are the same registry —
     /// a `PauseWorkflow` and the `StartWorkflow` drive it pauses serialize together.
     workflow_host: WorkflowConductorHost<AgentLoopNodeExecutor>,
+    /// The repository root a `PublishDocument` command writes/commits against
+    /// (Phase 4 STEP 4.4). Unlike a run's repository — carried per-command on
+    /// `StartRun` (issue #6 item 1) — a document has no per-command repository
+    /// field (documents live outside the session ledger), so publication uses
+    /// this daemon's own startup working directory, set via
+    /// [`Self::with_repository_root`]. Defaults to the process's current
+    /// directory so a caller that never sets it still gets a sensible root.
+    repository_root: PathBuf,
+    /// The promotion-pipeline gateway (Phase 7 STEP 7.5): backs
+    /// `ProposePromotion`/`AdvancePromotion`/`ApprovePromotion`/`RollbackPromotion`.
+    /// Stateless beyond the pool, so it is built once here and cloned out by
+    /// [`RunExecutor::promotion_gateway`].
+    promotion: PromotionStoreGateway,
+    /// The per-run blackboard fan-out (Phase 5 STEP 5.3). Owned here so BOTH the
+    /// workflow node executor (which publishes an agent's posted artifacts through
+    /// it) and the server (which subscribes a client's `Subscription::Blackboard`
+    /// forwarder to it, via [`RunExecutor::blackboard_hub`]) share one hub — the
+    /// publisher is the agent loop inside the executor, so it cannot be a
+    /// server-created fresh hub the way the document hub is.
+    blackboards: BlackboardHub,
+    /// The per-run node-lifecycle fan-out (Phase 5 STEP 5.2 / T9). Owned here for the
+    /// same reason as `blackboards`: the publisher is the workflow host + observer
+    /// inside the executor, so the server subscribes a client's
+    /// `Subscription::Workflow` forwarder to THIS hub (via [`RunExecutor::workflow_hub`]).
+    workflows: WorkflowHub,
+    /// The in-flight node agent-run cancellation registry (T9). Owned here — and
+    /// carried across a `with_github` rebuild like `drive_locks` — so a
+    /// `CancelWorkflow` fires the token the node executor registered, even if the host
+    /// was reconfigured after the drive started.
+    workflow_cancellations: WorkflowRunCancellations,
+    /// The Phase-7 routing seam (STEP 7.2/7.3), **default OFF**. When the
+    /// `<data_dir>/routing.toml` registry item enables it, [`Self::execute`] asks
+    /// the router which model to run a task on (recording the decision in the
+    /// trace) instead of the Phase-1 [`resolve_model`]; when it is absent/disabled
+    /// the run resolves a model exactly as before. Bound to the shared
+    /// subscription hub so a recorded routing note reaches attached clients live.
+    routing: RoutingCoordinator,
 }
 
 impl RuntimeExecutor {
@@ -90,8 +142,15 @@ impl RuntimeExecutor {
     /// fan-out + approval broker the server binds to via [`Self::collaborators`].
     /// `startup_repository` is the id `main` already scanned from the daemon's own
     /// directory; it seeds the "already scanned" set so the primary checkout is
-    /// not re-scanned when its first run arrives.
-    pub fn new(pool: SqlitePool, paths: RuntimePaths, startup_repository: RepositoryId) -> Self {
+    /// not re-scanned when its first run arrives. `startup_repository_root` is that
+    /// directory's path — the fallback repository a workflow run that recorded
+    /// none is driven against (Phase 5 T5).
+    pub fn new(
+        pool: SqlitePool,
+        paths: RuntimePaths,
+        startup_repository: RepositoryId,
+        startup_repository_root: PathBuf,
+    ) -> Self {
         let subscriptions = SubscriptionHub::new();
         // Bind the broker to the SAME hub the server fans out to, so an
         // `ApprovalRequested` raised by the agent loop reaches attached clients
@@ -99,23 +158,61 @@ impl RuntimeExecutor {
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
         let mut scanned = HashSet::new();
         scanned.insert(startup_repository);
+        // The per-run blackboard fan-out, shared with every workflow agent node so
+        // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
+        let blackboards = BlackboardHub::new();
+        // The per-run node-lifecycle fan-out + the in-flight node cancellation
+        // registry, shared with the workflow host so its drives publish transitions
+        // here and its cancel seam fires the tokens the node executor registers (T9).
+        let workflows = WorkflowHub::new();
+        let workflow_cancellations = WorkflowRunCancellations::default();
+        // The first workflow host this process builds: no existing drive-lock
+        // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
             pool.clone(),
             paths.clone(),
             subscriptions.clone(),
             approvals.clone(),
             None,
+            None,
+            startup_repository_root.clone(),
+            blackboards.clone(),
+            workflows.clone(),
+            workflow_cancellations.clone(),
         );
+        let promotion = PromotionStoreGateway::new(pool.clone());
+        // The Phase-7 routing seam, loaded from `<data_dir>/routing.toml` (absent
+        // ⇒ OFF). Bound to the shared fan-out so a recorded routing decision
+        // reaches attached clients live, exactly like the run's context note.
+        let routing = RoutingCoordinator::new(pool.clone(), RoutingConfig::load(&paths))
+            .with_subscriptions(subscriptions.clone());
         Self {
             pool,
             paths,
+            startup_repository_root,
             subscriptions,
             approvals,
             scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
             workflow_host,
+            repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            promotion,
+            blackboards,
+            workflows,
+            workflow_cancellations,
+            routing,
         }
+    }
+
+    /// Set the repository root a `PublishDocument` command operates against
+    /// (Phase 4 STEP 4.4). The assembly's `main` calls this with the same
+    /// working directory it derives the startup repository identity from, so
+    /// publication and the code-graph scan agree on one root.
+    #[must_use]
+    pub fn with_repository_root(mut self, root: PathBuf) -> Self {
+        self.repository_root = root;
+        self
     }
 
     /// Startup recovery for durable workflow runs (Phase 5 STEP 5.2): spawn a drive
@@ -132,14 +229,28 @@ impl RuntimeExecutor {
     pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
         self.github = Some(github.clone());
         // Rebuild the workflow host so agent nodes drive with the same GitHub
-        // client. Called once at startup before any run exists, so replacing the
-        // (still-empty) per-run drive-lock registry is safe.
+        // client, but SHARE the existing drive-lock registry rather than minting
+        // a fresh one (P5-D6c): today this is called once at startup before any
+        // run exists, but a fresh registry would only be safe under that
+        // construction-order assumption — carrying the same registry forward
+        // means a drive already serializing under the OLD host would still
+        // serialize against the NEW host for the same run id even if that
+        // assumption ever stopped holding.
+        let drive_locks = self.workflow_host.drive_locks();
         self.workflow_host = build_workflow_host(
             self.pool.clone(),
             self.paths.clone(),
             self.subscriptions.clone(),
             self.approvals.clone(),
             Some(github),
+            Some(drive_locks),
+            self.startup_repository_root.clone(),
+            self.blackboards.clone(),
+            // Carry the SAME node-lifecycle hub + cancellation registry forward (like
+            // `drive_locks`), so a drive that started under the OLD host still
+            // publishes to — and is cancellable through — the shared instances (T9).
+            self.workflows.clone(),
+            self.workflow_cancellations.clone(),
         );
         self
     }
@@ -235,10 +346,46 @@ impl RuntimeExecutor {
     /// the caller must fail it cleanly.
     async fn execute(&self, launch: &RunLaunch, token: CancellationToken) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
-        let resolved = resolve_model(&registry, &policy, launch.mode)
+        // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When routing is
+        // enabled the router picks the model from the measured profile store and
+        // the decision is recorded in the run trace; when it is disabled (the
+        // default, and the state in every existing test — none writes a
+        // `routing.toml`) this returns `None` and the model is resolved exactly
+        // as before. A refusal (classified data with no eligible model) fails the
+        // run CLOSED here rather than leaking off-device through the
+        // classification-blind Phase-1 resolver.
+        let routed = self
+            .routing
+            .select(
+                launch.mode,
+                "agent",
+                &launch.objective,
+                estimate_input_tokens(&launch.objective),
+                // `RunLaunch` carries no per-run classification, so the coordinator
+                // falls back to its operator-declared, fail-closed ceiling. Deriving
+                // a real per-run classification is a documented follow-up.
+                None,
+            )
             .await
-            .map_err(|e| format!("no model configured: {e}"))?;
-        let model_id = resolved.id;
+            .map_err(|e| format!("routing refused to place this run: {e}"))?;
+        let model_id = match routed {
+            Some(selection) => {
+                if let Err(error) = self
+                    .routing
+                    .record_decision(launch.session_id, launch.run_id, &selection.decision)
+                    .await
+                {
+                    warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
+                }
+                selection.model().clone()
+            }
+            None => {
+                resolve_model(&registry, &policy, launch.mode)
+                    .await
+                    .map_err(|e| format!("no model configured: {e}"))?
+                    .id
+            }
+        };
         info!(run_id = %launch.run_id, model = %model_id, "resolved model; executing run");
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
@@ -265,19 +412,47 @@ impl RuntimeExecutor {
             runtime = runtime.with_github(github.clone());
         }
 
-        // Phase 1: the worktree is the repository itself (no per-run worktree
-        // allocation yet — STEP 1.8 binds a dedicated worktree later).
+        // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
+        // mode (`Build`) gets a DEDICATED, isolated worktree carved from the
+        // repository through the [`WorktreeManager`], so its writes never touch
+        // the shared checkout; a read-only mode (Explore/Ask/Plan/Review — writes
+        // denied by policy) keeps running in the repository root, exactly as
+        // before.
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(
+            &self.pool,
+            &manager,
+            launch.run_id,
+            run_writes_to_worktree(launch.mode),
+            &launch.repository,
+        )
+        .await?;
+
+        // The agent operates ENTIRELY within its bound tree: the policy read/search
+        // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH that tree,
+        // so a write and its read-back hit the same directory (read-your-writes).
+        // For an isolated run that tree is the worktree (a full checkout at HEAD,
+        // outside the repository, so `$REPOSITORY` = the repo would NOT cover it);
+        // for a read-only run it is the repository root. Repository IDENTITY (the
+        // code graph, curated memories, and the GitHub target) stays the run's
+        // repository `R`, resolved separately — in `spawn_run`'s scan and in the
+        // GitHub resolution below — never conflated with this policy read root.
+        let operating_tree = binding.worktree.clone();
+        let guard =
+            WorktreeReleaseGuard::arm(self.pool.clone(), self.artifacts(), manager, binding);
+
         let mut ctx = RunContext::new(
             launch.session_id,
             launch.run_id,
             launch.objective.clone(),
             launch.mode,
-            launch.repository.clone(),
-            launch.repository.clone(),
+            operating_tree.clone(),
+            operating_tree,
         );
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
-        // so the `github.*` tools know their target. Only meaningful when a client
-        // is configured; a checkout with no GitHub origin leaves the tools inert.
+        // so the `github.*` tools know their target. Uses the repository IDENTITY
+        // (`R`), not the worktree read root. Only meaningful when a client is
+        // configured; a checkout with no GitHub origin leaves the tools inert.
         if self.github.is_some() {
             if let Some(repo) = resolve_github_repo(&launch.repository).await {
                 ctx = ctx.with_github_repo(repo);
@@ -295,11 +470,16 @@ impl RuntimeExecutor {
             Err(error) => warn!(%error, "could not load IDE context for the run"),
         }
 
-        runtime
+        // Drive the loop, then release the worktree — the guard releases it even if
+        // the loop unwinds (the manager preserves any unmerged work as a patch
+        // before teardown; a read-only run bound no worktree, so release is a no-op).
+        let result = runtime
             .execute_run(&driver, ctx, token)
             .await
             .map(|_| ())
-            .map_err(|e| format!("run failed: {e}"))
+            .map_err(|e| format!("run failed: {e}"));
+        guard.release().await;
+        result
     }
 
     /// Append a run-scoped `NoteAppended` event to `session_id`'s ledger and
@@ -556,6 +736,27 @@ impl RunExecutor for RuntimeExecutor {
         )))
     }
 
+    fn document_publisher(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::documents::DocumentPublisher>> {
+        // Compute a `PublishDocument` plan, park its approval, and (once
+        // approved) execute it against this daemon's repository root (Phase 4
+        // STEP 4.4). Shares the same approval broker the server resolves
+        // `ResolveApproval` against, and the same GitHub client (if any) the
+        // `github.*` tools use, so the PR target's idempotent create/update
+        // behaves identically to an agent-proposed `GitHubMutation`.
+        let mut publisher = crate::publish::KnowledgePublisher::new(
+            self.pool.clone(),
+            self.approvals.clone(),
+            self.repository_root.clone(),
+            artifact_store(&self.paths),
+        );
+        if let Some(github) = &self.github {
+            publisher = publisher.with_github(github.clone());
+        }
+        Some(Arc::new(publisher))
+    }
+
     fn workflow_starter(&self) -> Option<Arc<dyn codypendent_daemon::workflows::WorkflowStarter>> {
         // Create a durable run from a `StartWorkflow` manifest and drive it to a
         // terminal state in the background (Phase 5 STEP 5.2). Shares the one host,
@@ -569,6 +770,40 @@ impl RunExecutor for RuntimeExecutor {
         // Pause/resume/retry an existing durable run over the same host (Phase 5
         // STEP 5.2).
         Some(Arc::new(self.workflow_host.clone()))
+    }
+
+    fn promotion_gateway(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::promotion::PromotionGateway>> {
+        // Propose/advance/approve/roll back a promotion candidate (Phase 7 STEP
+        // 7.5) over `codypendent-eval`'s durable store.
+        Some(Arc::new(self.promotion.clone()))
+    }
+
+    fn blackboard_reader(&self) -> Option<Arc<dyn BlackboardReader>> {
+        // Read a durable run's board for a `ReadBlackboard` command over the
+        // workflow `BlackboardStore` on the shared pool (Phase 5 STEP 5.3).
+        Some(Arc::new(WorkflowBlackboardReader::new(self.pool.clone())))
+    }
+
+    fn blackboard_hub(&self) -> Option<BlackboardHub> {
+        // The server reuses THIS hub (rather than a fresh one) so an agent's posts,
+        // published deep inside the workflow executor, reach the server's
+        // `Subscription::Blackboard` forwarders (Phase 5 STEP 5.3).
+        Some(self.blackboards.clone())
+    }
+
+    fn workflow_reader(&self) -> Option<Arc<dyn WorkflowReader>> {
+        // Read a durable run's observability snapshot for a `ReadWorkflowRun` command
+        // over the workflow store on the shared pool (Phase 5 STEP 5.2 / T9).
+        Some(Arc::new(WorkflowRunReader::new(self.pool.clone())))
+    }
+
+    fn workflow_hub(&self) -> Option<WorkflowHub> {
+        // The server reuses THIS hub (rather than a fresh one) so node transitions,
+        // published by the workflow host's observer deep inside the executor, reach the
+        // server's `Subscription::Workflow` forwarders (Phase 5 STEP 5.2 / T9).
+        Some(self.workflows.clone())
     }
 }
 
@@ -658,6 +893,149 @@ pub(crate) fn artifact_sink(pool: &SqlitePool, store: ArtifactStore) -> Box<dyn 
     ))
 }
 
+/// A run's bound worktree: the path its agent loop operates in, plus the lease
+/// to release once the run is terminal. `lease` is `None` for a read-only run
+/// that keeps the repository root (nothing was allocated, so nothing to release).
+pub(crate) struct WorktreeBinding {
+    /// The worktree root the run's `$WORKTREE` scope resolves to.
+    pub worktree: PathBuf,
+    /// The workspace lease to release on teardown, if a worktree was allocated.
+    pub lease: Option<uuid::Uuid>,
+}
+
+/// Whether a run in `mode` may write to its worktree — the single source of the
+/// "does this run need an isolated worktree" decision. Keyed on the policy
+/// [`mode_overlay`], so it tracks the mode→write-capability mapping the runtime
+/// enforces (only `Build` writes the worktree today; Explore/Ask/Plan/Review are
+/// read-only). A read-only run keeps the repository root; a writer is isolated so
+/// two concurrent writers never share a tree (Phase 5 exit criterion 1).
+pub(crate) fn run_writes_to_worktree(mode: AgentMode) -> bool {
+    mode_overlay(mode).write_allowed
+}
+
+/// Bind a worktree for a run. When `isolate` is set, allocate a dedicated,
+/// isolated worktree through the [`WorktreeManager`] (recording the lease on the
+/// run's projection for provenance) and return its path; otherwise the run keeps
+/// the repository root read-only and no lease is taken. An allocation failure is
+/// returned as a human reason the caller fails the run with — never a silent
+/// fall-through to a shared writable tree.
+pub(crate) async fn bind_run_worktree(
+    pool: &SqlitePool,
+    manager: &WorktreeManager,
+    run_id: RunId,
+    isolate: bool,
+    repository: &Path,
+) -> Result<WorktreeBinding, String> {
+    if !isolate {
+        return Ok(WorktreeBinding {
+            worktree: repository.to_path_buf(),
+            lease: None,
+        });
+    }
+    match manager.allocate(pool, repository, run_id).await {
+        Ok(lease) => {
+            // Record run→lease provenance on the reserved projection column, so a
+            // run's real worktree is recoverable from its `runs` row alone.
+            if let Err(error) = projections::set_run_workspace_lease(pool, run_id, lease.id).await {
+                warn!(%run_id, %error, "could not record the run's workspace lease");
+            }
+            Ok(WorktreeBinding {
+                worktree: lease.worktree_path,
+                lease: Some(lease.id),
+            })
+        }
+        Err(error) => Err(format!("could not allocate an isolated worktree: {error}")),
+    }
+}
+
+/// Release a run's bound worktree, protecting any unmerged work (the manager
+/// exports a patch and retains the directory when the branch holds commits or the
+/// tree is dirty — `force: false`). A no-op when the run bound no worktree. A
+/// release failure is logged, never fatal: the run has already reached its
+/// terminal state, and a stale lease is swept by startup reconciliation.
+pub(crate) async fn release_run_worktree(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    manager: &WorktreeManager,
+    binding: &WorktreeBinding,
+) {
+    if let Some(lease_id) = binding.lease {
+        if let Err(error) = manager.release(pool, artifacts, lease_id, false).await {
+            warn!(%lease_id, %error, "could not release the run's worktree");
+        }
+    }
+}
+
+/// Releases a run's bound worktree **even if the drive panics**. A plain
+/// post-await `release_run_worktree` is skipped when the agent loop unwinds,
+/// leaking the lease + worktree for the process lifetime — startup reconciliation
+/// cannot reclaim a directory that still exists. This guard closes that gap: the
+/// normal path calls [`release`](Self::release) (awaited, so a caller/test observes
+/// the released state synchronously); an unwind drops the guard while still armed,
+/// which schedules the async release on the current runtime — `Drop` cannot itself
+/// `await`, so a detached, best-effort task does the teardown while the runtime is
+/// alive. `force = false` semantics are unchanged (unmerged work is still
+/// preserved as a patch).
+pub(crate) struct WorktreeReleaseGuard {
+    pool: SqlitePool,
+    artifacts: ArtifactStore,
+    manager: WorktreeManager,
+    /// `Some` while armed; taken by a normal `release` or by `Drop` on unwind.
+    binding: Option<WorktreeBinding>,
+}
+
+impl WorktreeReleaseGuard {
+    /// Arm a guard over `binding`. Until [`release`](Self::release) runs, an
+    /// unwind schedules the release.
+    pub(crate) fn arm(
+        pool: SqlitePool,
+        artifacts: ArtifactStore,
+        manager: WorktreeManager,
+        binding: WorktreeBinding,
+    ) -> Self {
+        Self {
+            pool,
+            artifacts,
+            manager,
+            binding: Some(binding),
+        }
+    }
+
+    /// Normal teardown: release the worktree, awaiting completion, then disarm (so
+    /// `Drop` is a no-op). Consumes the guard.
+    pub(crate) async fn release(mut self) {
+        if let Some(binding) = self.binding.take() {
+            release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
+        }
+    }
+}
+
+impl Drop for WorktreeReleaseGuard {
+    fn drop(&mut self) {
+        // Fires only on the unwind path (a normal `release` already took the
+        // binding). `Drop` cannot await, so schedule the async release on the
+        // current runtime as a detached, best-effort task — enough not to leak on a
+        // panic while the runtime is still alive. A run-with-no-worktree binding
+        // needs no task at all.
+        if let Some(binding) = self.binding.take() {
+            if binding.lease.is_some() {
+                let pool = self.pool.clone();
+                let artifacts = self.artifacts.clone();
+                let manager = self.manager.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        release_run_worktree(&pool, &artifacts, &manager, &binding).await;
+                    });
+                } else {
+                    tracing::warn!(
+                        "WorktreeReleaseGuard dropped outside of active Tokio runtime; lease cleanup deferred to startup reconciliation"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The `repository` recorded on the StartRun command that created a queued run,
 /// if any. The commands table stores the applied outcome (`result_json`, with
 /// `created_run`) beside the body, so the originating command is found by the
@@ -737,7 +1115,7 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_github_slug;
+    use super::*;
 
     #[test]
     fn parses_https_and_ssh_remotes() {
@@ -769,5 +1147,238 @@ mod tests {
         assert!(parse_github_slug("https://mygithub.com/octocat/hello-world.git").is_none());
         assert!(parse_github_slug("https://github.com.evil.example/octocat/hello.git").is_none());
         assert!(parse_github_slug("").is_none());
+    }
+
+    // -- Per-run worktree binding (Phase 5 T5) ------------------------------
+
+    /// Run `git` synchronously in a test, asserting success.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Initialise a git repo `parent/repo` with one commit and return its path.
+    fn init_git_repo(parent: &Path) -> PathBuf {
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "test@codypendent.dev"]);
+        git(&repo, &["config", "user.name", "Codypendent Test"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        repo
+    }
+
+    /// A migrated pool plus an artifact store, both under `dir`.
+    async fn test_pool(dir: &Path) -> (SqlitePool, ArtifactStore) {
+        let pool = codypendent_daemon::db::open_database(&dir.join("test.db"))
+            .await
+            .expect("open database");
+        (pool, ArtifactStore::new(dir.join("artifacts")))
+    }
+
+    /// Insert a session + run so a lease's `owner_run_id` FK resolves.
+    async fn seed_run(pool: &SqlitePool) -> RunId {
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind(session_id.to_string())
+            .bind("worktree-bind")
+            .bind(&now)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, 'diagnose', 'Running', 'Build', 'hosted-default', '{}')",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        run_id
+    }
+
+    #[test]
+    fn run_writes_to_worktree_matches_the_mode_write_capability() {
+        // Only Build writes the worktree (and so needs isolation); the read-only
+        // modes keep the shared repository root.
+        assert!(run_writes_to_worktree(AgentMode::Build));
+        assert!(!run_writes_to_worktree(AgentMode::Explore));
+        assert!(!run_writes_to_worktree(AgentMode::Ask));
+        assert!(!run_writes_to_worktree(AgentMode::Plan));
+        assert!(!run_writes_to_worktree(AgentMode::Review));
+    }
+
+    #[tokio::test]
+    async fn build_run_allocates_and_releases_an_isolated_worktree() {
+        // A single-agent Build run (writes allowed) binds a DEDICATED worktree
+        // outside the repository, records the lease on its projection, and
+        // releases it cleanly (clean tree ⇒ directory removed, lease released).
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+
+        let binding = bind_run_worktree(
+            &pool,
+            &manager,
+            run_id,
+            run_writes_to_worktree(AgentMode::Build),
+            &repo,
+        )
+        .await
+        .expect("Build binds a worktree");
+        assert!(binding.lease.is_some(), "a writing run takes a lease");
+        assert!(
+            binding.worktree.exists(),
+            "the worktree directory is created"
+        );
+        assert!(
+            !binding
+                .worktree
+                .starts_with(std::fs::canonicalize(&repo).unwrap()),
+            "the worktree lives OUTSIDE the repository"
+        );
+        // The lease is recorded on the run's projection (run→worktree provenance).
+        let lease_id: Option<String> =
+            sqlx::query_scalar("SELECT workspace_lease_id FROM runs WHERE id = ?")
+                .bind(run_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lease_id, Some(binding.lease.unwrap().to_string()));
+
+        let worktree = binding.worktree.clone();
+        release_run_worktree(&pool, &artifacts, &manager, &binding).await;
+        assert!(!worktree.exists(), "a clean worktree is removed on release");
+        let state: String = sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
+            .bind(binding.lease.unwrap().to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn explore_run_keeps_the_repository_root_and_binds_no_worktree() {
+        // A read-only Explore run (writes denied by policy) keeps running in the
+        // repository root: no worktree is allocated, no lease is taken, and
+        // releasing the (empty) binding is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+
+        let binding = bind_run_worktree(
+            &pool,
+            &manager,
+            run_id,
+            run_writes_to_worktree(AgentMode::Explore),
+            &repo,
+        )
+        .await
+        .expect("Explore keeps the repo root");
+        assert!(binding.lease.is_none(), "a read-only run takes no lease");
+        assert_eq!(binding.worktree, repo, "it runs in the repository root");
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM workspace_leases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "no lease row is written for a read-only run");
+
+        // Releasing an empty binding is a clean no-op (and leaves the repo intact).
+        release_run_worktree(&pool, &artifacts, &manager, &binding).await;
+        assert!(repo.exists());
+    }
+
+    #[tokio::test]
+    async fn release_guard_releases_the_worktree_on_the_normal_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+            .await
+            .unwrap();
+        let lease_id = binding.lease.unwrap();
+        let worktree = binding.worktree.clone();
+
+        WorktreeReleaseGuard::arm(pool.clone(), artifacts, manager, binding)
+            .release()
+            .await;
+
+        assert!(
+            !worktree.exists(),
+            "the normal release removes a clean worktree"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
+            .bind(lease_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn release_guard_releases_the_worktree_on_unwind() {
+        // A guard dropped while still armed (the panic path — `release` never ran)
+        // schedules the async release, so the lease still lands `released` and the
+        // clean worktree is removed: a panicking drive leaks nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+            .await
+            .unwrap();
+        let lease_id = binding.lease.unwrap();
+        let worktree = binding.worktree.clone();
+
+        // Drop the guard WITHOUT calling `release` — models an unwind through it.
+        drop(WorktreeReleaseGuard::arm(
+            pool.clone(),
+            artifacts,
+            manager,
+            binding,
+        ));
+
+        // The detached release runs on the current runtime; wait for it to land.
+        let mut released = false;
+        for _ in 0..200 {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
+                    .bind(lease_id.to_string())
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if state.as_deref() == Some("released") {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(released, "the unwind path releases the lease");
+        assert!(
+            !worktree.exists(),
+            "the unwind path removes the clean worktree"
+        );
     }
 }

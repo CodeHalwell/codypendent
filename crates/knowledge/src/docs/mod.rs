@@ -18,6 +18,7 @@ pub mod crdt;
 pub mod leases;
 pub mod model;
 pub mod render;
+pub mod replica;
 pub mod staleness;
 pub mod store;
 
@@ -29,4 +30,5 @@ pub use model::{
     DocumentLink, DocumentMetadata, DocumentRelation, DocumentStatus, KnowledgeDocument,
     LinkTarget, MutationKind, ResolvedSymbol,
 };
+pub use replica::DocumentReplica;
 pub use store::{DocStoreError, Document, DocumentStore, DocumentSummary, NewDocument};

@@ -13,6 +13,10 @@ const REPAIR_GITHUB_CHECK: &str = include_str!("../../../docs/specs/workflow.yam
 
 /// A registry that knows exactly the tools, skills, and roles the canonical
 /// manifest references — the set a correctly configured daemon would present.
+/// The tool names mirror the **runtime** registry, which uses underscores
+/// (`github.update_pull_request`); the manifest's hyphenated
+/// `github.update-pull-request` resolves against it through the T6 namespace
+/// normalization applied by `validate_references`.
 fn repair_github_check_registry() -> SetRegistry {
     SetRegistry::new()
         .with_agent_role("investigator")
@@ -21,7 +25,7 @@ fn repair_github_check_registry() -> SetRegistry {
         .with_skill("github.inspect-failed-check")
         .with_skill("code.repair")
         .with_tool("repository.test")
-        .with_tool("github.update-pull-request")
+        .with_tool("github.update_pull_request")
 }
 
 #[test]

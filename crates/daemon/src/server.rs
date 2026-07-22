@@ -32,19 +32,25 @@ use tracing::{error, info, warn};
 
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
+use crate::blackboard::{BlackboardHub, BlackboardReader, ReadBlackboardRequest};
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
     DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
-    DocumentMutationRequest, DocumentMutator,
+    DocumentMutationRequest, DocumentMutator, DocumentPublisher, PublishDocumentRequest,
 };
 use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
 use crate::projections;
+use crate::promotion::{
+    AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
+    RollbackPromotionRequest,
+};
 use crate::subscriptions::SubscriptionHub;
+use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
-    PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest, StartWorkflowRequest,
-    WorkflowLifecycle, WorkflowStarter,
+    CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
+    StartWorkflowRequest, WorkflowLifecycle, WorkflowStarter,
 };
 
 /// Heartbeat cadence advertised in `ServerHello` and used to probe idle clients.
@@ -105,6 +111,40 @@ pub struct ServerState {
     /// (those commands are then rejected `workflow.transport-unavailable`); injected
     /// together with `starter` by the assembly.
     pub lifecycle: Option<Arc<dyn WorkflowLifecycle>>,
+    /// Per-workflow-run blackboard fan-out: the workflow executor publishes each
+    /// posted artifact here, and a client's `Subscription::Blackboard` forwarder
+    /// delivers from it (Phase 5 STEP 5.3). Reuses the executor's own hub (the
+    /// publisher is the agent loop inside the executor), or a fresh empty one in a
+    /// lib-only / test embedding.
+    pub blackboards: BlackboardHub,
+    /// Reads a durable run's board for an accepted `ReadBlackboard` (Phase 5
+    /// STEP 5.3). `None` in a lib-only / test embedding (the command is then
+    /// rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub blackboard_reader: Option<Arc<dyn BlackboardReader>>,
+    /// Per-workflow-run node-lifecycle fan-out: the workflow host publishes each
+    /// node transition (and run-phase change) here, and a client's
+    /// `Subscription::Workflow` forwarder delivers from it (Phase 5 STEP 5.2 / T9).
+    /// Reuses the executor's own hub (the publisher is the driver inside the
+    /// executor), or a fresh empty one in a lib-only / test embedding.
+    pub workflows: WorkflowHub,
+    /// Reads a durable run's observability snapshot for an accepted `ReadWorkflowRun`
+    /// (Phase 5 STEP 5.2 / T9). `None` in a lib-only / test embedding (the command is
+    /// then rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub workflow_reader: Option<Arc<dyn WorkflowReader>>,
+    /// Computes an accepted `PublishDocument` command's plan, parks its approval,
+    /// and (once approved) executes it (Phase 4 STEP 4.4). `None` in a lib-only /
+    /// test embedding (the command is then rejected
+    /// `document.transport-unavailable`); the assembly injects a
+    /// knowledge-backed implementation over the pool, mirroring `mutator`/`leaser`.
+    pub publisher: Option<Arc<dyn DocumentPublisher>>,
+    /// Drives the evaluation-gated promotion pipeline (Phase 7 STEP 7.5):
+    /// propose/advance/approve/rollback. `None` in a lib-only / test embedding
+    /// (every promotion command is then rejected
+    /// `promotion.transport-unavailable`); the assembly injects a
+    /// `codypendent-eval`-backed implementation over the pool.
+    pub promotion: Option<Arc<dyn PromotionGateway>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -181,9 +221,30 @@ pub async fn run_with_executor_on(
     // client's `Document` forwarder), and the mutator only computes the sync.
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
+    let publisher = executor.as_ref().and_then(|e| e.document_publisher());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
+    let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
     let documents = DocumentHub::new();
+    // The blackboard read seam, bundled with the executor by the assembly. Unlike
+    // the document hub, the per-run blackboard fan-out is REUSED from the executor
+    // (not created fresh): the publisher is the agent loop deep inside the executor,
+    // so both sides must share one hub — exactly as `collaborators` shares the
+    // `SubscriptionHub`. Absent an executor, a fresh empty hub (never published to).
+    let blackboard_reader = executor.as_ref().and_then(|e| e.blackboard_reader());
+    let blackboards = executor
+        .as_ref()
+        .and_then(|e| e.blackboard_hub())
+        .unwrap_or_default();
+    // The workflow observability seams, bundled with the executor exactly like the
+    // blackboard ones: the per-run node-lifecycle hub is REUSED from the executor
+    // (the publisher is the driver inside it, so both sides must share one hub),
+    // and the snapshot reader is pulled out for `ReadWorkflowRun` (T9).
+    let workflow_reader = executor.as_ref().and_then(|e| e.workflow_reader());
+    let workflows = executor
+        .as_ref()
+        .and_then(|e| e.workflow_hub())
+        .unwrap_or_default();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
@@ -194,6 +255,8 @@ pub async fn run_with_executor_on(
         let broker = approvals.clone();
         let hub = subscriptions.clone();
         let doc_hub = documents.clone();
+        let board_hub = blackboards.clone();
+        let workflow_hub = workflows.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -207,6 +270,8 @@ pub async fn run_with_executor_on(
                 }
                 hub.prune_idle();
                 doc_hub.prune_idle();
+                board_hub.prune_idle();
+                workflow_hub.prune_idle();
             }
         })
     };
@@ -231,6 +296,12 @@ pub async fn run_with_executor_on(
         leaser,
         starter,
         lifecycle,
+        publisher,
+        promotion,
+        blackboards,
+        blackboard_reader,
+        workflows,
+        workflow_reader,
     });
 
     #[cfg(unix)]
@@ -815,12 +886,75 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // Publishing a document is a Git write (Phase 4 STEP 4.4), so it
+                // is gated like the other repository-mutating controls
+                // (`CancelRun`/`PauseRun`/`ResumeRun`) rather than the looser
+                // "any non-Observer" gate `MutateDocument` uses: only a
+                // `Controller` may publish. Intercepted here (like
+                // `MutateDocument`/`StartWorkflow`) because a document lives
+                // outside the session ledger. The seam only PARKS the approval
+                // and returns — nothing is written until a human resolves it via
+                // the ordinary `ResolveApproval` command, which the assembly's
+                // background task is awaiting.
+                CommandBody::PublishDocument {
+                    document_id,
+                    target,
+                } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may publish a document".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(publisher) = state.publisher.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let publish = PublishDocumentRequest {
+                        document_id: *document_id,
+                        target: target.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match publisher.publish(publish).await {
+                        Ok(parked) => Envelope::reply_to(
+                            &request,
+                            Payload::DocumentPublishRequested {
+                                command_id: command.command_id,
+                                approval_id: parked.approval_id,
+                                target: parked.target_description,
+                                changed_files: parked.changed_files,
+                                git_action: parked.git_action,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
                 // A `StartWorkflow` creates a durable run in the workflow store,
                 // which lives outside the session ledger — so, like `MutateDocument`,
                 // it is intercepted here and applied through the assembly's
                 // `WorkflowStarter` seam rather than the event write path (Phase 5
                 // STEP 5.2). Driving the created run is a later step.
-                CommandBody::StartWorkflow { manifest, inputs } => {
+                CommandBody::StartWorkflow {
+                    manifest,
+                    workflow_id,
+                    inputs,
+                    repository,
+                } => {
                     // An Observer may not start a run.
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
@@ -851,11 +985,20 @@ async fn handle_request(
                     };
                     let start = StartWorkflowRequest {
                         manifest: manifest.clone(),
+                        workflow_id: workflow_id.clone(),
                         inputs: inputs.clone(),
                         // Carry the command's idempotency key so a duplicate
                         // delivery resolves to the same durable run (the write
                         // path's idempotency, applied to this intercepted command).
                         idempotency_key: command.idempotency_key.clone(),
+                        // The run carries its own repository root so its agent
+                        // nodes' isolated worktrees are carved from the right
+                        // checkout (Phase 5 T5); persisted raw so recovery reads
+                        // it back. An older client that sends none leaves the node
+                        // executor to fall back to the daemon's startup repository
+                        // — the fallback is applied at node-execution time, never
+                        // resolved from a wandering `current_dir()` here.
+                        repository: repository.clone(),
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {
@@ -958,6 +1101,335 @@ async fn handle_request(
                         };
                         send(writer, &reply).await?;
                     }
+                }
+                // Cancel is the missing control (pause/resume/retry existed; T9): a
+                // cooperative drain, Controller-gated like the others, through the same
+                // `WorkflowLifecycle` seam. The seam performs the synchronous state
+                // change (run → Cancelled, pending nodes → Skipped) and interrupts any
+                // in-flight node agent run, so the reply is a fast accept/reject.
+                CommandBody::CancelWorkflow { workflow_run_id } => {
+                    if let Some(lifecycle) =
+                        workflow_control_seam(state, conn, writer, &request, "cancel").await?
+                    {
+                        let reply = match lifecycle
+                            .cancel(CancelWorkflowRequest {
+                                workflow_run_id: workflow_run_id.clone(),
+                                client_id: conn.client_id_or(request.client_id),
+                            })
+                            .await
+                        {
+                            Ok(()) => Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                        send(writer, &reply).await?;
+                    }
+                }
+                // A promotion candidate lives in its own durable store outside
+                // the session ledger — so, like `StartWorkflow`, it is
+                // intercepted here and applied through the assembly's
+                // `PromotionGateway` seam rather than the event write path
+                // (Phase 7 STEP 7.5). A draft may be authored by anyone
+                // (including an agent/grader), so this is gated like
+                // `StartWorkflow` — any role but `Observer`.
+                CommandBody::ProposePromotion {
+                    kind,
+                    name,
+                    version,
+                    requires_permission_review,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not propose a promotion candidate".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let propose = ProposePromotionRequest {
+                        kind: kind.clone(),
+                        name: name.clone(),
+                        version: *version,
+                        requires_permission_review: *requires_permission_review,
+                        idempotency_key: command.idempotency_key.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.propose(propose).await {
+                        Ok(candidate_id) => Envelope::reply_to(
+                            &request,
+                            Payload::PromotionProposed {
+                                command_id: command.command_id,
+                                candidate_id,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Advancing through regression/shadow/canary is likewise open to
+                // any role but `Observer` — the same reasoning as
+                // `ProposePromotion`; only the final `approve`/`rollback` step
+                // requires `Controller` (below).
+                CommandBody::AdvancePromotion {
+                    candidate_id,
+                    action,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not advance a promotion candidate".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let advance = AdvancePromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        action: action.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.advance(advance).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // **The human-approval gate (ADR-010, exit criterion 2).** Only a
+                // `Controller` may issue this command; over this local-first
+                // socket, a `Controller`-role connection IS the human operator
+                // (Chapter 03 / `ConnState::role`'s own doc — the single
+                // connecting user is trusted with control), the same mapping
+                // `apply_resolve_approval` already uses for `resolved_by`. There
+                // is no wire field for a caller to *supply* an actor — the
+                // `Actor::Human` constructed just below is the ONLY actor this
+                // code path can ever hand to the promotion seam, so an
+                // agent/system-initiated approve cannot even be expressed here,
+                // let alone succeed; `Candidate::approve` then refuses a
+                // non-human actor a second, structural time regardless.
+                CommandBody::ApprovePromotion { candidate_id } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may approve a promotion".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let client_id = conn.client_id_or(request.client_id);
+                    let approve = ApprovePromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        // The ONE place an `Actor::Human` is minted for this
+                        // command — from the authenticated connection's role,
+                        // never from client-supplied data.
+                        approver: codypendent_protocol::Actor::Human {
+                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                        },
+                        client_id,
+                    };
+                    let reply = match gateway.approve(approve).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // A manual rollback is likewise `Controller`-only — the engine
+                // itself does not require a human actor to roll back (stopping a
+                // bad change needs no human), but the daemon still reserves the
+                // action to the trusted local operator and attributes it as
+                // `Actor::Human`, so it is never confused in the audit trail with
+                // the system-attributed auto-rollback a canary regression
+                // produces on its own (`AdvancePromotion { ObserveCanary }`).
+                CommandBody::RollbackPromotion { candidate_id } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may roll back a promotion".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let client_id = conn.client_id_or(request.client_id);
+                    let rollback = RollbackPromotionRequest {
+                        candidate_id: candidate_id.clone(),
+                        actor: codypendent_protocol::Actor::Human {
+                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                        },
+                        client_id,
+                    };
+                    let reply = match gateway.rollback(rollback).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Reading a workflow run's blackboard is intercepted at the
+                // connection level like `StartWorkflow` (the board lives in its own
+                // durable store outside the session ledger). Unlike the lifecycle
+                // commands this is a READ — an Observer may issue it (there is no
+                // client-facing post command; only the workflow executor writes the
+                // board) — so it carries no role gate, only the transport check
+                // (Phase 5 STEP 5.3).
+                CommandBody::ReadBlackboard {
+                    workflow_run_id,
+                    kind,
+                    include_superseded,
+                } => {
+                    let Some(reader) = state.blackboard_reader.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "workflow.transport-unavailable",
+                                "workflow transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let read = ReadBlackboardRequest {
+                        workflow_run_id: workflow_run_id.clone(),
+                        kind: kind.clone(),
+                        include_superseded: *include_superseded,
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match reader.read(read).await {
+                        Ok(items) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItems {
+                                command_id: command.command_id,
+                                items,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Reading a workflow run's observability snapshot is intercepted at the
+                // connection level like `ReadBlackboard` (the run lives in its own
+                // durable store outside the session ledger). A READ — any client (an
+                // Observer included) may issue it — so it carries no role gate, only the
+                // transport check (Phase 5 STEP 5.2 / T9). It is the catch-up baseline a
+                // client folds a `Subscription::Workflow` live stream on top of.
+                CommandBody::ReadWorkflowRun { workflow_run_id } => {
+                    let Some(reader) = state.workflow_reader.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "workflow.transport-unavailable",
+                                "workflow transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let read = ReadWorkflowRunRequest {
+                        workflow_run_id: workflow_run_id.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match reader.read(read).await {
+                        Ok(snapshot) => Envelope::reply_to(
+                            &request,
+                            Payload::WorkflowRunSnapshot {
+                                command_id: command.command_id,
+                                snapshot,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
                 }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
@@ -1178,6 +1650,22 @@ async fn handle_attach(
                     client_id,
                 )))
             }
+            Subscription::Blackboard { workflow_run_id } => {
+                let receiver = state.blackboards.subscribe(workflow_run_id.clone());
+                Some(tokio::spawn(forward_blackboard_posts(
+                    Arc::clone(writer),
+                    receiver,
+                    client_id,
+                )))
+            }
+            Subscription::Workflow { workflow_run_id } => {
+                let receiver = state.workflows.subscribe(workflow_run_id.clone());
+                Some(tokio::spawn(forward_workflow_events(
+                    Arc::clone(writer),
+                    receiver,
+                    client_id,
+                )))
+            }
             _ => None,
         })
         .collect();
@@ -1293,6 +1781,60 @@ async fn forward_document_syncs(
                 }
             }
             // Slow consumer: skip the dropped span; the next sync reconverges.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Forward a workflow run's live blackboard posts to one subscribed client,
+/// framing each as a [`Payload::BlackboardPosted`] (Phase 5 STEP 5.3). Never
+/// blocks the publisher: a lagging receiver skips the dropped span (its next read
+/// of the board reconverges — items merge idempotently by id) and a vanished
+/// client ends the task. Board posts are not session-scoped, so the frame carries
+/// no `session_id`; the client routes by the item's own `workflow_run_id`.
+/// Mirrors [`forward_document_syncs`].
+async fn forward_blackboard_posts(
+    writer: SharedWriter,
+    mut receiver: broadcast::Receiver<codypendent_protocol::BlackboardItemView>,
+    client_id: ClientId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(item) => {
+                let envelope = Envelope::request(client_id, Payload::BlackboardPosted(item));
+                if send(&writer, &envelope).await.is_err() {
+                    break; // client gone
+                }
+            }
+            // Slow consumer: skip the dropped span; the next read reconverges.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Forward a workflow run's live node-lifecycle events to one subscribed client,
+/// framing each as a [`Payload::WorkflowEvent`] (Phase 5 STEP 5.2 / T9). Never
+/// blocks the publisher: a lagging receiver skips the dropped span (its next
+/// snapshot read reconverges — each node transition is full-state, merged by
+/// `node_id`) and a vanished client ends the task. Workflow events are not
+/// session-scoped, so the frame carries no `session_id`; the client routes by the
+/// event's own `workflow_run_id`. Mirrors [`forward_blackboard_posts`].
+async fn forward_workflow_events(
+    writer: SharedWriter,
+    mut receiver: broadcast::Receiver<codypendent_protocol::WorkflowEvent>,
+    client_id: ClientId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let envelope = Envelope::request(client_id, Payload::WorkflowEvent { event });
+                if send(&writer, &envelope).await.is_err() {
+                    break; // client gone
+                }
+            }
+            // Slow consumer: skip the dropped span; the next snapshot reconverges.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }

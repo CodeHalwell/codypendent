@@ -207,10 +207,14 @@ fn a_canary_regression_auto_rolls_back_a_human_approved_pipeline() {
     candidate.run_regression(false).unwrap();
     candidate.start_shadow().unwrap();
     candidate.start_canary().unwrap();
-    assert_eq!(
-        candidate.observe_canary(true).unwrap(),
-        CanaryOutcome::AutoRolledBack
-    );
+    let outcome = candidate.observe_canary(true).unwrap();
+    let CanaryOutcome::AutoRolledBack(record) = outcome else {
+        panic!("expected an auto-rollback, got {outcome:?}");
+    };
+    // P7-5: the auto-rollback is attributed to "system" with a reason, not the
+    // human who drafted/would have approved the candidate.
+    assert_eq!(record.actor_kind(), "system");
+    assert!(record.reason().is_some());
     assert_eq!(candidate.stage(), PromotionStage::RolledBack);
     // It cannot then be approved — it never reached the decision point.
     assert!(candidate.approve(&human()).is_err());

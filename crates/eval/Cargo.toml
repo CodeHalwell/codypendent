@@ -14,6 +14,20 @@ codypendent-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Durable promotion-candidate persistence (STEP 7.5 daemon wiring). SQLite via
+# the shared migrations, mirroring `codypendent-workflow`'s own `db` helper so
+# this crate never has to depend on `codypendent-daemon` ("daemon-free" means no
+# dependency on the daemon crate, not "no database" — see `crate::store`).
+sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

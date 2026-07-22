@@ -31,7 +31,10 @@ const REPOSITORY_ROOT: &str = "$REPOSITORY";
 /// The mutable worktree root the Git tools operate on.
 const WORKTREE_ROOT: &str = "$WORKTREE";
 
-/// The five Phase-1 tools as governed registry items.
+/// The built-in tools as governed registry items: the five Phase-1 tools
+/// (`workspace.read_file`, `workspace.search`, `shell.run`, `git.diff`,
+/// `git.apply_patch`), the Phase-5 `repository.test` verification tool (T6), and
+/// the two Phase-5 blackboard tools (STEP 5.3).
 ///
 /// Ids are freshly minted here; [`register_builtins`] reuses any existing id for
 /// the same identity so a built-in's id is stable across restarts.
@@ -98,23 +101,99 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
                 CapabilityRequest::Command("git".into()),
             ],
         ),
+        // The Phase-5 workflow verification tool (T6): a workflow **tool node**
+        // runs the repository's own test command in its worktree through the same
+        // sandboxed process-spawn path as `shell.run`, returning a structured
+        // result a `test_result` blackboard artifact is built from. The concrete
+        // program is the granted command allow-list (`*` = any allow-listed
+        // program), so its risk mirrors `shell.run`.
+        tool(
+            "repository.test",
+            "Run the repository's own test command (detected from Cargo.toml / package.json / \
+             pyproject.toml, or a `.codypendent/test-command` override) in the workflow node's \
+             worktree, returning the exit status and captured output as a verification result.",
+            &[
+                "run the repository tests",
+                "verify a change",
+                "check the tests pass",
+                "run the test suite",
+            ],
+            &["test", "verify", "repository", "cargo", "pytest", "check"],
+            vec![
+                CapabilityRequest::FilesystemRead(WORKTREE_ROOT.into()),
+                CapabilityRequest::Command("*".into()),
+            ],
+        ),
+        // The Phase-5 blackboard tools (STEP 5.3): a workflow agent's only channel
+        // for sharing typed results. They target the run's own artifact board — not
+        // the filesystem, a command, the network, or a secret — so they request no
+        // capability (risk `Safe`); their access is gated by being offered solely
+        // inside a workflow node, not by a policy scope. Registered here so they
+        // render in the Skill Studio alongside the other built-ins.
+        tool(
+            "blackboard.post",
+            "Post a typed artifact (finding, decision, hypothesis, code_location, proposed_patch, \
+             test_result, document_draft, open_question) to the workflow blackboard so downstream \
+             agents can build on it. Claim-like kinds require evidence; pass `supersedes` to \
+             correct a prior artifact. Available only inside a workflow agent node.",
+            &[
+                "post a finding to the blackboard",
+                "record a decision for other agents",
+                "share a result with the workflow",
+                "supersede a prior blackboard artifact",
+            ],
+            &[
+                "blackboard",
+                "post",
+                "finding",
+                "artifact",
+                "workflow",
+                "handoff",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "blackboard.query",
+            "Read the workflow blackboard — the typed artifacts other agents posted — optionally \
+             filtered by kind. Available only inside a workflow agent node.",
+            &[
+                "read the blackboard",
+                "see what other agents found",
+                "query workflow findings",
+                "check the blackboard for decisions",
+            ],
+            &[
+                "blackboard",
+                "query",
+                "read",
+                "findings",
+                "workflow",
+                "artifacts",
+            ],
+            Vec::new(),
+        ),
     ]
 }
 
 /// The built-in commands as governed registry items.
 ///
-/// Phase 3 ships `/fix-ci` (STEP 3.2): investigate a failed GitHub check and
-/// prepare a verified change set. Registering it as a [`RegistryItemKind::Command`]
-/// item makes it discoverable in the Skill Studio alongside tools and skills; the
-/// invocation (`/fix-ci`) drives the hard-coded repair workflow.
+/// `/fix-ci` (Phase 3 STEP 3.2, now Phase 5 STEP 5.1.4): investigate a failed
+/// GitHub check and prepare a verified change set. Registering it as a
+/// [`RegistryItemKind::Command`] item makes it discoverable in the Skill Studio
+/// alongside tools and skills; the invocation (`/fix-ci`) starts the declarative
+/// `repair-github-check` workflow — the supervised investigator → implementer →
+/// independent-reviewer flow — through the workflow engine, replacing the Phase-3
+/// hard-coded objective template.
 #[must_use]
 pub fn builtin_commands() -> Vec<RegistryItem> {
     vec![
         command(
             "fix-ci",
             "Investigate a failed GitHub check and prepare a verified change set. \
-             Invoked as `/fix-ci`; retrieves the check + logs, proposes a patch in an \
-             isolated worktree, runs tests, and — on approval — updates the pull request.",
+             Invoked as `/fix-ci`; runs the declarative `repair-github-check` workflow — an \
+             investigator inspects the check, an implementer proposes a patch in an isolated \
+             worktree, the tests are re-run to verify it, an independent reviewer decides, and \
+             — on approval — the pull request is updated.",
             &[
                 "fix the failing CI",
                 "repair a failed github check",

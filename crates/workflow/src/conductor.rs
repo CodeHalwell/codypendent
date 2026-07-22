@@ -186,21 +186,74 @@ impl WorkflowConductor {
         }
     }
 
-    /// Validate that a run may be resumed — that it is [`Paused`] — without
-    /// driving it, so the daemon can reply to a `ResumeWorkflow` command
-    /// *synchronously* (accepted / rejected) and then drive in the background.
-    /// Only a paused run may be resumed; a pending/running/terminal run is an
-    /// [`IllegalTransition`](ConductorError::IllegalTransition), so a resume never
-    /// double-drives a run that is already advancing.
+    /// Cancel a run (STEP 5.2 / T9 — the control pause/resume/retry left missing).
+    /// A cooperative drain mirroring [`pause`](Self::pause): flip the run to
+    /// [`Cancelled`](WorkflowRunState::Cancelled) so a live driver stops launching
+    /// further nodes at its next scheduling boundary, and mark every still-`Pending`
+    /// node [`Skipped`](crate::store::NodeState::Skipped) (they will never run). An
+    /// in-flight node's agent run is interrupted separately, at the daemon layer,
+    /// through the same cancellation machinery `CancelRun` uses — this crate is
+    /// daemon-free and cannot reach it, so the caller fires the token.
+    ///
+    /// Returns the node ids newly skipped, so the caller can publish a transition
+    /// for each. `Cancelled` is **terminal**: cancelling an already-cancelled run is
+    /// an idempotent no-op (no nodes newly skipped), and cancelling a
+    /// completed/failed run is an
+    /// [`IllegalTransition`](ConductorError::IllegalTransition).
+    ///
+    /// Order matters: the run is flipped to `Cancelled` **before** the pending nodes
+    /// are skipped, so the driver sees the cancel and stops promptly; a node the
+    /// driver races into `Running` in that window is left for token cancellation, not
+    /// wrongly skipped.
+    pub async fn cancel(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Vec<String>, ConductorError> {
+        match self.state(pool, workflow_run_id).await? {
+            WorkflowRunState::Pending | WorkflowRunState::Running | WorkflowRunState::Paused => {
+                self.store
+                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Cancelled)
+                    .await?;
+                let skipped = self.store.skip_pending_nodes(pool, workflow_run_id).await?;
+                Ok(skipped)
+            }
+            WorkflowRunState::Cancelled => Ok(Vec::new()),
+            terminal => Err(ConductorError::IllegalTransition {
+                action: "cancelled",
+                state: terminal.as_str(),
+            }),
+        }
+    }
+
+    /// Validate that a run may be resumed — that it is [`Paused`] — and flip it
+    /// to [`Running`](WorkflowRunState::Running), so the daemon can reply to a
+    /// `ResumeWorkflow` command *synchronously* (accepted / rejected) and then
+    /// drive in the background (mirrors [`prepare_retry`](Self::prepare_retry)'s
+    /// validate-then-mutate shape). Only a paused run may be resumed; a
+    /// pending/running/terminal run is an
+    /// [`IllegalTransition`](ConductorError::IllegalTransition), so a resume
+    /// never double-drives a run that is already advancing.
+    ///
+    /// The mutation matters, not only the validation: [`drive`](Self::drive) (the
+    /// library-level driver) refuses to touch anything but a
+    /// [`Pending`](WorkflowRunState::Pending)/`Running` run (P5-D5) — a paused
+    /// run must already have left `Paused` by the time `drive` sees it, or
+    /// driving it would be a clean no-op instead of the intended resume.
     ///
     /// [`Paused`]: WorkflowRunState::Paused
-    pub async fn ensure_resumable(
+    pub async fn prepare_resume(
         &self,
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<(), ConductorError> {
         match self.state(pool, workflow_run_id).await? {
-            WorkflowRunState::Paused => Ok(()),
+            WorkflowRunState::Paused => {
+                self.store
+                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Running)
+                    .await?;
+                Ok(())
+            }
             other => Err(ConductorError::IllegalTransition {
                 action: "resumed",
                 state: other.as_str(),
@@ -208,10 +261,10 @@ impl WorkflowConductor {
         }
     }
 
-    /// Resume a paused run: validate it is paused, then drive it onward from its
-    /// ready frontier (the driver flips it back to `running` as it starts). The
-    /// direct drive-to-completion form; the daemon instead pairs
-    /// [`ensure_resumable`](Self::ensure_resumable) with a backgrounded
+    /// Resume a paused run: validate it is paused (flipping it to `Running`),
+    /// then drive it onward from its ready frontier. The direct
+    /// drive-to-completion form; the daemon instead pairs
+    /// [`prepare_resume`](Self::prepare_resume) with a backgrounded
     /// [`drive`](Self::drive).
     pub async fn resume<E: NodeExecutor, O: NodeObserver>(
         &self,
@@ -220,7 +273,7 @@ impl WorkflowConductor {
         executor: &E,
         observer: &O,
     ) -> Result<WorkflowRunState, ConductorError> {
-        self.ensure_resumable(pool, workflow_run_id).await?;
+        self.prepare_resume(pool, workflow_run_id).await?;
         self.drive(pool, workflow_run_id, executor, observer).await
     }
 
@@ -260,12 +313,25 @@ impl WorkflowConductor {
     }
 
     /// Recompile the run's stored manifest into its graph, or a structured error
-    /// when the manifest is absent or no longer compiles.
+    /// when the run does not exist, the run exists but has no stored manifest, or
+    /// the manifest no longer compiles.
+    ///
+    /// [`WorkflowStore::manifest`] collapses "no such run" and "run exists with
+    /// no manifest" into the same `Ok(None)` (by its own contract — a recovery
+    /// pass never needs the distinction, since it only ever calls this on rows it
+    /// just enumerated). A **client-supplied** run id (e.g. `RetryWorkflowNode`
+    /// on a made-up id) is not so guaranteed, so this checks existence first
+    /// (P5-D6a): a nonexistent run is [`NotFound`](ConductorError::NotFound), kept
+    /// distinct from [`NoManifest`](ConductorError::NoManifest) so a client sees
+    /// "no such run" rather than the misleading "this run has no manifest".
     async fn recompile(
         &self,
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<CompiledWorkflow, ConductorError> {
+        if self.store.snapshot(pool, workflow_run_id).await?.is_none() {
+            return Err(ConductorError::NotFound(workflow_run_id.to_owned()));
+        }
         let manifest = self
             .store
             .manifest(pool, workflow_run_id)
@@ -425,6 +491,34 @@ steps:
     }
 
     #[tokio::test]
+    async fn driving_or_retrying_a_nonexistent_run_is_not_found_not_no_manifest() {
+        // P5-D6a: a run that never existed must be reported distinctly from one
+        // that exists but has no stored manifest (the previous test) — both used
+        // to collapse into `NoManifest` because `WorkflowStore::manifest` returns
+        // `None` for either case.
+        let (_tmp, pool) = temp_pool().await;
+        let conductor = WorkflowConductor::new();
+
+        let err = conductor
+            .drive(&pool, "wfrun-does-not-exist", &FakeExecutor::default(), &())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConductorError::NotFound(id) if id == "wfrun-does-not-exist"),
+            "expected NotFound, got {err:?}"
+        );
+
+        let err = conductor
+            .prepare_retry(&pool, "wfrun-does-not-exist", "verify")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConductorError::NotFound(id) if id == "wfrun-does-not-exist"),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_incomplete_drives_pending_runs_and_leaves_paused_ones() {
         let (_tmp, pool) = temp_pool().await;
         let store = WorkflowStore::new();
@@ -541,6 +635,68 @@ steps:
                 state: "completed"
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_skips_pending_nodes_and_cancels_the_run() {
+        // A paused run (its node `a` completed, `b`/`c` still pending) is cancelled:
+        // the run lands `Cancelled` and every still-pending node becomes `Skipped`.
+        let (_tmp, pool) = temp_pool().await;
+        let store = WorkflowStore::new();
+        let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        let conductor = WorkflowConductor::new();
+
+        let pauser = FakeExecutor::pausing_after(pool.clone(), "a");
+        conductor.drive(&pool, &run_id, &pauser, &()).await.unwrap();
+
+        let skipped = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert_eq!(skipped, vec!["b".to_string(), "c".to_string()]);
+
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(snap.run.state, WorkflowRunState::Cancelled);
+        let state_of = |id: &str| {
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .map(|n| n.state)
+                .unwrap()
+        };
+        assert_eq!(state_of("a"), NodeState::Completed, "a already completed");
+        assert_eq!(state_of("b"), NodeState::Skipped);
+        assert_eq!(state_of("c"), NodeState::Skipped);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_idempotent_and_a_terminal_run_rejects() {
+        let (_tmp, pool) = temp_pool().await;
+        let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        let conductor = WorkflowConductor::new();
+
+        // First cancel of a fresh (pending) run skips all three nodes.
+        let skipped = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert_eq!(skipped.len(), 3);
+        // A second cancel is an idempotent no-op — the run is already cancelled,
+        // nothing newly skipped.
+        let again = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert!(again.is_empty(), "re-cancel skips nothing: {again:?}");
+
+        // A COMPLETED run cannot be cancelled.
+        let done = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        conductor
+            .drive(&pool, &done, &FakeExecutor::default(), &())
+            .await
+            .unwrap();
+        let err = conductor.cancel(&pool, &done).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConductorError::IllegalTransition {
+                    action: "cancelled",
+                    state: "completed"
+                }
+            ),
+            "expected illegal-transition, got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,36 @@
 schema_version: 1
 id: repair-github-check
 version: 1
-description: Investigate and repair a failed GitHub check in an isolated worktree.
+description: >-
+  Investigate and repair a failed GitHub check in an isolated worktree. This is
+  the `/fix-ci` product path (Phase 5 STEP 5.1.4), replacing the Phase-3 hard-coded
+  objective template with a supervised investigator -> implementer -> independent
+  reviewer flow. Intentional divergence from the old prompt flow: it does NOT post
+  a separate github.create_check_run_summary; the single `publish` step
+  (github.update-pull-request), gated on approval, carries the outcome onto the PR.
+  A plain single-agent run can still post a check-run summary if one is wanted.
+
+# Tool-node namespace (Phase 5 T6): a step's `tool:` id is resolved against the
+# runtime tool registry after normalizing `-` to `_`, so the manifest may use the
+# hyphenated house style (`github.update-pull-request`) while the runtime keeps its
+# underscored names (`github.update_pull_request`). The rule is an alias, not a
+# rename: runtime names are unchanged and a manifest already using underscores is
+# unaffected.
+#
+# Tool-node arguments (Phase 5 T6): the compiled graph carries no per-node tool
+# arguments, so a tool node binds them from the run's typed `inputs`. Two ways:
+#   * an explicit `with:` map — string values interpolate `${{ inputs.<name> }}`
+#     against the inputs (a whole-string placeholder keeps the input's type; there
+#     is no expression language). For example:
+#         - id: publish
+#           tool: github.update-pull-request
+#           with:
+#             number: ${{ inputs.pull_request }}   # the integer input, type-preserved
+#             body: 'Automated update for PR #${{ inputs.pull_request }}'
+#   * the executor's default per-tool binding when `with:` is absent — e.g.
+#     `repository.test` needs none, and `github.update-pull-request` binds its PR
+#     number from the `pull_request` input and its body from the run's live
+#     `decision`/`finding` blackboard artifacts (as this workflow relies on below).
 
 # Multi-agent (investigator → implementer → independent reviewer): the reviewer
 # is a separate agent so its judgement is structurally independent of the

@@ -9,5 +9,7 @@ pub mod acp;
 pub mod client;
 pub mod commands;
 pub mod connection;
+pub mod eval;
 pub mod stream;
+pub mod theme_select;
 pub mod tui;

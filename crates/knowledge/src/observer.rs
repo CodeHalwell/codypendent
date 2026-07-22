@@ -52,12 +52,12 @@ const SHELL_TOOL: &str = "shell.run";
 /// Markers that flag a note as an explicit memory proposal.
 const PROPOSE_MARKERS: [&str; 2] = ["memory.propose:", "memory:"];
 
-/// The canonical revision for a ledger sequence: `seq:` + a fixed-width,
-/// zero-padded number, so `valid_from`/`valid_until` sort lexicographically the
-/// same as numerically (the memory query compares them as strings in SQL —
-/// without padding, `seq:10` would sort before `seq:2`). 20 digits covers `u64`.
+/// The canonical orderable revision for a ledger sequence. Delegates to
+/// [`Revision::sequence`] so the `seq:` + fixed-width-zero-padded format (which
+/// the memory query relies on to compare revisions as ordered text) is defined
+/// in exactly one place.
 fn seq_revision(sequence: u64) -> Revision {
-    Revision(format!("seq:{sequence:020}"))
+    Revision::sequence(sequence)
 }
 
 /// Extract [`CandidateMemory`] proposals from a slice of session events under

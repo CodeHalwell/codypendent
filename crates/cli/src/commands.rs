@@ -1,5 +1,6 @@
 //! Daemon lifecycle commands (Phase 0), the headless JSONL client (STEP 1.13:
-//! `run` and `attach`), and the Phase-2 `index rebuild` maintenance command.
+//! `run` and `attach`), the Phase-2 `index rebuild` maintenance command, and
+//! `docs publish` (Phase 4 STEP 4.4).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -7,12 +8,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use codypendent_knowledge::{
-    db as knowledge_db, register_builtins, retrieve, HashingEmbedder, Registry, RetrievalConfig,
-    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+    db as knowledge_db, plan_publication, publications, register_builtins, retrieve, DocumentStore,
+    HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
+    RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ClientRole, CommandBody, Payload, SessionId, Subscription, WorkspaceId,
+    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DocumentId, Payload,
+    PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView, WorkflowRunPhase,
+    WorkflowRunSnapshot, WorkspaceId,
 };
 
 use crate::client;
@@ -425,6 +429,282 @@ pub async fn open(
     Ok(())
 }
 
+/// `codypendent docs publish --target <T>` (Phase 4 STEP 4.4). Which Git
+/// target to publish to, decoupled from `clap`'s `ValueEnum` derive (mirrors
+/// `codypendent_knowledge::PublishTarget`'s three variants with CLI-friendly
+/// names: `repo-file` / `docs-branch` / `doc-pr`).
+pub enum PublishTargetKind {
+    RepoFile,
+    DocsBranch,
+    DocPr,
+}
+
+/// `codypendent docs publish <DOCUMENT> --target <T>` (Phase 4 STEP 4.4,
+/// closing the deferred "executing a `PublishPlan`" roadmap item).
+///
+/// Opens the daemon's database directly (the CLI projection seam — the same
+/// read-only pattern the TUI's Docs view and `index rebuild` use) to load the
+/// document and compute the exact deterministic plan the daemon itself will
+/// compute, so the target/changed-files/Git-action preview printed here is
+/// never a guess (STEP 4.4.2). After confirming (or `--yes`), ensures a
+/// daemon, sends `PublishDocument` — which durably parks an approval and
+/// replies with the parked plan the daemon computed independently — then
+/// immediately resolves that approval with the confirmed decision over the
+/// SAME connection (this CLI invocation is the human approver). A rejection
+/// performs no write. On approval the daemon executes in the background, so
+/// this polls the publication history briefly for the resulting commit before
+/// reporting the outcome.
+pub async fn docs_publish(
+    paths: &RuntimePaths,
+    document_id: DocumentId,
+    target: PublishTargetKind,
+    path: Option<String>,
+    branch: Option<String>,
+    title: Option<String>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let doc = DocumentStore::new()
+        .snapshot_document(&pool, document_id)
+        .await
+        .with_context(|| format!("loading document {document_id}"))?
+        .ok_or_else(|| anyhow::anyhow!("no document {document_id}"))?;
+
+    let resolved_target = resolve_publish_target(target, &doc.title, path, branch, title);
+    let plan = plan_publication(&doc, resolved_target.clone());
+
+    println!("Publish plan for \"{}\" ({document_id}):", doc.title);
+    println!("  target: {}", describe_publish_target(&resolved_target));
+    println!("  changed files:");
+    for file in &plan.changed_files {
+        println!("    {file}");
+    }
+    println!("  git action: {}", plan.git_action);
+
+    let approved = if yes {
+        true
+    } else {
+        print!("Publish? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+
+    let decision = if approved {
+        ApprovalDecision::Approve
+    } else {
+        ApprovalDecision::Reject
+    };
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let approval_id = docs_publish_over_connection(
+        &mut conn,
+        document_id,
+        to_wire_target(&resolved_target),
+        decision,
+    )
+    .await?;
+    println!("Parked approval {approval_id}.");
+
+    if !approved {
+        println!("Publish rejected; nothing was written.");
+        return Ok(());
+    }
+
+    let existing = publications(&pool, document_id).await?.len();
+    match wait_for_new_publication(&pool, document_id, existing).await {
+        Some(publication) => println!(
+            "Published \"{}\" ({document_id}) -> commit {}",
+            doc.title,
+            publication.git_commit.as_deref().unwrap_or("(none)")
+        ),
+        None => println!(
+            "Publish approved; the daemon is still executing it in the background. \
+             Check the daemon log, or re-run `codypendent docs publish` shortly to see \
+             the recorded commit."
+        ),
+    }
+    Ok(())
+}
+
+/// The connected core of [`docs_publish`]: handshake, bind the `Controller`
+/// role, send `PublishDocument`, then immediately resolve the parked approval
+/// with `decision` over the SAME connection (this CLI invocation is the human
+/// approver — the confirmation already happened before this is called).
+/// Returns the parked [`ApprovalId`](codypendent_protocol::ApprovalId). Split
+/// out so a test can drive it against a mock daemon, mirroring
+/// [`workflow_run_over_connection`].
+pub async fn docs_publish_over_connection(
+    conn: &mut Connection,
+    document_id: DocumentId,
+    target: codypendent_protocol::document::PublishTarget,
+    decision: ApprovalDecision,
+) -> anyhow::Result<codypendent_protocol::ApprovalId> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::PublishDocument {
+            document_id,
+            target,
+        })
+        .await?;
+    let approval_id = match reply.payload {
+        Payload::DocumentPublishRequested { approval_id, .. } => approval_id,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("publish rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to PublishDocument: {other:?}"),
+    };
+
+    let reply = conn
+        .send_command(CommandBody::ResolveApproval {
+            approval_id,
+            decision,
+            scope: ApprovalScope::Once,
+        })
+        .await?;
+    match reply.payload {
+        Payload::CommandAccepted { .. } => Ok(approval_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "could not resolve the publish approval: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to ResolveApproval: {other:?}"),
+    }
+}
+
+/// Resolve `kind` (plus any explicit `--path`/`--branch`/`--title`) into the
+/// knowledge engine's domain `PublishTarget`, filling in sensible defaults: a
+/// slug of the document's title under `docs/` for `path`, `docs/publish` for
+/// `branch`, and `Publish: <title>` for a PR's `title`.
+fn resolve_publish_target(
+    kind: PublishTargetKind,
+    document_title: &str,
+    path: Option<String>,
+    branch: Option<String>,
+    title: Option<String>,
+) -> KnowledgePublishTarget {
+    let path = path.unwrap_or_else(|| format!("docs/{}.md", slugify(document_title)));
+    match kind {
+        PublishTargetKind::RepoFile => KnowledgePublishTarget::RepositoryFile { path },
+        PublishTargetKind::DocsBranch => {
+            let branch = branch.unwrap_or_else(|| "docs/publish".to_string());
+            KnowledgePublishTarget::DocsBranchCommit { branch, path }
+        }
+        PublishTargetKind::DocPr => {
+            let branch = branch.unwrap_or_else(|| "docs/publish".to_string());
+            let title = title.unwrap_or_else(|| format!("Publish: {document_title}"));
+            KnowledgePublishTarget::DocumentationPr {
+                branch,
+                path,
+                title,
+            }
+        }
+    }
+}
+
+/// A short human description of a target, matching the daemon seam's own
+/// `describe_target` (kept independent — the CLI's is a client-side preview
+/// computed from the SAME plan function, not a value the daemon returns until
+/// after `PublishDocument` is sent).
+fn describe_publish_target(target: &KnowledgePublishTarget) -> String {
+    match target {
+        KnowledgePublishTarget::RepositoryFile { path } => format!("repository file {path}"),
+        KnowledgePublishTarget::DocsBranchCommit { branch, path } => {
+            format!("docs-branch commit {path} on {branch}")
+        }
+        KnowledgePublishTarget::DocumentationPr {
+            branch,
+            path,
+            title,
+        } => format!("documentation PR \"{title}\" ({path} on {branch})"),
+    }
+}
+
+/// Convert the knowledge engine's domain `PublishTarget` into its wire mirror
+/// for the `PublishDocument` command.
+fn to_wire_target(
+    target: &KnowledgePublishTarget,
+) -> codypendent_protocol::document::PublishTarget {
+    use codypendent_protocol::document::PublishTarget as Wire;
+    match target {
+        KnowledgePublishTarget::RepositoryFile { path } => {
+            Wire::RepositoryFile { path: path.clone() }
+        }
+        KnowledgePublishTarget::DocsBranchCommit { branch, path } => Wire::DocsBranchCommit {
+            branch: branch.clone(),
+            path: path.clone(),
+        },
+        KnowledgePublishTarget::DocumentationPr {
+            branch,
+            path,
+            title,
+        } => Wire::DocumentationPr {
+            branch: branch.clone(),
+            path: path.clone(),
+            title: title.clone(),
+        },
+    }
+}
+
+/// A filesystem/branch-safe slug: lowercased alphanumerics, runs of anything
+/// else collapsed to a single `-`, with no leading/trailing dash. Never empty
+/// (falls back to `document`).
+fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "document".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Poll the publication history for a fresh row beyond `existing_count`
+/// (the daemon's execution is fire-and-forget once the approval resolves),
+/// or give up after a generous bound and let the caller report "still
+/// running" rather than hang indefinitely.
+async fn wait_for_new_publication(
+    pool: &sqlx::SqlitePool,
+    document_id: DocumentId,
+    existing_count: usize,
+) -> Option<Publication> {
+    for _ in 0..100 {
+        let published = publications(pool, document_id).await.ok()?;
+        if published.len() > existing_count {
+            return published.into_iter().next();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
 /// `codypendent workflow validate <FILE> [--agents <DIR>]` (Phase 5 STEP 5.1):
 /// parse and compile a declarative `workflow.yaml`, reporting either a one-line
 /// summary of the validated graph or the precise error (naming the offending
@@ -498,15 +778,19 @@ pub fn workflow_show(file: &std::path::Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `codypendent workflow run <FILE> [--inputs <JSON>]` (Phase 5 STEP 5.2): start a
-/// durable workflow run. Ensures a daemon, sends `StartWorkflow`, and prints the
-/// new run id the daemon drives to a terminal state in the background. The manifest
-/// content (never a path) is what crosses the wire, and `--inputs` is parsed as a
-/// JSON value the manifest's typed inputs bind to.
+/// `codypendent workflow run <FILE> [--inputs <JSON>] [--repo <PATH>]` (Phase 5
+/// STEP 5.2): start a durable workflow run. Ensures a daemon, sends `StartWorkflow`,
+/// and prints the new run id the daemon drives to a terminal state in the
+/// background. The manifest content (never a path) is what crosses the wire,
+/// `--inputs` is parsed as a JSON value the manifest's typed inputs bind to, and
+/// `repo`'s canonical path is carried so the daemon carves each writing node its
+/// own isolated worktree from *this* checkout (Phase 5 T5) — mirroring how the
+/// `run` command carries `StartRun`'s repository.
 pub async fn workflow_run(
     paths: &RuntimePaths,
     file: &std::path::Path,
     inputs: Option<String>,
+    repo: PathBuf,
 ) -> anyhow::Result<()> {
     let manifest = std::fs::read_to_string(file)
         .with_context(|| format!("reading workflow manifest {}", file.display()))?;
@@ -516,26 +800,45 @@ pub async fn workflow_run(
         }
         None => serde_json::Value::Null,
     };
+    let repo = repo.canonicalize().with_context(|| {
+        format!(
+            "--repo {}: not a valid, accessible directory",
+            repo.display()
+        )
+    })?;
+    if !repo.is_dir() {
+        anyhow::bail!("--repo {}: not a directory", repo.display());
+    }
+    let repository = repo.to_string_lossy().into_owned();
     ensure_daemon(paths).await?;
     let mut conn = Connection::connect(&paths.socket_path).await?;
-    let run_id = workflow_run_over_connection(&mut conn, manifest, inputs).await?;
+    let run_id =
+        workflow_run_over_connection(&mut conn, manifest, inputs, Some(repository)).await?;
     println!("workflow run started: {run_id}");
     Ok(())
 }
 
 /// The connected core of [`workflow_run`]: handshake, bind the `Controller` role,
 /// send `StartWorkflow`, and return the new run id. Split out so a test can drive it
-/// against a mock server (like [`run_over_connection`]).
+/// against a mock server (like [`run_over_connection`]). `repository` is the
+/// canonical repo root the run's agent nodes operate on (Phase 5 T5); `None` lets
+/// the daemon fall back to its startup repository.
 pub async fn workflow_run_over_connection(
     conn: &mut Connection,
     manifest: String,
     inputs: serde_json::Value,
+    repository: Option<String>,
 ) -> anyhow::Result<String> {
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(conn).await?;
     let reply = conn
-        .send_command(CommandBody::StartWorkflow { manifest, inputs })
+        .send_command(CommandBody::StartWorkflow {
+            manifest,
+            workflow_id: None,
+            inputs,
+            repository,
+        })
         .await?;
     match reply.payload {
         Payload::WorkflowRunStarted {
@@ -545,6 +848,64 @@ pub async fn workflow_run_over_connection(
             anyhow::bail!("StartWorkflow rejected: {} ({})", error.message, error.code)
         }
         other => anyhow::bail!("unexpected reply to StartWorkflow: {other:?}"),
+    }
+}
+
+/// `codypendent fix-ci --pr <N> [--repo PATH]` (Phase 5 STEP 5.1.4). Runs the
+/// declarative `repair-github-check` workflow — the supervised investigator →
+/// implementer → independent-reviewer flow that replaced the Phase-3 hard-coded
+/// `/fix-ci` objective. The daemon resolves the workflow from its own sources
+/// (the embedded built-in, shadowable by `<repo>/.codypendent/workflows`), so a
+/// fresh checkout needs no manifest file. Every GitHub write still parks for
+/// durable approval; without a GitHub token the run fails with the same
+/// `github is not configured` error the prompt flow gave, at its first check read.
+pub async fn fix_ci(paths: &RuntimePaths, pr: u64, repo: PathBuf) -> anyhow::Result<()> {
+    let repo = repo.canonicalize().with_context(|| {
+        format!(
+            "--repo {}: not a valid, accessible directory",
+            repo.display()
+        )
+    })?;
+    if !repo.is_dir() {
+        anyhow::bail!("--repo {}: not a directory", repo.display());
+    }
+    let repository = repo.to_string_lossy().into_owned();
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let run_id = fix_ci_over_connection(&mut conn, pr, Some(repository)).await?;
+    println!("workflow run started: {run_id}");
+    Ok(())
+}
+
+/// The connected core of [`fix_ci`]: handshake, bind `Controller`, and start the
+/// named `repair-github-check` workflow with the PR number as its input (Phase 5
+/// STEP 5.1.4). Split out so a test can drive it against a mock server, mirroring
+/// [`workflow_run_over_connection`]. Sends no inline manifest — the daemon resolves
+/// the workflow by id, enforcing the source registry's version + shadowing rules.
+pub async fn fix_ci_over_connection(
+    conn: &mut Connection,
+    pr: u64,
+    repository: Option<String>,
+) -> anyhow::Result<String> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::StartWorkflow {
+            manifest: String::new(),
+            workflow_id: Some(codypendent_workflow::REPAIR_GITHUB_CHECK_ID.to_string()),
+            inputs: serde_json::json!({ "pull_request": pr }),
+            repository,
+        })
+        .await?;
+    match reply.payload {
+        Payload::WorkflowRunStarted {
+            workflow_run_id, ..
+        } => Ok(workflow_run_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("/fix-ci rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to /fix-ci StartWorkflow: {other:?}"),
     }
 }
 
@@ -583,6 +944,232 @@ pub async fn workflow_retry(
         "retry",
     )
     .await
+}
+
+/// `codypendent workflow cancel <RUN_ID>` (Phase 5 T9). A cooperative drain — the
+/// driver stops launching new nodes, any in-flight node's agent run is interrupted,
+/// pending nodes are skipped, and the run lands cancelled (terminal — no resume).
+pub async fn workflow_cancel(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    lifecycle_command(
+        paths,
+        CommandBody::CancelWorkflow { workflow_run_id },
+        "cancel",
+    )
+    .await
+}
+
+/// `codypendent workflow watch <RUN_ID>` (Phase 5 T9): print the run's current
+/// observability snapshot, then stream each node transition + run-phase change until
+/// the run reaches a terminal phase. Attaches a `Subscription::Workflow` forwarder to
+/// a throwaway session (the connection-level anchor a per-run subscription needs),
+/// reads the snapshot as the baseline over the SAME connection, then folds the live
+/// stream — the catch-up/idempotency contract (subscribe-then-snapshot, merge by
+/// node id). Does not start a daemon: watching only makes sense against a live run.
+pub async fn workflow_watch(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    workflow_watch_over_connection(&mut conn, workflow_run_id, &mut stdout).await
+}
+
+/// The connected core of [`workflow_watch`], split out for testability like
+/// [`workflow_run_over_connection`]: handshake, create + attach a throwaway session
+/// carrying the `Subscription::Workflow` forwarder, read the snapshot baseline, then
+/// stream live events until a terminal run phase.
+pub async fn workflow_watch_over_connection<W: Write>(
+    conn: &mut Connection,
+    workflow_run_id: String,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+
+    // A per-run subscription forwarder spawns only on a valid session attach (the
+    // connection-level anchor); create a throwaway session as the Observer to carry
+    // it. Subscribe BEFORE reading the snapshot so no transition is missed between
+    // the read and the subscribe (the catch-up contract).
+    let create_reply = conn
+        .send_command(CommandBody::CreateSession {
+            workspace: WorkspaceId::new(),
+            title: format!("watch {workflow_run_id}"),
+        })
+        .await?;
+    let session_id = match &create_reply.payload {
+        Payload::CommandAccepted { .. } => create_reply.session_id.ok_or_else(|| {
+            anyhow::anyhow!("daemon accepted CreateSession but sent no session id")
+        })?,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("CreateSession rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to CreateSession: {other:?}"),
+    };
+    conn.send_command(CommandBody::AttachSession {
+        session_id,
+        last_seen_sequence: None,
+        subscriptions: vec![Subscription::Workflow {
+            workflow_run_id: workflow_run_id.clone(),
+        }],
+        requested_role: ClientRole::Observer,
+    })
+    .await?;
+
+    // The catch-up baseline: the run's current phase + every node's view.
+    let snapshot_reply = conn
+        .send_command(CommandBody::ReadWorkflowRun {
+            workflow_run_id: workflow_run_id.clone(),
+        })
+        .await?;
+    match snapshot_reply.payload {
+        Payload::WorkflowRunSnapshot { snapshot, .. } => {
+            render_workflow_snapshot(out, &snapshot)?;
+            if snapshot_phase_is_terminal(snapshot.phase) {
+                // Already finished — nothing to stream.
+                return Ok(());
+            }
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "ReadWorkflowRun rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to ReadWorkflowRun: {other:?}"),
+    }
+
+    // Fold the live stream until a terminal run phase (or the daemon closes).
+    while let Some(envelope) = conn.next_envelope().await? {
+        if let Payload::WorkflowEvent { event } = envelope.payload {
+            // Route only this run's events (the frame is not session-scoped).
+            if workflow_event_run_id(&event) != Some(workflow_run_id.as_str()) {
+                continue;
+            }
+            render_workflow_event(out, &event)?;
+            if let WorkflowEvent::RunPhaseChanged { phase, .. } = &event {
+                if snapshot_phase_is_terminal(*phase) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a run phase is terminal (the watch stream ends there).
+fn snapshot_phase_is_terminal(phase: WorkflowRunPhase) -> bool {
+    matches!(
+        phase,
+        WorkflowRunPhase::Completed | WorkflowRunPhase::Failed | WorkflowRunPhase::Cancelled
+    )
+}
+
+/// The run id a live workflow event belongs to.
+fn workflow_event_run_id(event: &WorkflowEvent) -> Option<&str> {
+    match event {
+        WorkflowEvent::NodeTransitioned(view) => Some(view.workflow_run_id.as_str()),
+        WorkflowEvent::RunPhaseChanged {
+            workflow_run_id, ..
+        } => Some(workflow_run_id.as_str()),
+        _ => None,
+    }
+}
+
+/// Print a run snapshot as a human header + one line per node.
+fn render_workflow_snapshot<W: Write>(
+    out: &mut W,
+    snapshot: &WorkflowRunSnapshot,
+) -> anyhow::Result<()> {
+    writeln!(
+        out,
+        "workflow run {} — {}",
+        snapshot.workflow_run_id,
+        run_phase_label(snapshot.phase)
+    )?;
+    for node in &snapshot.nodes {
+        writeln!(out, "  {}", node_view_line(node))?;
+    }
+    Ok(())
+}
+
+/// Print one live workflow event as a human line.
+fn render_workflow_event<W: Write>(out: &mut W, event: &WorkflowEvent) -> anyhow::Result<()> {
+    match event {
+        WorkflowEvent::NodeTransitioned(view) => writeln!(out, "  {}", node_view_line(view))?,
+        WorkflowEvent::RunPhaseChanged { phase, .. } => {
+            writeln!(out, "run {}", run_phase_label(*phase))?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A one-line human rendering of a node's view (state, attempt, cost, error).
+fn node_view_line(view: &WorkflowNodeView) -> String {
+    let mut line = format!("{}: {}", view.node_id, node_state_label(view));
+    if view.attempt > 1 {
+        line.push_str(&format!(" (attempt {})", view.attempt));
+    }
+    if let Some(cost) = &view.cost {
+        if let Some(rendered) = render_cost(cost) {
+            line.push_str(&format!(" · {rendered}"));
+        }
+    }
+    if let Some(error) = &view.error {
+        line.push_str(&format!(" — {error}"));
+    }
+    line
+}
+
+/// The wire node state as a lowercase label.
+fn node_state_label(view: &WorkflowNodeView) -> &'static str {
+    use codypendent_protocol::WorkflowNodeState::*;
+    match view.state {
+        Pending => "pending",
+        Running => "running",
+        WaitingApproval => "waiting_approval",
+        Blocked => "blocked",
+        Completed => "completed",
+        Failed => "failed",
+        Skipped => "skipped",
+        _ => "unknown",
+    }
+}
+
+/// The wire run phase as a lowercase label.
+fn run_phase_label(phase: WorkflowRunPhase) -> &'static str {
+    match phase {
+        WorkflowRunPhase::Pending => "pending",
+        WorkflowRunPhase::Running => "running",
+        WorkflowRunPhase::Paused => "paused",
+        WorkflowRunPhase::Completed => "completed",
+        WorkflowRunPhase::Failed => "failed",
+        WorkflowRunPhase::Cancelled => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`) as a human
+/// string, or `None` when empty. Only measured dimensions — never a fabricated
+/// token/USD figure (T8).
+fn render_cost(cost: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(secs) = cost.get("wall_time_secs").and_then(|v| v.as_u64()) {
+        parts.push(format!("{secs}s"));
+    }
+    if let Some(calls) = cost.get("tool_calls").and_then(|v| v.as_u64()) {
+        let unit = if calls == 1 {
+            "tool call"
+        } else {
+            "tool calls"
+        };
+        parts.push(format!("{calls} {unit}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
 }
 
 /// Send one workflow lifecycle command to a *running* daemon (it does not start
@@ -630,6 +1217,189 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
     })
     .await?;
     Ok(())
+}
+
+// --- STEP 7.1: eval harness runner -------------------------------------------
+
+/// `codypendent eval run --suite <NAME> [--policy P] --report out.json`
+/// (Phase 7 STEP 7.1). Loads every case in the suite, runs each headlessly
+/// against its pinned fixture revision, scores it, and writes the aggregate
+/// [`codypendent_eval::SuiteReport`] to `--report`. `policy` is recorded on
+/// stdout only — Phase 7 routing is not yet wired into `StartRun` (see the
+/// roadmap's "routing⇄eval composition" note), so it does not yet select a
+/// model.
+pub async fn eval_run(
+    paths: &RuntimePaths,
+    suite: &str,
+    policy: Option<String>,
+    report: &std::path::Path,
+) -> anyhow::Result<()> {
+    let suite_dir = crate::eval::resolve_suite_dir(suite)?;
+    let cases = crate::eval::load_suite(&suite_dir)?;
+    println!(
+        "eval: loaded {} case(s) from {}{}",
+        cases.len(),
+        suite_dir.display(),
+        policy
+            .as_deref()
+            .map(|p| format!(" (policy: {p}, not yet enforced)"))
+            .unwrap_or_default()
+    );
+    let fixture_root = crate::eval::fixture_root(&suite_dir, "tiny-crate")?;
+    let suite_report = crate::eval::run_suite(paths, &cases, &fixture_root).await?;
+
+    let json = serde_json::to_string_pretty(&suite_report)?;
+    std::fs::write(report, json)
+        .with_context(|| format!("writing suite report to {}", report.display()))?;
+
+    let passed = suite_report.results.iter().filter(|r| r.passed()).count();
+    println!(
+        "eval: {passed}/{} case(s) passed ({:.0}%); report written to {}",
+        suite_report.results.len(),
+        suite_report.success_rate() * 100.0,
+        report.display()
+    );
+    if !suite_report.all_passed() {
+        anyhow::bail!(
+            "eval suite did not pass: failed case(s): {}",
+            suite_report.failed_case_ids().join(", ")
+        );
+    }
+    Ok(())
+}
+
+// --- STEP 7.5: promotion pipeline commands ----------------------------------
+
+/// `codypendent promote propose --kind K --name NAME --version N
+/// [--requires-permission-review]` (Phase 7 STEP 7.5). Ensures a daemon (like
+/// `workflow run`, this is the "creation" verb) and prints the new candidate id.
+pub async fn promote_propose(
+    paths: &RuntimePaths,
+    kind: String,
+    name: String,
+    version: u32,
+    requires_permission_review: bool,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let candidate_id =
+        promote_propose_over_connection(&mut conn, kind, name, version, requires_permission_review)
+            .await?;
+    println!("promotion candidate proposed: {candidate_id}");
+    Ok(())
+}
+
+/// The connected core of [`promote_propose`]: handshake, bind the `Controller`
+/// role, send `ProposePromotion`, and return the new candidate id. Split out
+/// for the same testability reason as [`workflow_run_over_connection`].
+pub async fn promote_propose_over_connection(
+    conn: &mut Connection,
+    kind: String,
+    name: String,
+    version: u32,
+    requires_permission_review: bool,
+) -> anyhow::Result<String> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::ProposePromotion {
+            kind,
+            name,
+            version,
+            requires_permission_review,
+        })
+        .await?;
+    match reply.payload {
+        Payload::PromotionProposed { candidate_id, .. } => Ok(candidate_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("propose rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to ProposePromotion: {other:?}"),
+    }
+}
+
+/// `codypendent promote advance <CANDIDATE_ID> --step <STEP> [--regressed]`
+/// (Phase 7 STEP 7.5).
+pub async fn promote_advance(
+    paths: &RuntimePaths,
+    candidate_id: String,
+    action: PromotionAction,
+) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::AdvancePromotion {
+            candidate_id,
+            action,
+        },
+        "advance",
+    )
+    .await
+}
+
+/// `codypendent promote approve <CANDIDATE_ID>` — the human-approval gate
+/// (Phase 7 STEP 7.5, ADR-010). This command does not start a daemon: approving
+/// only makes sense against an already-running one with a real candidate.
+pub async fn promote_approve(paths: &RuntimePaths, candidate_id: String) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::ApprovePromotion { candidate_id },
+        "approve",
+    )
+    .await
+}
+
+/// `codypendent promote rollback <CANDIDATE_ID>` (Phase 7 STEP 7.5).
+pub async fn promote_rollback(paths: &RuntimePaths, candidate_id: String) -> anyhow::Result<()> {
+    promotion_command(
+        paths,
+        CommandBody::RollbackPromotion { candidate_id },
+        "rollback",
+    )
+    .await
+}
+
+/// Send one promotion command to a *running* daemon (mirrors
+/// [`lifecycle_command`]: advancing/approving/rolling back only makes sense
+/// against a daemon that already exists) and report whether it was accepted.
+async fn promotion_command(
+    paths: &RuntimePaths,
+    body: CommandBody,
+    verb: &str,
+) -> anyhow::Result<()> {
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    promotion_command_over_connection(&mut conn, body, verb).await
+}
+
+/// The connected core of [`promotion_command`]: handshake, bind the
+/// `Controller` role, send `body`, and report whether it was accepted. Split
+/// out (and `pub`, like [`workflow_run_over_connection`]) so a test can drive
+/// it against a hand-rolled mock daemon.
+pub async fn promotion_command_over_connection(
+    conn: &mut Connection,
+    body: CommandBody,
+    verb: &str,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn.send_command(body).await?;
+    match reply.payload {
+        Payload::CommandAccepted { .. } => {
+            println!("promotion {verb} accepted");
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "promotion {verb} rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to promotion {verb}: {other:?}"),
+    }
 }
 
 /// A human, indented rendering of a compiled workflow graph. Pure, so it is tested
@@ -698,10 +1468,10 @@ pub fn plugin_inspect(file: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// `codypendent plugin diff <INSTALLED> <UPDATE>` (Phase 6 STEP 6.1): parse both
-/// manifests, print the capability permission diff, and report whether the update
-/// expands permissions and so requires re-approval (exit criterion 2). Exits
-/// non-zero when the update expands permissions, so a caller (or CI) can gate on
-/// it.
+/// manifests, print the permission diff (capabilities **and** resource caps —
+/// P6-A), and report whether the update expands permissions and so requires
+/// re-approval (exit criterion 2). Exits non-zero when the update expands
+/// permissions, so a caller (or CI) can gate on it.
 pub fn plugin_diff(installed: &std::path::Path, update: &std::path::Path) -> anyhow::Result<()> {
     let installed_manifest = read_manifest(installed)?;
     let update_manifest = read_manifest(update)?;
@@ -712,9 +1482,12 @@ pub fn plugin_diff(installed: &std::path::Path, update: &std::path::Path) -> any
             update_manifest.id
         );
     }
-    let old = codypendent_sandbox::CapabilitySet::from_spec(&installed_manifest.capabilities);
-    let new = codypendent_sandbox::CapabilitySet::from_spec(&update_manifest.capabilities);
-    let diff = old.diff_to(&new);
+    // diff_manifests() folds resource-cap changes in alongside the capability
+    // diff (P6-A) — a bare CapabilitySet::diff_to() here would miss a raised
+    // memory/cpu/wall/output cap entirely, since it has no resource data to
+    // compare, letting this CI re-approval gate print "safe" and exit 0 on
+    // exactly the update it exists to catch.
+    let diff = codypendent_sandbox::diff_manifests(&installed_manifest, &update_manifest);
     print!("{}", plugin_diff_report(&installed_manifest.id, &diff));
     if diff.expands_permissions() {
         // A widening update is not applied without re-approval — signal that with a
@@ -815,6 +1588,127 @@ fn plugin_diff_report(id: &str, diff: &codypendent_sandbox::PermissionDiff) -> S
         );
     }
     out
+}
+
+/// Resolve the trusted-publisher key store path
+/// (`<config_dir>/codypendent/trusted_publishers.toml`, the `models.toml`
+/// precedent). `CODYPENDENT_CONFIG_DIR` overrides the config root (test isolation),
+/// mirroring how `CODYPENDENT_DATA_DIR` overrides the data root.
+fn trusted_publishers_path() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CODYPENDENT_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join("trusted_publishers.toml"));
+    }
+    let dirs = directories::ProjectDirs::from("", "", "codypendent")
+        .context("cannot determine a config directory for the current user")?;
+    Ok(dirs.config_dir().join("trusted_publishers.toml"))
+}
+
+/// `codypendent plugin trust add <ID> <PUBLIC_KEY_B64>` (Phase 6 STEP 6.2): record
+/// a trusted publisher's ed25519 public key so signed plugins from that publisher
+/// verify against a real key. The key is validated before it is stored.
+pub fn plugin_trust_add(id: &str, public_key_b64: &str) -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    store
+        .add(id, public_key_b64)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    store
+        .save(&path)
+        .with_context(|| format!("writing trusted-publisher store {}", path.display()))?;
+    println!("Trusted publisher `{id}` added ({}).", path.display());
+    Ok(())
+}
+
+/// `codypendent plugin trust list` (Phase 6 STEP 6.2): print the trusted
+/// publishers and their public keys.
+pub fn plugin_trust_list() -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    if store.is_empty() {
+        println!(
+            "No trusted publishers ({}). Signed plugins from unknown publishers are refused.",
+            path.display()
+        );
+        return Ok(());
+    }
+    println!("Trusted publishers ({}):", path.display());
+    for (id, key) in store.list() {
+        println!("  {id}  {key}");
+    }
+    Ok(())
+}
+
+/// `codypendent plugin trust remove <ID>` (Phase 6 STEP 6.2): stop trusting a
+/// publisher. Exits non-zero if the publisher was not present.
+pub fn plugin_trust_remove(id: &str) -> anyhow::Result<()> {
+    let path = trusted_publishers_path()?;
+    let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+    if !store.remove(id) {
+        anyhow::bail!("publisher `{id}` was not trusted");
+    }
+    store
+        .save(&path)
+        .with_context(|| format!("writing trusted-publisher store {}", path.display()))?;
+    println!("Trusted publisher `{id}` removed.");
+    Ok(())
+}
+
+/// `codypendent plugin verify <MANIFEST> <ARTIFACT>` (Phase 6 STEP 6.2): verify a
+/// plugin artifact against its manifest using the **trusted-publisher key store** —
+/// the real-keys install gate. Checksum + signature are checked, then the grant is
+/// evaluated (`install_disabled`). A signed plugin from an unknown publisher, a bad
+/// signature, or an unsigned plugin (unless `--allow-unsigned`) is **refused** with
+/// a non-zero exit, so this is the fail-closed pre-install verification a stateful
+/// `plugin install` builds on (persisting the installed record is daemon-wired
+/// follow-up work).
+pub fn plugin_verify(
+    manifest_file: &std::path::Path,
+    artifact_file: &std::path::Path,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let manifest = read_manifest(manifest_file)?;
+    let artifact = std::fs::read(artifact_file)
+        .with_context(|| format!("reading plugin artifact {}", artifact_file.display()))?;
+
+    let path = trusted_publishers_path()?;
+    let store = codypendent_sandbox::TrustedPublishers::load(&path)
+        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
+
+    let unsigned = if allow_unsigned {
+        codypendent_sandbox::UnsignedPolicy::Allow
+    } else {
+        codypendent_sandbox::UnsignedPolicy::Deny
+    };
+    // The store is the resolver: an unknown publisher yields no key, so a signed
+    // plugin fails closed (default-deny unsigned already covers the unsigned case).
+    let publisher_key = store.key_for(&manifest.publisher);
+
+    // Full grant at install: the profile is derived from what the manifest requests.
+    let granted = codypendent_sandbox::CapabilitySet::from_spec(&manifest.capabilities);
+    let installed = codypendent_sandbox::InstalledPlugin::install_disabled(
+        manifest.clone(),
+        &artifact,
+        publisher_key.map(|k| k.as_slice()),
+        unsigned,
+        granted,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("{} @ {}: refused — {error}", manifest.id, manifest.version)
+    })?;
+
+    let trust = if installed.signed {
+        format!("signed by trusted publisher `{}`", manifest.publisher)
+    } else {
+        "unsigned (allowed by --allow-unsigned)".to_string()
+    };
+    println!(
+        "\u{2713} {} v{} verified — {trust}; installed disabled (inert until enabled).",
+        manifest.id, manifest.version,
+    );
+    Ok(())
 }
 
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.
@@ -983,6 +1877,253 @@ steps:
     }
 }
 
+// ---------------------------------------------------------------------------
+// `codypendent models bench <id>` (Phase 7 STEP 7.2.2)
+// ---------------------------------------------------------------------------
+
+/// `codypendent models bench <id>`: measure the local model `id` (configured in
+/// `<data_dir>/models.toml`) and persist its measured profile + first-use
+/// capability probe to the daemon's `model_profiles` store (migration 0014), so
+/// the router reads MEASURED numbers.
+///
+/// This is an **offline measurement/maintenance command**: unlike the run/eval
+/// commands (which drive the daemon over the socket), it opens the migrated
+/// database directly — the same way the daemon does — because it writes the
+/// `model_profiles` table the live daemon only *reads* (and only when routing is
+/// enabled, default OFF). SQLite WAL + the shared `busy_timeout` make the
+/// concurrent open safe.
+pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    use codypendent_runtime::agent::FrameworkModelDriver;
+    use codypendent_runtime::bench::{BenchOptions, DriverBenchTarget};
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    // Resolve the model's endpoint from models.toml (the profile + probe key).
+    let models_path = paths.data_dir.join("models.toml");
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    let config = configs
+        .iter()
+        .find(|c| c.id.0 == id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model `{id}` is not configured in {}",
+                models_path.display()
+            )
+        })?
+        .clone();
+    let endpoint = config.base_url.clone();
+
+    // Build a real client for the model and a bench target over it. The model-
+    // driver seam does not surface streaming/usage or the endpoint's advertised
+    // capabilities, so the target is described with conservative declared
+    // capabilities (a real capability-discovery probe against the endpoint is a
+    // documented future seam); the timing + scripted-probe numbers are measured.
+    let registry = ModelRegistry::new(configs);
+    let driver = FrameworkModelDriver::from_registry(&registry, config.id.clone())
+        .with_context(|| format!("building a model client for `{id}`"))?;
+    let target = DriverBenchTarget::new(&driver, default_bench_description());
+
+    // The persisted profile's location is derived from the endpoint (fail-closed
+    // to hosted). `models bench` is a LOCAL-model harness; warn loudly when it is
+    // pointed at a non-local endpoint rather than silently mislabelling it.
+    if matches!(
+        codypendent_runtime::bench::endpoint_location(&endpoint),
+        codypendent_routing::ModelLocation::Hosted
+    ) {
+        eprintln!(
+            "models bench: WARNING — `{endpoint}` is not a local endpoint; the profile will be \
+             stored as HOSTED (so the routing hard filter still applies) and its token price is \
+             not measured. `models bench` is intended for local models."
+        );
+    }
+
+    eprintln!("models bench: measuring `{id}` at {endpoint} (this drives the model)...");
+    let profile = {
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .context("opening the database to persist the model profile")?;
+        bench_to_store(&pool, &endpoint, &target, BenchOptions::default()).await?
+    };
+
+    let bench = profile
+        .bench
+        .as_ref()
+        .expect("a benched profile carries a LocalBench");
+    println!(
+        "measured `{id}` (persisted to model_profiles @ {endpoint}):\n  \
+         tokens/sec: {:.1}\n  time-to-first-token: {:.0} ms\n  warm-up: {:.0} ms\n  \
+         memory: {} MB\n  context limit: {}\n  structured-output reliability: {:.2}\n  \
+         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}",
+        bench.tokens_per_second,
+        bench.time_to_first_token_ms,
+        bench.warmup_ms,
+        bench.memory_mb,
+        bench.context_limit,
+        bench.structured_output_reliability,
+        bench.tool_call_accuracy,
+        bench.coding_eval_score,
+    );
+    Ok(())
+}
+
+/// Run the bench against `target` and persist the measured profile to the store,
+/// returning the persisted profile. The persistence core, split from
+/// [`models_bench`] so a test drives it with a scripted target and a temp DB
+/// (no model, no network).
+async fn bench_to_store(
+    pool: &sqlx::SqlitePool,
+    endpoint: &str,
+    target: &dyn codypendent_runtime::bench::BenchTarget,
+    options: codypendent_runtime::bench::BenchOptions,
+) -> anyhow::Result<codypendent_routing::ModelProfile> {
+    let outcome = codypendent_runtime::bench::run_bench(target, options)
+        .await
+        .map_err(|reason| anyhow::anyhow!("bench failed: {reason}"))?;
+    // Derive the location from the endpoint — never assume local. A non-local
+    // endpoint stored as `Local` would short-circuit the routing hard filter
+    // (`endpoint_location` fails closed to `Hosted`).
+    let location = codypendent_runtime::bench::endpoint_location(endpoint);
+    let profile = outcome.into_profile(location);
+    codypendent_daemon::model_profiles::ModelProfileStore::new()
+        .upsert(pool, endpoint, &profile)
+        .await
+        .context("persisting the measured model profile")?;
+    Ok(profile)
+}
+
+/// The conservative declared capabilities a benched local model is described
+/// with until a real endpoint capability-discovery probe exists (the model-
+/// driver seam surfaces none): streaming (OpenAI-compatible endpoints stream),
+/// single tool calls, best-effort JSON mode, and an unadvertised (unbounded)
+/// context window. Documented as declared, not measured.
+fn default_bench_description() -> codypendent_runtime::bench::TargetDescription {
+    use codypendent_routing::{ModelCapabilities, StructuredOutputSupport, ToolCallSupport};
+    codypendent_runtime::bench::TargetDescription {
+        capabilities: ModelCapabilities {
+            streaming: true,
+            tools: ToolCallSupport::Single,
+            parallel_tools: false,
+            structured_output: StructuredOutputSupport::JsonMode,
+            vision: false,
+            audio_input: false,
+            embeddings: false,
+            prompt_caching: false,
+            reasoning_controls: false,
+            context_tokens: None,
+            output_tokens: None,
+        },
+        context_limit: 0,
+        memory_mb: 0,
+    }
+}
+
+#[cfg(test)]
+mod models_bench_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use codypendent_protocol::ModelId;
+    use codypendent_routing::{ModelCapabilities, StructuredOutputSupport, ToolCallSupport};
+    use codypendent_runtime::bench::{
+        BenchOptions, BenchTarget, GenerationSample, TargetDescription,
+    };
+    use std::time::Duration;
+
+    /// A local scripted bench target (the CLI need not depend on the runtime's
+    /// test-only mock): returns fixed numbers so `bench_to_store`'s persistence
+    /// wiring runs with no model or network.
+    struct ScriptedTarget;
+
+    #[async_trait]
+    impl BenchTarget for ScriptedTarget {
+        fn model_id(&self) -> ModelId {
+            ModelId("qwen-local".into())
+        }
+        async fn describe(&self) -> Result<TargetDescription, String> {
+            Ok(TargetDescription {
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tools: ToolCallSupport::Parallel,
+                    parallel_tools: true,
+                    structured_output: StructuredOutputSupport::JsonMode,
+                    vision: false,
+                    audio_input: false,
+                    embeddings: false,
+                    prompt_caching: false,
+                    reasoning_controls: false,
+                    context_tokens: Some(128_000),
+                    output_tokens: Some(8_192),
+                },
+                context_limit: 128_000,
+                memory_mb: 9_200,
+            })
+        }
+        async fn timed_generation(&self, warm: bool) -> Result<GenerationSample, String> {
+            Ok(GenerationSample {
+                tokens: 100,
+                time_to_first_token: Duration::from_millis(if warm { 180 } else { 400 }),
+                total: Duration::from_millis(if warm { 2_000 } else { 2_500 }),
+            })
+        }
+        async fn structured_output_probe(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(8))
+        }
+        async fn tool_call_probe(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(7))
+        }
+        async fn coding_eval(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(6))
+        }
+    }
+
+    #[tokio::test]
+    async fn bench_to_store_measures_and_persists_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = codypendent_daemon::db::open_database(&dir.path().join("codypendent.db"))
+            .await
+            .unwrap();
+        let endpoint = "http://localhost:11434/v1";
+
+        let profile = bench_to_store(&pool, endpoint, &ScriptedTarget, BenchOptions::default())
+            .await
+            .unwrap();
+        assert!(profile.is_local());
+        assert_eq!(profile.id, ModelId("qwen-local".into()));
+
+        // It is durably persisted and reads back identically.
+        let stored = codypendent_daemon::model_profiles::ModelProfileStore::new()
+            .get(&pool, &ModelId("qwen-local".into()), endpoint)
+            .await
+            .unwrap()
+            .expect("the benched profile is persisted");
+        assert_eq!(stored, profile);
+        // The measured bench survived (50 tok/s from 100 tokens over 2.0s warm).
+        assert!((stored.bench.unwrap().tokens_per_second - 50.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn benching_a_non_local_endpoint_stores_hosted_not_local() {
+        // Finding-2 pin: a cloud endpoint must NOT be persisted as local (which
+        // would short-circuit the routing hard filter). `bench_to_store` derives
+        // the location from the endpoint (fail-closed to hosted).
+        let dir = tempfile::tempdir().unwrap();
+        let pool = codypendent_daemon::db::open_database(&dir.path().join("codypendent.db"))
+            .await
+            .unwrap();
+        let profile = bench_to_store(
+            &pool,
+            "https://api.openai.com/v1",
+            &ScriptedTarget,
+            BenchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !profile.is_local(),
+            "a non-local base_url is stored as hosted, so the classification filter still applies"
+        );
+    }
+}
+
 #[cfg(test)]
 mod plugin_tests {
     use super::*;
@@ -1103,6 +2244,24 @@ sandbox_profile = "network-client"
             "network = [\"api.github.com:443\", \"uploads.github.com:443\"]\nfilesystem_read = [\"/etc\"]",
         );
         std::fs::write(&update, expanded).unwrap();
+        let err = plugin_diff(&installed, &update).unwrap_err().to_string();
+        assert!(err.contains("re-approval required"), "got: {err}");
+    }
+
+    #[test]
+    fn diff_command_exits_nonzero_when_a_resource_cap_is_raised() {
+        // P6-A fix pass: identical capabilities, only the memory cap raised.
+        // plugin_diff() now routes through codypendent_sandbox::diff_manifests(),
+        // which folds resource-cap changes into the diff. Before that, this
+        // computed via a bare CapabilitySet diff that never saw resources,
+        // so it printed "no permission changes — safe to update" and exited
+        // 0 on exactly the update this CI gate exists to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.toml");
+        let update = dir.path().join("update.toml");
+        std::fs::write(&installed, GITHUB_MANIFEST).unwrap();
+        let raised = GITHUB_MANIFEST.replace("memory_mb = 256", "memory_mb = 4096");
+        std::fs::write(&update, raised).unwrap();
         let err = plugin_diff(&installed, &update).unwrap_err().to_string();
         assert!(err.contains("re-approval required"), "got: {err}");
     }

@@ -7,14 +7,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::blackboard::BlackboardItemView;
 use crate::catchup::Catchup;
 use crate::command::Command;
 use crate::document::{DocumentLeaseGrant, DocumentSync};
 use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
-use crate::ids::{ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId};
+use crate::ids::{
+    ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
+};
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
+use crate::workflow::{WorkflowEvent, WorkflowRunSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -114,6 +118,64 @@ pub enum Payload {
     WorkflowRunStarted {
         command_id: CommandId,
         workflow_run_id: String,
+    },
+    /// A `PublishDocument` command was accepted: its deterministic plan was
+    /// computed and a durable approval parked (Phase 4 STEP 4.4). Carries the
+    /// plan's human-reviewable content **verbatim** — a short target
+    /// description, the changed files, and the resulting Git action — so the
+    /// client can render it immediately; the same content the parked
+    /// `ApprovalRequested` event's approval card carries. Nothing is written
+    /// yet: the approval must still resolve via the ordinary
+    /// `ResolveApproval` command, and a rejection performs no write.
+    DocumentPublishRequested {
+        command_id: CommandId,
+        approval_id: ApprovalId,
+        target: String,
+        changed_files: Vec<String>,
+        git_action: String,
+    },
+    /// A `ProposePromotion` command was accepted; carries the new promotion
+    /// candidate's id (Phase 7 STEP 7.5). A distinct reply from
+    /// `CommandAccepted` for the same reason as `WorkflowRunStarted`: the
+    /// client needs the id back to advance/approve/roll back that exact
+    /// candidate.
+    PromotionProposed {
+        command_id: CommandId,
+        candidate_id: String,
+    },
+    /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
+    /// artifacts on the workflow run's board. A distinct reply from
+    /// `CommandAccepted` because the client needs the items back, not just an
+    /// acknowledgement.
+    BlackboardItems {
+        command_id: CommandId,
+        items: Vec<BlackboardItemView>,
+    },
+    /// One blackboard artifact that just landed on a run's board, delivered to the
+    /// clients subscribed to it (`Subscription::Blackboard`) as the run's agents
+    /// post/supersede (Phase 5 STEP 5.3). The item carries its own
+    /// `workflow_run_id`, so — like [`DocumentSync`](Payload::DocumentSync) — the
+    /// frame is not session-scoped; a receiver merges it into the run's board by id
+    /// (a superseding revision arrives as its own delivery).
+    BlackboardPosted(BlackboardItemView),
+    /// A `ReadWorkflowRun` command's reply (Phase 5 STEP 5.2 / T9): the run's
+    /// observability snapshot — its current phase plus every node's full current
+    /// view. A distinct reply from `CommandAccepted` because the client needs the
+    /// snapshot back as its live-stream baseline, not just an acknowledgement.
+    WorkflowRunSnapshot {
+        command_id: CommandId,
+        snapshot: WorkflowRunSnapshot,
+    },
+    /// One live event on a workflow run's node-lifecycle stream, delivered to the
+    /// clients subscribed to it (`Subscription::Workflow`) as the driver advances the
+    /// graph (Phase 5 STEP 5.2 / T9): a node transition (carrying the node's full new
+    /// view) or a run-phase change. The event carries its own `workflow_run_id`, so
+    /// the frame is not session-scoped; a receiver merges a node transition into the
+    /// run's graph by `node_id` (each transition is full-state, so an overlap is
+    /// harmless). Wrapped in a named field so the internally-tagged event's `type`
+    /// tag never collides with the payload tag (as [`Catchup`](Payload::Catchup) is).
+    WorkflowEvent {
+        event: WorkflowEvent,
     },
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
@@ -325,6 +387,145 @@ mod tests {
                 assert_eq!(workflow_run_id, "0192abcd-run");
             }
             other => panic!("expected WorkflowRunStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_publish_requested_payload_round_trips() {
+        let command_id = CommandId::new();
+        let approval_id = ApprovalId::new();
+        let requested = Payload::DocumentPublishRequested {
+            command_id,
+            approval_id,
+            target: "repository file docs/architecture.md".to_string(),
+            changed_files: vec!["docs/architecture.md".to_string()],
+            git_action:
+                "write docs/architecture.md in the working tree (approval-gated change set)"
+                    .to_string(),
+        };
+        match round_trip_payload(requested) {
+            Payload::DocumentPublishRequested {
+                command_id: id,
+                approval_id: approval,
+                target,
+                changed_files,
+                git_action,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(approval, approval_id);
+                assert_eq!(target, "repository file docs/architecture.md");
+                assert_eq!(changed_files, vec!["docs/architecture.md".to_string()]);
+                assert!(git_action.contains("docs/architecture.md"));
+            }
+            other => panic!("expected DocumentPublishRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promotion_proposed_payload_round_trips() {
+        let command_id = CommandId::new();
+        let proposed = Payload::PromotionProposed {
+            command_id,
+            candidate_id: "cand-0192abcd".to_string(),
+        };
+        match round_trip_payload(proposed) {
+            Payload::PromotionProposed {
+                command_id: id,
+                candidate_id,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(candidate_id, "cand-0192abcd");
+            }
+            other => panic!("expected PromotionProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blackboard_payloads_round_trip() {
+        use crate::blackboard::BlackboardItemView;
+        use serde_json::json;
+
+        let item = BlackboardItemView {
+            id: "0192-item".to_string(),
+            workflow_run_id: "wfrun-abc".to_string(),
+            kind: "finding".to_string(),
+            payload: json!({ "summary": "root cause found" }),
+            author: json!({ "role": "investigator", "node_id": "diagnose" }),
+            confidence: Some(0.9),
+            evidence: vec![json!({ "path": "src/lib.rs", "line": 7 })],
+            revision: 2,
+            superseded_by: None,
+        };
+
+        // The read-command reply carries a list of items.
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::BlackboardItems {
+            command_id,
+            items: vec![item.clone()],
+        }) {
+            Payload::BlackboardItems {
+                command_id: id,
+                items,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(items, vec![item.clone()]);
+            }
+            other => panic!("expected BlackboardItems, got {other:?}"),
+        }
+
+        // The subscription delivers one posted item.
+        match round_trip_payload(Payload::BlackboardPosted(item.clone())) {
+            Payload::BlackboardPosted(delivered) => assert_eq!(delivered, item),
+            other => panic!("expected BlackboardPosted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_payloads_round_trip() {
+        use crate::workflow::{
+            WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
+            WorkflowRunSnapshot,
+        };
+        use serde_json::json;
+
+        let node = WorkflowNodeView {
+            workflow_run_id: "wfrun-abc".to_string(),
+            node_id: "inspect".to_string(),
+            state: WorkflowNodeState::Completed,
+            attempt: 1,
+            cost: Some(json!({ "wall_time_secs": 3, "tool_calls": 1 })),
+            error: None,
+            warnings: Vec::new(),
+        };
+
+        // The read-command reply carries a run snapshot.
+        let command_id = CommandId::new();
+        let snapshot = WorkflowRunSnapshot {
+            workflow_run_id: "wfrun-abc".to_string(),
+            phase: WorkflowRunPhase::Running,
+            nodes: vec![node.clone()],
+        };
+        match round_trip_payload(Payload::WorkflowRunSnapshot {
+            command_id,
+            snapshot: snapshot.clone(),
+        }) {
+            Payload::WorkflowRunSnapshot {
+                command_id: id,
+                snapshot: got,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(got, snapshot);
+            }
+            other => panic!("expected WorkflowRunSnapshot, got {other:?}"),
+        }
+
+        // The subscription delivers one live event.
+        let event = WorkflowEvent::NodeTransitioned(node);
+        match round_trip_payload(Payload::WorkflowEvent {
+            event: event.clone(),
+        }) {
+            Payload::WorkflowEvent { event: delivered } => assert_eq!(delivered, event),
+            other => panic!("expected WorkflowEvent, got {other:?}"),
         }
     }
 

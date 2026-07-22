@@ -9,8 +9,12 @@
 //!
 //! [`RunExecutor`]: codypendent_daemon::executor::RunExecutor
 
+mod blackboard;
 mod documents;
 mod executor;
+mod promotion;
+mod publish;
+mod routing;
 mod scan;
 mod workflow_exec;
 mod workflows;
@@ -92,8 +96,14 @@ async fn main() -> anyhow::Result<()> {
 
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run
-    // through the runtime agent loop.
-    let mut executor = RuntimeExecutor::new(pool.clone(), paths.clone(), repository);
+    // through the runtime agent loop. `workdir` is the daemon's startup root,
+    // used both as the per-run worktree-binding fallback / node repository (T5,
+    // the 4th `new` arg) and as the document-publish root (Phase 4 STEP 4.4 —
+    // a document has no per-command repository field the way `StartRun` does,
+    // so publication uses this same startup root, as the code-graph scan does).
+    let mut executor =
+        RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
+            .with_repository_root(workdir);
 
     // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
     // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the

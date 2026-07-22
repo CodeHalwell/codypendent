@@ -29,19 +29,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use codypendent_knowledge::{
     db as knowledge_db, BlockContent, CapabilityRequest, CodeEdge, CodeRelation, CollaborationMode,
-    DocumentAuthor, DocumentBlock, DocumentStore, EvidenceKind, EvidenceRef, KnowledgeDocument,
-    MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem, RegistryItemKind,
-    RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
+    DocumentAuthor, DocumentBlock, DocumentReplica, DocumentStore, EvidenceKind, EvidenceRef,
+    KnowledgeDocument, MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem,
+    RegistryItemKind, RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus,
+    SuggestionStore, TrustTier,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Catchup, ClientId, ClientRole, CodeNodeId, Command, CommandBody,
-    CommandId, Envelope, Payload, RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
+    CommandId, DocumentEditLease, DocumentId, DocumentSync, Envelope, Payload, RepositoryId,
+    SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
@@ -61,6 +63,23 @@ use crate::connection::Connection;
 /// immediately on any real event anyway).
 const TICK: Duration = Duration::from_millis(200);
 
+/// The most live events [`GapTracker`] will buffer while a gap repair is in
+/// flight before giving up on the incremental replay and re-attaching for a
+/// fresh catch-up (FP-2a). A slow client behind a fast producer could otherwise
+/// grow this buffer without bound; the ledger is the source of truth, so
+/// dropping the buffer and re-attaching from `last_seen` re-fetches the whole
+/// span losslessly — we fail toward a fresh catch-up, never toward unbounded
+/// memory.
+const MAX_GAP_BUFFER: usize = 2048;
+
+/// How long [`GapTracker`] waits for a gap repair's catch-up reply before
+/// re-attaching afresh (FP-2b). Without a deadline a dropped catch-up reply
+/// (the daemon's fan-out is lossy under lag) would wedge the client in
+/// `repairing` forever, silently holding back every later event — worst case an
+/// `ApprovalRequested`. On expiry we re-attach from `last_seen`, which re-drives
+/// the catch-up.
+const REPAIR_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The client-facing subscription set for the TUI: it wants the whole session,
 /// not one run's trace.
 fn default_subscriptions() -> Vec<Subscription> {
@@ -73,13 +92,28 @@ fn default_subscriptions() -> Vec<Subscription> {
 /// catch-up, and runs the event loop until the user detaches (`q`) or the daemon
 /// closes the stream. Detaching never affects the run — the daemon keeps it
 /// going; a later `codypendent` reopens the same session and catches up.
-pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
+///
+/// `theme_override` is `--theme <NAME>` / `CODYPENDENT_THEME` (resolved by the
+/// caller, flag winning over env — see `main.rs`): a built-in variant name or
+/// a theme-pack id under `<data-dir>/themes/<id>.toml` (STEP 6.6, see
+/// `theme_select`). Resolved before any daemon/socket work so a bad name fails
+/// fast on a normal cooked terminal instead of after entering raw mode.
+pub async fn run(
+    paths: &RuntimePaths,
+    repo: PathBuf,
+    theme_override: Option<String>,
+) -> anyhow::Result<()> {
     let repo = repo
         .canonicalize()
         .with_context(|| format!("{}: not a valid, accessible directory", repo.display()))?;
     if !repo.is_dir() {
         bail!("{}: not a directory", repo.display());
     }
+
+    // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
+    // with a manual override that always wins, replacing the old hardcoded
+    // `Theme::dark()`.
+    let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
 
     commands::ensure_daemon(paths).await?;
     let mut conn = Connection::connect(&paths.socket_path).await?;
@@ -127,11 +161,27 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     state.docs = projections.docs;
     state.edges = projections.edges;
     state.blackboard = projections.blackboard;
-    // Phase 5 STEP 5.2: seed the workflow-graph view by compiling the
-    // repository's declared workflow manifests. This reads files, not the
-    // knowledge db, so it is a standalone projection; a malformed manifest logs
-    // and is skipped rather than failing the TUI.
-    state.workflow = load_workflows(&repo);
+    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests, then overlay each workflow's
+    // LATEST durable run — its per-node live state, measured cost, and
+    // failure/block reason — from the knowledge db (WAL allows a concurrent read
+    // alongside the daemon). A malformed manifest logs and is skipped; a db-open
+    // failure degrades to the compiled (pre-run) view — neither fails the TUI.
+    {
+        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+            .await
+            .ok();
+        state.workflow = load_workflows(&repo, overlay_pool.as_ref()).await;
+    }
+
+    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
+    // event loop seeds a document's client replica from it and re-reads the
+    // review rail's suggestions when a sync arrives. WAL mode lets this read
+    // concurrently with the daemon. `None` on failure — document editing then
+    // degrades to converging from live syncs alone (no seed, empty review rail).
+    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+        .await
+        .ok();
 
     // Wire the two socket tasks. Start them before the terminal so no live
     // event or heartbeat is missed during setup.
@@ -153,7 +203,6 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     let input_running = Arc::new(AtomicBool::new(true));
     spawn_input_thread(input_tx, Arc::clone(&input_running));
 
-    let theme = Theme::dark();
     let (mut width, _) = crossterm::terminal::size().unwrap_or((80, 24));
 
     let mut ticker = tokio::time::interval(TICK);
@@ -173,6 +222,7 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
         session_id,
         &repository,
         attach_watermark,
+        docs_pool.clone(),
     )
     .await;
 
@@ -183,7 +233,215 @@ pub async fn run(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
     drop(out_tx);
     reader.abort();
     writer.abort();
+    if let Some(pool) = docs_pool {
+        pool.close().await;
+    }
     result
+}
+
+/// What [`GapTracker::on_event`] asks the harness to do with one live event.
+#[derive(Debug)]
+enum GapAction {
+    /// Nothing to fold — the event was a duplicate, a sentinel already handled,
+    /// or it was buffered pending an in-flight repair.
+    Ignore,
+    /// Fold this event into state now; the watermark has already advanced.
+    /// Boxed to keep the action small (a `SessionEvent` is a large payload).
+    Apply(Box<SessionEvent>),
+    /// Re-attach with `last_seen_sequence` to replay a missed span (a detected
+    /// gap, a buffer overflow, or — via [`GapTracker::on_tick`] — a repair
+    /// timeout). Any events to fold afterwards are held inside the tracker.
+    Reattach { last_seen_sequence: u64 },
+}
+
+/// The result of feeding a gap-repair catch-up reply to
+/// [`GapTracker::on_catchup`].
+struct CatchupDrain {
+    /// Buffered events to fold now, in ascending sequence order, deduped
+    /// against the watermark the catch-up advanced.
+    apply: Vec<SessionEvent>,
+    /// A follow-up re-attach `last_seen_sequence`, set when the buffered tail
+    /// still revealed a missing span (more loss occurred while repairing).
+    reattach: Option<u64>,
+}
+
+/// The reconnect / gap-repair state machine for the TUI's live event fold.
+///
+/// This is the code that keeps a lagged client from losing an event the daemon
+/// dropped from its live fan-out (worst case, an `ApprovalRequested`). It is
+/// deliberately **pure** — it owns no socket and no [`AppState`], only the
+/// sequence bookkeeping — so the harness can drive it with I/O while the tests
+/// drive it directly. The harness feeds it every live event, every gap-repair
+/// catch-up reply, and every timer tick, and performs the [`GapAction`] /
+/// [`CatchupDrain`] it returns.
+///
+/// # Sequence numbering
+///
+/// The daemon assigns ledger sequences 1-based (`COALESCE(MAX(sequence),0)+1`),
+/// and even ephemeral events (presence) are appended before fan-out, so every
+/// live event on the wire carries a sequence `>= 1`. Sequence `0` is therefore
+/// a **sentinel** ("no ledger position"), never a real event: it cannot be a
+/// duplicate and cannot open or fill a gap, so it is folded straight through in
+/// any state (FP-2c — previously a sentinel arriving mid-repair was buffered and
+/// then silently discarded).
+struct GapTracker {
+    /// The highest real ledger sequence folded so far (the catch-up + live
+    /// dedup watermark). `0` means "no baseline yet" — the first live event
+    /// seeds it without gap detection.
+    last_seen: u64,
+    /// Events held back while a repair is in flight. They must NOT fold (or
+    /// advance `last_seen`) before the replay lands: advancing the watermark to
+    /// the gap-revealing event first made every replayed event read as a
+    /// duplicate and silently discarded the whole repair (the original C6 bug).
+    gap_buffer: Vec<SessionEvent>,
+    /// Whether a gap repair is in flight (awaiting a catch-up reply).
+    repairing: bool,
+    /// When the in-flight repair should be abandoned for a fresh re-attach
+    /// (FP-2b). `None` when not repairing.
+    repair_deadline: Option<Instant>,
+}
+
+impl GapTracker {
+    /// Start tracking from the attach-time watermark (the catch-up's `through`).
+    fn new(attach_watermark: u64) -> Self {
+        Self {
+            last_seen: attach_watermark,
+            gap_buffer: Vec::new(),
+            repairing: false,
+            repair_deadline: None,
+        }
+    }
+
+    /// The current dedup/catch-up watermark. A proactive re-attach (e.g. adding a
+    /// Document subscription on the first edit, Phase 4 STEP 4.3) carries this so
+    /// the daemon replays only what this client has not already folded.
+    fn last_seen(&self) -> u64 {
+        self.last_seen
+    }
+
+    /// Feed one live event. `now` anchors the repair deadline when a repair
+    /// starts. Returns what the harness should do with it.
+    fn on_event(&mut self, event: SessionEvent, now: Instant) -> GapAction {
+        // Sentinel (see the type docs): no position to dedup or order by, so
+        // fold it straight through, never buffered/discarded, even mid-repair.
+        if event.sequence == 0 {
+            return GapAction::Apply(Box::new(event));
+        }
+        // A duplicate of something already folded (catch-up + live overlap).
+        if event.sequence <= self.last_seen {
+            return GapAction::Ignore;
+        }
+        if self.repairing {
+            // FP-2a: bound the buffer. On overflow, drop the incremental replay
+            // and re-attach from `last_seen` — the ledger re-delivers the whole
+            // span, so this loses nothing and can never grow without bound.
+            if self.gap_buffer.len() >= MAX_GAP_BUFFER {
+                self.gap_buffer.clear();
+                self.repair_deadline = Some(now + REPAIR_TIMEOUT);
+                return GapAction::Reattach {
+                    last_seen_sequence: self.last_seen,
+                };
+            }
+            // Hold ordering: nothing folds past the missing span until the
+            // replay has landed.
+            self.gap_buffer.push(event);
+            return GapAction::Ignore;
+        }
+        if self.last_seen != 0 && event.sequence > self.last_seen + 1 {
+            // Gap: re-attach to replay the missed span. Buffer this event
+            // instead of folding it now — it is out of order until the span
+            // before it has been replayed. Crucially, `last_seen` is NOT
+            // advanced to this event, so the re-attach replays from the true
+            // watermark (reverting that is the C6 regression the tests pin).
+            self.repairing = true;
+            self.repair_deadline = Some(now + REPAIR_TIMEOUT);
+            let last_seen_sequence = self.last_seen;
+            self.gap_buffer.push(event);
+            return GapAction::Reattach { last_seen_sequence };
+        }
+        // In order (or the first event past a 0 baseline): fold it and advance.
+        self.last_seen = self.last_seen.max(event.sequence);
+        GapAction::Apply(Box::new(event))
+    }
+
+    /// Feed a gap-repair catch-up reply's `through` watermark (the harness has
+    /// already folded the catch-up's own events into state). Advances the
+    /// watermark, ends the repair, and drains the buffered events in order,
+    /// asking for another repair if the buffered tail still reveals a gap.
+    fn on_catchup(&mut self, through: u64, now: Instant) -> CatchupDrain {
+        self.last_seen = self.last_seen.max(through);
+        self.repairing = false;
+        self.repair_deadline = None;
+
+        let mut buffered = std::mem::take(&mut self.gap_buffer);
+        buffered.sort_by_key(|event| event.sequence);
+
+        let mut apply = Vec::new();
+        for (index, event) in buffered.iter().enumerate() {
+            if event.sequence <= self.last_seen {
+                continue; // already folded (via the catch-up or an earlier event)
+            }
+            if event.sequence > self.last_seen + 1 {
+                // Still a hole: repair again, keeping this event and the tail.
+                self.repairing = true;
+                self.repair_deadline = Some(now + REPAIR_TIMEOUT);
+                self.gap_buffer = buffered[index..].to_vec();
+                return CatchupDrain {
+                    apply,
+                    reattach: Some(self.last_seen),
+                };
+            }
+            self.last_seen = event.sequence;
+            apply.push(event.clone());
+        }
+        CatchupDrain {
+            apply,
+            reattach: None,
+        }
+    }
+
+    /// Feed a timer tick. Returns a re-attach `last_seen_sequence` when an
+    /// in-flight repair has outlived [`REPAIR_TIMEOUT`] (FP-2b): drop the stale
+    /// buffer and re-drive the catch-up from the watermark rather than wedging
+    /// the client in `repairing` forever.
+    fn on_tick(&mut self, now: Instant) -> Option<u64> {
+        if self.repairing {
+            if let Some(deadline) = self.repair_deadline {
+                if now >= deadline {
+                    self.gap_buffer.clear();
+                    self.repair_deadline = Some(now + REPAIR_TIMEOUT);
+                    return Some(self.last_seen);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Send an `AttachSession` re-attach carrying `last_seen_sequence`, so the
+/// daemon replaces this connection's forwarder and replies with a `Catchup`
+/// windowed to the missed span. Best-effort: a closed writer just means the
+/// connection is going down and the loop will exit on its own.
+async fn send_reattach(
+    out_tx: &mpsc::Sender<Envelope>,
+    client_id: ClientId,
+    session_id: SessionId,
+    last_seen_sequence: u64,
+    subscriptions: &[Subscription],
+) {
+    let attach = command_envelope(
+        client_id,
+        CommandBody::AttachSession {
+            session_id,
+            last_seen_sequence: Some(last_seen_sequence),
+            // The caller's live (possibly grown) subscription set, so a gap-repair
+            // re-attach preserves Document subscriptions added while editing
+            // (Phase 4 STEP 4.3) rather than resetting to the session defaults.
+            subscriptions: subscriptions.to_vec(),
+            requested_role: ClientRole::Controller,
+        },
+    );
+    let _ = out_tx.send(attach).await;
 }
 
 /// The render/reduce/dispatch loop. Broken out from [`run`] so the setup and
@@ -202,96 +460,101 @@ async fn event_loop(
     session_id: SessionId,
     repository: &str,
     attach_watermark: u64,
+    docs_pool: Option<sqlx::SqlitePool>,
 ) -> anyhow::Result<()> {
     guard
         .terminal_mut()
         .draw(|frame| render(frame, state, theme))?;
 
-    // The highest ledger sequence folded so far. Live fan-out is lossy for a
-    // slow client (the daemon skips `Lagged` spans), so a jump past
-    // `last_seen + 1` means events were dropped from the live view; a
-    // re-attach with `last_seen_sequence` replays exactly the gap. Also
-    // dedups: catch-up + live can overlap during that window.
-    let mut last_seen: u64 = attach_watermark;
-    // Events held back while a gap repair is in flight. They must NOT fold (or
-    // advance `last_seen`) before the replay lands: advancing the watermark to
-    // the gap-revealing event made every replayed event read as a duplicate
-    // and silently discarded the whole repair — a lagged TUI permanently lost
-    // the missed span (worst case, an ApprovalRequested).
-    let mut gap_buffer: Vec<SessionEvent> = Vec::new();
-    let mut repairing = false;
+    // Tracks live-fan-out sequence continuity and drives gap repair. Live
+    // fan-out is lossy for a slow client (the daemon skips `Lagged` spans), so a
+    // jump past `last_seen + 1` means events were dropped from the live view and
+    // a re-attach with `last_seen_sequence` replays exactly the gap. The
+    // decision logic is extracted into [`GapTracker`] — a pure unit owning no
+    // I/O and no `AppState` — so the reconnect/repair path (the code protecting
+    // an `ApprovalRequested` from being lost under lag) is deterministically
+    // testable; this loop performs the I/O the tracker asks for.
+    let mut tracker = GapTracker::new(attach_watermark);
+
+    // The client's live subscription set: seeded with the session views and grown
+    // with a `Document` subscription the first time an edit targets one, so a
+    // gap-repair re-attach preserves the documents this client is editing (Phase 4
+    // STEP 4.3).
+    let mut subscriptions = default_subscriptions();
+    // Per-open-document client replicas that consume the sync stream. Presence in
+    // the map also marks the document as already subscribed, so an edit
+    // subscribes + seeds it exactly once.
+    let mut replicas: HashMap<DocumentId, DocumentReplica> = HashMap::new();
 
     loop {
+        // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
+        // inside the `select!` arm, so the arm stashes it here and the loop body
+        // folds it just after.
+        let mut pending_sync: Option<Box<DocumentSync>> = None;
         let action = tokio::select! {
             signal = event_rx.recv() => match signal {
                 Some(ReaderSignal::Event(event)) => {
-                    if event.sequence != 0 && event.sequence <= last_seen {
-                        Action::NoOp // duplicate of something already folded
-                    } else if repairing {
-                        // Hold ordering: nothing folds past the missing span
-                        // until the replay has landed.
-                        gap_buffer.push(*event);
-                        Action::NoOp
-                    } else if last_seen != 0 && event.sequence > last_seen + 1 {
-                        // Gap: re-attach to replay the missed span. The daemon
-                        // replaces this connection's forwarder and replies
-                        // with a Catchup the reader forwards back. Buffer this
-                        // event instead of folding it now — it is out of order
-                        // until the span before it has been replayed.
-                        let attach = command_envelope(
-                            client_id,
-                            CommandBody::AttachSession {
+                    match tracker.on_event(*event, Instant::now()) {
+                        GapAction::Ignore => Action::NoOp,
+                        GapAction::Apply(event) => Action::DaemonEvent(event),
+                        GapAction::Reattach { last_seen_sequence } => {
+                            // Re-attach with the *grown* subscription set (Phase 4
+                            // STEP 4.3) so a gap-repair preserves the Document
+                            // subscriptions this client added while editing.
+                            send_reattach(
+                                out_tx,
+                                client_id,
                                 session_id,
-                                last_seen_sequence: Some(last_seen),
-                                subscriptions: default_subscriptions(),
-                                requested_role: ClientRole::Controller,
-                            },
-                        );
-                        let _ = out_tx.send(attach).await;
-                        repairing = true;
-                        gap_buffer.push(*event);
-                        Action::NoOp
-                    } else {
-                        last_seen = last_seen.max(event.sequence);
-                        Action::DaemonEvent(event)
+                                last_seen_sequence,
+                                &subscriptions,
+                            )
+                            .await;
+                            Action::NoOp
+                        }
                     }
                 }
                 Some(ReaderSignal::Rejected { code, message }) => {
                     Action::Notice(format!("command rejected: {message} ({code})"))
                 }
+                // Phase 4 STEP 4.3 live document editing. A sync is merged after the
+                // select (it needs an async replica merge + suggestion re-read); the
+                // lease replies fold directly.
+                Some(ReaderSignal::DocumentSync(sync)) => {
+                    pending_sync = Some(sync);
+                    Action::NoOp
+                }
+                Some(ReaderSignal::DocumentLeaseGranted {
+                    document_id,
+                    lease_id,
+                }) => Action::DocumentLeaseGranted {
+                    document_id,
+                    lease_id,
+                },
+                Some(ReaderSignal::DocumentLeaseBlocked) => Action::DocumentLeaseBlocked,
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
-                    // snapshot), then drain the events buffered while the
-                    // repair was in flight — watermark-deduped, in order. If
-                    // the buffer itself still reveals a missing span (more
-                    // loss while repairing), repair again and keep the tail.
+                    // snapshot), then drain the events buffered while the repair
+                    // was in flight — watermark-deduped, in order. If the buffer
+                    // itself still reveals a missing span (more loss while
+                    // repairing), the tracker asks to repair again and keeps the
+                    // tail.
                     let through = fold_catchup(state, *catchup);
-                    last_seen = last_seen.max(through);
-                    repairing = false;
-                    let mut buffered = std::mem::take(&mut gap_buffer);
-                    buffered.sort_by_key(|event| event.sequence);
-                    for (index, event) in buffered.iter().enumerate() {
-                        if event.sequence <= last_seen {
-                            continue;
-                        }
-                        if event.sequence > last_seen + 1 {
-                            let attach = command_envelope(
-                                client_id,
-                                CommandBody::AttachSession {
-                                    session_id,
-                                    last_seen_sequence: Some(last_seen),
-                                    subscriptions: default_subscriptions(),
-                                    requested_role: ClientRole::Controller,
-                                },
-                            );
-                            let _ = out_tx.send(attach).await;
-                            repairing = true;
-                            gap_buffer = buffered[index..].to_vec();
-                            break;
-                        }
-                        last_seen = event.sequence;
-                        reduce(state, Action::DaemonEvent(Box::new(event.clone())));
+                    let drain = tracker.on_catchup(through, Instant::now());
+                    for event in drain.apply {
+                        reduce(state, Action::DaemonEvent(Box::new(event)));
+                    }
+                    if let Some(last_seen_sequence) = drain.reattach {
+                        // Same grown subscription set on a repair-during-repair
+                        // re-attach (Phase 4 STEP 4.3).
+                        send_reattach(
+                            out_tx,
+                            client_id,
+                            session_id,
+                            last_seen_sequence,
+                            &subscriptions,
+                        )
+                        .await;
                     }
                     Action::NoOp
                 }
@@ -306,12 +569,60 @@ async fn event_loop(
                 Some(event) => map_event(&event, state.input_mode(), *width),
                 None => return Ok(()), // input bridge ended
             },
-            _ = ticker.tick() => Action::Tick,
+            _ = ticker.tick() => {
+                // FP-2b: a repair whose catch-up reply never arrived (the
+                // daemon's fan-out drops spans under lag) must not wedge the
+                // client in `repairing` forever — once the deadline passes,
+                // re-attach afresh to re-drive the catch-up.
+                if let Some(last_seen_sequence) = tracker.on_tick(Instant::now()) {
+                    send_reattach(
+                        out_tx,
+                        client_id,
+                        session_id,
+                        last_seen_sequence,
+                        &subscriptions,
+                    )
+                    .await;
+                }
+                Action::Tick
+            }
         };
+
+        // Fold a merged document sync (its async merge could not run in the arm).
+        if let Some(sync) = pending_sync.take() {
+            if let Some(synced) =
+                merge_document_sync(&mut replicas, docs_pool.as_ref(), *sync).await
+            {
+                reduce(state, synced);
+            }
+        }
 
         reduce(state, action);
 
         for intent in state.drain_outbox() {
+            // The first edit on a document subscribes this client to its live sync
+            // stream (a re-attach carrying the grown subscription set) and seeds its
+            // replica, so the edit's own resulting sync — and every other writer's —
+            // comes back. Done before the edit command is sent.
+            if let Some(document_id) = doc_intent_target(&intent) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = replicas.entry(document_id)
+                {
+                    slot.insert(seed_replica(docs_pool.as_ref(), document_id).await);
+                    subscriptions.push(Subscription::Document { document_id });
+                    let attach = command_envelope(
+                        client_id,
+                        CommandBody::AttachSession {
+                            session_id,
+                            last_seen_sequence: Some(tracker.last_seen()),
+                            subscriptions: subscriptions.clone(),
+                            requested_role: ClientRole::Controller,
+                        },
+                    );
+                    if out_tx.send(attach).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             let envelope =
                 command_envelope(client_id, intent_to_command(intent, session_id, repository));
             if out_tx.send(envelope).await.is_err() {
@@ -340,6 +651,18 @@ enum ReaderSignal {
     Rejected { code: String, message: String },
     /// A catch-up reply (from the loop's own gap-triggered re-attach).
     Catchup(Box<Catchup>),
+    /// A collaborative document's live CRDT sync (Phase 4 STEP 4.3). Boxed — it
+    /// carries opaque CRDT bytes and every other signal here is tiny. The loop
+    /// merges it into the document's client replica.
+    DocumentSync(Box<DocumentSync>),
+    /// The daemon granted an edit lease this client requested.
+    DocumentLeaseGranted {
+        document_id: DocumentId,
+        lease_id: String,
+    },
+    /// The daemon refused an edit lease: the block range is held by another writer
+    /// (`document.range-leased`) — surfaced as the presence-lite "blocked" signal.
+    DocumentLeaseBlocked,
     /// The daemon closed the connection.
     Closed,
 }
@@ -373,11 +696,35 @@ async fn read_loop(
                     }
                 }
                 Payload::CommandRejected(error) => {
-                    if event_tx
-                        .send(ReaderSignal::Rejected {
+                    // A refused edit lease drives the presence-lite "blocked"
+                    // indicator; every other rejection is a transient notice.
+                    let signal = if error.code == "document.range-leased" {
+                        ReaderSignal::DocumentLeaseBlocked
+                    } else {
+                        ReaderSignal::Rejected {
                             code: error.code,
                             message: error.message,
+                        }
+                    };
+                    if event_tx.send(signal).await.is_err() {
+                        break;
+                    }
+                }
+                Payload::DocumentLeaseGranted { grant, .. } => {
+                    if event_tx
+                        .send(ReaderSignal::DocumentLeaseGranted {
+                            document_id: grant.document_id,
+                            lease_id: grant.lease_id,
                         })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::DocumentSync(sync) => {
+                    if event_tx
+                        .send(ReaderSignal::DocumentSync(Box::new(sync)))
                         .await
                         .is_err()
                     {
@@ -466,7 +813,108 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::ResumeRun { run_id } => CommandBody::ResumeRun { run_id },
         Intent::CancelRun { run_id } => CommandBody::CancelRun { run_id },
         Intent::QueueSteering { run_id, text } => CommandBody::QueueSteering { run_id, text },
+        // Phase 4 STEP 4.3: document editing. Subscription to the document's sync
+        // stream is arranged separately (in the drain loop) before the first of
+        // these is sent, so the client sees its own edit's authoritative result.
+        Intent::AcquireDocumentLease {
+            document_id,
+            block_id,
+        } => CommandBody::AcquireDocumentLease {
+            lease: DocumentEditLease {
+                document_id,
+                block_id,
+            },
+            ttl_seconds: None,
+        },
+        Intent::ReleaseDocumentLease { lease_id } => CommandBody::ReleaseDocumentLease { lease_id },
+        Intent::MutateDocument {
+            document_id,
+            mutation,
+        } => CommandBody::MutateDocument {
+            document_id,
+            mutation,
+        },
     }
+}
+
+/// The document a doc-editing intent operates on, when it is one the harness must
+/// be subscribed to before sending (an edit needs to observe its own resulting
+/// sync). A release needs no subscription.
+fn doc_intent_target(intent: &Intent) -> Option<DocumentId> {
+    match intent {
+        Intent::AcquireDocumentLease { document_id, .. }
+        | Intent::MutateDocument { document_id, .. } => Some(*document_id),
+        _ => None,
+    }
+}
+
+/// Seed a document's client replica from its current persisted CRDT snapshot — the
+/// document read path (Phase 4 STEP 4.3). Falls back to an empty replica when the
+/// pool is absent or the read fails: an empty replica still converges on the first
+/// full-snapshot sync, so editing degrades gracefully rather than breaking.
+async fn seed_replica(pool: Option<&sqlx::SqlitePool>, document_id: DocumentId) -> DocumentReplica {
+    if let Some(pool) = pool {
+        match DocumentStore::new().load(pool, document_id).await {
+            Ok(Some(document)) => match document.crdt.snapshot() {
+                Ok(snapshot) => {
+                    match DocumentReplica::from_snapshot(&snapshot, document.revision) {
+                        Ok(replica) => return replica,
+                        Err(error) => {
+                            eprintln!("codypendent: could not seed a doc replica: {error}")
+                        }
+                    }
+                }
+                Err(error) => eprintln!("codypendent: could not read a doc snapshot: {error}"),
+            },
+            Ok(None) => {}
+            Err(error) => eprintln!("codypendent: could not load a document to seed: {error}"),
+        }
+    }
+    DocumentReplica::empty()
+}
+
+/// Merge one incoming [`DocumentSync`] into the document's replica and project the
+/// result into a reducer action: the block-structured editor view (from the merged
+/// replica) plus the review rail's pending suggestions (re-read from the store,
+/// since a suggestion rides the DB, not the CRDT bytes). `None` when the merge or
+/// projection fails.
+async fn merge_document_sync(
+    replicas: &mut HashMap<DocumentId, DocumentReplica>,
+    pool: Option<&sqlx::SqlitePool>,
+    sync: DocumentSync,
+) -> Option<Action> {
+    let document_id = sync.document_id;
+    let replica = replicas
+        .entry(document_id)
+        .or_insert_with(DocumentReplica::empty);
+    if let Err(error) = replica.merge(&sync) {
+        eprintln!("codypendent: could not merge a document sync: {error}");
+        return None;
+    }
+    let blocks: Vec<_> = match replica.blocks() {
+        Ok(blocks) => blocks.iter().map(block_view).collect(),
+        Err(error) => {
+            eprintln!("codypendent: could not project a merged document: {error}");
+            return None;
+        }
+    };
+    let revision = format!("r{}", replica.revision());
+    // Suggestions live in the DB (not the sync bytes); re-read them so a
+    // just-proposed or just-resolved suggestion shows in the review rail.
+    let suggestions = match pool {
+        Some(pool) => SuggestionStore::new()
+            .pending(pool, document_id)
+            .await
+            .map(|list| list.iter().map(suggestion_view).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Some(Action::DocumentSynced {
+        document_id,
+        revision,
+        blocks,
+        suggestions,
+    })
 }
 
 /// Wrap a command in a fresh, self-idempotent request envelope (the command id's
@@ -953,6 +1401,7 @@ fn memory_class_label(class: MemoryClass) -> &'static str {
 /// engine enforces (STEP 4.3).
 fn doc_card(document: &KnowledgeDocument, suggestions: &[Suggestion]) -> DocCard {
     DocCard {
+        document_id: document.id,
         title: document.title.clone(),
         scope: scope_label(&document.scope),
         status: document.status.as_str().to_owned(),
@@ -995,6 +1444,7 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
     };
     // Collapse to one line — the editor rail renders a block per row.
     DocBlockView {
+        id: block.id.clone(),
         kind,
         text: text.replace('\n', " "),
     }
@@ -1003,6 +1453,7 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
 /// Map a [`Suggestion`] into the review rail's [`DocSuggestionView`].
 fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
     DocSuggestionView {
+        id: suggestion.id.clone(),
         status: suggestion_status_label(suggestion.status).to_owned(),
         author: document_author_label(&suggestion.author),
         range: format!("{}..{}", suggestion.range_start, suggestion.range_end),
@@ -1052,10 +1503,14 @@ const MAX_WORKFLOW_NODES: usize = 500;
 /// Manifests are compiled in sorted filename order for a deterministic view; an
 /// unreadable or non-compiling manifest logs to stderr and is skipped, so one
 /// broken file drops only its own workflow — never the others, and never the
-/// TUI. Nodes keep their compiled topological order. State/cost are the pre-run
-/// values (`pending` / `—`); overlaying a durable run's live per-node
-/// state/cost lands with the daemon-side workflow executor.
-fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
+/// TUI. Nodes keep their compiled topological order.
+///
+/// When `pool` is present, each workflow's LATEST durable run overlays its
+/// per-node live state, MEASURED cost, and failure/block reason (Phase 5 T8 /
+/// P5-D4) onto the compiled defaults; `None` (or no run yet) shows the pre-run
+/// values (`pending` / `—`). Read failures degrade to the compiled view, never
+/// fail the TUI.
+async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<WorkflowNodeCard> {
     let dir = repo.join(".codypendent").join("workflows");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -1098,11 +1553,17 @@ fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
         match codypendent_workflow::compile_yaml(&yaml) {
             Ok(compiled) => {
                 let label = format!("{} v{}", compiled.id, compiled.version);
+                // Overlay the latest durable run's per-node state/cost/error, when
+                // one exists and a pool is available.
+                let records = match pool {
+                    Some(pool) => latest_run_node_records(pool, &compiled.id).await,
+                    None => HashMap::new(),
+                };
                 cards.extend(
                     compiled
                         .nodes
                         .iter()
-                        .map(|node| workflow_node_card(&label, node)),
+                        .map(|node| workflow_node_card(&label, node, records.get(&node.id))),
                 );
             }
             Err(error) => {
@@ -1124,17 +1585,94 @@ fn load_workflows(repo: &Path) -> Vec<WorkflowNodeCard> {
     cards
 }
 
+/// The most recent durable run's node records for `workflow_id`, keyed by node id
+/// — the overlay [`load_workflows`] applies so the graph view shows a run's live
+/// state, MEASURED cost, and failure/block reason. An empty map when no run exists
+/// or a read fails: the view then shows the compiled defaults, never a stale one.
+async fn latest_run_node_records(
+    pool: &sqlx::SqlitePool,
+    workflow_id: &str,
+) -> HashMap<String, codypendent_workflow::WorkflowNodeRecord> {
+    let run_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM workflow_runs WHERE workflow_id = ? \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(workflow_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(run_id) = run_id else {
+        return HashMap::new();
+    };
+    match codypendent_workflow::WorkflowStore::new()
+        .snapshot(pool, &run_id)
+        .await
+    {
+        Ok(Some(snapshot)) => snapshot
+            .nodes
+            .into_iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// Render a node's MEASURED cost JSON into a human string for the graph view
+/// (Phase 5 T8). Only the dimensions actually measured are shown — wall time and
+/// tool calls — so the column never displays a fabricated token/USD figure. An
+/// empty or unrecognized cost shape renders `"—"` (nothing was measured).
+fn render_node_cost(cost: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(secs) = cost
+        .get("wall_time_secs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        parts.push(format!("{secs}s"));
+    }
+    if let Some(calls) = cost.get("tool_calls").and_then(serde_json::Value::as_u64) {
+        parts.push(format!(
+            "{calls} tool call{}",
+            if calls == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        "\u{2014}".to_owned()
+    } else {
+        parts.join(" \u{b7} ")
+    }
+}
+
 /// Map one [`CompiledNode`](codypendent_workflow::CompiledNode) into the view's
 /// [`WorkflowNodeCard`], pre-rendering every field to a human string. `workflow`
-/// is the owning workflow's `id vN` label the view groups by. State/cost are the
-/// pre-run values a compiled (not-yet-run) graph carries.
+/// is the owning workflow's `id vN` label the view groups by.
+///
+/// `record` is the node's durable run record when a run of this workflow exists:
+/// its live state, MEASURED cost (T8), and failure/block reason (P5-D4) overlay
+/// the compiled node's pre-run defaults (`pending` / `—` / `—`). This is the seam
+/// that turns the forever-`—` cost column and the reasonless `failed`/`blocked`
+/// node into real values.
 fn workflow_node_card(
     workflow: &str,
     node: &codypendent_workflow::CompiledNode,
+    record: Option<&codypendent_workflow::WorkflowNodeRecord>,
 ) -> WorkflowNodeCard {
     use codypendent_workflow::{ApprovalPolicy, NodeAction, WorkspaceMode};
 
     let dash = || "\u{2014}".to_owned(); // "—"
+
+    // Live state / measured cost / failure reason from a durable run record, else
+    // the compiled node's pre-run defaults.
+    let state = record.map_or_else(
+        || "pending".to_owned(),
+        |record| record.state.as_str().to_owned(),
+    );
+    let cost = record
+        .and_then(|record| record.cost.as_ref())
+        .map_or_else(dash, render_node_cost);
+    let error = record
+        .and_then(|record| record.error.clone())
+        .unwrap_or_else(dash);
     let (kind, action, agent, model_policy) = match &node.action {
         NodeAction::Agent {
             role,
@@ -1193,9 +1731,7 @@ fn workflow_node_card(
         id: node.id.clone(),
         action,
         kind,
-        // A compiled-but-not-yet-run node is pending; a durable run record
-        // overlays a live state here once the executor lands.
-        state: "pending".to_owned(),
+        state,
         agent,
         model_policy,
         workspace,
@@ -1203,8 +1739,8 @@ fn workflow_node_card(
         retry,
         depends_on: join(&node.depends_on),
         outputs: join(&node.outputs),
-        // No run has recorded a cost against a compiled-only node.
-        cost: dash(),
+        cost,
+        error,
     }
 }
 
@@ -1521,6 +2057,72 @@ mod tests {
                 text: "focus on the failing test".into(),
             }
         );
+
+        // Phase 4 STEP 4.3 document-editing intents lower to their commands.
+        let document_id = codypendent_protocol::DocumentId::new();
+        assert_eq!(
+            intent_to_command(
+                Intent::AcquireDocumentLease {
+                    document_id,
+                    block_id: Some("b1".into()),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::AcquireDocumentLease {
+                lease: DocumentEditLease {
+                    document_id,
+                    block_id: Some("b1".into()),
+                },
+                ttl_seconds: None,
+            }
+        );
+        assert_eq!(
+            intent_to_command(
+                Intent::ReleaseDocumentLease {
+                    lease_id: "lease-1".into(),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::ReleaseDocumentLease {
+                lease_id: "lease-1".into(),
+            }
+        );
+        let mutation = codypendent_protocol::DocumentMutation::AcceptSuggestion {
+            suggestion_id: "s1".into(),
+        };
+        assert_eq!(
+            intent_to_command(
+                Intent::MutateDocument {
+                    document_id,
+                    mutation: mutation.clone(),
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::MutateDocument {
+                document_id,
+                mutation,
+            }
+        );
+
+        // Only edit-bearing intents drive a subscription; a release does not.
+        assert_eq!(
+            doc_intent_target(&Intent::MutateDocument {
+                document_id,
+                mutation: codypendent_protocol::DocumentMutation::RejectSuggestion {
+                    suggestion_id: "s1".into(),
+                },
+            }),
+            Some(document_id)
+        );
+        assert_eq!(
+            doc_intent_target(&Intent::ReleaseDocumentLease {
+                lease_id: "lease-1".into(),
+            }),
+            None
+        );
     }
 
     #[test]
@@ -1627,7 +2229,7 @@ steps:
         let cards: Vec<_> = compiled
             .nodes
             .iter()
-            .map(|node| workflow_node_card(&label, node))
+            .map(|node| workflow_node_card(&label, node, None))
             .collect();
 
         let patch = cards.iter().find(|c| c.id == "patch").expect("patch node");
@@ -1642,9 +2244,10 @@ steps:
         );
         assert_eq!(patch.workspace, "isolated worktree");
         assert_eq!(patch.approval, "before write");
-        // A compiled-but-not-yet-run node is pending with no recorded cost.
+        // A compiled-but-not-yet-run node (no record) is pending with no cost/error.
         assert_eq!(patch.state, "pending");
         assert_eq!(patch.cost, "\u{2014}");
+        assert_eq!(patch.error, "\u{2014}");
         assert_eq!(patch.depends_on, "\u{2014}"); // no dependencies
         assert_eq!(patch.outputs, "proposed_patch");
 
@@ -1662,13 +2265,49 @@ steps:
         assert_eq!(verify.depends_on, "patch");
     }
 
+    /// The T8 seam: a durable node record overlays the compiled defaults — the
+    /// graph view renders the node's live state, MEASURED cost (only measured
+    /// dimensions), and failure/block reason (P5-D4). This is what turns the
+    /// forever-`—` cost column and the reasonless block into real values.
     #[test]
-    fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
+    fn workflow_node_card_renders_a_durable_records_cost_state_and_error() {
+        use codypendent_workflow::{NodeState, WorkflowNodeRecord};
+        let compiled = codypendent_workflow::compile_yaml(TEST_MANIFEST).expect("compiles");
+        let label = format!("{} v{}", compiled.id, compiled.version);
+        let node = compiled.node("verify").expect("verify node");
+
+        // A blocked record carrying a measured cost + a budget-block reason.
+        let record = WorkflowNodeRecord {
+            node_id: "verify".to_owned(),
+            state: NodeState::Blocked,
+            agent_run_id: None,
+            attempt: 1,
+            topo_order: node.topo_order,
+            cost: Some(serde_json::json!({ "wall_time_secs": 12, "tool_calls": 3 })),
+            error: Some("workflow.budget-exceeded: node budget for `tool_calls`".to_owned()),
+        };
+        let card = workflow_node_card(&label, node, Some(&record));
+        assert_eq!(card.state, "blocked");
+        assert_eq!(card.cost, "12s \u{b7} 3 tool calls");
+        assert!(card.error.contains("budget"), "error: {}", card.error);
+
+        // A cost with only a tool-call count renders just that (singular form),
+        // never a fabricated wall-time or token/USD figure.
+        assert_eq!(
+            render_node_cost(&serde_json::json!({ "tool_calls": 1 })),
+            "1 tool call"
+        );
+        // An unrecognized / empty cost shape renders "—" (nothing was measured).
+        assert_eq!(render_node_cost(&serde_json::json!({})), "\u{2014}");
+    }
+
+    #[tokio::test]
+    async fn load_workflows_compiles_manifests_and_skips_the_uncompilable() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
 
         // No workflows directory → an empty view, not an error.
-        assert!(load_workflows(repo).is_empty());
+        assert!(load_workflows(repo, None).await.is_empty());
 
         let dir = repo.join(".codypendent").join("workflows");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1683,7 +2322,7 @@ steps:
         // A non-manifest file is ignored by extension.
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let cards = load_workflows(repo);
+        let cards = load_workflows(repo, None).await;
         assert_eq!(
             cards.len(),
             2,
@@ -1749,5 +2388,296 @@ steps:
         assert_eq!(card.evidence, "\u{2014}");
         assert_eq!(card.revision, "r3");
         assert!(card.superseded);
+    }
+
+    // ----------------------------------------------------------------------
+    // GapTracker — the reconnect / gap-repair state machine (C6 + FP-2).
+    //
+    // This is the code that keeps a lagged client from losing an event the
+    // daemon dropped from its live fan-out — worst case an `ApprovalRequested`.
+    // It had zero tests; these drive the pure decision unit directly.
+    // ----------------------------------------------------------------------
+
+    use codypendent_protocol::{Actor, EventBody, ProposedAction, Risk, RiskLevel};
+
+    /// A benign live event at `sequence` (body content is irrelevant to the
+    /// tracker, which orders purely by sequence).
+    fn ev(sequence: u64) -> SessionEvent {
+        SessionEvent {
+            sequence,
+            occurred_at: chrono::Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::NoteAppended {
+                text: format!("event {sequence}"),
+                run_id: None,
+            },
+        }
+    }
+
+    /// An `ApprovalRequested` event at `sequence` carrying `approval_id` — the
+    /// event whose loss under lag the whole repair path exists to prevent.
+    fn approval_ev(sequence: u64, approval_id: ApprovalId) -> SessionEvent {
+        SessionEvent {
+            sequence,
+            occurred_at: chrono::Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::ApprovalRequested {
+                approval_id,
+                action: ProposedAction::ReadFiles {
+                    paths: vec!["src/lib.rs".to_owned()],
+                },
+                risk: Risk {
+                    level: RiskLevel::Low,
+                    reasons: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn seqs(events: &[SessionEvent]) -> Vec<u64> {
+        events.iter().map(|e| e.sequence).collect()
+    }
+
+    /// An in-order event is applied and advances the watermark; a duplicate of
+    /// an already-folded event is ignored (catch-up + live overlap).
+    #[test]
+    fn in_order_events_apply_and_duplicates_are_ignored() {
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        match t.on_event(ev(6), now) {
+            GapAction::Apply(e) => assert_eq!(e.sequence, 6),
+            other => panic!("expected Apply(6), got {other:?}"),
+        }
+        assert_eq!(t.last_seen, 6);
+        // A stale re-delivery of an already-folded sequence folds nothing.
+        assert!(matches!(t.on_event(ev(4), now), GapAction::Ignore));
+        assert!(matches!(t.on_event(ev(6), now), GapAction::Ignore));
+        assert_eq!(t.last_seen, 6);
+    }
+
+    /// Behaviour 1: a detected gap re-attaches from `last_seen` — the watermark
+    /// BEFORE the gap-revealing event, never the gap event's own sequence.
+    #[test]
+    fn detected_gap_reattaches_from_last_seen_not_the_gap_event() {
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        // Expected next is 6; 8 arrives → a 6..=7 gap.
+        match t.on_event(ev(8), now) {
+            GapAction::Reattach { last_seen_sequence } => {
+                assert_eq!(
+                    last_seen_sequence, 5,
+                    "must replay from the pre-gap watermark, not the gap event"
+                );
+            }
+            other => panic!("expected Reattach, got {other:?}"),
+        }
+        // The watermark did NOT advance to the gap event (the C6 invariant), and
+        // the gap event is held for after the replay.
+        assert_eq!(t.last_seen, 5);
+        assert_eq!(seqs(&t.gap_buffer), vec![8]);
+    }
+
+    /// Behaviour 2 + 3: events that arrive live during the repair are buffered,
+    /// then applied after the catch-up in ascending order, deduped against the
+    /// watermark — none dropped (the original C6 bug dropped them), none
+    /// duplicated.
+    #[test]
+    fn buffered_events_apply_in_order_after_repair_without_loss_or_dup() {
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        // Gap at 8 opens the repair.
+        assert!(matches!(t.on_event(ev(8), now), GapAction::Reattach { .. }));
+        // More live events during the repair, out of order and with a duplicate.
+        assert!(matches!(t.on_event(ev(10), now), GapAction::Ignore));
+        assert!(matches!(t.on_event(ev(9), now), GapAction::Ignore));
+        assert!(matches!(t.on_event(ev(8), now), GapAction::Ignore)); // dup of buffered
+                                                                      // A stale re-delivery below the watermark is ignored, not buffered.
+        assert!(matches!(t.on_event(ev(3), now), GapAction::Ignore));
+
+        // The daemon replayed 6,7 (the harness folds those); catch-up through=7.
+        let drain = t.on_catchup(7, now);
+        assert_eq!(
+            seqs(&drain.apply),
+            vec![8, 9, 10],
+            "buffered events apply in order, deduped, none lost"
+        );
+        assert!(drain.reattach.is_none());
+        assert_eq!(t.last_seen, 10);
+    }
+
+    /// Behaviour 4 (the safety property): an `ApprovalRequested` that fell in
+    /// the gap is applied after the repair, never dropped.
+    #[test]
+    fn an_approval_in_the_gap_is_never_lost() {
+        let approval_id = ApprovalId::new();
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        // The gap-revealing event IS the approval (it raced ahead of its span).
+        assert!(matches!(
+            t.on_event(approval_ev(8, approval_id), now),
+            GapAction::Reattach { .. }
+        ));
+        let drain = t.on_catchup(7, now);
+        assert_eq!(drain.apply.len(), 1, "the approval must survive the repair");
+        match &drain.apply[0].body {
+            EventBody::ApprovalRequested {
+                approval_id: got, ..
+            } => assert_eq!(*got, approval_id),
+            other => panic!("the approval was lost or corrupted: {other:?}"),
+        }
+    }
+
+    /// The C6 fix summary "buffers mid-repair events and re-repairs": if the
+    /// catch-up did not reach the buffered tail (more loss occurred while
+    /// repairing), the tracker applies what it can and asks to repair again,
+    /// keeping the tail — still no loss, still in order.
+    #[test]
+    fn a_hole_in_the_buffered_tail_triggers_another_repair() {
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        assert!(matches!(t.on_event(ev(8), now), GapAction::Reattach { .. }));
+        // Further loss: 12 arrives with 9..=11 still missing.
+        assert!(matches!(t.on_event(ev(12), now), GapAction::Ignore));
+
+        // First catch-up only reached 7. Buffer is [8, 12].
+        let drain = t.on_catchup(7, now);
+        assert_eq!(
+            seqs(&drain.apply),
+            vec![8],
+            "8 folds, 12 is still out of order"
+        );
+        assert_eq!(
+            drain.reattach,
+            Some(8),
+            "re-repair from 8, keeping the tail"
+        );
+        assert_eq!(seqs(&t.gap_buffer), vec![12]);
+
+        // Second catch-up fills 9,10,11 → through=11; 12 now folds.
+        let drain2 = t.on_catchup(11, now);
+        assert_eq!(seqs(&drain2.apply), vec![12]);
+        assert!(drain2.reattach.is_none());
+        assert_eq!(t.last_seen, 12);
+    }
+
+    /// FP-2a: the buffer is bounded. Once it fills during a repair, the next
+    /// event drops the incremental replay and re-attaches afresh from the
+    /// watermark — failing toward a fresh catch-up, never toward unbounded
+    /// memory. The ledger re-delivers the whole span, so nothing is lost.
+    #[test]
+    fn a_full_gap_buffer_reattaches_fresh_instead_of_growing() {
+        let mut t = GapTracker::new(5);
+        let now = Instant::now();
+
+        assert!(matches!(t.on_event(ev(8), now), GapAction::Reattach { .. }));
+
+        // Feed distinct later sequences until the buffer overflows. The range is
+        // generous enough (cap + slack) that the overflow must occur within it.
+        let mut overflowed = false;
+        for seq in 9..=(9 + MAX_GAP_BUFFER as u64 + 5) {
+            match t.on_event(ev(seq), now) {
+                GapAction::Ignore => {}
+                GapAction::Reattach { last_seen_sequence } => {
+                    assert_eq!(last_seen_sequence, 5, "overflow replays from the watermark");
+                    overflowed = true;
+                    break;
+                }
+                other => panic!("unexpected action during buffering: {other:?}"),
+            }
+        }
+        assert!(
+            overflowed,
+            "the buffer must overflow into a fresh re-attach, not grow past the cap"
+        );
+        assert!(t.gap_buffer.len() <= MAX_GAP_BUFFER);
+        assert!(
+            t.gap_buffer.is_empty(),
+            "the stale buffer is dropped on overflow"
+        );
+        assert!(t.repairing, "still awaiting the fresh catch-up");
+    }
+
+    /// FP-2b: a repair whose catch-up reply never arrives is abandoned once the
+    /// deadline passes — `on_tick` asks for a fresh re-attach from the
+    /// watermark instead of wedging the client in `repairing` forever.
+    #[test]
+    fn a_stalled_repair_times_out_into_a_fresh_reattach() {
+        let mut t = GapTracker::new(5);
+        let t0 = Instant::now();
+
+        assert!(matches!(t.on_event(ev(8), t0), GapAction::Reattach { .. }));
+        // Before the deadline: nothing.
+        assert!(t.on_tick(t0 + Duration::from_millis(1)).is_none());
+        assert!(t
+            .on_tick(t0 + REPAIR_TIMEOUT - Duration::from_millis(1))
+            .is_none());
+        // Past the deadline: re-attach from the watermark, dropping the stale
+        // buffer.
+        assert_eq!(
+            t.on_tick(t0 + REPAIR_TIMEOUT + Duration::from_millis(1)),
+            Some(5)
+        );
+        assert!(t.gap_buffer.is_empty());
+
+        // A tracker that is not repairing never fires a timeout.
+        let mut idle = GapTracker::new(5);
+        assert!(idle
+            .on_tick(Instant::now() + Duration::from_secs(3600))
+            .is_none());
+    }
+
+    /// FP-2c: sequence 0 is a sentinel (the daemon numbers events 1-based), so
+    /// it is folded straight through in any state — including mid-repair, where
+    /// it was previously buffered and then silently discarded — and it never
+    /// moves the watermark or disturbs the gap buffer.
+    #[test]
+    fn sentinel_sequence_zero_is_applied_in_any_state() {
+        let now = Instant::now();
+
+        // Idle: applied, watermark untouched.
+        let mut t = GapTracker::new(5);
+        match t.on_event(ev(0), now) {
+            GapAction::Apply(e) => assert_eq!(e.sequence, 0),
+            other => panic!("expected Apply(0), got {other:?}"),
+        }
+        assert_eq!(t.last_seen, 5);
+
+        // Mid-repair: STILL applied immediately (not buffered/discarded), and
+        // the real gap buffer is left intact.
+        let mut t = GapTracker::new(5);
+        assert!(matches!(t.on_event(ev(8), now), GapAction::Reattach { .. }));
+        match t.on_event(ev(0), now) {
+            GapAction::Apply(e) => assert_eq!(e.sequence, 0),
+            other => panic!("a sentinel must fold through mid-repair, got {other:?}"),
+        }
+        assert_eq!(seqs(&t.gap_buffer), vec![8]);
+        assert_eq!(t.last_seen, 5);
+    }
+
+    /// A zero attach-watermark (an empty catch-up baseline) accepts the first
+    /// live event without gap detection — there is no baseline to gap against.
+    #[test]
+    fn a_zero_watermark_seeds_from_the_first_live_event() {
+        let mut t = GapTracker::new(0);
+        let now = Instant::now();
+        match t.on_event(ev(42), now) {
+            GapAction::Apply(e) => assert_eq!(e.sequence, 42),
+            other => panic!("expected Apply(42), got {other:?}"),
+        }
+        assert_eq!(t.last_seen, 42);
+        // And now a real gap past that seed is detected.
+        assert!(matches!(
+            t.on_event(ev(50), now),
+            GapAction::Reattach { .. }
+        ));
     }
 }

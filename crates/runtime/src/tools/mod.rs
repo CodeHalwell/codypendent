@@ -27,9 +27,11 @@
 //!
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
+mod blackboard;
 mod git;
 mod github;
 mod read_file;
+mod repository;
 mod salient;
 mod search;
 mod shell;
@@ -41,17 +43,22 @@ use async_trait::async_trait;
 use codypendent_daemon::artifacts::Provenance;
 use codypendent_protocol::ArtifactRef;
 
+pub use blackboard::{
+    parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool,
+};
 pub use git::{
     ApplyPatch, ApplyPatchInput, ApplyPatchOutcome, GitDiff, GitDiffInput, GitDiffOutcome,
 };
 pub use github::{
-    fix_ci_objective, new_pull_request, parse_create_check_run, parse_create_draft_pull_request,
+    new_pull_request, parse_create_check_run, parse_create_draft_pull_request,
     parse_get_pull_request, parse_list_check_runs, parse_update_pull_request, render_check_runs,
     render_pull_request, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
     CreateDraftPullRequestInput, GetPullRequest, GetPullRequestInput, ListCheckRuns,
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
 };
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
+pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
@@ -242,5 +249,62 @@ fn effective_timeout(requested: Duration, maximum_seconds: u64) -> Duration {
         bounded
     } else {
         bounded.min(Duration::from_secs(maximum_seconds))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_timeout, ABSOLUTE_MAX_TIMEOUT};
+    use std::time::Duration;
+
+    /// With no scope ceiling (`maximum_seconds == 0`) a modest request passes
+    /// through unchanged — the clamp only ever narrows.
+    #[test]
+    fn unset_ceiling_keeps_a_modest_request() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(30), 0),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// With no scope ceiling a model-supplied timeout is still bounded by the
+    /// absolute maximum — the fix that stops a `u64::MAX` request running
+    /// forever (C12).
+    #[test]
+    fn unset_ceiling_is_bounded_by_the_absolute_maximum() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(u64::MAX / 2), 0),
+            ABSOLUTE_MAX_TIMEOUT
+        );
+        assert_eq!(effective_timeout(Duration::MAX, 0), ABSOLUTE_MAX_TIMEOUT);
+    }
+
+    /// A scope ceiling below the request clamps the request down to it.
+    #[test]
+    fn scope_ceiling_clamps_a_larger_request() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(600), 60),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A request below the scope ceiling is left alone (never rounded up).
+    #[test]
+    fn request_below_ceiling_is_unchanged() {
+        assert_eq!(
+            effective_timeout(Duration::from_secs(10), 60),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Both bounds apply at once: the absolute maximum caps even a scope
+    /// ceiling that exceeds it, so no configuration can lift the hard ceiling.
+    #[test]
+    fn absolute_maximum_caps_an_over_large_scope_ceiling() {
+        let huge_ceiling = ABSOLUTE_MAX_TIMEOUT.as_secs() * 10;
+        assert_eq!(
+            effective_timeout(Duration::MAX, huge_ceiling),
+            ABSOLUTE_MAX_TIMEOUT
+        );
     }
 }

@@ -1,0 +1,22 @@
+{
+  "BlackboardItemView": {
+    "author": {
+      "node_id": "diagnose",
+      "role": "investigator"
+    },
+    "confidence": 0.8,
+    "evidence": [
+      {
+        "line": 42,
+        "path": "src/parse.rs"
+      }
+    ],
+    "id": "0192-item",
+    "kind": "finding",
+    "payload": {
+      "summary": "the parser drops trailing commas"
+    },
+    "revision": 1,
+    "workflow_run_id": "wfrun-abc"
+  }
+}

@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::ArtifactId;
+use crate::ids::{ArtifactId, DocumentId};
 
 /// A mode preset: a bundle of policy and interaction defaults, not merely a
 /// prompt (Chapter 20). Modes are enforced by the policy engine — an `Explore`
@@ -127,6 +127,43 @@ pub enum ProposedAction {
         /// A short human-readable description of the write, rendered on the
         /// approval card (e.g. `create draft PR on owner/repo`).
         summary: String,
+    },
+    /// Publish a document's deterministic Markdown render to a Git target
+    /// (Phase 4 STEP 4.4). Every publish is approval-gated; the approval card
+    /// renders `target`, `changed_files`, and `git_action` **verbatim** from
+    /// the computed plan (STEP 4.4.2: "every publish displays target, changed
+    /// files, and resulting Git action before approval").
+    PublishDocument {
+        document_id: DocumentId,
+        /// A short human description of the target (e.g. `repository file
+        /// docs/architecture.md`).
+        target: String,
+        /// The repo-relative files the publish changes.
+        changed_files: Vec<String>,
+        /// The resulting Git action (e.g. `commit docs/x.md on branch
+        /// docs/publish`).
+        git_action: String,
+    },
+    /// Post a typed artifact to a workflow run's blackboard (Phase 5 STEP 5.3) —
+    /// the run-scoped coordination channel a workflow's agents share. Always
+    /// permitted by policy within a workflow run (the `blackboard.post` tool is
+    /// only offered when the run is a workflow node), but recorded as a proposed
+    /// action so every board write is traced like any other tool call. Not a
+    /// filesystem, repository, or remote write — it targets only the run's own
+    /// board, so it never reaches the approval gate.
+    BlackboardPost {
+        /// The workflow run whose board is written (server-derived from the run
+        /// context, never model-supplied).
+        workflow_run_id: String,
+        /// The artifact kind being posted (`finding`, `decision`, …).
+        kind: String,
+    },
+    /// Query a workflow run's blackboard (Phase 5 STEP 5.3). A read of the run's
+    /// own coordination channel; always permitted by policy within a workflow run
+    /// and recorded so every board access is traced.
+    BlackboardQuery {
+        /// The workflow run whose board is read (server-derived).
+        workflow_run_id: String,
     },
     #[serde(other)]
     Unknown,
@@ -252,6 +289,14 @@ mod tests {
         round_trip(ProposedAction::GitHubMutation {
             repository: "octocat/hello-world".to_string(),
             summary: "create draft PR on octocat/hello-world".to_string(),
+        });
+        round_trip(ProposedAction::PublishDocument {
+            document_id: DocumentId::new(),
+            target: "repository file docs/architecture.md".to_string(),
+            changed_files: vec!["docs/architecture.md".to_string()],
+            git_action:
+                "write docs/architecture.md in the working tree (approval-gated change set)"
+                    .to_string(),
         });
         round_trip(Risk {
             level: RiskLevel::High,

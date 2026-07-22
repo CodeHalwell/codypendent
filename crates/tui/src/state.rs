@@ -8,8 +8,8 @@
 use std::cell::Cell;
 
 use codypendent_protocol::{
-    AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, ModelId, ProposedAction,
-    Risk, RunDisposition, RunId, RunState, ToolOutcome,
+    AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, DocumentId, DocumentMutation,
+    ModelId, ProposedAction, Risk, RunDisposition, RunId, RunState, ToolOutcome,
 };
 
 use crate::action::Intent;
@@ -136,6 +136,13 @@ pub enum Overlay {
     /// binding each. `query` is the live filter; `selected` indexes the filtered
     /// results (reset to 0 whenever the query changes). Opened with `/`.
     Palette { query: String, selected: usize },
+    /// The Docs Studio block-edit prompt (Phase 4 STEP 4.3 client wiring): a
+    /// single-line buffer for the text to insert into the focused block. On submit
+    /// the reducer acquires the block's edit lease and, once granted, sends the
+    /// `MutateDocument`; the daemon's collaboration mode decides whether it applies
+    /// directly (Edit) or lands as a suggestion (Suggest). `block_id` is the block
+    /// the edit targets, captured when the prompt opened.
+    DocEdit { block_id: String, buffer: String },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -334,6 +341,11 @@ pub struct MemoryCard {
 /// [`KnowledgeDocument`]: (mapped by the CLI from `codypendent-knowledge`)
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocCard {
+    /// The document's stable id — the key that correlates an incoming
+    /// [`DocumentSync`](codypendent_protocol::DocumentSync) (merged into the
+    /// client replica by the CLI harness) back to this card, and the target of an
+    /// edit's `MutateDocument`/`AcquireDocumentLease`.
+    pub document_id: DocumentId,
     /// The document title (its heading in the tree).
     pub title: String,
     /// The scope the document lives in (e.g. `system`, `workspace …`).
@@ -355,6 +367,9 @@ pub struct DocCard {
 /// text or a structured-block label — never the raw serialized content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocBlockView {
+    /// The block's stable id — the target an edit action leases and mutates (never
+    /// rendered; carried so the reducer can name the block without a second lookup).
+    pub id: String,
     /// The block kind label (`heading` / `paragraph` / `code` / …).
     pub kind: String,
     /// A one-line human rendering of the block's content.
@@ -366,6 +381,10 @@ pub struct DocBlockView {
 /// read-only — accept/reject is a later live-transport concern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocSuggestionView {
+    /// The suggestion's stable id — the target of an accept/reject
+    /// `MutateDocument` (never rendered; carried so the reducer can resolve the
+    /// focused suggestion without a second lookup).
+    pub id: String,
     /// The suggestion status (`pending` for the review rail).
     pub status: String,
     /// Who proposed it, pre-rendered (e.g. `"agent"` / `"human"`).
@@ -376,6 +395,69 @@ pub struct DocSuggestionView {
     pub replacement: String,
     /// The proposer's rationale, when given.
     pub rationale: Option<String>,
+}
+
+/// Which rail of the Docs Studio overlay the keyboard drives (Phase 4 client
+/// wiring). Defaults to [`DocFocus::Tree`] so the overlay opens on the document
+/// list exactly as before this focus existed; `Tab` cycles it, and `↑/↓` then move
+/// the selection within the focused rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocFocus {
+    /// The document tree (left): `↑/↓` move [`AppState::selected_doc`].
+    #[default]
+    Tree,
+    /// The editor rail (right, top): `↑/↓` move [`AppState::selected_block`]; `e`
+    /// edits the focused block.
+    Editor,
+    /// The review rail (right, bottom): `↑/↓` move [`AppState::selected_suggestion`];
+    /// `a`/`r` accept/reject the focused suggestion.
+    Review,
+}
+
+impl DocFocus {
+    /// The next rail in `Tab` order (Tree → Editor → Review → Tree).
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            DocFocus::Tree => DocFocus::Editor,
+            DocFocus::Editor => DocFocus::Review,
+            DocFocus::Review => DocFocus::Tree,
+        }
+    }
+}
+
+/// The state of the client's edit lease over one document block (Phase 4 client
+/// wiring, presence-lite). Surfaced in the Docs editor rail so a writer sees
+/// whether it holds the block or is blocked by another writer — the one
+/// status-line touch the collaboration slice needs (no cursors/presence UI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocLeaseState {
+    /// `AcquireDocumentLease` sent; awaiting the grant.
+    Acquiring,
+    /// The lease is held — edits may apply.
+    Held,
+    /// The range is leased by another writer (`document.range-leased`).
+    Blocked,
+}
+
+/// One in-flight document edit: the block being leased/edited, the lease's
+/// lifecycle, and the mutation queued until the lease is granted. The reducer
+/// stores this on [`AppState::doc_edit`] so the lease→mutate handshake — inherently
+/// two round-trips — is driven by folding the daemon's replies, keeping the TUI a
+/// pure reducer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocEdit {
+    /// The document being edited.
+    pub document_id: DocumentId,
+    /// The block the lease covers (`None` would be a whole-document structural
+    /// lease; the editor only takes block leases).
+    pub block_id: Option<String>,
+    /// Where the lease is in its lifecycle.
+    pub lease: DocLeaseState,
+    /// The granted lease id, once held — the capability needed to release it.
+    pub lease_id: Option<String>,
+    /// The mutation to send once the lease is granted, then cleared (fired once).
+    pub pending: Option<DocumentMutation>,
 }
 
 /// A code-graph edge projected for the graph-edge inspector (Phase 4 exit
@@ -443,8 +525,14 @@ pub struct WorkflowNodeCard {
     /// The blackboard artifact kinds the node declares to produce, pre-rendered
     /// (comma-joined, or `"—"`).
     pub outputs: String,
-    /// The node's recorded cost, pre-rendered (`"—"` until a run records one).
+    /// The node's MEASURED cost, pre-rendered (e.g. `"12s · 3 tool calls"`, or
+    /// `"—"` until a durable run records one). Only measured dimensions appear —
+    /// never a fabricated token/USD figure (Phase 5 T8).
     pub cost: String,
+    /// The node's latest failure or budget-block reason when a durable run
+    /// recorded one (P5-D4), else `"—"`. Surfaced in the node detail so a
+    /// `failed`/`blocked` node explains itself.
+    pub error: String,
 }
 
 /// A blackboard artifact projected for the blackboard view (Phase 5 STEP 5.3).
@@ -531,6 +619,17 @@ pub struct AppState {
     pub docs: Vec<DocCard>,
     /// Index into `docs` of the focused document.
     pub selected_doc: usize,
+    /// Index into the focused document's `blocks` of the focused block (the editor
+    /// rail cursor; the edit action targets this block).
+    pub selected_block: usize,
+    /// Index into the focused document's `suggestions` of the focused suggestion
+    /// (the review rail cursor; accept/reject target this suggestion).
+    pub selected_suggestion: usize,
+    /// Which rail of the Docs overlay the keyboard drives (`Tab` cycles it).
+    pub doc_focus: DocFocus,
+    /// The in-flight document edit (lease lifecycle + queued mutation), if any.
+    /// Drives the editor rail's lease indicator and the lease→mutate handshake.
+    pub doc_edit: Option<DocEdit>,
     /// The code-graph edge projection (Phase 4 exit criterion 4): this
     /// repository's edges, mapped to self-contained [`GraphEdgeCard`]s by the
     /// CLI. May be empty. The [`Overlay::Edges`] inspector reads it.
@@ -607,6 +706,10 @@ impl AppState {
             selected_memory: 0,
             docs: Vec::new(),
             selected_doc: 0,
+            selected_block: 0,
+            selected_suggestion: 0,
+            doc_focus: DocFocus::default(),
+            doc_edit: None,
             edges: Vec::new(),
             selected_edge: 0,
             workflow: Vec::new(),
@@ -630,7 +733,9 @@ impl AppState {
     #[must_use]
     pub fn input_mode(&self) -> InputMode {
         match self.overlay {
-            Overlay::NewRun(_) | Overlay::Steering(_) => InputMode::Editing,
+            Overlay::NewRun(_) | Overlay::Steering(_) | Overlay::DocEdit { .. } => {
+                InputMode::Editing
+            }
             Overlay::ConfirmCancel => InputMode::Confirm,
             // The palette filters on printable keys but stays arrow-navigable, so
             // it has its own input mode (see [`crate::input::map_palette_key`]).
@@ -705,6 +810,21 @@ impl AppState {
     #[must_use]
     pub fn focused_doc(&self) -> Option<&DocCard> {
         self.docs.get(self.selected_doc)
+    }
+
+    /// The focused block of the focused document, if any (the editor rail cursor).
+    #[must_use]
+    pub fn focused_block(&self) -> Option<&DocBlockView> {
+        self.focused_doc()?.blocks.get(self.selected_block)
+    }
+
+    /// The focused suggestion of the focused document, if any (the review rail
+    /// cursor).
+    #[must_use]
+    pub fn focused_suggestion(&self) -> Option<&DocSuggestionView> {
+        self.focused_doc()?
+            .suggestions
+            .get(self.selected_suggestion)
     }
 
     /// The focused code-graph edge card, if any.

@@ -25,6 +25,7 @@ pub mod outbox;
 pub mod registry;
 pub mod repomap;
 pub mod retrieval;
+pub mod skill_exec;
 pub mod types;
 
 pub use types::{
@@ -42,6 +43,7 @@ pub use manifest::{
     SkillTrust,
 };
 pub use registry::{resolve_shadowed, Registry, RegistryError};
+pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
 
 pub use retrieval::{
     embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
@@ -86,6 +88,7 @@ pub use docs::render::{
     plan_publication, publications, record_publication, render_document, Publication, PublishPlan,
     PublishTarget,
 };
+pub use docs::replica::DocumentReplica;
 pub use docs::staleness::{
     detect_staleness, resolve_links, symbol_references, StalenessFinding, StalenessReason,
     SymbolRef,

@@ -14,6 +14,11 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+# The Phase-7 routing engine's `ModelProfile` is the value this crate's
+# `ModelProfileStore` (migration 0014) persists — the daemon owns the durable
+# profile store the router reads. `codypendent-routing` is a leaf crate
+# (protocol-only deps), so this adds no cycle.
+codypendent-routing = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -125,9 +125,12 @@ fn a_task_routes_cheap_then_escalates_the_full_chain_on_repeated_failure() {
         .escalate(&first.model, "targeted tests still fail", &task)
         .unwrap();
     assert_eq!(second.model, ModelId("hosted-default".into()));
-    assert!(
-        t1.artifacts_preserved,
-        "escalation preserves artifacts, not a restart"
+    // P7-4: the router re-executes the same task node (not a restart), but it
+    // never runs anything itself, so it cannot honestly claim to have observed
+    // artifact preservation — that must come from the (unbuilt) executor.
+    assert_eq!(
+        t1.artifacts_preserved, None,
+        "the router must not fabricate an artifacts-preserved claim"
     );
     assert!(
         t1.cost_impact_usd > 0.0,

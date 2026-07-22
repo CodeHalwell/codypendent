@@ -36,7 +36,9 @@
 //! scheduling, recovery, and lifecycle logic.
 
 pub mod agent;
+pub mod binding;
 pub mod blackboard;
+pub mod budget;
 pub mod compile;
 pub mod conductor;
 pub mod db;
@@ -44,27 +46,39 @@ pub mod drive;
 pub mod model;
 pub mod registry;
 pub mod resolve;
+pub mod source;
 pub mod store;
 
 pub use agent::{
     parse_agent_profile, AgentBudget, AgentCompletion, AgentPermissions, AgentProfile,
     AgentProfileError,
 };
+pub use binding::{bind_with, normalize_tool_name, scan_input_refs};
 pub use blackboard::{
     BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
+};
+pub use budget::{
+    BudgetDimension, BudgetExceeded, BudgetLimits, BudgetScope, BudgetVerdict, BudgetWarning,
+    NodeCost,
 };
 pub use compile::{
     compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
     CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };
 pub use conductor::{ConductorError, RecoveryReport, WorkflowConductor};
-pub use drive::{NodeContext, NodeExecutor, NodeObserver, NodeOutcome, WorkflowDriver};
+pub use drive::{
+    NodeContext, NodeExecutor, NodeObserver, NodeOutcome, NodeTransition, WorkflowDriver,
+};
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,
 };
 pub use registry::{SetRegistry, WorkflowRegistry};
 pub use resolve::{AgentProfileSet, AgentProfileSetError, UnresolvedRole};
+pub use source::{
+    WorkflowScope, WorkflowSourceError, WorkflowSourceRegistry, REPAIR_GITHUB_CHECK_ID,
+    REPAIR_GITHUB_CHECK_MANIFEST,
+};
 pub use store::{
     blocked_node_ids, ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord,
     WorkflowRunRecord, WorkflowRunSnapshot, WorkflowRunState, WorkflowStore, WorkflowStoreError,

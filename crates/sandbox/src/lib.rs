@@ -23,28 +23,40 @@
 //! * [`sanitize`] — neutralize untrusted plugin/MCP output (label by origin,
 //!   size-cap, strip control sequences) before it enters context.
 //!
-//! What this crate deliberately does **not** contain: the OS-level enforcement
-//! (bubblewrap + seccomp / `sandbox-exec` / AppContainer) and the `wasmtime` WASM
-//! runtime that *consume* a [`SandboxProfile`](profile::SandboxProfile). Those are
-//! the executor; this crate is the compiler that emits the profile it enforces.
+//! What this crate contains as of STEP 6.2: the [`executor`] — the OS-level
+//! enforcement seam (`sandbox-exec` on macOS, `bwrap` arg-generation on Linux, a
+//! fail-closed refusal elsewhere) that *consumes* a [`SandboxProfile`](profile::SandboxProfile)
+//! and actually confines a process — and the [`trust_store`], the data-only
+//! trusted-publisher key store that gives [`verify_artifact`](verify::verify_artifact)
+//! real keys to verify against. What it still defers (named, not faked): the
+//! `wasmtime` WASM component runtime and the brokered-secrets daemon.
 //!
 //! [`docs/specs/plugin.toml`]: ../../docs/specs/plugin.toml
 
+pub mod executor;
 pub mod lifecycle;
 pub mod manifest;
 pub mod permission;
 pub mod profile;
 pub mod sanitize;
+pub mod trust_store;
 pub mod verify;
 
+pub use executor::{
+    bwrap_argv, enforcing_executor, seatbelt_profile, CapabilityReport, RefusingSandbox,
+    SandboxBackend, SandboxCommand, SandboxError, SandboxExecutor, SandboxOutcome,
+};
 pub use lifecycle::{InstalledPlugin, LifecycleError, LifecycleState, TrustTier};
 pub use manifest::{
     parse_manifest, CapabilitiesSpec, ManifestError, PluginKind, PluginManifest, ResourcesSpec,
     RuntimeSpec, SecuritySpec, UpdateSpec, SUPPORTED_PLUGIN_SCHEMA_VERSION,
 };
-pub use permission::{Capability, CapabilitySet, PermissionDiff};
+pub use permission::{
+    diff_manifests, diff_resources, Capability, CapabilitySet, PermissionDiff, ResourceChange,
+};
 pub use profile::{SandboxProfile, ENV_ALLOWLIST};
 pub use sanitize::{sanitize_untrusted, Sanitized};
+pub use trust_store::{TrustStoreError, TrustedPublishers};
 pub use verify::{
     checksum_of, signing_digest, verify_artifact, UnsignedPolicy, Verified, VerifyError,
 };

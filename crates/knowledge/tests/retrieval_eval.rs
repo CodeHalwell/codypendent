@@ -69,12 +69,14 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
     }
 
     let items = registry.list(&pool).await.unwrap();
-    // 5 built-in tools + 2 built-in commands (`/fix-ci`, `/update-docs`) + the
-    // rust.fix-ci skill + 20 decoys. (The High-risk `/fix-ci` command is filtered
-    // by the Medium risk ceiling the eval queries under; the Low-risk
-    // `/update-docs` command is eligible but its docs-only intents keep it out of
-    // the CI/tool query top-k, so neither perturbs recall/exclusion.)
-    assert_eq!(items.len(), 28, "unexpected seeded item count");
+    // 8 built-in tools (5 Phase-1 tools + the Phase-5 `repository.test` verification
+    // tool + the 2 Phase-5 blackboard tools) + 2 built-in commands (`/fix-ci`,
+    // `/update-docs`) + the rust.fix-ci skill + 20 decoys. (The High-risk `/fix-ci`
+    // command is filtered by the Medium risk ceiling the eval queries under; the
+    // Low-risk `/update-docs` command, the Safe-risk `blackboard.*` tools, and the
+    // `repository.test` tool are eligible but their docs/blackboard/test intents keep
+    // them out of the CI/tool query top-k, so none perturb recall/exclusion.)
+    assert_eq!(items.len(), 31, "unexpected seeded item count");
     (tmp, items, repo)
 }
 

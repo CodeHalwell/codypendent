@@ -1,0 +1,32 @@
+-- Phase 5 (T8): durable failure reasons on workflow nodes (P5-D4), and the
+-- durable footing for budget-block bookkeeping.
+--
+-- The 0010 schema tracked each node's lifecycle state, attempt, cost, and
+-- timings, but NOT *why* a node failed or blocked: the driver dropped the
+-- outcome's reason string on the floor, so a `failed` node in the store carried
+-- no explanation, an intermediate retry failure vanished, and a budget block
+-- (a node driven to `blocked` because it exhausted its slice or the workflow
+-- envelope) had nowhere to record which dimension tipped it over. The TUI node
+-- detail therefore rendered a bare `failed`/`blocked` with no reason.
+--
+-- One nullable column carries the latest reason:
+--
+--   * error — the latest failure OR budget-block reason for the node, or NULL
+--     when its latest state is a success (a node that fails, retries, and then
+--     completes clears it). "Latest reason wins": a fail→retry→fail node keeps
+--     the final attempt's reason here, while the per-attempt history is emitted
+--     to the NodeObserver (it is progress, not durable state). A budget-blocked
+--     node records which dimension it exceeded here, so a human resuming the
+--     paused run sees why it paused.
+--
+-- Why no separate budget-ledger table: the workflow-level budget consumption is
+-- DERIVED by summing the per-node `cost_json` records this schema already
+-- carries (each node's MEASURED wall-time + tool-calls), so a node blocked on
+-- budget re-evaluates against the same durable costs after a restart without a
+-- second source of truth to keep in sync. `attempt` (0010) already carries the
+-- attempt bookkeeping the retry/observer logic needs. So this one column is all
+-- the budget/failure work genuinely requires.
+--
+-- Nullable and appended (migrations are append-only): every existing node row
+-- reads NULL (no recorded reason), exactly as before this column existed.
+ALTER TABLE workflow_nodes ADD COLUMN error TEXT;

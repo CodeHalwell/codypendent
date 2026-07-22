@@ -77,6 +77,30 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --all-features
 
+  # Phase 7 STEP 7.1 eval-harness smoke: already covered by `test`'s
+  # workspace-wide sweep, but broken out as its own job (like `deny`) so the
+  # harness + shipped corpus have a distinct, fast, clearly-labelled signal —
+  # "is `codypendent eval run`'s own machinery still correct" separate from
+  # the rest of the workspace. `corpus_it.rs` validates the REAL
+  # `evals/tasks/core/` suite shipped in this repo (parses, task classes and
+  # the mandated assertion kinds present, one pinned revision); `eval_it.rs`
+  # drives the exact runner code path against a deterministic, hand-rolled
+  # mock daemon (no live model, no `codypendentd` subprocess) plus a real
+  # throwaway git repo + `cargo test`, proving a known-pass case passes and a
+  # known-fail case fails end to end. See `evals/README.md`.
+  eval-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-smoke
+      - name: Eval harness + shipped corpus
+        run: cargo test -p codypendent-eval --all-features
+      - name: Eval runner smoke (mock daemon, known-pass/known-fail)
+        run: cargo test -p codypendent-cli --all-features --test eval_it
+
   # Supply-chain gate (every-release hygiene): advisories, licenses, bans, and
   # sources per `deny.toml`. A separate lightweight job — it needs no build, only
   # the lockfile and the RustSec advisory database the action fetches. Its dated
@@ -88,4 +112,31 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # VS Code extension (extensions/vscode): install, typecheck, lint, and the
+  # vitest suite. A separate job on its own Node toolchain — a failure here
+  # must never be entangled with the Rust jobs' disk/cache usage above, and
+  # this suite runs in well under a minute either way.
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # No .nvmrc/engines.node exists yet; 22 matches the extension's own
+          # @types/node ^22.5.0.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extensions/vscode/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
 

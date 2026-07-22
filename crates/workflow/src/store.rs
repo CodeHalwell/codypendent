@@ -39,6 +39,19 @@ pub enum WorkflowStoreError {
     /// Resume refused: the compiled graph differs from the one the run started on.
     #[error("workflow graph changed since the run started (expected {expected}, found {found})")]
     GraphSignatureChanged { expected: String, found: String },
+    /// An idempotency key already started a run from a **different** compiled
+    /// workflow (P5-D2). The bare key is not sufficient proof of "the same
+    /// request": a client must not reuse a key across distinct manifests, so
+    /// this is a rejection, never a silent success pointing at the first run.
+    #[error(
+        "idempotency key {key} already started a different workflow \
+         (expected graph {expected}, found {found})"
+    )]
+    IdempotencyKeyReused {
+        key: String,
+        expected: String,
+        found: String,
+    },
 }
 
 /// The lifecycle state of a workflow run.
@@ -161,6 +174,11 @@ pub struct WorkflowNodeRecord {
     pub attempt: u32,
     pub topo_order: usize,
     pub cost: Option<Value>,
+    /// The latest failure or budget-block reason (P5-D4, migration 0013), or
+    /// `None` when the node's latest state is a success or it never failed. A
+    /// client surfaces this in the node detail so a `failed`/`blocked` node
+    /// explains itself.
+    pub error: Option<String>,
 }
 
 /// A run plus its node records, in topological order.
@@ -272,9 +290,20 @@ impl WorkflowStore {
     /// one — the durable equivalent of the command write path's idempotency.
     ///
     /// The run row is inserted `OR IGNORE`: on a duplicate the primary-key
-    /// (derived id) conflict is ignored, no second run or node set is created, and
-    /// the existing id is returned. SQLite serialises writes, so two concurrent
-    /// duplicate deliveries resolve to one run. Returns the run id in both cases.
+    /// (derived id) conflict is ignored, no second run or node set is created,
+    /// and — **since the bare key is not sufficient proof of "the same
+    /// request"** (P5-D2) — the already-stored run's graph signature is compared
+    /// against `compiled`'s. A match returns the existing id (the genuine
+    /// duplicate-delivery case); a mismatch means the same key was reused for a
+    /// **different** manifest and is rejected as
+    /// [`IdempotencyKeyReused`](WorkflowStoreError::IdempotencyKeyReused) rather
+    /// than silently resolving to the first run's id. SQLite serialises writes,
+    /// so two concurrent duplicate deliveries resolve to one run.
+    ///
+    /// `repository` is the checkout the run's agent nodes operate on (Phase 5
+    /// T5), recorded so recovery carves each node's isolated worktree from the
+    /// right tree; `None` records none and the node executor falls back to the
+    /// daemon's startup repository root.
     pub async fn create_run_idempotent(
         &self,
         pool: &SqlitePool,
@@ -282,6 +311,7 @@ impl WorkflowStore {
         idempotency_key: &str,
         inputs: &Value,
         manifest: Option<&str>,
+        repository: Option<&str>,
     ) -> Result<String, WorkflowStoreError> {
         let id = deterministic_run_id(idempotency_key);
         let now = Utc::now().to_rfc3339();
@@ -291,8 +321,8 @@ impl WorkflowStore {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO workflow_runs \
              (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
-              manifest_yaml, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?)",
+              manifest_yaml, repository, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&compiled.id)
@@ -300,6 +330,7 @@ impl WorkflowStore {
         .bind(&signature)
         .bind(serde_json::to_string(inputs)?)
         .bind(manifest)
+        .bind(repository)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -307,9 +338,22 @@ impl WorkflowStore {
         .rows_affected();
 
         // A duplicate delivery: the run (and its nodes) already exist from the
-        // first application. Nothing to insert — return the same id.
+        // first application. Compare its stored signature against the incoming
+        // compiled workflow's before treating this as a success (P5-D2).
         if inserted == 0 {
+            let existing_signature: String =
+                sqlx::query_scalar("SELECT graph_signature FROM workflow_runs WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
+            if existing_signature != signature {
+                return Err(WorkflowStoreError::IdempotencyKeyReused {
+                    key: idempotency_key.to_owned(),
+                    expected: existing_signature,
+                    found: signature,
+                });
+            }
             return Ok(id);
         }
 
@@ -351,11 +395,57 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Transition a run to `state` **only if** its CURRENT state is one of
+    /// `legal_from` — a single atomic conditional `UPDATE`, never a separate
+    /// read-then-write. Mirrors the daemon's `projections::set_run_state_if_legal`
+    /// (FP-3) at this crate's layer: a caller whose legality check happened
+    /// against an earlier read — or, here, whose write simply races an
+    /// independent writer that does not take the per-run drive lock
+    /// (`PauseWorkflow`, by design — P5-D3) — cannot silently clobber a state
+    /// that has since moved (the P5-D5 follow-up: the driver's own first
+    /// transition into `Running` used to be an unconditional write here).
+    ///
+    /// Returns the number of rows affected: `1` if the transition applied,
+    /// `0` if the run does not exist or its current state was not in
+    /// `legal_from`.
+    pub async fn set_run_state_if_legal(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        legal_from: &[WorkflowRunState],
+        state: WorkflowRunState,
+    ) -> Result<u64, WorkflowStoreError> {
+        if legal_from.is_empty() {
+            // No prior state makes this transition legal — nothing can
+            // match, so skip the round-trip.
+            return Ok(0);
+        }
+        let placeholders = legal_from
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE workflow_runs SET state = ?, updated_at = ? \
+             WHERE id = ? AND state IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(state.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id);
+        for from in legal_from {
+            query = query.bind(from.as_str());
+        }
+        Ok(query.execute(pool).await?.rows_affected())
+    }
+
     /// Transition a node to `state` with the given `attempt`, stamping
     /// `started_at` the first time it runs and setting `ended_at` to the terminal
     /// time — or **clearing it** when the node is not terminal, so a node retried
     /// back to `Running` never carries a stale end timestamp. `agent_run_id` and
-    /// `cost` are recorded when provided (and otherwise left as they were).
+    /// `cost` are recorded when provided (and otherwise left as they were). Leaves
+    /// the durable failure reason untouched (a successful transition clears it —
+    /// see [`transition_node_with_error`](Self::transition_node_with_error)).
     #[allow(clippy::too_many_arguments)]
     pub async fn transition_node(
         &self,
@@ -367,6 +457,41 @@ impl WorkflowStore {
         agent_run_id: Option<&str>,
         cost: Option<&Value>,
     ) -> Result<(), WorkflowStoreError> {
+        self.transition_node_with_error(
+            pool,
+            workflow_run_id,
+            node_id,
+            state,
+            attempt,
+            agent_run_id,
+            cost,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`transition_node`](Self::transition_node), but also records the
+    /// node's durable failure/block reason (P5-D4, migration 0013). The reason
+    /// column follows "latest reason wins": a transition to `Completed` (a
+    /// success) **clears** it, so a node that failed, retried, and then completed
+    /// carries no stale reason; any other transition sets `error` when a reason is
+    /// supplied and otherwise preserves whatever reason was there (so a park
+    /// round-trip through `WaitingApproval`/`Running` does not wipe a pending
+    /// reason). A `Failed` or `Blocked` transition supplies the reason; the
+    /// per-attempt history of an intermediate retry failure is the observer's,
+    /// not this column's.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition_node_with_error(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+        state: NodeState,
+        attempt: u32,
+        agent_run_id: Option<&str>,
+        cost: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<(), WorkflowStoreError> {
         let now = Utc::now().to_rfc3339();
         let cost_json = match cost {
             Some(value) => Some(serde_json::to_string(value)?),
@@ -374,11 +499,15 @@ impl WorkflowStore {
         };
         let started = (state == NodeState::Running).then(|| now.clone());
         let ended = state.is_terminal().then(|| now.clone());
+        // A completed node has, by definition, no failure reason — clear it. Every
+        // other state sets the supplied reason or preserves the existing one.
+        let clears_error = state == NodeState::Completed;
 
         let affected = sqlx::query(
             "UPDATE workflow_nodes SET state = ?, attempt = ?, \
              agent_run_id = COALESCE(?, agent_run_id), \
              cost_json = COALESCE(?, cost_json), \
+             error = CASE WHEN ? THEN NULL ELSE COALESCE(?, error) END, \
              started_at = COALESCE(started_at, ?), \
              ended_at = ? \
              WHERE workflow_run_id = ? AND node_id = ?",
@@ -387,6 +516,8 @@ impl WorkflowStore {
         .bind(i64::from(attempt))
         .bind(agent_run_id)
         .bind(cost_json)
+        .bind(clears_error)
+        .bind(error)
         .bind(started)
         .bind(ended)
         .bind(workflow_run_id)
@@ -430,6 +561,26 @@ impl WorkflowStore {
         .execute(pool)
         .await?;
         Ok(id)
+    }
+
+    /// The repository root a run's agent nodes operate on (Phase 5 T5), if one
+    /// was recorded. `Ok(None)` means either the run does not exist or it was
+    /// created without a repository (a store-mechanics test, a run from before
+    /// the column existed, or an older client that sent none) — the node
+    /// executor then falls back to the daemon's startup repository root rather
+    /// than deriving it from a wandering `current_dir()`. Recorded once at
+    /// creation, exactly like [`manifest`](Self::manifest), so recovery carves a
+    /// node's isolated worktree from the same checkout the run started against.
+    pub async fn repository(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Option<String>, WorkflowStoreError> {
+        let row = sqlx::query("SELECT repository FROM workflow_runs WHERE id = ?")
+            .bind(workflow_run_id)
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("repository")))
     }
 
     /// The most recent checkpoint for a run, if any.
@@ -531,7 +682,7 @@ impl WorkflowStore {
         };
 
         let node_rows = sqlx::query(
-            "SELECT node_id, state, agent_run_id, attempt, topo_order, cost_json \
+            "SELECT node_id, state, agent_run_id, attempt, topo_order, cost_json, error \
              FROM workflow_nodes WHERE workflow_run_id = ? ORDER BY topo_order ASC, node_id ASC",
         )
         .bind(workflow_run_id)
@@ -549,6 +700,7 @@ impl WorkflowStore {
                     Some(json) => Some(serde_json::from_str(&json)?),
                     None => None,
                 },
+                error: row.get("error"),
             });
         }
         Ok(Some(WorkflowRunSnapshot { run, nodes }))
@@ -697,6 +849,130 @@ impl WorkflowStore {
         tx.commit().await?;
 
         Ok(to_reset.into_iter().collect())
+    }
+
+    /// Reset a node left `Blocked` by a budget exhaustion back to `Pending` so it
+    /// re-enters the ready frontier on a resume drive (the scheduler surfaces only
+    /// `Pending` nodes), **preserving** its measured `cost`, block `error`,
+    /// `attempt`, and `agent_run_id` — the exact opposite of
+    /// [`reset_interrupted_node`](Self::reset_interrupted_node)'s clear.
+    ///
+    /// The preserved cost is what lets the executor's budget pre-gate re-block the
+    /// node against the same durable workflow consumption WITHOUT re-running its
+    /// work (so a resume that did not raise the budget re-blocks and re-pauses,
+    /// never re-spending or double-counting). Only `ended_at` is cleared (the node
+    /// is live again). A no-op for a node that is not `blocked`.
+    pub async fn reset_blocked_node(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+    ) -> Result<(), WorkflowStoreError> {
+        let affected = sqlx::query(
+            "UPDATE workflow_nodes SET state = 'pending', ended_at = NULL \
+             WHERE workflow_run_id = ? AND node_id = ? AND state = 'blocked'",
+        )
+        .bind(workflow_run_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(WorkflowStoreError::NotFound(format!(
+                "{workflow_run_id}/{node_id}"
+            )));
+        }
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Reset a node interrupted mid-execution by an earlier, crashed drive back
+    /// to `Pending`, preserving its `attempt` (so a resumed retry-policy loop
+    /// does not restart the count — see [`WorkflowDriver`](crate::drive::WorkflowDriver)'s
+    /// resume contract) but **explicitly clearing** `agent_run_id`/`cost`/
+    /// `ended_at` rather than [`transition_node`](Self::transition_node)'s
+    /// COALESCE-preserve semantics (P5-D6b).
+    ///
+    /// `transition_node` deliberately *preserves* fields not supplied on an
+    /// in-place transition (e.g. a `Running` attempt does not know its final
+    /// cost yet) — that is the right contract for the normal lifecycle, but
+    /// wrong for THIS reset: a node whose in-flight attempt is being thrown
+    /// away must never carry forward a value tied to that abandoned attempt.
+    /// A node that never re-reaches a real completion after this reset must
+    /// not keep pointing at whatever agent run its previous attempt happened
+    /// to record.
+    pub async fn reset_interrupted_node(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<(), WorkflowStoreError> {
+        let affected = sqlx::query(
+            "UPDATE workflow_nodes SET state = 'pending', attempt = ?, agent_run_id = NULL, \
+             cost_json = NULL, ended_at = NULL \
+             WHERE workflow_run_id = ? AND node_id = ?",
+        )
+        .bind(i64::from(attempt))
+        .bind(workflow_run_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(WorkflowStoreError::NotFound(format!(
+                "{workflow_run_id}/{node_id}"
+            )));
+        }
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark every still-`Pending` node of a run `Skipped` — the cancel drain (T9):
+    /// a cancelled run's un-started nodes will never run, so they land in the one
+    /// no-producer terminal node state a `CancelWorkflow` newly produces (alongside
+    /// a `Cancelled` run). Stamps `ended_at`. Nodes that are `Running` (an in-flight
+    /// attempt) are left untouched — those are interrupted through the agent-run
+    /// cancellation machinery and drain via the driver, not skipped here — as are
+    /// already-terminal nodes. Returns how many nodes were skipped, in caller order
+    /// so the daemon can publish a `Skipped` transition for each newly-skipped node.
+    pub async fn skip_pending_nodes(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        // The ids about to be skipped, read before the update so the caller learns
+        // exactly which nodes newly transitioned (a re-run cancel finds none).
+        let skipped: Vec<String> =
+            sqlx::query_scalar("SELECT node_id FROM workflow_nodes WHERE workflow_run_id = ? AND state = 'pending' ORDER BY topo_order")
+                .bind(workflow_run_id)
+                .fetch_all(pool)
+                .await?;
+        if skipped.is_empty() {
+            return Ok(skipped);
+        }
+        sqlx::query(
+            "UPDATE workflow_nodes SET state = 'skipped', ended_at = ? \
+             WHERE workflow_run_id = ? AND state = 'pending'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(workflow_run_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(skipped)
     }
 }
 

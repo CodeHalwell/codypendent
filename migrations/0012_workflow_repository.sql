@@ -1,0 +1,19 @@
+-- Phase 5 (T5): bind a durable workflow run to the repository its agent nodes
+-- operate on, so RECOVERY drives them in the right checkout after a restart.
+--
+-- The 0010/0011 schema recorded a run's compiled-graph signature and manifest
+-- (enough to recompile and resume the graph) but NOT which repository to run it
+-- against. A node executor was therefore left deriving the repository from the
+-- daemon's `current_dir()` at node-execution time — the P5-D1 defect: that is
+-- whatever directory the daemon happened to start in, not the run's repository,
+-- and it means every node of every workflow shared one writable tree. Recording
+-- the repository per run lets the node executor allocate a dedicated worktree
+-- under the correct repository, and lets a recovering daemon do the same.
+--
+-- Nullable and appended: a run created before this column existed reads NULL,
+-- and the node executor then falls back to the daemon's startup repository root
+-- (captured once at construction) — never re-derived from a wandering
+-- `current_dir()`. Every run created through the StartWorkflow seam records its
+-- repository from now on (the CLI sends the canonical current repo root, exactly
+-- as `StartRun` clients do).
+ALTER TABLE workflow_runs ADD COLUMN repository TEXT;

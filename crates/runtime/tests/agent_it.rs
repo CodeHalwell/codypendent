@@ -21,15 +21,19 @@ use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections};
 use codypendent_integrations::github::{model, GitHubApi, GitHubError, RepoId};
 use codypendent_protocol::{
-    Actor, AgentMode, ApprovalDecision, ApprovalScope, DataClassification, EventBody,
-    ProposedAction, RunDisposition, RunId, RunState, SessionEvent, SessionId,
+    Actor, AgentMode, ApprovalDecision, ApprovalScope, BlackboardItemView, DataClassification,
+    EventBody, ProposedAction, RunDisposition, RunId, RunState, SessionEvent, SessionId,
+    ToolOutcome,
 };
 use codypendent_runtime::agent::{
     cancellation, ApprovalRequest, CancellationToken, FrameworkAgentRuntime, ModelStep, RunContext,
-    RunJournal, ScriptedDriver,
+    RunJournal, ScriptedDriver, WorkflowContext,
 };
+use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use codypendent_runtime::models::ModelRegistry;
-use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
+use codypendent_runtime::tools::{
+    ArtifactSink, BlackboardPostTool, BlackboardQueryTool, ClosureSink,
+};
 use serde_json::json;
 
 /// An [`ArtifactSink`] over a store + pool, capturing clones (the pool's type is
@@ -1330,10 +1334,255 @@ async fn read_without_dirty_buffer_is_unlabeled() {
     assert!(text.contains("plain filesystem read"));
 }
 
+// ---------------------------------------------------------------------------
+// Read-your-writes on an isolated worktree (T5 fix pass).
+//
+// An isolated run's read/search root and write root must be the SAME tree (the
+// worktree), so a file the agent writes reads and searches back. The two probes
+// below drive the real apply_patch → read_file → search path: with the fixed
+// wiring (read root == worktree) both succeed and return the edit; with the
+// pre-fix split (read root == repository, write == a sibling worktree) the read
+// is denied and the search never sees the write.
+// ---------------------------------------------------------------------------
+
+/// The concatenated `ToolResult` outputs for `tool_name` in a captured transcript.
+fn tool_result_text(items: &[codypendent_runtime::agent::TurnItem], tool_name: &str) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            codypendent_runtime::agent::TurnItem::ToolResult { tool, output }
+                if tool == tool_name =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A sentinel the agent writes into the worktree, then reads and searches back.
+const RYW_SENTINEL: &str = "READYOURWRITES_XYZZY";
+
+/// Drive an agent (Build) that applies a patch to the worktree, then reads the
+/// patched file back (relative path) and searches for its new content. Returns the
+/// captured `(read_result, search_result)` observations. `read_root_is_worktree`
+/// selects the fixed wiring (read root == the worktree) vs the pre-fix split (read
+/// root == the repository), with the write root always the isolated worktree.
+async fn read_your_writes_probe(read_root_is_worktree: bool) -> (String, String) {
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    repo_with_committed_file(&repo, "src.txt", "hello\n").await;
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    // A real isolated worktree (a checkout at HEAD OUTSIDE the repository) — the
+    // shape WorktreeManager produces.
+    let worktree = base.path().join("wt");
+    assert!(
+        git(
+            &repo,
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()]
+        )
+        .await
+        .status
+        .success(),
+        "git worktree add"
+    );
+    let worktree = std::fs::canonicalize(&worktree).unwrap();
+
+    let pool = open_database(&base.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(base.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "ryw").await.unwrap();
+    seed_started_run!(pool, session, run, "ryw", AgentMode::Build);
+    let runtime = build_runtime!(pool, store, broker, hub);
+
+    // A patch that turns `src.txt`'s committed "hello" into the sentinel.
+    let patch = format!(
+        "diff --git a/src.txt b/src.txt\n\
+         index 0000000..1111111 100644\n\
+         --- a/src.txt\n\
+         +++ b/src.txt\n\
+         @@ -1 +1 @@\n\
+         -hello\n\
+         +{RYW_SENTINEL}\n"
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let driver = CapturingDriver {
+        steps: std::sync::Mutex::new(
+            vec![
+                ModelStep::CallTool {
+                    tool: "git.apply_patch".to_string(),
+                    args: json!({ "patch": patch }),
+                },
+                ModelStep::CallTool {
+                    tool: "workspace.read_file".to_string(),
+                    // A RELATIVE path — resolved against the run's worktree.
+                    args: json!({ "path": "src.txt" }),
+                },
+                ModelStep::CallTool {
+                    tool: "workspace.search".to_string(),
+                    args: json!({ "pattern": RYW_SENTINEL }),
+                },
+                ModelStep::Finish {
+                    summary: "done".to_string(),
+                },
+            ]
+            .into(),
+        ),
+        seen: seen.clone(),
+    };
+
+    let read_root = if read_root_is_worktree {
+        worktree.clone()
+    } else {
+        repo.clone()
+    };
+    let ctx = RunContext::new(session, run, "ryw", AgentMode::Build, read_root, worktree);
+
+    let mut rx = hub.subscribe(session);
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+    // Pump events, auto-approving the apply_patch write so the loop never blocks.
+    loop {
+        let event = rx.recv().await.expect("event");
+        let done = matches!(event.body, EventBody::RunCompleted { .. });
+        if let EventBody::ToolProposed { approval_id, .. } = &event.body {
+            broker
+                .resolve(
+                    &pool,
+                    *approval_id,
+                    ApprovalDecision::Approve,
+                    ApprovalScope::Once,
+                    "tester".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        if done {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+
+    let items = seen.lock().unwrap().clone();
+    (
+        tool_result_text(&items, "workspace.read_file"),
+        tool_result_text(&items, "workspace.search"),
+    )
+}
+
 #[tokio::test]
-async fn fix_ci_sequence_updates_the_pr_after_approval() {
-    // STEP 3.2 /fix-ci: read the failing check, run a test, then update the PR
-    // and post a check summary — the two writes each parking for approval.
+async fn isolated_worktree_agent_reads_and_searches_back_its_own_writes() {
+    // The fix: read root == write root == the worktree. The agent's own write is
+    // read back verbatim and found by search.
+    let (read, search) = read_your_writes_probe(true).await;
+    assert!(
+        read.contains(RYW_SENTINEL),
+        "read must return the agent's own edit, not stale/denied; got:\n{read}"
+    );
+    assert!(
+        search.contains(RYW_SENTINEL),
+        "search must find the agent's own edit in the worktree; got:\n{search}"
+    );
+}
+
+#[tokio::test]
+async fn split_read_root_cannot_read_or_search_back_worktree_writes() {
+    // The pre-fix split (read root == repository, write == a sibling worktree): the
+    // write lands in the worktree, but the read-back is DENIED (outside the read
+    // root) and the search over the repository never sees it. This is exactly the
+    // defect the executor fix closes by making read root == write root == worktree.
+    let (read, search) = read_your_writes_probe(false).await;
+    assert!(
+        !read.contains(RYW_SENTINEL),
+        "the split read root must NOT read the worktree write back; got:\n{read}"
+    );
+    assert!(
+        read.contains("outside the allowed roots"),
+        "the read-back is policy-denied out-of-scope (policy.path-out-of-scope); got:\n{read}"
+    );
+    assert!(
+        !search.contains(RYW_SENTINEL),
+        "search over the repository never sees the worktree write; got:\n{search}"
+    );
+}
+
+#[tokio::test]
+async fn explore_run_reads_the_repository_root() {
+    // A read-only run keeps read root == write root == the repository root (no
+    // isolated worktree). Reading a committed file there works, unchanged — the fix
+    // must not regress the non-isolated path.
+    let base = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(base.path()).unwrap();
+    repo_with_committed_file(&repo, "src.txt", "explore-me\n").await;
+
+    let pool = open_database(&base.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(base.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "explore")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "look", AgentMode::Explore);
+    let runtime = build_runtime!(pool, store, broker, hub);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let driver = CapturingDriver {
+        steps: std::sync::Mutex::new(
+            vec![
+                ModelStep::CallTool {
+                    tool: "workspace.read_file".to_string(),
+                    args: json!({ "path": "src.txt" }),
+                },
+                ModelStep::Finish {
+                    summary: "looked".to_string(),
+                },
+            ]
+            .into(),
+        ),
+        seen: seen.clone(),
+    };
+    // Read-only: read root == write root == repo. No approval needed for a read.
+    let ctx = RunContext::new(session, run, "look", AgentMode::Explore, repo.clone(), repo);
+    let mut rx = hub.subscribe(session);
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+    loop {
+        let event = rx.recv().await.expect("event");
+        if matches!(event.body, EventBody::RunCompleted { .. }) {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+
+    let read = tool_result_text(&seen.lock().unwrap(), "workspace.read_file");
+    assert!(
+        read.contains("explore-me"),
+        "an Explore run reads the repository root; got:\n{read}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_agent_run_drives_github_writes_through_approval() {
+    // The single-agent baseline (plain `StartRun`) can still drive the GitHub
+    // repair sequence directly: read the failing check, run a test, then update the
+    // PR and post a check summary — the two writes each parking for approval. This
+    // is the Phase-1 loop capability that the declarative `repair-github-check`
+    // workflow now packages as the `/fix-ci` product path (its `publish` step
+    // covers the PR update; the check-run summary is the intentional divergence
+    // documented in the workflow, still reachable from a plain run as shown here).
     let dir = tempfile::tempdir().unwrap();
     let repo = std::fs::canonicalize(dir.path()).unwrap();
     let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
@@ -1431,5 +1680,143 @@ async fn fix_ci_sequence_updates_the_pr_after_approval() {
     assert_eq!(
         github_mutations, 2,
         "the PR update and the check summary each parked for approval"
+    );
+}
+
+/// A no-op blackboard channel: enough to make the tools *available* (the runtime
+/// only checks `is_some()` to decide whether to offer them) without a store.
+struct FakeBlackboardChannel;
+
+#[async_trait]
+impl BlackboardChannel for FakeBlackboardChannel {
+    async fn post(
+        &self,
+        _workflow_run_id: &str,
+        _post: BlackboardPost,
+    ) -> Result<BlackboardItemView, BlackboardChannelError> {
+        Err(BlackboardChannelError::Backend("fake channel".to_string()))
+    }
+    async fn query(
+        &self,
+        _workflow_run_id: &str,
+        _kind: Option<String>,
+        _include_superseded: bool,
+    ) -> Result<Vec<BlackboardItemView>, BlackboardChannelError> {
+        Ok(Vec::new())
+    }
+}
+
+/// STEP 5.3 test 4: the `blackboard.*` tools are offered ONLY to a workflow agent
+/// node (a `RunContext` carrying a `WorkflowContext`), never to a plain
+/// single-agent run — even when a channel is wired. Asserts both the offered-tool
+/// set and the dispatch behaviour: a single-agent run that calls `blackboard.post`
+/// gets an unknown-tool refusal (the tool is not offered), keeping that baseline
+/// clean.
+#[tokio::test]
+async fn blackboard_tools_are_offered_only_inside_a_workflow_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    repo_with_committed_file(&repo, "a.txt", "hello\n").await;
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let runtime =
+        build_runtime!(pool, store, broker, hub).with_blackboard(Arc::new(FakeBlackboardChannel));
+
+    // The registered-tool set: a single-agent run is NOT offered the blackboard
+    // tools; a workflow node IS.
+    let single = RunContext::new(
+        SessionId::new(),
+        RunId::new(),
+        "solo",
+        AgentMode::Build,
+        repo.clone(),
+        repo.clone(),
+    );
+    let node = RunContext::new(
+        SessionId::new(),
+        RunId::new(),
+        "node",
+        AgentMode::Build,
+        repo.clone(),
+        repo.clone(),
+    )
+    .with_workflow(WorkflowContext {
+        workflow_run_id: "wfrun-1".to_string(),
+        node_id: "inspect".to_string(),
+        agent_role: "investigator".to_string(),
+    });
+
+    let solo_tools = runtime.offered_tool_names(&single);
+    assert!(
+        !solo_tools.contains(&BlackboardPostTool::NAME)
+            && !solo_tools.contains(&BlackboardQueryTool::NAME),
+        "a single-agent run is not offered the blackboard tools: {solo_tools:?}"
+    );
+    let node_tools = runtime.offered_tool_names(&node);
+    assert!(
+        node_tools.contains(&BlackboardPostTool::NAME)
+            && node_tools.contains(&BlackboardQueryTool::NAME),
+        "a workflow node is offered the blackboard tools: {node_tools:?}"
+    );
+
+    // Dispatch behaviour: a single-agent run that calls blackboard.post is refused
+    // as an unknown tool (not offered) — the baseline never touches the board.
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "solo")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "solo", AgentMode::Build);
+    let mut rx = hub.subscribe(session);
+    let driver = ScriptedDriver::new(vec![
+        ModelStep::CallTool {
+            tool: BlackboardPostTool::NAME.to_string(),
+            args: json!({ "kind": "finding", "payload": {}, "evidence": [{}] }),
+        },
+        ModelStep::Finish {
+            summary: "done".to_string(),
+        },
+    ]);
+    let ctx = RunContext::new(
+        session,
+        run,
+        "solo",
+        AgentMode::Build,
+        repo.clone(),
+        repo.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+
+    let mut post_failed_unknown = false;
+    loop {
+        let event = rx.recv().await.expect("event");
+        if let EventBody::ToolCompleted { tool, outcome, .. } = &event.body {
+            if tool == BlackboardPostTool::NAME {
+                match outcome {
+                    ToolOutcome::Failed { message } => {
+                        assert!(
+                            message.contains("unknown tool"),
+                            "blackboard.post in a single-agent run is an unknown tool: {message}"
+                        );
+                        post_failed_unknown = true;
+                    }
+                    other => panic!("expected a Failed outcome, got {other:?}"),
+                }
+            }
+        }
+        if matches!(event.body, EventBody::RunCompleted { .. }) {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+    assert!(
+        post_failed_unknown,
+        "the single-agent blackboard.post call must be refused as unknown"
     );
 }

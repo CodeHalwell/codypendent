@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{DocumentEditLease, DocumentMutation};
+use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, DocumentId, RunId, SessionId, WorkspaceId};
@@ -126,6 +126,24 @@ pub enum CommandBody {
     ReleaseDocumentLease {
         lease_id: String,
     },
+    /// Publish a document's current revision to a Git target (Phase 4 STEP 4.4,
+    /// closing the deferred "executing a `PublishPlan`" roadmap item).
+    ///
+    /// Handled at the connection level like `MutateDocument`/`StartWorkflow`
+    /// (documents live outside the session ledger): the daemon computes the
+    /// deterministic publish plan, then durably parks its approval — carrying
+    /// the plan's target, changed files, and resulting Git action, shown
+    /// verbatim on the approval card before any write — through the
+    /// assembly's `DocumentPublisher` seam, and replies
+    /// [`DocumentPublishRequested`](crate::envelope::Payload::DocumentPublishRequested)
+    /// with the parked plan. Nothing is written until a human resolves the
+    /// approval through the ordinary `ResolveApproval` command; a rejection
+    /// executes nothing. Requires the `Controller` role; a daemon assembled
+    /// without a publisher rejects it `document.transport-unavailable`.
+    PublishDocument {
+        document_id: DocumentId,
+        target: PublishTarget,
+    },
     /// Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).
     ///
     /// Carries the workflow **manifest YAML** (its content, not a path — the daemon
@@ -140,12 +158,34 @@ pub enum CommandBody {
     /// (Driving the created run is a later step; this command only makes runs
     /// durably creatable.)
     StartWorkflow {
-        /// The workflow manifest YAML (the content of a `workflow.yaml`).
+        /// The workflow manifest YAML (the content of a `workflow.yaml`). Empty
+        /// when [`workflow_id`](CommandBody::StartWorkflow::workflow_id) names a
+        /// workflow the daemon resolves from its own sources instead.
         manifest: String,
+        /// A named workflow to resolve from the daemon's sources (embedded
+        /// built-ins, the user config directory, and the run repository's
+        /// `.codypendent/workflows`) rather than shipping the manifest inline —
+        /// the path `/fix-ci` takes (`repair-github-check`). Additive
+        /// (`#[serde(default)]`): an older client omits it and ships `manifest`.
+        /// When set, `manifest` is ignored and the daemon enforces the workflow
+        /// registry's version-stability + shadowing rules at resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_id: Option<String>,
         /// The typed inputs the manifest declares, as JSON. Defaults to null when
         /// omitted (a workflow with no required inputs).
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         inputs: serde_json::Value,
+        /// The canonical filesystem root of the repository this workflow's agent
+        /// nodes operate on. A per-user daemon can serve several checkouts over
+        /// one socket, so the run — not the daemon's startup working directory —
+        /// must decide which repository its agent nodes' isolated worktrees are
+        /// carved from (Phase 5 T5, fixing P5-D1). Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun): `#[serde(default)]`
+        /// keeps an older client (which sends none) working — the daemon then
+        /// falls back to its own startup repository root, never a wandering
+        /// `current_dir()` at node-execution time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
     },
     /// Pause a running durable workflow run (Phase 5 STEP 5.2 lifecycle command).
     ///
@@ -178,6 +218,136 @@ pub enum CommandBody {
         /// The node id to re-drive from (its transitive dependents reset with it).
         node_id: String,
     },
+    /// Cancel a durable workflow run (Phase 5 STEP 5.2 / T9 — the missing control:
+    /// pause/resume/retry exist, cancel did not). Like `PauseWorkflow`, handled at
+    /// the connection level and gated to the
+    /// [`Controller`](crate::handshake::ClientRole::Controller) role. A cooperative
+    /// drain (mirroring pause): the driver stops launching further nodes, any
+    /// in-flight node's agent run is interrupted through the same cancellation
+    /// machinery `CancelRun` uses, every still-`Pending` node becomes `Skipped`, and
+    /// the run lands `Cancelled` — a **terminal** state (no resume from `Cancelled`;
+    /// a later resume/pause is rejected `workflow.illegal-transition`). Idempotent on
+    /// an already-cancelled run; a daemon without workflow transport rejects it
+    /// `workflow.transport-unavailable`.
+    CancelWorkflow {
+        workflow_run_id: String,
+    },
+    /// Read a durable workflow run's observability snapshot (Phase 5 STEP 5.2 / T9):
+    /// the run's current phase plus every node's full current view (state, attempt,
+    /// measured cost, failure/block reason, budget warnings), in topological order.
+    /// Like `ReadBlackboard`, intercepted at the connection level (a workflow run
+    /// lives in its own durable store outside the session ledger) and served through
+    /// the assembly's `WorkflowReader` seam; the daemon replies
+    /// [`WorkflowRunSnapshot`](crate::envelope::Payload::WorkflowRunSnapshot). This
+    /// is the catch-up baseline a client folds a `Subscription::Workflow` live stream
+    /// on top of; reconstructed from the store, so a late subscriber after a restart
+    /// still gets a truthful baseline. A **read** — any attached client (an Observer
+    /// included) may issue it. An unknown run is rejected `workflow.run-not-found`; a
+    /// daemon without workflow transport rejects it `workflow.transport-unavailable`.
+    ReadWorkflowRun {
+        workflow_run_id: String,
+    },
+    /// Draft a candidate for the evaluation-gated promotion pipeline (Phase 7
+    /// STEP 7.5 — nothing promotes itself, ADR-010).
+    ///
+    /// Handled at the connection level like `StartWorkflow` (a promotion
+    /// candidate lives in its own durable store outside the session ledger):
+    /// the daemon creates a draft through its `PromotionGateway` seam and
+    /// replies [`Payload::PromotionProposed`](crate::envelope::Payload::PromotionProposed)
+    /// with the new candidate id — or `CommandRejected` when a synthesized
+    /// candidate needs permission review, or the daemon has no promotion
+    /// transport (`promotion.transport-unavailable`). `kind` is the wire name
+    /// of an `ArtifactKind` (e.g. `"skill"`, `"router"`); an unrecognized kind
+    /// is rejected rather than guessed at.
+    ProposePromotion {
+        kind: String,
+        name: String,
+        version: u32,
+        #[serde(default)]
+        requires_permission_review: bool,
+    },
+    /// Advance a candidate through the offline-regression / shadow / canary
+    /// legs of the pipeline (Phase 7 STEP 7.5). `action` names exactly which
+    /// transition to attempt; an illegal transition (wrong stage, or an
+    /// unobserved canary trying to finish) is rejected verbatim as the
+    /// underlying state-machine error, never silently coerced into success.
+    /// Same connection-level handling and role gating as `ProposePromotion`.
+    AdvancePromotion {
+        candidate_id: String,
+        action: PromotionAction,
+    },
+    /// **Approve and promote a candidate.** The human-approval gate
+    /// (ADR-010, exit criterion 2): the daemon authenticates the acting party
+    /// as `Actor::Human` from the connection's role — over this local-first
+    /// socket, a `Controller`-role connection **is** the human operator (the
+    /// same mapping `ResolveApproval` already uses for `resolved_by`) — and
+    /// only a `Controller` may issue this command; every other role, and
+    /// necessarily every non-human actor, is refused structurally before the
+    /// promotion seam is ever invoked. No field on the wire lets a caller
+    /// *supply* an actor — that would defeat the whole point of ADR-010.
+    ApprovePromotion {
+        candidate_id: String,
+    },
+    /// Manually roll back a promoted candidate to its predecessor version
+    /// (Phase 7 STEP 7.5, exit criterion 4: reversible). Requires the
+    /// `Controller` role like `ApprovePromotion`, and — unlike approval — the
+    /// engine itself does not restrict rollback to a human actor (stopping a
+    /// bad change needs no human, only promoting a good one does); the
+    /// daemon still attributes the connection's mapped `Actor::Human` so a
+    /// manual rollback is never confused with the system-attributed
+    /// auto-rollback a canary regression produces on its own.
+    RollbackPromotion {
+        candidate_id: String,
+    },
+    /// Read a durable workflow run's blackboard (Phase 5 STEP 5.3): the typed
+    /// artifacts its agents posted, optionally filtered by `kind`. Like
+    /// `StartWorkflow`, intercepted at the connection level (a workflow run's board
+    /// lives in its own durable store outside the session ledger): the daemon reads
+    /// it through its `BlackboardReader` seam and replies
+    /// [`BlackboardItems`](crate::envelope::Payload::BlackboardItems) with the
+    /// matching [`BlackboardItemView`](crate::blackboard::BlackboardItemView)s. This
+    /// is a **read** — any attached client, an Observer included, may issue it
+    /// (there is no client-facing *post* command; only the workflow executor writes
+    /// the board). A daemon assembled without a reader rejects it
+    /// `workflow.transport-unavailable`.
+    ReadBlackboard {
+        workflow_run_id: String,
+        /// A blackboard artifact kind to filter by (`finding`, `decision`, …), or
+        /// all kinds when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// Include superseded revisions too; the default (`false`) returns only the
+        /// live board (the "live-only" view the TUI shows).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_superseded: bool,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One legal state-machine transition to attempt via `AdvancePromotion`
+/// (Phase 7 STEP 7.5). Mirrors `codypendent_eval::promote::Candidate`'s
+/// methods exactly; `regressed`/canary-observation verdicts are supplied by
+/// the caller — this command *records* a result, it does not compute one (see
+/// the crate-level docs on why live shadow/canary traffic capture is a
+/// separate, later concern).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[non_exhaustive]
+pub enum PromotionAction {
+    /// Run the offline regression suite; `regressed` is the caller's verdict.
+    RunRegression { regressed: bool },
+    /// Begin the shadow run.
+    StartShadow,
+    /// Begin the limited canary.
+    StartCanary,
+    /// Record one canary signal observation; `regressed` is the caller's
+    /// verdict. A regression auto-rolls-back immediately (no human needed to
+    /// *stop* a bad change).
+    ObserveCanary { regressed: bool },
+    /// Finish the canary and assemble the comparison. Refused if no
+    /// observation was ever recorded (a canary must not "pass" unobserved).
+    FinishCanary,
     #[serde(other)]
     Unknown,
 }
@@ -291,9 +461,25 @@ mod tests {
         round_trip(CommandBody::ReleaseDocumentLease {
             lease_id: "lease-1".to_string(),
         });
+        round_trip(CommandBody::PublishDocument {
+            document_id: DocumentId::new(),
+            target: crate::document::PublishTarget::RepositoryFile {
+                path: "docs/architecture.md".to_string(),
+            },
+        });
         round_trip(CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
             inputs: serde_json::json!({ "pull_request": 42 }),
+            repository: Some("/home/user/project".to_string()),
+        });
+        // A named-workflow start (the `/fix-ci` shape): no inline manifest, a
+        // resolved workflow id instead.
+        round_trip(CommandBody::StartWorkflow {
+            manifest: String::new(),
+            workflow_id: Some("repair-github-check".to_string()),
+            inputs: serde_json::json!({ "pull_request": 42 }),
+            repository: Some("/home/user/project".to_string()),
         });
         round_trip(CommandBody::PauseWorkflow {
             workflow_run_id: "wfrun-abc123".to_string(),
@@ -305,6 +491,102 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             node_id: "verify".to_string(),
         });
+        round_trip(CommandBody::CancelWorkflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        });
+        round_trip(CommandBody::ReadWorkflowRun {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        });
+        round_trip(CommandBody::ProposePromotion {
+            kind: "router".to_string(),
+            name: "tool-selection".to_string(),
+            version: 12,
+            requires_permission_review: false,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::RunRegression { regressed: false },
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::StartShadow,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::StartCanary,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::ObserveCanary { regressed: true },
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::FinishCanary,
+        });
+        round_trip(CommandBody::ApprovePromotion {
+            candidate_id: "cand-abc123".to_string(),
+        });
+        round_trip(CommandBody::RollbackPromotion {
+            candidate_id: "cand-abc123".to_string(),
+        });
+        round_trip(CommandBody::ReadBlackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+            kind: Some("finding".to_string()),
+            include_superseded: true,
+        });
+    }
+
+    #[test]
+    fn propose_promotion_without_the_review_flag_reparses_to_false() {
+        // A payload missing `requires_permission_review` entirely (what an
+        // older client, or one hand-constructing the minimal shape, sends)
+        // must still parse — defaulted to `false` — rather than erroring.
+        let json = serde_json::json!({
+            "type": "ProposePromotion",
+            "kind": "skill",
+            "name": "rust-ci",
+            "version": 1,
+        });
+        let parsed: CommandBody = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            parsed,
+            CommandBody::ProposePromotion {
+                kind: "skill".to_string(),
+                name: "rust-ci".to_string(),
+                version: 1,
+                requires_permission_review: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_promotion_action_tag_deserializes_to_unknown() {
+        // Forward-compatibility (RULE 1) for the nested PromotionAction enum,
+        // exactly like CommandBody's own Unknown fallback.
+        let parsed: PromotionAction = serde_json::from_value(
+            serde_json::json!({ "type": "RunOnnxInference", "confidence": 0.9 }),
+        )
+        .expect("unknown tag must parse, not error");
+        assert!(matches!(parsed, PromotionAction::Unknown));
+    }
+
+    #[test]
+    fn read_blackboard_omits_default_filter_and_flag() {
+        // A live-only, all-kinds read sends neither optional key, and such a payload
+        // (also what an older client emits) reparses with both defaulted.
+        let body = CommandBody::ReadBlackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+            kind: None,
+            include_superseded: false,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("kind"), "absent kind is skipped: {json}");
+        assert!(
+            !json.contains("include_superseded"),
+            "default (false) include_superseded is skipped: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]
@@ -314,10 +596,40 @@ mod tests {
         // null.
         let body = CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
             inputs: serde_json::Value::Null,
+            repository: None,
         };
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(!json.contains("inputs"), "null inputs are skipped: {json}");
+        assert!(
+            !json.contains("repository"),
+            "an absent repository is skipped on the wire: {json}"
+        );
+        assert!(
+            !json.contains("workflow_id"),
+            "an absent workflow_id is skipped on the wire (an older client's shape): {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body, "a payload without either key defaults them");
+    }
+
+    #[test]
+    fn start_workflow_carries_a_repository_when_present() {
+        // A workflow run bound to a repository (Phase 5 T5) serializes the key,
+        // and round-trips back to the same value — the durable store persists it
+        // so recovery drives the run's agent nodes in the right checkout.
+        let body = CommandBody::StartWorkflow {
+            manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
+            inputs: serde_json::Value::Null,
+            repository: Some("/home/user/project".to_string()),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            json.contains("/home/user/project"),
+            "repository on the wire: {json}"
+        );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);
     }

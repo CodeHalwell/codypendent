@@ -98,6 +98,30 @@ pub enum Subscription {
     /// watermark is needed). Re-attaching with a different `Document` set
     /// replaces the previous forwarders.
     Document { document_id: DocumentId },
+    /// A workflow run's blackboard stream (Phase 5 STEP 5.3): as the run's agents
+    /// post (and supersede) typed artifacts, the daemon fans each
+    /// [`BlackboardItemView`](crate::blackboard::BlackboardItemView) out to
+    /// subscribers over a per-run hub, delivered as
+    /// [`Payload::BlackboardPosted`](crate::envelope::Payload). A subscriber's
+    /// baseline comes from the blackboard read command
+    /// ([`ReadBlackboard`](crate::command::CommandBody::ReadBlackboard)); this
+    /// stream carries the post-subscribe artifacts it merges by id (a superseding
+    /// revision arrives as its own delivery, so no watermark is needed). Mirrors
+    /// [`Document`](Subscription::Document)'s per-id hub, keyed by workflow run.
+    Blackboard { workflow_run_id: String },
+    /// A workflow run's live node-lifecycle stream (Phase 5 STEP 5.2 / T9): as the
+    /// driver advances the graph, the daemon fans each
+    /// [`WorkflowEvent`](crate::workflow::WorkflowEvent) out to subscribers over a
+    /// per-run hub, delivered as
+    /// [`Payload::WorkflowEvent`](crate::envelope::Payload::WorkflowEvent). A
+    /// subscriber's baseline comes from the run snapshot command
+    /// ([`ReadWorkflowRun`](crate::command::CommandBody::ReadWorkflowRun)); this
+    /// stream carries the post-subscribe node transitions + run-phase changes it
+    /// merges by `node_id` (each transition is full-state, so an overlap is a
+    /// harmless re-write — no watermark). Mirrors
+    /// [`Blackboard`](Subscription::Blackboard)'s per-run hub, keyed by workflow
+    /// run.
+    Workflow { workflow_run_id: String },
     #[serde(other)]
     Unknown,
 }
@@ -177,6 +201,24 @@ mod tests {
             let parsed: Subscription = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(sub, parsed);
         }
+        // The per-run blackboard subscription (STEP 5.3) round-trips its run id.
+        let blackboard = Subscription::Blackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        };
+        let json = serde_json::to_string(&blackboard).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<Subscription>(&json).expect("deserialize"),
+            blackboard
+        );
+        // The per-run workflow observability subscription (T9) round-trips too.
+        let workflow = Subscription::Workflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        };
+        let json = serde_json::to_string(&workflow).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<Subscription>(&json).expect("deserialize"),
+            workflow
+        );
     }
 
     #[test]

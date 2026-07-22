@@ -88,6 +88,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: Some("wheel"),
     },
     KeyBinding {
+        keys: "Tab / e / a / r",
+        description: "Docs: switch rail · edit block · accept / reject suggestion",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "Ctrl-C",
         description: "detach (the run keeps going)",
         mouse: None,
@@ -175,6 +180,7 @@ fn map_normal_char(c: char) -> Action {
         'S' => Action::OpenSkills,
         'M' => Action::OpenMemory,
         'o' => Action::OpenSource,
+        'e' => Action::EditDoc,
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
@@ -357,6 +363,7 @@ mod tests {
             map_event(&ch('o'), InputMode::Normal, W),
             Action::OpenSource
         );
+        assert_eq!(map_event(&ch('e'), InputMode::Normal, W), Action::EditDoc);
         assert_eq!(map_event(&ch('D'), InputMode::Normal, W), Action::OpenDocs);
         assert_eq!(map_event(&ch('G'), InputMode::Normal, W), Action::OpenEdges);
         assert_eq!(

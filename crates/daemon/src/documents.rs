@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use codypendent_protocol::{
-    ClientId, CodypendentError, DocumentId, DocumentLeaseGrant, DocumentMutation, DocumentSync,
+    ApprovalId, ClientId, CodypendentError, DocumentId, DocumentLeaseGrant, DocumentMutation,
+    DocumentSync, PublishTarget,
 };
 use tokio::sync::broadcast;
 
@@ -188,6 +189,83 @@ pub trait DocumentLeaser: Send + Sync {
     /// Release the identified lease. Idempotent: releasing an already-released or
     /// unknown lease succeeds.
     fn release(&self, request: DocumentLeaseReleaseRequest) -> DocumentReleaseFuture<'_>;
+}
+
+/// A client's request to publish a document's current revision to a Git
+/// target (Phase 4 STEP 4.4).
+#[derive(Debug, Clone)]
+pub struct PublishDocumentRequest {
+    pub document_id: DocumentId,
+    pub target: PublishTarget,
+    /// The identity of the requesting client, for attribution (mirrors
+    /// [`DocumentMutationRequest::client_id`]).
+    pub client_id: ClientId,
+}
+
+/// What a `PublishDocument` command parks for approval: everything a client
+/// needs to render the same human-reviewable content the approval card will
+/// carry (STEP 4.4.2 — target, changed files, and the resulting Git action,
+/// shown before approval) plus the minted [`ApprovalId`] it must eventually
+/// resolve via the ordinary `ResolveApproval` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishParked {
+    pub approval_id: ApprovalId,
+    /// A short human description of the target (e.g. `repository file
+    /// docs/architecture.md`).
+    pub target_description: String,
+    /// The repo-relative files the publish changes.
+    pub changed_files: Vec<String>,
+    /// The resulting Git action (e.g. `commit docs/x.md on branch
+    /// docs/publish`), verbatim from the computed plan.
+    pub git_action: String,
+}
+
+/// The future a [`DocumentPublisher`] returns: the parked plan to reply with,
+/// or a structured error. Boxed so the trait stays object-safe without an
+/// `async-trait` dependency, matching [`DocumentMutationFuture`].
+pub type PublishDocumentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PublishParked, CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for *publishing* an accepted `PublishDocument` command
+/// (Phase 4 STEP 4.4, closing the deferred "executing a `PublishPlan`"
+/// roadmap item).
+///
+/// Implemented by the assembly binary over `codypendent-knowledge`'s
+/// `plan_publication`/`record_publication` and the shared [`ApprovalBroker`]
+/// (only the assembly can name knowledge) — mirroring the
+/// [`DocumentMutator`]/[`DocumentLeaser`] layout exactly. A call:
+///
+/// 1. loads the document and computes its deterministic [`PublishPlan`]
+///    (target / changed files / Git action);
+/// 2. durably parks an approval carrying that plan's human-reviewable
+///    content **before any write** — reusing the existing `ApprovalBroker` +
+///    `ProposedAction` machinery, exactly as a `GitHubMutation` parks; and
+/// 3. returns as soon as the approval is recorded, spawning a background
+///    task that awaits the decision and, **only on approval**, executes the
+///    plan's Git action and records the `(document revision ↔ git commit)`
+///    publication.
+///
+/// So [`publish`](DocumentPublisher::publish) itself never blocks on a human
+/// decision — it mirrors [`WorkflowStarter::start`](crate::workflows::WorkflowStarter::start)
+/// (durably create, then drive in the background) rather than
+/// [`DocumentMutator::apply_mutation`] (which has no approval step to await).
+/// The default `None` leaves publication unwired — the executor-less server
+/// and the daemon's own tests then reject `PublishDocument` with
+/// `document.transport-unavailable`, exactly as `MutateDocument` is without a
+/// mutator.
+///
+/// `PublishPlan` itself is a `codypendent-knowledge` type this crate cannot
+/// name (the daemon depends only on the protocol crate), so it never appears
+/// in this trait's signature — only the plan's rendered *content* crosses the
+/// seam, in [`PublishParked`].
+///
+/// [`ApprovalBroker`]: crate::approvals::ApprovalBroker
+pub trait DocumentPublisher: Send + Sync {
+    /// Compute the plan, durably park its approval, and return the parked
+    /// plan. Errors (no such document, transport failure) leave everything
+    /// unchanged and are surfaced verbatim to the client as a
+    /// `CommandRejected`.
+    fn publish(&self, request: PublishDocumentRequest) -> PublishDocumentFuture<'_>;
 }
 
 #[cfg(test)]

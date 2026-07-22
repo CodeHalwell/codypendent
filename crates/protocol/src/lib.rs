@@ -10,6 +10,7 @@
 //! - unknown enum variants must be handled safely by receivers.
 
 pub mod artifact;
+pub mod blackboard;
 pub mod capabilities;
 pub mod catchup;
 pub mod command;
@@ -25,13 +26,16 @@ pub mod ids;
 pub mod input;
 pub mod run;
 pub mod version;
+pub mod workflow;
 
 pub use artifact::{ArtifactRef, DataClassification};
+pub use blackboard::BlackboardItemView;
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, SessionProjection};
-pub use command::{Command, CommandBody};
+pub use command::{Command, CommandBody, PromotionAction};
 pub use document::{
-    DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, SuggestionInput,
+    DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
+    SuggestionInput,
 };
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};
@@ -55,3 +59,6 @@ pub use run::{
     RunDisposition, RunState, ToolOutcome,
 };
 pub use version::{ProtocolVersion, PROTOCOL_V1};
+pub use workflow::{
+    WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
+};

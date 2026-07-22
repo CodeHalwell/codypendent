@@ -1,0 +1,265 @@
+{
+  "AudioArtifact": {
+    "duration_ms": 1500,
+    "original": {
+      "byte_length": 4096,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "audio/wav",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "sample_rate_hz": 16000,
+    "transcript": {
+      "mode": {
+        "type": "local"
+      },
+      "reviewed": true,
+      "source_audio": "80000000-0000-0000-0000-000000000001",
+      "text": "approve the patch"
+    }
+  },
+  "GitHubRefKind_Comment": {
+    "type": "comment"
+  },
+  "GitHubRefKind_Commit": {
+    "type": "commit"
+  },
+  "GitHubRefKind_Issue": {
+    "type": "issue"
+  },
+  "GitHubRefKind_PullRequest": {
+    "type": "pull-request"
+  },
+  "GitHubReference": {
+    "kind": {
+      "type": "pull-request"
+    },
+    "number": 14,
+    "owner": "CodeHalwell",
+    "repo": "codypendent"
+  },
+  "ImageArtifact": {
+    "extracted_text": {
+      "byte_length": 256,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "text/plain",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "height": 720,
+    "observations": [
+      {
+        "model": "claude-sonnet-5",
+        "text": "A terminal showing a failing test."
+      }
+    ],
+    "original": {
+      "byte_length": 20480,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "image/png",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "regions": [
+      {
+        "height": 40,
+        "label": "error message",
+        "width": 300,
+        "x": 10,
+        "y": 20
+      }
+    ],
+    "width": 1280
+  },
+  "ImageRegion": {
+    "height": 40,
+    "label": "error message",
+    "width": 300,
+    "x": 10,
+    "y": 20
+  },
+  "InputBlock_Audio": {
+    "block": "audio",
+    "duration_ms": 1500,
+    "original": {
+      "byte_length": 4096,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "audio/wav",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "sample_rate_hz": 16000,
+    "transcript": {
+      "mode": {
+        "type": "local"
+      },
+      "reviewed": true,
+      "source_audio": "80000000-0000-0000-0000-000000000001",
+      "text": "approve the patch"
+    }
+  },
+  "InputBlock_CodeSymbol": {
+    "block": "code-symbol",
+    "kind": "function",
+    "line": 42,
+    "path": "crates/workflow/src/drive.rs",
+    "symbol": "WorkflowDriver::advance"
+  },
+  "InputBlock_EditorSelection": {
+    "block": "editor-selection",
+    "path": "src/lib.rs",
+    "range": {
+      "end": {
+        "character": 4,
+        "line": 2
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    }
+  },
+  "InputBlock_File": {
+    "block": "file",
+    "byte_length": 128,
+    "id": "80000000-0000-0000-0000-000000000001",
+    "media_type": "text/x-diff",
+    "sensitivity": {
+      "type": "Internal"
+    },
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+  },
+  "InputBlock_GitHubReference": {
+    "block": "github-reference",
+    "kind": {
+      "type": "pull-request"
+    },
+    "number": 14,
+    "owner": "CodeHalwell",
+    "repo": "codypendent"
+  },
+  "InputBlock_Image": {
+    "block": "image",
+    "extracted_text": {
+      "byte_length": 256,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "text/plain",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "height": 720,
+    "observations": [
+      {
+        "model": "claude-sonnet-5",
+        "text": "A terminal showing a failing test."
+      }
+    ],
+    "original": {
+      "byte_length": 20480,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "image/png",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "regions": [
+      {
+        "height": 40,
+        "label": "error message",
+        "width": 300,
+        "x": 10,
+        "y": 20
+      }
+    ],
+    "width": 1280
+  },
+  "InputBlock_Text": {
+    "block": "text",
+    "text": "approve the patch"
+  },
+  "InputEnvelope": {
+    "blocks": [
+      {
+        "block": "text",
+        "text": "approve the patch"
+      }
+    ],
+    "scope": {
+      "type": "session"
+    },
+    "source": {
+      "type": "ide"
+    }
+  },
+  "InputSource_Cli": {
+    "type": "cli"
+  },
+  "InputSource_Ide": {
+    "type": "ide"
+  },
+  "InputSource_Tui": {
+    "type": "tui"
+  },
+  "InputSource_Voice": {
+    "type": "voice"
+  },
+  "InputSource_Web": {
+    "type": "web"
+  },
+  "ModelObservation": {
+    "model": "claude-sonnet-5",
+    "text": "A terminal showing a failing test."
+  },
+  "OffDevicePolicy": {
+    "max_off_device": {
+      "type": "Internal"
+    }
+  },
+  "ScopeLevel_Branch": {
+    "type": "branch"
+  },
+  "ScopeLevel_Organization": {
+    "type": "organization"
+  },
+  "ScopeLevel_Repository": {
+    "type": "repository"
+  },
+  "ScopeLevel_Session": {
+    "type": "session"
+  },
+  "ScopeLevel_System": {
+    "type": "system"
+  },
+  "ScopeLevel_Task": {
+    "type": "task"
+  },
+  "ScopeLevel_User": {
+    "type": "user"
+  },
+  "ScopeLevel_Workspace": {
+    "type": "workspace"
+  },
+  "SymbolRef": {
+    "kind": "function",
+    "line": 42,
+    "path": "crates/workflow/src/drive.rs",
+    "symbol": "WorkflowDriver::advance"
+  },
+  "TranscriptionMode_Local": {
+    "type": "local"
+  },
+  "TranscriptionMode_Remote": {
+    "type": "remote"
+  }
+}
