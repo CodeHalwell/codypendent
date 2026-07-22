@@ -52,6 +52,16 @@ fail on the TypeScript side — that is the drift catch.
 Whenever a wire type in `crates/protocol/src/` changes shape (new field, new
 variant, a changed field type):
 
+> **New _variant_ (not just a new field): add its vector first.** A new field on
+> an already-vectored type is self-enforcing — the Rust struct literal in
+> `golden_vectors.rs` won't compile until you supply the new field, so it flows
+> into the vectors automatically. A brand-new **variant** has no such forcing
+> function: `regenerate_vectors` only re-serializes the instances already listed,
+> so you must first add a `vec_of("TypeName_NewVariant", …)` call in the matching
+> `*_vectors()` function (and, if the extension uses that type, its
+> `reconstruct*`/partition entry) — *then* regenerate. Otherwise the guard stays
+> silently blind to the new variant on both sides.
+
 ```sh
 cargo test -p codypendent-protocol --test golden_vectors regenerate_vectors -- --ignored
 ```
