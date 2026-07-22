@@ -708,6 +708,7 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
             Payload::Command(command(
                 CommandBody::StartWorkflow {
                     manifest: manifest.to_string(),
+                    workflow_id: None,
                     inputs: serde_json::Value::Null,
                     repository: None,
                 },
@@ -739,6 +740,7 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
             Payload::Command(command(
                 CommandBody::StartWorkflow {
                     manifest: manifest.to_string(),
+                    workflow_id: None,
                     inputs: serde_json::Value::Null,
                     repository: None,
                 },

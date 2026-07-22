@@ -243,6 +243,10 @@ pub(crate) fn build_workflow_host(
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
     });
+    // The per-user workflow source directory a `StartWorkflow`-by-id (`/fix-ci`)
+    // consults below the built-in and the repository scope (STEP 5.1.4). Following
+    // the theme-pack data-dir convention, it lives at `<data_dir>/workflows`.
+    let user_workflow_dir = paths.data_dir.join("workflows");
     let executor = AgentLoopNodeExecutor::new(
         pool.clone(),
         paths,
@@ -264,8 +268,10 @@ pub(crate) fn build_workflow_host(
     };
     // Give the host the SAME node-lifecycle hub (its observer + run-phase changes
     // publish here) and cancellation registry (its cancel seam fires here) the node
-    // executor and the server share (T9).
+    // executor and the server share (T9), plus the per-user workflow source
+    // directory a named `StartWorkflow` (`/fix-ci`) resolves against (STEP 5.1.4).
     host.with_streaming(workflows, cancellations)
+        .with_workflow_source_dir(Some(user_workflow_dir))
 }
 
 /// Live cancellation handles for in-flight workflow **node** agent runs, keyed by
@@ -1466,7 +1472,10 @@ impl AgentLoopNodeExecutor {
         args: &Value,
     ) -> Result<ToolNodeResult, String> {
         let Some(github) = self.github.clone() else {
-            return Err("github is not configured for this daemon".to_string());
+            // Same wording as the runtime's `github_target` (crates/runtime), so
+            // `/fix-ci` without a token fails with ONE legible error regardless of
+            // which GitHub step trips it — parity with the old prompt flow (T10).
+            return Err("github is not configured (no token available)".to_string());
         };
         let repository = self.node_repository(ctx.workflow_run_id).await;
         let Some(repo) = resolve_github_repo(&repository).await else {
@@ -2092,8 +2101,13 @@ fn summarize_payload(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflows::WorkflowConductorHost;
+    use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
+    use codypendent_protocol::ClientId;
     use codypendent_runtime::agent::{ModelStep, ScriptedDriver};
-    use codypendent_workflow::{compile_yaml, NodeState, WorkflowConductor, WorkflowRunState};
+    use codypendent_workflow::{
+        compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
+    };
     use serde_json::json;
 
     /// A factory that hands back a scripted driver — no model, no network — so the
@@ -3705,6 +3719,245 @@ steps:
         assert!(
             github.updated.lock().unwrap().is_empty(),
             "a rejected publish never reaches GitHub"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // /fix-ci on the declarative engine (Phase 5 T10 / STEP 5.1.4)
+    // ----------------------------------------------------------------------
+
+    /// Poll a run's state until it reaches `target` (the drive is spawned by
+    /// `host.start` fire-and-forget). Loops on the condition, panicking on the last
+    /// observed state if it never lands — the workflows.rs `wait_for_state` pattern.
+    async fn wait_for_run_state(pool: &SqlitePool, run_id: &str, target: WorkflowRunState) {
+        for _ in 0..500 {
+            let snap = WorkflowStore::new()
+                .snapshot(pool, run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if snap.run.state == target {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let snap = WorkflowStore::new()
+            .snapshot(pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        panic!(
+            "run never reached {target:?}; last state {:?}",
+            snap.run.state
+        );
+    }
+
+    /// Build a [`WorkflowConductorHost`] over the repair harness (a GitHub double,
+    /// the scripted investigator/implementer/reviewer drivers, and a patch-aware
+    /// test runner), so a test can drive `/fix-ci` through the SAME `host.start`
+    /// resolution + fire-and-forget drive the daemon uses in production.
+    fn repair_host(
+        pool: &SqlitePool,
+        paths: &RuntimePaths,
+        startup_repository: &Path,
+        github: Option<Arc<dyn GitHubApi>>,
+        broker: ApprovalBroker,
+        runner: Arc<dyn RepositoryTestRunner>,
+    ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
+        let executor = tool_executor(
+            pool,
+            paths,
+            startup_repository,
+            github,
+            runner,
+            broker,
+            Arc::new(RepairDriverFactory {
+                patch: readme_patch(FIX_SENTINEL),
+            }),
+        );
+        WorkflowConductorHost::new(pool.clone(), Arc::new(executor))
+    }
+
+    fn fix_ci_request(repo: &Path, key: &str) -> StartWorkflowRequest {
+        StartWorkflowRequest {
+            // The `/fix-ci` shape: no inline manifest — the daemon resolves the
+            // built-in `repair-github-check` by id — plus the PR-number input and
+            // the run's repository (Phase 5 T5).
+            manifest: String::new(),
+            workflow_id: Some(REPAIR_GITHUB_CHECK_ID.to_string()),
+            inputs: json!({ "pull_request": 7 }),
+            idempotency_key: key.to_string(),
+            repository: Some(repo.to_string_lossy().into_owned()),
+            client_id: ClientId::new(),
+        }
+    }
+
+    /// THE ported `/fix-ci` regression: starting the run by NAME (as `/fix-ci`
+    /// does) resolves the embedded `repair-github-check` built-in and drives it end
+    /// to end through the daemon's `host.start` path — the supervised
+    /// investigator → implementer → verify → reviewer → publish flow completes,
+    /// every write parked for durable approval, and PR #7 is updated exactly once
+    /// after its approval is granted. This replaces the Phase-3 single-run e2e; its
+    /// internal assertions are now workflow-run equivalents (nodes + artifacts).
+    #[tokio::test]
+    async fn fix_ci_resolves_the_built_in_and_runs_end_to_end() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo_with_origin(tmp.path(), "repo");
+        let github: Arc<FakeGitHub> = Arc::new(FakeGitHub::default());
+        let broker = ApprovalBroker::new();
+        let runner = PatchAwareTestRunner::new("README.md", FIX_SENTINEL);
+        let host = repair_host(
+            &pool,
+            &paths,
+            &repo,
+            Some(github.clone()),
+            broker.clone(),
+            runner.clone(),
+        );
+
+        // Grant every parked write (the applied-patch `verify` and the `publish`)
+        // as it appears, exactly as an operator approving `/fix-ci` would.
+        let approver = spawn_auto_approver(pool.clone(), broker.clone());
+        let run_id = host
+            .start(fix_ci_request(&repo, "cmd-fixci"))
+            .await
+            .expect("/fix-ci resolves and starts the built-in workflow");
+        wait_for_run_state(&pool, &run_id, WorkflowRunState::Completed).await;
+        approver.abort();
+
+        // The run drove the SAME externally-visible effect the old flow had for its
+        // publish step: PR #7 updated exactly once, only after approval.
+        assert_eq!(*github.updated.lock().unwrap(), vec![7]);
+
+        // Verification was meaningful (T6b): `verify` applied the implementer's patch
+        // into its own worktree and observed the fix.
+        assert_eq!(runner.observations(), vec![true]);
+
+        // Every declared artifact reached the board — the supervised hand-off.
+        let store = BlackboardStore::new();
+        for kind in [
+            BlackboardKind::Finding,
+            BlackboardKind::ProposedPatch,
+            BlackboardKind::TestResult,
+            BlackboardKind::Decision,
+        ] {
+            assert!(
+                !store
+                    .query(&pool, &run_id, Some(kind), false)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{} must be on the board",
+                kind.as_str()
+            );
+        }
+
+        // The stored run recorded the RESOLVED built-in manifest (recovery recompiles
+        // it), and every node completed.
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.run.workflow_id, REPAIR_GITHUB_CHECK_ID);
+        assert!(snapshot
+            .nodes
+            .iter()
+            .all(|n| n.state == NodeState::Completed));
+    }
+
+    /// Behaviour matrix, the rejection row: driving `/fix-ci` and REJECTING the
+    /// publish approval fails the run and never calls GitHub — the "rejected/denied
+    /// writes never reach GitHub" invariant, now on the workflow engine.
+    #[tokio::test]
+    async fn fix_ci_rejected_publish_never_calls_github() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo_with_origin(tmp.path(), "repo");
+        let github: Arc<FakeGitHub> = Arc::new(FakeGitHub::default());
+        let broker = ApprovalBroker::new();
+        let host = repair_host(
+            &pool,
+            &paths,
+            &repo,
+            Some(github.clone()),
+            broker.clone(),
+            PatchAwareTestRunner::new("README.md", FIX_SENTINEL),
+        );
+
+        let run_id = host
+            .start(fix_ci_request(&repo, "cmd-fixci-reject"))
+            .await
+            .expect("start");
+        // The parks are sequential: approve the applied-patch `verify` (T6b), then
+        // REJECT the `publish` GitHub write.
+        resolve_next_approval(&pool, &broker, ApprovalDecision::Approve).await;
+        resolve_next_approval(&pool, &broker, ApprovalDecision::Reject).await;
+        wait_for_run_state(&pool, &run_id, WorkflowRunState::Failed).await;
+
+        assert!(
+            github.updated.lock().unwrap().is_empty(),
+            "a rejected publish never reaches GitHub"
+        );
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let publish = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "publish")
+            .unwrap();
+        assert_eq!(publish.state, NodeState::Failed);
+    }
+
+    /// `/fix-ci` with no GitHub token configured fails with the SAME legible error
+    /// the Phase-3 prompt flow gave — `github is not configured (no token
+    /// available)` — parity kept (the run drives to `publish`, which trips the
+    /// shared configured-check and fails the run).
+    #[tokio::test]
+    async fn fix_ci_without_github_fails_with_the_legible_configured_error() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo_with_origin(tmp.path(), "repo");
+        let broker = ApprovalBroker::new();
+        // No GitHub client wired — the daemon that found no token.
+        let host = repair_host(
+            &pool,
+            &paths,
+            &repo,
+            None,
+            broker.clone(),
+            PatchAwareTestRunner::new("README.md", FIX_SENTINEL),
+        );
+
+        // The applied-patch `verify` still parks; approve it so the run reaches the
+        // `publish` node, where the missing GitHub client trips the failure.
+        let approver = spawn_auto_approver(pool.clone(), broker.clone());
+        let run_id = host
+            .start(fix_ci_request(&repo, "cmd-fixci-nogh"))
+            .await
+            .expect("start");
+        wait_for_run_state(&pool, &run_id, WorkflowRunState::Failed).await;
+        approver.abort();
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let publish = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "publish")
+            .unwrap();
+        assert_eq!(publish.state, NodeState::Failed);
+        assert!(
+            publish
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("github is not configured (no token available)")),
+            "same legible error as the old prompt flow, got {:?}",
+            publish.error
         );
     }
 

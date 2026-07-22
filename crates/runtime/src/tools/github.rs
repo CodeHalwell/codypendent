@@ -258,29 +258,6 @@ pub fn render_pull_request(pr: &PullRequest) -> String {
     )
 }
 
-/// The hard-coded `/fix-ci` objective (Phase 3 STEP 3.2). Registering `/fix-ci`
-/// starts a `Build`-mode run with this objective in an isolated worktree on the
-/// PR branch; the agent drives the Chapter 10 repair flow using the `github.*`
-/// (read + write), `workspace.*`, `git.apply_patch`, and `shell.run` tools. Every
-/// GitHub write is approval-gated by the policy engine, so the push and PR update
-/// surface for approval before they happen. The declarative workflow engine
-/// (Phase 5) later replaces this prompt-encoded sequence.
-pub fn fix_ci_objective(repo_slug: &str, pr_number: u64) -> String {
-    format!(
-        "Repair the failing CI check on pull request #{pr_number} of {repo_slug}.\n\
-         Work in this order, using only the provided tools:\n\
-         1. `github.get_pull_request` to read PR #{pr_number} and its head branch.\n\
-         2. `github.list_check_runs` on the head ref to find the failing check.\n\
-         3. Investigate the failure with `workspace.search` / `workspace.read_file`.\n\
-         4. Propose a fix with `git.apply_patch`.\n\
-         5. Verify with `shell.run` (run the tests).\n\
-         6. When the tests pass, `github.update_pull_request` to describe the fix \
-            and `github.create_check_run_summary` to report the result. These are \
-            writes — they will pause for your operator's approval.\n\
-         Stop and summarize if you cannot make the tests pass."
-    )
-}
-
 /// Render a list of check runs as a compact observation for the transcript.
 pub fn render_check_runs(runs: &[CheckRun]) -> String {
     if runs.is_empty() {
@@ -302,17 +279,6 @@ pub fn render_check_runs(runs: &[CheckRun]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fix_ci_objective_names_the_pr_and_repo_and_the_write_tools() {
-        let objective = fix_ci_objective("octocat/hello-world", 7);
-        assert!(objective.contains("#7"));
-        assert!(objective.contains("octocat/hello-world"));
-        assert!(objective.contains("github.list_check_runs"));
-        assert!(objective.contains("github.update_pull_request"));
-        assert!(objective.contains("github.create_check_run_summary"));
-        assert!(objective.contains("approval"));
-    }
 
     #[test]
     fn create_draft_key_is_ref_safe() {

@@ -1,7 +1,14 @@
 schema_version: 1
 id: repair-github-check
 version: 1
-description: Investigate and repair a failed GitHub check in an isolated worktree.
+description: >-
+  Investigate and repair a failed GitHub check in an isolated worktree. This is
+  the `/fix-ci` product path (Phase 5 STEP 5.1.4), replacing the Phase-3 hard-coded
+  objective template with a supervised investigator -> implementer -> independent
+  reviewer flow. Intentional divergence from the old prompt flow: it does NOT post
+  a separate github.create_check_run_summary; the single `publish` step
+  (github.update-pull-request), gated on approval, carries the outcome onto the PR.
+  A plain single-agent run can still post a check-run summary if one is wanted.
 
 # Tool-node namespace (Phase 5 T6): a step's `tool:` id is resolved against the
 # runtime tool registry after normalizing `-` to `_`, so the manifest may use the

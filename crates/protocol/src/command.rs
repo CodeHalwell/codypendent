@@ -158,8 +158,19 @@ pub enum CommandBody {
     /// (Driving the created run is a later step; this command only makes runs
     /// durably creatable.)
     StartWorkflow {
-        /// The workflow manifest YAML (the content of a `workflow.yaml`).
+        /// The workflow manifest YAML (the content of a `workflow.yaml`). Empty
+        /// when [`workflow_id`](CommandBody::StartWorkflow::workflow_id) names a
+        /// workflow the daemon resolves from its own sources instead.
         manifest: String,
+        /// A named workflow to resolve from the daemon's sources (embedded
+        /// built-ins, the user config directory, and the run repository's
+        /// `.codypendent/workflows`) rather than shipping the manifest inline —
+        /// the path `/fix-ci` takes (`repair-github-check`). Additive
+        /// (`#[serde(default)]`): an older client omits it and ships `manifest`.
+        /// When set, `manifest` is ignored and the daemon enforces the workflow
+        /// registry's version-stability + shadowing rules at resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_id: Option<String>,
         /// The typed inputs the manifest declares, as JSON. Defaults to null when
         /// omitted (a workflow with no required inputs).
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -458,6 +469,15 @@ mod tests {
         });
         round_trip(CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
+            inputs: serde_json::json!({ "pull_request": 42 }),
+            repository: Some("/home/user/project".to_string()),
+        });
+        // A named-workflow start (the `/fix-ci` shape): no inline manifest, a
+        // resolved workflow id instead.
+        round_trip(CommandBody::StartWorkflow {
+            manifest: String::new(),
+            workflow_id: Some("repair-github-check".to_string()),
             inputs: serde_json::json!({ "pull_request": 42 }),
             repository: Some("/home/user/project".to_string()),
         });
@@ -576,6 +596,7 @@ mod tests {
         // null.
         let body = CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
             inputs: serde_json::Value::Null,
             repository: None,
         };
@@ -584,6 +605,10 @@ mod tests {
         assert!(
             !json.contains("repository"),
             "an absent repository is skipped on the wire: {json}"
+        );
+        assert!(
+            !json.contains("workflow_id"),
+            "an absent workflow_id is skipped on the wire (an older client's shape): {json}"
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body, "a payload without either key defaults them");
@@ -596,6 +621,7 @@ mod tests {
         // so recovery drives the run's agent nodes in the right checkout.
         let body = CommandBody::StartWorkflow {
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
+            workflow_id: None,
             inputs: serde_json::Value::Null,
             repository: Some("/home/user/project".to_string()),
         };

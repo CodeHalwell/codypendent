@@ -20,8 +20,15 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub struct StartWorkflowRequest {
     /// The workflow manifest YAML (its content, never a path — the daemon does not
-    /// read an arbitrary client-named file).
+    /// read an arbitrary client-named file). Empty when [`workflow_id`](Self::workflow_id)
+    /// names a workflow the assembly resolves from its own sources instead.
     pub manifest: String,
+    /// A named workflow to resolve from the assembly's sources (embedded
+    /// built-ins + the user config directory + the run repository's
+    /// `.codypendent/workflows`) rather than compiling an inline `manifest` — the
+    /// `/fix-ci` path. When `Some`, the [`WorkflowStarter`] resolves it (enforcing
+    /// the registry's version-stability + shadowing rules) and ignores `manifest`.
+    pub workflow_id: Option<String>,
     /// The typed inputs the manifest declares (opaque JSON to the daemon; the
     /// store records them with the run).
     pub inputs: Value,

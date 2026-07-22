@@ -835,6 +835,7 @@ pub async fn workflow_run_over_connection(
     let reply = conn
         .send_command(CommandBody::StartWorkflow {
             manifest,
+            workflow_id: None,
             inputs,
             repository,
         })
@@ -847,6 +848,64 @@ pub async fn workflow_run_over_connection(
             anyhow::bail!("StartWorkflow rejected: {} ({})", error.message, error.code)
         }
         other => anyhow::bail!("unexpected reply to StartWorkflow: {other:?}"),
+    }
+}
+
+/// `codypendent fix-ci --pr <N> [--repo PATH]` (Phase 5 STEP 5.1.4). Runs the
+/// declarative `repair-github-check` workflow — the supervised investigator →
+/// implementer → independent-reviewer flow that replaced the Phase-3 hard-coded
+/// `/fix-ci` objective. The daemon resolves the workflow from its own sources
+/// (the embedded built-in, shadowable by `<repo>/.codypendent/workflows`), so a
+/// fresh checkout needs no manifest file. Every GitHub write still parks for
+/// durable approval; without a GitHub token the run fails with the same
+/// `github is not configured` error the prompt flow gave, at its first check read.
+pub async fn fix_ci(paths: &RuntimePaths, pr: u64, repo: PathBuf) -> anyhow::Result<()> {
+    let repo = repo.canonicalize().with_context(|| {
+        format!(
+            "--repo {}: not a valid, accessible directory",
+            repo.display()
+        )
+    })?;
+    if !repo.is_dir() {
+        anyhow::bail!("--repo {}: not a directory", repo.display());
+    }
+    let repository = repo.to_string_lossy().into_owned();
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let run_id = fix_ci_over_connection(&mut conn, pr, Some(repository)).await?;
+    println!("workflow run started: {run_id}");
+    Ok(())
+}
+
+/// The connected core of [`fix_ci`]: handshake, bind `Controller`, and start the
+/// named `repair-github-check` workflow with the PR number as its input (Phase 5
+/// STEP 5.1.4). Split out so a test can drive it against a mock server, mirroring
+/// [`workflow_run_over_connection`]. Sends no inline manifest — the daemon resolves
+/// the workflow by id, enforcing the source registry's version + shadowing rules.
+pub async fn fix_ci_over_connection(
+    conn: &mut Connection,
+    pr: u64,
+    repository: Option<String>,
+) -> anyhow::Result<String> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::StartWorkflow {
+            manifest: String::new(),
+            workflow_id: Some(codypendent_workflow::REPAIR_GITHUB_CHECK_ID.to_string()),
+            inputs: serde_json::json!({ "pull_request": pr }),
+            repository,
+        })
+        .await?;
+    match reply.payload {
+        Payload::WorkflowRunStarted {
+            workflow_run_id, ..
+        } => Ok(workflow_run_id),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("/fix-ci rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to /fix-ci StartWorkflow: {other:?}"),
     }
 }
 

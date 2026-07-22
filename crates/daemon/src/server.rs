@@ -951,6 +951,7 @@ async fn handle_request(
                 // STEP 5.2). Driving the created run is a later step.
                 CommandBody::StartWorkflow {
                     manifest,
+                    workflow_id,
                     inputs,
                     repository,
                 } => {
@@ -984,6 +985,7 @@ async fn handle_request(
                     };
                     let start = StartWorkflowRequest {
                         manifest: manifest.clone(),
+                        workflow_id: workflow_id.clone(),
                         inputs: inputs.clone(),
                         // Carry the command's idempotency key so a duplicate
                         // delivery resolves to the same durable run (the write

@@ -1575,9 +1575,14 @@ async fn explore_run_reads_the_repository_root() {
 }
 
 #[tokio::test]
-async fn fix_ci_sequence_updates_the_pr_after_approval() {
-    // STEP 3.2 /fix-ci: read the failing check, run a test, then update the PR
-    // and post a check summary — the two writes each parking for approval.
+async fn a_single_agent_run_drives_github_writes_through_approval() {
+    // The single-agent baseline (plain `StartRun`) can still drive the GitHub
+    // repair sequence directly: read the failing check, run a test, then update the
+    // PR and post a check summary — the two writes each parking for approval. This
+    // is the Phase-1 loop capability that the declarative `repair-github-check`
+    // workflow now packages as the `/fix-ci` product path (its `publish` step
+    // covers the PR update; the check-run summary is the intentional divergence
+    // documented in the workflow, still reachable from a plain run as shown here).
     let dir = tempfile::tempdir().unwrap();
     let repo = std::fs::canonicalize(dir.path()).unwrap();
     let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();

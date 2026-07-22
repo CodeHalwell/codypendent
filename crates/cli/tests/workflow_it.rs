@@ -167,3 +167,114 @@ async fn workflow_run_sends_the_manifest_and_returns_the_run_id() {
 
     server.await.expect("mock server task");
 }
+
+/// Play the daemon's side of one `/fix-ci`: handshake, the ignored `AttachSession`
+/// rejection, then a `StartWorkflow` that carries NO inline manifest but the named
+/// `repair-github-check` workflow id, the PR-number input, and the repository —
+/// the shape [`fix_ci_over_connection`] must send (Phase 5 STEP 5.1.4).
+async fn mock_daemon_fix_ci(mut stream: UnixStream, workflow_run_id: &str) {
+    let hello = read_envelope(&mut stream)
+        .await
+        .expect("read ClientHello")
+        .expect("connection open");
+    write_envelope(
+        &mut stream,
+        &Envelope::reply_to(
+            &hello,
+            Payload::ServerHello(ServerHello {
+                resume_token: None,
+                selected_protocol: PROTOCOL_V1,
+                daemon_version: "mock".to_string(),
+                daemon_instance: DaemonInstanceId::new(),
+                heartbeat_interval_ms: 15_000,
+            }),
+        ),
+    )
+    .await
+    .expect("write ServerHello");
+
+    let attach = read_envelope(&mut stream)
+        .await
+        .expect("read AttachSession")
+        .expect("connection open");
+    write_envelope(
+        &mut stream,
+        &Envelope::reply_to(
+            &attach,
+            Payload::CommandRejected(CodypendentError::new(
+                "protocol.session-not-found",
+                "unknown session",
+                false,
+            )),
+        ),
+    )
+    .await
+    .expect("write attach rejection");
+
+    let start = read_envelope(&mut stream)
+        .await
+        .expect("read StartWorkflow")
+        .expect("connection open");
+    let command_id = command_id_of(&start);
+    match &expect_command(&start).body {
+        CommandBody::StartWorkflow {
+            manifest,
+            workflow_id,
+            inputs,
+            repository,
+        } => {
+            assert!(
+                manifest.is_empty(),
+                "/fix-ci sends no inline manifest; the daemon resolves the workflow by id"
+            );
+            assert_eq!(
+                workflow_id.as_deref(),
+                Some("repair-github-check"),
+                "/fix-ci names the built-in workflow"
+            );
+            assert_eq!(
+                inputs.get("pull_request").and_then(|v| v.as_u64()),
+                Some(42),
+                "the PR number crosses the wire as the workflow input"
+            );
+            assert_eq!(repository.as_deref(), Some("/tmp/ci-repo"));
+        }
+        other => panic!("expected StartWorkflow, got {other:?}"),
+    }
+    write_envelope(
+        &mut stream,
+        &Envelope::reply_to(
+            &start,
+            Payload::WorkflowRunStarted {
+                command_id,
+                workflow_run_id: workflow_run_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("write WorkflowRunStarted");
+}
+
+#[tokio::test]
+async fn fix_ci_starts_the_named_repair_workflow() {
+    let (socket, listener) = MockSocket::bind();
+    let server = tokio::spawn(async move {
+        let (stream, _addr) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("mock accepted a connection in time")
+            .expect("accept");
+        mock_daemon_fix_ci(stream, "wfrun-fixci-1").await;
+    });
+
+    let mut conn = Connection::connect(&socket.path).await.expect("connect");
+    let run_id = codypendent_cli::commands::fix_ci_over_connection(
+        &mut conn,
+        42,
+        Some("/tmp/ci-repo".to_string()),
+    )
+    .await
+    .expect("/fix-ci");
+    assert_eq!(run_id, "wfrun-fixci-1");
+
+    server.await.expect("mock server task");
+}

@@ -112,6 +112,19 @@ enum TopCommand {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Investigate and repair a failed GitHub check on a pull request (`/fix-ci`).
+    /// Runs the declarative `repair-github-check` workflow — the supervised
+    /// investigator → implementer → independent-reviewer flow — through the
+    /// daemon; every GitHub write parks for approval (Phase 5 STEP 5.1.4).
+    FixCi {
+        /// The pull-request number whose failing check to repair.
+        #[arg(long)]
+        pr: u64,
+        /// Repository the repair runs against (its agent nodes each get an
+        /// isolated worktree). Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Publish a collaborative document to Git (Phase 4 STEP 4.4).
     Docs {
         #[command(subcommand)]
@@ -588,6 +601,13 @@ async fn main() -> anyhow::Result<()> {
                 commands::workflow_watch(&paths, workflow_run_id).await
             }
         },
+        TopCommand::FixCi { pr, repo } => {
+            let repo = match repo {
+                Some(repo) => repo,
+                None => std::env::current_dir()?,
+            };
+            commands::fix_ci(&paths, pr, repo).await
+        }
         TopCommand::Docs { command } => match command {
             DocsCommand::Publish {
                 document,

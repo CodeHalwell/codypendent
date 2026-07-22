@@ -36,7 +36,7 @@
 //! node through the agent loop.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use codypendent_daemon::workflow_stream::{
@@ -53,8 +53,8 @@ use codypendent_protocol::{
 };
 use codypendent_workflow::{
     compile_yaml, BudgetWarning, ConductorError, NodeExecutor, NodeObserver, NodeState,
-    NodeTransition, WorkflowConductor, WorkflowNodeRecord, WorkflowRunState, WorkflowStore,
-    WorkflowStoreError,
+    NodeTransition, WorkflowConductor, WorkflowNodeRecord, WorkflowRunState,
+    WorkflowSourceRegistry, WorkflowStore, WorkflowStoreError,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -96,6 +96,13 @@ pub struct WorkflowConductorHost<E> {
     /// executor (which registers) so the [`cancel`](WorkflowLifecycle::cancel) seam
     /// interrupts an in-flight node's agent run.
     cancellations: WorkflowRunCancellations,
+    /// The per-user workflow directory (the daemon points this at
+    /// `<data_dir>/workflows`), consulted when a `StartWorkflow` names a workflow
+    /// by id (`/fix-ci`) instead of shipping a manifest — see
+    /// [`resolve_named_workflow`](Self::resolve_named_workflow). `None` in a test
+    /// host and on any host that only ever runs inline manifests; the embedded
+    /// built-in is always available regardless (STEP 5.1.4).
+    user_workflow_dir: Option<PathBuf>,
 }
 
 // Manual `Clone` so the host clones regardless of whether `E: Clone` — only
@@ -109,6 +116,7 @@ impl<E> Clone for WorkflowConductorHost<E> {
             drive_locks: self.drive_locks.clone(),
             workflows: self.workflows.clone(),
             cancellations: self.cancellations.clone(),
+            user_workflow_dir: self.user_workflow_dir.clone(),
         }
     }
 }
@@ -148,7 +156,43 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
             // and node executor meet the host (T9).
             workflows: WorkflowHub::new(),
             cancellations: WorkflowRunCancellations::default(),
+            // No user-scope source by default; the embedded built-in still
+            // resolves. Production sets the real directory via
+            // [`with_workflow_source_dir`](Self::with_workflow_source_dir).
+            user_workflow_dir: None,
         }
+    }
+
+    /// Point the host at the per-user workflow directory a `StartWorkflow`-by-id
+    /// consults (below the built-in, above nothing). Production wires
+    /// `<data_dir>/workflows`; a test host leaves it `None` (the built-in still
+    /// resolves). Builder-style so the assembly's `build_workflow_host` sets it
+    /// after `with_streaming`.
+    #[must_use]
+    pub(crate) fn with_workflow_source_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.user_workflow_dir = dir;
+        self
+    }
+
+    /// Resolve a `StartWorkflow`'s named workflow (`/fix-ci`'s `repair-github-check`)
+    /// to its manifest text from the assembly's sources: the embedded built-in,
+    /// the per-user directory, and the run repository's `.codypendent/workflows`
+    /// (highest precedence). Enforces the registry's version-stability +
+    /// shadowing rules (STEP 5.1.3/5.1.4), surfacing a collision or an unknown id
+    /// as a legible, non-retryable [`CodypendentError`].
+    fn resolve_named_workflow(
+        &self,
+        workflow_id: &str,
+        repository: Option<&str>,
+    ) -> Result<String, CodypendentError> {
+        let repo_dir =
+            repository.map(|repo| Path::new(repo).join(".codypendent").join("workflows"));
+        let registry =
+            WorkflowSourceRegistry::load(self.user_workflow_dir.as_deref(), repo_dir.as_deref());
+        registry
+            .resolve(workflow_id)
+            .map(str::to_string)
+            .map_err(|error| CodypendentError::new(error.code(), error.to_string(), false))
     }
 
     /// Bind the host to the SHARED node-lifecycle hub (its drives publish
@@ -330,11 +374,22 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
         Box::pin(async move {
             let StartWorkflowRequest {
                 manifest,
+                workflow_id,
                 inputs,
                 idempotency_key,
                 repository,
                 ..
             } = request;
+
+            // A named workflow (`/fix-ci`'s `repair-github-check`) is resolved from
+            // the assembly's sources (built-in / user / repository), enforcing the
+            // registry's version + shadowing rules; an inline manifest is taken
+            // verbatim. The rest of the flow is identical — the resolved text is a
+            // manifest like any other.
+            let manifest = match workflow_id.as_deref() {
+                Some(id) => host.resolve_named_workflow(id, repository.as_deref())?,
+                None => manifest,
+            };
 
             // Compile the manifest — a malformed workflow is the client's to fix,
             // surfaced verbatim. Non-retryable: recompiling the same text fails the
@@ -842,6 +897,7 @@ steps:
     fn start_request(key: &str) -> StartWorkflowRequest {
         StartWorkflowRequest {
             manifest: MANIFEST.to_owned(),
+            workflow_id: None,
             inputs: json!({ "pull_request": 7 }),
             idempotency_key: key.to_owned(),
             repository: None,
@@ -921,6 +977,7 @@ steps:
         let error = host
             .start(StartWorkflowRequest {
                 manifest: "schema_version: 1\nid: empty\nversion: 1\nsteps: []\n".to_owned(),
+                workflow_id: None,
                 inputs: json!(null),
                 idempotency_key: "cmd-bad".to_owned(),
                 repository: None,
@@ -1210,6 +1267,7 @@ steps:
         let error = host
             .start(StartWorkflowRequest {
                 manifest: different_manifest,
+                workflow_id: None,
                 inputs: json!({ "pull_request": 7 }),
                 idempotency_key: "cmd-shared-key".to_owned(),
                 repository: None,

@@ -177,18 +177,23 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
 
 /// The built-in commands as governed registry items.
 ///
-/// Phase 3 ships `/fix-ci` (STEP 3.2): investigate a failed GitHub check and
-/// prepare a verified change set. Registering it as a [`RegistryItemKind::Command`]
-/// item makes it discoverable in the Skill Studio alongside tools and skills; the
-/// invocation (`/fix-ci`) drives the hard-coded repair workflow.
+/// `/fix-ci` (Phase 3 STEP 3.2, now Phase 5 STEP 5.1.4): investigate a failed
+/// GitHub check and prepare a verified change set. Registering it as a
+/// [`RegistryItemKind::Command`] item makes it discoverable in the Skill Studio
+/// alongside tools and skills; the invocation (`/fix-ci`) starts the declarative
+/// `repair-github-check` workflow — the supervised investigator → implementer →
+/// independent-reviewer flow — through the workflow engine, replacing the Phase-3
+/// hard-coded objective template.
 #[must_use]
 pub fn builtin_commands() -> Vec<RegistryItem> {
     vec![
         command(
             "fix-ci",
             "Investigate a failed GitHub check and prepare a verified change set. \
-             Invoked as `/fix-ci`; retrieves the check + logs, proposes a patch in an \
-             isolated worktree, runs tests, and — on approval — updates the pull request.",
+             Invoked as `/fix-ci`; runs the declarative `repair-github-check` workflow — an \
+             investigator inspects the check, an implementer proposes a patch in an isolated \
+             worktree, the tests are re-run to verify it, an independent reviewer decides, and \
+             — on approval — the pull request is updated.",
             &[
                 "fix the failing CI",
                 "repair a failed github check",
