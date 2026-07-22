@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{AgentMode, SessionId};
+use codypendent_protocol::{AgentMode, DocumentId, SessionId};
 
 #[derive(Parser)]
 #[command(
@@ -111,6 +111,11 @@ enum TopCommand {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Publish a collaborative document to Git (Phase 4 STEP 4.4).
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
     },
     /// Inspect plugin manifests and their permissions (Phase 6).
     Plugin {
@@ -225,6 +230,62 @@ enum WorkflowCommand {
         #[arg(long)]
         node: String,
     },
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    /// Publish a document's current revision to a Git target (Phase 4 STEP
+    /// 4.4). Prints the computed plan (target / changed files / resulting Git
+    /// action) and prompts for confirmation, then sends `PublishDocument`;
+    /// ensures a daemon, parks a durable approval, and resolves it with the
+    /// confirmed decision. Nothing is written until the approval resolves —
+    /// on approval, the daemon executes the plan in the background and this
+    /// prints the resulting commit once recorded.
+    Publish {
+        /// The document to publish.
+        document: DocumentId,
+        /// Where to publish it.
+        #[arg(long, value_enum)]
+        target: PublishTargetArg,
+        /// The repo-relative path to write. Defaults to a slug of the
+        /// document's title under `docs/`.
+        #[arg(long)]
+        path: Option<String>,
+        /// The docs branch (`docs-branch`/`doc-pr` targets only). Defaults to
+        /// `docs/publish`.
+        #[arg(long)]
+        branch: Option<String>,
+        /// The pull-request title (`doc-pr` target only). Defaults to
+        /// `Publish: <document title>`.
+        #[arg(long)]
+        title: Option<String>,
+        /// Skip the confirmation prompt and approve immediately.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `codypendent docs publish --target <TARGET>`: which Git target STEP 4.4.2
+/// describes. Mirrors `codypendent_knowledge::PublishTarget`'s three variants
+/// with CLI-friendly names.
+#[derive(Clone, Copy, ValueEnum)]
+enum PublishTargetArg {
+    /// Write the rendered Markdown to a repository file in the working tree.
+    RepoFile,
+    /// Commit the rendered Markdown to a dedicated docs branch.
+    DocsBranch,
+    /// Open a documentation pull request via the GitHub write path.
+    DocPr,
+}
+
+impl From<PublishTargetArg> for commands::PublishTargetKind {
+    fn from(arg: PublishTargetArg) -> Self {
+        match arg {
+            PublishTargetArg::RepoFile => commands::PublishTargetKind::RepoFile,
+            PublishTargetArg::DocsBranch => commands::PublishTargetKind::DocsBranch,
+            PublishTargetArg::DocPr => commands::PublishTargetKind::DocPr,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -400,6 +461,19 @@ async fn main() -> anyhow::Result<()> {
                 workflow_run_id,
                 node,
             } => commands::workflow_retry(&paths, workflow_run_id, node).await,
+        },
+        TopCommand::Docs { command } => match command {
+            DocsCommand::Publish {
+                document,
+                target,
+                path,
+                branch,
+                title,
+                yes,
+            } => {
+                commands::docs_publish(&paths, document, target.into(), path, branch, title, yes)
+                    .await
+            }
         },
         TopCommand::Plugin { command } => match command {
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),

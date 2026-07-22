@@ -1986,6 +1986,21 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
         ProposedAction::GitPush { remote, branch } => {
             vec![format!("git push: {remote} {branch}")]
         }
+        // STEP 4.4.2: every publish displays target, changed files, and the
+        // resulting Git action before approval — render all three verbatim
+        // from the plan, exactly as computed (never re-derived here).
+        ProposedAction::PublishDocument {
+            target,
+            changed_files,
+            git_action,
+            ..
+        } => {
+            let mut v = vec![format!("publish document: {target}")];
+            v.push("changed files:".to_owned());
+            v.extend(changed_files.iter().map(|f| format!("  {f}")));
+            v.push(format!("git action: {git_action}"));
+            v
+        }
         _ => vec!["unsupported action".to_owned()],
     }
 }
@@ -1999,6 +2014,7 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::NetworkRequest { .. } => "network",
         ProposedAction::GitCommit { .. } => "git commit",
         ProposedAction::GitPush { .. } => "git push",
+        ProposedAction::PublishDocument { .. } => "publish document",
         _ => "unsupported",
     }
 }
@@ -2323,6 +2339,55 @@ mod tests {
         );
         // Decision keys present.
         assert!(text.contains("approve once"), "keys missing:\n{text}");
+    }
+
+    #[test]
+    fn approval_modal_snapshot_shows_publish_document_plan_verbatim() {
+        // STEP 4.4.2: every publish displays target, changed files, and the
+        // resulting Git action before approval — the generic approval card
+        // (not a bespoke docs-publish UI) must render a `PublishDocument`
+        // proposal's plan content verbatim, exactly as it renders any other
+        // action.
+        let mut state = running_build_state();
+        reduce(
+            &mut state,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::PublishDocument {
+                    document_id: codypendent_protocol::DocumentId::new(),
+                    target: "repository file docs/architecture.md".to_owned(),
+                    changed_files: vec!["docs/architecture.md".to_owned()],
+                    git_action: "write docs/architecture.md in the working tree \
+                                 (approval-gated change set)"
+                        .to_owned(),
+                },
+                risk: Risk {
+                    level: RiskLevel::Medium,
+                    reasons: vec!["writes docs/architecture.md and commits it".to_owned()],
+                },
+            }),
+        );
+        assert!(state.show_approval_modal());
+        let text = render_to_string(&state, 110, 34);
+
+        assert!(text.contains("Approval required"), "title missing:\n{text}");
+        assert!(
+            text.contains("repository file docs/architecture.md"),
+            "target missing verbatim:\n{text}"
+        );
+        assert!(
+            text.contains("docs/architecture.md"),
+            "changed file missing verbatim:\n{text}"
+        );
+        assert!(
+            text.contains("write docs/architecture.md in the working tree"),
+            "git action missing verbatim:\n{text}"
+        );
+        assert!(text.contains("MED"), "risk level missing:\n{text}");
+        assert!(
+            text.contains("GitCommit (repository file docs/architecture.md)"),
+            "capability label missing:\n{text}"
+        );
     }
 
     #[test]

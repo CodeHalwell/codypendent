@@ -93,6 +93,14 @@ pub struct RuntimeExecutor {
     /// the server pulls out, so their per-run drive locks are the same registry —
     /// a `PauseWorkflow` and the `StartWorkflow` drive it pauses serialize together.
     workflow_host: WorkflowConductorHost<AgentLoopNodeExecutor>,
+    /// The repository root a `PublishDocument` command writes/commits against
+    /// (Phase 4 STEP 4.4). Unlike a run's repository — carried per-command on
+    /// `StartRun` (issue #6 item 1) — a document has no per-command repository
+    /// field (documents live outside the session ledger), so publication uses
+    /// this daemon's own startup working directory, set via
+    /// [`Self::with_repository_root`]. Defaults to the process's current
+    /// directory so a caller that never sets it still gets a sensible root.
+    repository_root: PathBuf,
 }
 
 impl RuntimeExecutor {
@@ -137,7 +145,18 @@ impl RuntimeExecutor {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
             workflow_host,
+            repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
+    }
+
+    /// Set the repository root a `PublishDocument` command operates against
+    /// (Phase 4 STEP 4.4). The assembly's `main` calls this with the same
+    /// working directory it derives the startup repository identity from, so
+    /// publication and the code-graph scan agree on one root.
+    #[must_use]
+    pub fn with_repository_root(mut self, root: PathBuf) -> Self {
+        self.repository_root = root;
+        self
     }
 
     /// Startup recovery for durable workflow runs (Phase 5 STEP 5.2): spawn a drive
@@ -617,6 +636,27 @@ impl RunExecutor for RuntimeExecutor {
         Some(Arc::new(crate::documents::KnowledgeDocumentMutator::new(
             self.pool.clone(),
         )))
+    }
+
+    fn document_publisher(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::documents::DocumentPublisher>> {
+        // Compute a `PublishDocument` plan, park its approval, and (once
+        // approved) execute it against this daemon's repository root (Phase 4
+        // STEP 4.4). Shares the same approval broker the server resolves
+        // `ResolveApproval` against, and the same GitHub client (if any) the
+        // `github.*` tools use, so the PR target's idempotent create/update
+        // behaves identically to an agent-proposed `GitHubMutation`.
+        let mut publisher = crate::publish::KnowledgePublisher::new(
+            self.pool.clone(),
+            self.approvals.clone(),
+            self.repository_root.clone(),
+            artifact_store(&self.paths),
+        );
+        if let Some(github) = &self.github {
+            publisher = publisher.with_github(github.clone());
+        }
+        Some(Arc::new(publisher))
     }
 
     fn workflow_starter(&self) -> Option<Arc<dyn codypendent_daemon::workflows::WorkflowStarter>> {

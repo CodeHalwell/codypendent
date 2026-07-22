@@ -13,7 +13,9 @@ use crate::document::{DocumentLeaseGrant, DocumentSync};
 use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
-use crate::ids::{ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId};
+use crate::ids::{
+    ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
+};
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +116,21 @@ pub enum Payload {
     WorkflowRunStarted {
         command_id: CommandId,
         workflow_run_id: String,
+    },
+    /// A `PublishDocument` command was accepted: its deterministic plan was
+    /// computed and a durable approval parked (Phase 4 STEP 4.4). Carries the
+    /// plan's human-reviewable content **verbatim** — a short target
+    /// description, the changed files, and the resulting Git action — so the
+    /// client can render it immediately; the same content the parked
+    /// `ApprovalRequested` event's approval card carries. Nothing is written
+    /// yet: the approval must still resolve via the ordinary
+    /// `ResolveApproval` command, and a rejection performs no write.
+    DocumentPublishRequested {
+        command_id: CommandId,
+        approval_id: ApprovalId,
+        target: String,
+        changed_files: Vec<String>,
+        git_action: String,
     },
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
@@ -325,6 +342,37 @@ mod tests {
                 assert_eq!(workflow_run_id, "0192abcd-run");
             }
             other => panic!("expected WorkflowRunStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_publish_requested_payload_round_trips() {
+        let command_id = CommandId::new();
+        let approval_id = ApprovalId::new();
+        let requested = Payload::DocumentPublishRequested {
+            command_id,
+            approval_id,
+            target: "repository file docs/architecture.md".to_string(),
+            changed_files: vec!["docs/architecture.md".to_string()],
+            git_action:
+                "write docs/architecture.md in the working tree (approval-gated change set)"
+                    .to_string(),
+        };
+        match round_trip_payload(requested) {
+            Payload::DocumentPublishRequested {
+                command_id: id,
+                approval_id: approval,
+                target,
+                changed_files,
+                git_action,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(approval, approval_id);
+                assert_eq!(target, "repository file docs/architecture.md");
+                assert_eq!(changed_files, vec!["docs/architecture.md".to_string()]);
+                assert!(git_action.contains("docs/architecture.md"));
+            }
+            other => panic!("expected DocumentPublishRequested, got {other:?}"),
         }
     }
 

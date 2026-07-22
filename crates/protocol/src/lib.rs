@@ -31,7 +31,8 @@ pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, SessionProjection};
 pub use command::{Command, CommandBody};
 pub use document::{
-    DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, SuggestionInput,
+    DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
+    SuggestionInput,
 };
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};

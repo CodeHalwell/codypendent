@@ -35,7 +35,7 @@ use crate::artifacts::ArtifactStore;
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
     DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
-    DocumentMutationRequest, DocumentMutator,
+    DocumentMutationRequest, DocumentMutator, DocumentPublisher, PublishDocumentRequest,
 };
 use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
@@ -105,6 +105,12 @@ pub struct ServerState {
     /// (those commands are then rejected `workflow.transport-unavailable`); injected
     /// together with `starter` by the assembly.
     pub lifecycle: Option<Arc<dyn WorkflowLifecycle>>,
+    /// Computes an accepted `PublishDocument` command's plan, parks its approval,
+    /// and (once approved) executes it (Phase 4 STEP 4.4). `None` in a lib-only /
+    /// test embedding (the command is then rejected
+    /// `document.transport-unavailable`); the assembly injects a
+    /// knowledge-backed implementation over the pool, mirroring `mutator`/`leaser`.
+    pub publisher: Option<Arc<dyn DocumentPublisher>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -181,6 +187,7 @@ pub async fn run_with_executor_on(
     // client's `Document` forwarder), and the mutator only computes the sync.
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
+    let publisher = executor.as_ref().and_then(|e| e.document_publisher());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let documents = DocumentHub::new();
@@ -231,6 +238,7 @@ pub async fn run_with_executor_on(
         leaser,
         starter,
         lifecycle,
+        publisher,
     });
 
     #[cfg(unix)]
@@ -809,6 +817,64 @@ async fn handle_request(
                                 command_id: command.command_id,
                                 sequence: None,
                                 created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Publishing a document is a Git write (Phase 4 STEP 4.4), so it
+                // is gated like the other repository-mutating controls
+                // (`CancelRun`/`PauseRun`/`ResumeRun`) rather than the looser
+                // "any non-Observer" gate `MutateDocument` uses: only a
+                // `Controller` may publish. Intercepted here (like
+                // `MutateDocument`/`StartWorkflow`) because a document lives
+                // outside the session ledger. The seam only PARKS the approval
+                // and returns — nothing is written until a human resolves it via
+                // the ordinary `ResolveApproval` command, which the assembly's
+                // background task is awaiting.
+                CommandBody::PublishDocument {
+                    document_id,
+                    target,
+                } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may publish a document".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(publisher) = state.publisher.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let publish = PublishDocumentRequest {
+                        document_id: *document_id,
+                        target: target.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match publisher.publish(publish).await {
+                        Ok(parked) => Envelope::reply_to(
+                            &request,
+                            Payload::DocumentPublishRequested {
+                                command_id: command.command_id,
+                                approval_id: parked.approval_id,
+                                target: parked.target_description,
+                                changed_files: parked.changed_files,
+                                git_action: parked.git_action,
                             },
                         ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),

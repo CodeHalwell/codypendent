@@ -26,7 +26,10 @@ tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# uuid: per-run worktree lease ids (T5) + the docs-publish scratch-worktree
+# directory name (Phase 4 STEP 4.4). thiserror: publish-path error types.
 uuid = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
