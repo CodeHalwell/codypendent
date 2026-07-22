@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
+use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
@@ -48,6 +49,7 @@ use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
+use crate::blackboard::WorkflowBlackboardReader;
 use crate::scan;
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor};
 use crate::workflows::WorkflowConductorHost;
@@ -93,6 +95,13 @@ pub struct RuntimeExecutor {
     /// the server pulls out, so their per-run drive locks are the same registry —
     /// a `PauseWorkflow` and the `StartWorkflow` drive it pauses serialize together.
     workflow_host: WorkflowConductorHost<AgentLoopNodeExecutor>,
+    /// The per-run blackboard fan-out (Phase 5 STEP 5.3). Owned here so BOTH the
+    /// workflow node executor (which publishes an agent's posted artifacts through
+    /// it) and the server (which subscribes a client's `Subscription::Blackboard`
+    /// forwarder to it, via [`RunExecutor::blackboard_hub`]) share one hub — the
+    /// publisher is the agent loop inside the executor, so it cannot be a
+    /// server-created fresh hub the way the document hub is.
+    blackboards: BlackboardHub,
 }
 
 impl RuntimeExecutor {
@@ -116,6 +125,9 @@ impl RuntimeExecutor {
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
         let mut scanned = HashSet::new();
         scanned.insert(startup_repository);
+        // The per-run blackboard fan-out, shared with every workflow agent node so
+        // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
+        let blackboards = BlackboardHub::new();
         // The first workflow host this process builds: no existing drive-lock
         // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
@@ -126,6 +138,7 @@ impl RuntimeExecutor {
             None,
             None,
             startup_repository_root.clone(),
+            blackboards.clone(),
         );
         Self {
             pool,
@@ -137,6 +150,7 @@ impl RuntimeExecutor {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
             workflow_host,
+            blackboards,
         }
     }
 
@@ -170,6 +184,7 @@ impl RuntimeExecutor {
             Some(github),
             Some(drive_locks),
             self.startup_repository_root.clone(),
+            self.blackboards.clone(),
         );
         self
     }
@@ -632,6 +647,19 @@ impl RunExecutor for RuntimeExecutor {
         // Pause/resume/retry an existing durable run over the same host (Phase 5
         // STEP 5.2).
         Some(Arc::new(self.workflow_host.clone()))
+    }
+
+    fn blackboard_reader(&self) -> Option<Arc<dyn BlackboardReader>> {
+        // Read a durable run's board for a `ReadBlackboard` command over the
+        // workflow `BlackboardStore` on the shared pool (Phase 5 STEP 5.3).
+        Some(Arc::new(WorkflowBlackboardReader::new(self.pool.clone())))
+    }
+
+    fn blackboard_hub(&self) -> Option<BlackboardHub> {
+        // The server reuses THIS hub (rather than a fresh one) so an agent's posts,
+        // published deep inside the workflow executor, reach the server's
+        // `Subscription::Blackboard` forwarders (Phase 5 STEP 5.3).
+        Some(self.blackboards.clone())
     }
 }
 

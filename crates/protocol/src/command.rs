@@ -189,6 +189,28 @@ pub enum CommandBody {
         /// The node id to re-drive from (its transitive dependents reset with it).
         node_id: String,
     },
+    /// Read a durable workflow run's blackboard (Phase 5 STEP 5.3): the typed
+    /// artifacts its agents posted, optionally filtered by `kind`. Like
+    /// `StartWorkflow`, intercepted at the connection level (a workflow run's board
+    /// lives in its own durable store outside the session ledger): the daemon reads
+    /// it through its `BlackboardReader` seam and replies
+    /// [`BlackboardItems`](crate::envelope::Payload::BlackboardItems) with the
+    /// matching [`BlackboardItemView`](crate::blackboard::BlackboardItemView)s. This
+    /// is a **read** — any attached client, an Observer included, may issue it
+    /// (there is no client-facing *post* command; only the workflow executor writes
+    /// the board). A daemon assembled without a reader rejects it
+    /// `workflow.transport-unavailable`.
+    ReadBlackboard {
+        workflow_run_id: String,
+        /// A blackboard artifact kind to filter by (`finding`, `decision`, …), or
+        /// all kinds when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// Include superseded revisions too; the default (`false`) returns only the
+        /// live board (the "live-only" view the TUI shows).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_superseded: bool,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -317,6 +339,30 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             node_id: "verify".to_string(),
         });
+        round_trip(CommandBody::ReadBlackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+            kind: Some("finding".to_string()),
+            include_superseded: true,
+        });
+    }
+
+    #[test]
+    fn read_blackboard_omits_default_filter_and_flag() {
+        // A live-only, all-kinds read sends neither optional key, and such a payload
+        // (also what an older client emits) reparses with both defaulted.
+        let body = CommandBody::ReadBlackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+            kind: None,
+            include_superseded: false,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("kind"), "absent kind is skipped: {json}");
+        assert!(
+            !json.contains("include_superseded"),
+            "default (false) include_superseded is skipped: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]

@@ -27,6 +27,7 @@
 //!
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
+mod blackboard;
 mod git;
 mod github;
 mod read_file;
@@ -41,6 +42,10 @@ use async_trait::async_trait;
 use codypendent_daemon::artifacts::Provenance;
 use codypendent_protocol::ArtifactRef;
 
+pub use blackboard::{
+    parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool,
+};
 pub use git::{
     ApplyPatch, ApplyPatchInput, ApplyPatchOutcome, GitDiff, GitDiffInput, GitDiffOutcome,
 };

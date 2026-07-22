@@ -98,6 +98,17 @@ pub enum Subscription {
     /// watermark is needed). Re-attaching with a different `Document` set
     /// replaces the previous forwarders.
     Document { document_id: DocumentId },
+    /// A workflow run's blackboard stream (Phase 5 STEP 5.3): as the run's agents
+    /// post (and supersede) typed artifacts, the daemon fans each
+    /// [`BlackboardItemView`](crate::blackboard::BlackboardItemView) out to
+    /// subscribers over a per-run hub, delivered as
+    /// [`Payload::BlackboardPosted`](crate::envelope::Payload). A subscriber's
+    /// baseline comes from the blackboard read command
+    /// ([`ReadBlackboard`](crate::command::CommandBody::ReadBlackboard)); this
+    /// stream carries the post-subscribe artifacts it merges by id (a superseding
+    /// revision arrives as its own delivery, so no watermark is needed). Mirrors
+    /// [`Document`](Subscription::Document)'s per-id hub, keyed by workflow run.
+    Blackboard { workflow_run_id: String },
     #[serde(other)]
     Unknown,
 }
@@ -177,6 +188,15 @@ mod tests {
             let parsed: Subscription = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(sub, parsed);
         }
+        // The per-run blackboard subscription (STEP 5.3) round-trips its run id.
+        let blackboard = Subscription::Blackboard {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        };
+        let json = serde_json::to_string(&blackboard).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<Subscription>(&json).expect("deserialize"),
+            blackboard
+        );
     }
 
     #[test]

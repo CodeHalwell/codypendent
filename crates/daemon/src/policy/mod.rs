@@ -273,10 +273,32 @@ impl PolicyEngine {
             ProposedAction::GitCommit { .. } => self.eval_git(GitOp::Commit, ctx),
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
             ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
+            ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
+                self.eval_blackboard()
+            }
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
             )),
+        }
+    }
+
+    /// A blackboard post/query (Phase 5 STEP 5.3) is always permitted: it targets
+    /// only the workflow run's OWN typed-artifact channel — not the filesystem, the
+    /// repository, or any remote — and the `blackboard.*` tools are offered solely
+    /// inside a workflow node's agent run. It grants no capability (the tool needs
+    /// no path/command/network scope) and is recorded purely so the board access is
+    /// traced like any other tool call. Writes that DO escape the run (files, git,
+    /// GitHub) keep their existing approval gates; this does not widen them.
+    fn eval_blackboard(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.blackboard-allowed",
+                "a workflow blackboard access targets only the run's own artifact channel",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
         }
     }
 

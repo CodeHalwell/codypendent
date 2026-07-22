@@ -32,6 +32,7 @@ use tracing::{error, info, warn};
 
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
+use crate::blackboard::{BlackboardHub, BlackboardReader, ReadBlackboardRequest};
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
     DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
@@ -105,6 +106,17 @@ pub struct ServerState {
     /// (those commands are then rejected `workflow.transport-unavailable`); injected
     /// together with `starter` by the assembly.
     pub lifecycle: Option<Arc<dyn WorkflowLifecycle>>,
+    /// Per-workflow-run blackboard fan-out: the workflow executor publishes each
+    /// posted artifact here, and a client's `Subscription::Blackboard` forwarder
+    /// delivers from it (Phase 5 STEP 5.3). Reuses the executor's own hub (the
+    /// publisher is the agent loop inside the executor), or a fresh empty one in a
+    /// lib-only / test embedding.
+    pub blackboards: BlackboardHub,
+    /// Reads a durable run's board for an accepted `ReadBlackboard` (Phase 5
+    /// STEP 5.3). `None` in a lib-only / test embedding (the command is then
+    /// rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub blackboard_reader: Option<Arc<dyn BlackboardReader>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -184,6 +196,16 @@ pub async fn run_with_executor_on(
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let documents = DocumentHub::new();
+    // The blackboard read seam, bundled with the executor by the assembly. Unlike
+    // the document hub, the per-run blackboard fan-out is REUSED from the executor
+    // (not created fresh): the publisher is the agent loop deep inside the executor,
+    // so both sides must share one hub — exactly as `collaborators` shares the
+    // `SubscriptionHub`. Absent an executor, a fresh empty hub (never published to).
+    let blackboard_reader = executor.as_ref().and_then(|e| e.blackboard_reader());
+    let blackboards = executor
+        .as_ref()
+        .and_then(|e| e.blackboard_hub())
+        .unwrap_or_default();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
@@ -194,6 +216,7 @@ pub async fn run_with_executor_on(
         let broker = approvals.clone();
         let hub = subscriptions.clone();
         let doc_hub = documents.clone();
+        let board_hub = blackboards.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -207,6 +230,7 @@ pub async fn run_with_executor_on(
                 }
                 hub.prune_idle();
                 doc_hub.prune_idle();
+                board_hub.prune_idle();
             }
         })
     };
@@ -231,6 +255,8 @@ pub async fn run_with_executor_on(
         leaser,
         starter,
         lifecycle,
+        blackboards,
+        blackboard_reader,
     });
 
     #[cfg(unix)]
@@ -971,6 +997,48 @@ async fn handle_request(
                         send(writer, &reply).await?;
                     }
                 }
+                // Reading a workflow run's blackboard is intercepted at the
+                // connection level like `StartWorkflow` (the board lives in its own
+                // durable store outside the session ledger). Unlike the lifecycle
+                // commands this is a READ — an Observer may issue it (there is no
+                // client-facing post command; only the workflow executor writes the
+                // board) — so it carries no role gate, only the transport check
+                // (Phase 5 STEP 5.3).
+                CommandBody::ReadBlackboard {
+                    workflow_run_id,
+                    kind,
+                    include_superseded,
+                } => {
+                    let Some(reader) = state.blackboard_reader.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "workflow.transport-unavailable",
+                                "workflow transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let read = ReadBlackboardRequest {
+                        workflow_run_id: workflow_run_id.clone(),
+                        kind: kind.clone(),
+                        include_superseded: *include_superseded,
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match reader.read(read).await {
+                        Ok(items) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItems {
+                                command_id: command.command_id,
+                                items,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -1179,12 +1247,24 @@ async fn handle_attach(
             handle.abort();
         }
     }
+    // Per-attach, non-session-scoped forwarders (documents + blackboards). Both
+    // ride their own id-keyed hubs (not the session hub), are aborted together on
+    // re-attach, and are tracked in one map so a re-attach with a reduced set stops
+    // the forwarders it no longer names.
     let new_doc_forwarders: Vec<JoinHandle<()>> = subscriptions
         .iter()
         .filter_map(|subscription| match subscription {
             Subscription::Document { document_id } => {
                 let receiver = state.documents.subscribe(*document_id);
                 Some(tokio::spawn(forward_document_syncs(
+                    Arc::clone(writer),
+                    receiver,
+                    client_id,
+                )))
+            }
+            Subscription::Blackboard { workflow_run_id } => {
+                let receiver = state.blackboards.subscribe(workflow_run_id.clone());
+                Some(tokio::spawn(forward_blackboard_posts(
                     Arc::clone(writer),
                     receiver,
                     client_id,
@@ -1305,6 +1385,33 @@ async fn forward_document_syncs(
                 }
             }
             // Slow consumer: skip the dropped span; the next sync reconverges.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Forward a workflow run's live blackboard posts to one subscribed client,
+/// framing each as a [`Payload::BlackboardPosted`] (Phase 5 STEP 5.3). Never
+/// blocks the publisher: a lagging receiver skips the dropped span (its next read
+/// of the board reconverges — items merge idempotently by id) and a vanished
+/// client ends the task. Board posts are not session-scoped, so the frame carries
+/// no `session_id`; the client routes by the item's own `workflow_run_id`.
+/// Mirrors [`forward_document_syncs`].
+async fn forward_blackboard_posts(
+    writer: SharedWriter,
+    mut receiver: broadcast::Receiver<codypendent_protocol::BlackboardItemView>,
+    client_id: ClientId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(item) => {
+                let envelope = Envelope::request(client_id, Payload::BlackboardPosted(item));
+                if send(&writer, &envelope).await.is_err() {
+                    break; // client gone
+                }
+            }
+            // Slow consumer: skip the dropped span; the next read reconverges.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }

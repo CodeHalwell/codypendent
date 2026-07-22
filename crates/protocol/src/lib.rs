@@ -10,6 +10,7 @@
 //! - unknown enum variants must be handled safely by receivers.
 
 pub mod artifact;
+pub mod blackboard;
 pub mod capabilities;
 pub mod catchup;
 pub mod command;
@@ -27,6 +28,7 @@ pub mod run;
 pub mod version;
 
 pub use artifact::{ArtifactRef, DataClassification};
+pub use blackboard::BlackboardItemView;
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, SessionProjection};
 pub use command::{Command, CommandBody};
