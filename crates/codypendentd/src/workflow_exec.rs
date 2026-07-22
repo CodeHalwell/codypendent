@@ -108,6 +108,7 @@ use crate::executor::{
     artifact_sink, artifact_store, bind_run_worktree, load_model_registry, resolve_github_repo,
     run_journal, run_writes_to_worktree, WorktreeReleaseGuard,
 };
+use crate::routing::{estimate_input_tokens, RoutingCoordinator};
 use crate::workflows::{DriveLockRegistry, WorkflowConductorHost};
 
 /// The stable dotted name of the GitHub update-pull-request runtime tool (mirrors
@@ -186,28 +187,52 @@ impl RepositoryTestRunner for ShellRepositoryTestRunner {
     }
 }
 
-/// Builds the model driver an agent node runs against. Production resolves a model
-/// from `models.toml` and builds a [`FrameworkModelDriver`]; a test returns a
-/// scripted driver so the agent-node path runs with no model or network.
+/// Builds the model driver an agent node runs against. Production threads the
+/// node through the Phase-7 [`RoutingCoordinator`] seam — **mirroring
+/// [`RuntimeExecutor::execute`](crate::executor::RuntimeExecutor::execute)'s use
+/// of the seam exactly**: routing OFF resolves a model from `models.toml` as
+/// before (every existing workflow-exec test, none of which write a
+/// `routing.toml`, is unchanged); enabled, the classification hard-filter
+/// applies to this node and a refusal is a clean node failure, never a
+/// classification-blind fallback. A test returns a scripted driver so the
+/// agent-node path runs with no model or network.
 #[async_trait]
 pub(crate) trait NodeModelDriverFactory: Send + Sync {
-    /// Build a driver for `mode` under the node's resolved `model_policy` (T8), or
-    /// a human reason it could not (e.g. no model configured) — which the caller
-    /// turns into a clean node failure. The policy name is recorded on the run row
-    /// and passed here for provenance; actual model selection is unchanged (the
-    /// production factory still resolves via the daemon's configured policy —
-    /// per-workflow policy routing is a later task).
+    /// Build a driver for `mode` under the node's resolved `model_policy` (T8),
+    /// or a human reason it could not (e.g. no model configured, or the router
+    /// refused) — which the caller turns into a clean node failure.
+    /// `objective`/`session_id`/`run_id` are the node's OWN already-created
+    /// agent-run identity (T8), threaded in so the production factory can feed
+    /// the routing seam (objective → classification/sizing) and record a
+    /// selection into THIS run's trace. The policy name is recorded on the run
+    /// row separately (by the caller) and passed here for provenance only:
+    /// there is no per-node-policy registry yet (a documented follow-up), so
+    /// every node routes under the ONE daemon-configured routing policy.
     async fn build(
         &self,
         mode: AgentMode,
         model_policy: &str,
+        objective: &str,
+        session_id: SessionId,
+        run_id: RunId,
     ) -> Result<Box<dyn ModelDriver>, String>;
 }
 
-/// The production factory: resolve a model from `<data_dir>/models.toml` and build
-/// the framework driver, exactly as [`RuntimeExecutor::execute`] does for a run.
+/// The production factory: routes through the Phase-7 [`RoutingCoordinator`]
+/// seam when enabled, falling back to resolving a model from
+/// `<data_dir>/models.toml` when it is not (`RoutingCoordinator::select`'s
+/// `Ok(None)`), then builds the framework driver — exactly as
+/// [`RuntimeExecutor::execute`](crate::executor::RuntimeExecutor::execute) does
+/// for a single-agent run.
 struct ConfiguredModelDriverFactory {
     paths: RuntimePaths,
+    /// The Phase-7 routing seam (STEP 7.2/7.3). Threading this into the
+    /// factory is what closes the gap this task fixes: before, an agent node
+    /// resolved a model classification-blind via `resolve_model`, discarding
+    /// `model_policy` entirely; now the SAME classification hard-filter +
+    /// fail-closed contract the single-agent executor uses applies to every
+    /// workflow agent node.
+    routing: RoutingCoordinator,
 }
 
 #[async_trait]
@@ -216,17 +241,58 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
         &self,
         mode: AgentMode,
         model_policy: &str,
+        objective: &str,
+        session_id: SessionId,
+        run_id: RunId,
     ) -> Result<Box<dyn ModelDriver>, String> {
-        // The node's resolved policy name is recorded on the run row for
-        // provenance; model SELECTION stays whatever `resolve_model` does with the
-        // daemon's configured policy today (per-workflow policy routing is T14 —
-        // this task only threads the name through, never changes selection).
+        // The node's resolved policy name (T8) is recorded on the run row by
+        // the caller (`create_agent_run`) for provenance only: there is no
+        // per-node-policy registry yet, so model SELECTION below routes under
+        // the ONE daemon-configured routing policy (a documented follow-up —
+        // see the module docs and `RoutingCoordinator`'s).
         let _requested_policy = model_policy;
         let (registry, policy) = load_model_registry(&self.paths)?;
-        let resolved = resolve_model(&registry, &policy, mode)
+        // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF — mirrors
+        // `RuntimeExecutor::execute`'s use of the seam EXACTLY: routing OFF
+        // returns `Ok(None)` and the model resolves the Phase-1 way (every
+        // existing workflow-exec test, none of which write a `routing.toml`,
+        // is unchanged); enabled, a refusal (classified data with no eligible
+        // local model) fails this node CLOSED rather than falling back to the
+        // classification-blind resolver below.
+        let routed = self
+            .routing
+            .select(
+                mode,
+                "agent",
+                objective,
+                estimate_input_tokens(objective),
+                // The workflow run carries no per-run classification today
+                // (mirrors `RunLaunch`); the coordinator falls back to its
+                // operator-declared, fail-closed ceiling. Deriving a real
+                // per-run classification is a documented follow-up.
+                None,
+            )
             .await
-            .map_err(|e| format!("no model configured: {e}"))?;
-        let driver = FrameworkModelDriver::from_registry(&registry, resolved.id)
+            .map_err(|e| format!("routing refused to place this node: {e}"))?;
+        let model_id = match routed {
+            Some(selection) => {
+                if let Err(error) = self
+                    .routing
+                    .record_decision(session_id, run_id, &selection.decision)
+                    .await
+                {
+                    warn!(%run_id, %error, "could not record the routing decision in the trace");
+                }
+                selection.model().clone()
+            }
+            None => {
+                resolve_model(&registry, &policy, mode)
+                    .await
+                    .map_err(|e| format!("no model configured: {e}"))?
+                    .id
+            }
+        };
+        let driver = FrameworkModelDriver::from_registry(&registry, model_id)
             .map_err(|e| format!("could not build model client: {e}"))?;
         Ok(Box::new(driver))
     }
@@ -238,7 +304,11 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 /// rebuilt by `with_github` so agent nodes drive with the daemon's GitHub
 /// client (`drive_locks: Some(existing)` — reconfiguring an ALREADY-running
 /// host must carry its per-run drive-lock registry forward, not mint a fresh
-/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c).
+/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c). `routing` is
+/// the SAME [`RoutingCoordinator`] the single-agent executor uses (built once
+/// by the caller and threaded through both places), so a workflow agent node's
+/// model selection goes through the identical classification hard-filter +
+/// fail-closed contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workflow_host(
     pool: SqlitePool,
@@ -251,9 +321,11 @@ pub(crate) fn build_workflow_host(
     blackboards: BlackboardHub,
     workflows: WorkflowHub,
     cancellations: WorkflowRunCancellations,
+    routing: RoutingCoordinator,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
+        routing,
     });
     // The per-user workflow source directory a `StartWorkflow`-by-id (`/fix-ci`)
     // consults below the built-in and the repository scope (STEP 5.1.4). Following
@@ -640,12 +712,15 @@ impl AgentLoopNodeExecutor {
             ));
         }
 
-        // Build the model driver for the resolved mode + policy; a missing model is
-        // a clean node failure, not a hang. The created run is failed so it never
-        // sits non-terminal.
+        // Build the model driver for the resolved mode + policy — threading the
+        // node's objective + its own run identity so the factory can feed the
+        // Phase-7 routing seam (when enabled) and record a selection into THIS
+        // run's trace. A missing model — or a routing refusal — is a clean node
+        // failure, not a hang. The created run is failed so it never sits
+        // non-terminal.
         let driver = match self
             .driver_factory
-            .build(mode, &resolved.model_policy)
+            .build(mode, &resolved.model_policy, &objective, session_id, run_id)
             .await
         {
             Ok(driver) => driver,
@@ -2255,6 +2330,9 @@ mod tests {
             &self,
             _mode: AgentMode,
             _model_policy: &str,
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
         ) -> Result<Box<dyn ModelDriver>, String> {
             let mut driver = ScriptedDriver::new(self.steps.clone());
             if let Some(usage) = self.usage {
@@ -2311,6 +2389,9 @@ mod tests {
             &self,
             _mode: AgentMode,
             _model_policy: &str,
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
         ) -> Result<Box<dyn ModelDriver>, String> {
             Ok(Box::new(SelfCancelDriver {
                 cancellations: self.cancellations.clone(),
@@ -2570,10 +2651,14 @@ steps:
     async fn an_agent_node_fails_cleanly_with_no_model_configured() {
         // The production factory over a data dir with no models.toml: the driver
         // build fails BEFORE any worktree is allocated, so the node fails cleanly
-        // (never hangs) and the run is Failed — and no lease is leaked.
+        // (never hangs) and the run is Failed — and no lease is leaked. Routing
+        // stays OFF (the default `RoutingConfig`), so this also pins that the
+        // routing seam introduces no new failure mode on the OFF path — the
+        // failure is still "no model configured", exactly as before this task.
         let (tmp, pool, paths) = temp_env().await;
         let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
             paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), RoutingConfig::default()),
         });
         let executor = executor_with(&pool, &paths, factory, tmp.path());
 
@@ -2592,6 +2677,324 @@ steps:
             leases(&pool).await.is_empty(),
             "a driver-build failure allocates no worktree"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-7 routing seam threaded through workflow agent nodes (T2): the
+    // production factory now routes through `RoutingCoordinator::select`
+    // exactly as `RuntimeExecutor::execute` does for a single-agent run —
+    // these pin the OFF-fallback, the classification hard filter, and the
+    // fail-closed refusal contract on the WORKFLOW path.
+    // ------------------------------------------------------------------
+
+    use crate::routing::RoutingConfig;
+    use codypendent_daemon::model_profiles::ModelProfileStore;
+    use codypendent_protocol::DataClassification;
+    use codypendent_routing::{
+        ModelCapabilities, ModelExecutionProfile, ModelLocation, ModelPerformance, ModelProfile,
+        RoutingPolicy, StructuredOutputSupport, ToolCallSupport,
+    };
+
+    /// Capabilities generous enough that they never themselves filter a
+    /// candidate out — these tests are about the CLASSIFICATION hard filter,
+    /// not capability fit (mirrors `routing.rs`'s own `caps` test helper; a
+    /// different module's private fixture, so this is its own small copy).
+    fn routing_seam_caps() -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tools: ToolCallSupport::Parallel,
+            parallel_tools: true,
+            structured_output: StructuredOutputSupport::Strict,
+            vision: false,
+            audio_input: false,
+            embeddings: false,
+            prompt_caching: false,
+            reasoning_controls: false,
+            context_tokens: Some(200_000),
+            output_tokens: Some(16_000),
+        }
+    }
+
+    /// A minimal [`ModelProfile`] fixture for the routing-seam tests below.
+    fn routing_seam_profile(
+        id: &str,
+        location: ModelLocation,
+        reliability: f64,
+        cost: f64,
+    ) -> ModelProfile {
+        ModelProfile {
+            id: codypendent_protocol::ModelId(id.to_string()),
+            location,
+            capabilities: routing_seam_caps(),
+            performance: ModelPerformance {
+                reliability,
+                cost_per_1k_tokens_usd: cost,
+                latency_ms_p50: 700.0,
+                task_class_success: std::collections::BTreeMap::new(),
+                failure_patterns: vec![],
+            },
+            execution: ModelExecutionProfile::default(),
+            bench: None,
+        }
+    }
+
+    /// Write a minimal `models.toml` with one `[[model]]` entry per `ids`, all
+    /// pointing at `addr` — an ephemeral, ALREADY-bound local listener, so
+    /// `FrameworkModelDriver::from_registry` can build a client for whichever
+    /// id the seam selects without ever dialing out (driver construction only
+    /// builds a client object; see `ModelRegistry::client_for`).
+    fn write_models_toml(paths: &RuntimePaths, ids: &[&str], addr: std::net::SocketAddr) {
+        let mut text = String::new();
+        for id in ids {
+            text.push_str(&format!(
+                "[[model]]\nid = \"{id}\"\nprovider = \"openai-compatible\"\n\
+                 base_url = \"http://{addr}/v1\"\nmodel = \"unused\"\napi_key_env = \"\"\n\n"
+            ));
+        }
+        std::fs::write(paths.data_dir.join("models.toml"), text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_factory_with_routing_off_resolves_the_phase_one_way() {
+        // Routing OFF (the default — no `routing.toml`, exactly the state of
+        // every other workflow-exec test): the production factory must still
+        // resolve a model exactly as it did before this task — via
+        // `resolve_model` against `<data_dir>/models.toml` — with the routing
+        // seam never entering the picture.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["local-default"], addr);
+
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), RoutingConfig::default()),
+        };
+        let driver = factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "fix the off-by-one bug",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+            .expect("routing OFF resolves via the unchanged Phase-1 path");
+        assert_eq!(
+            driver.model_id(),
+            codypendent_protocol::ModelId("local-default".to_string()),
+            "routing OFF: the SAME model `resolve_model` would pick, unchanged"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn configured_factory_secret_data_never_selects_a_hosted_model_through_the_seam() {
+        // THE workflow-path leak test (mirrors `routing::tests::
+        // secret_data_never_selects_a_hosted_model_through_the_seam`): a node
+        // whose real classification is Secret, under a policy that only allows
+        // Internal off-device, must never select a hosted model — even though
+        // the hosted model here is BOTH more reliable AND cheaper, so neither
+        // cost nor quality can explain local winning. ONLY the classification
+        // hard filter can. This is the security gap T2 closes: before, a
+        // workflow agent node resolved a model classification-blind.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["hosted-strong", "local"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-strong", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "http://localhost/v1",
+                &routing_seam_profile("local", ModelLocation::Local, 0.75, 0.010),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        };
+
+        let driver = factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "handle the secret payload",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+            .expect("a local model can serve secret data");
+        assert_eq!(
+            driver.model_id(),
+            codypendent_protocol::ModelId("local".to_string()),
+            "Secret data stays on-device on the WORKFLOW path too: the hosted \
+             model is filtered before scoring"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn configured_factory_secret_data_with_no_local_model_refuses_rather_than_leaks() {
+        // No local model + Secret data + a policy that only allows Internal
+        // off-device ⇒ the seam REFUSES (fail closed) — mirrors `routing::
+        // tests::secret_data_with_no_local_model_refuses_rather_than_leaks`.
+        // The factory's `build` returns `Err` naming the refusal, so the
+        // caller (`run_agent_node`) turns it into a clean node failure rather
+        // than silently falling back to the classification-blind
+        // `resolve_model`.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["hosted-only"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-only", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        };
+
+        // `Box<dyn ModelDriver>` is not `Debug`, so `expect_err`/`unwrap_err`
+        // (which require it on the `Ok` side) do not apply here — match instead.
+        let error = match factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "handle the secret payload",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+        {
+            Ok(_) => panic!("classified data with no eligible model must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("routing refused"),
+            "the failure names the routing refusal, not a silent fallback: {error}"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn an_agent_node_fails_closed_when_routing_refuses_rather_than_leaking() {
+        // The end-to-end contract, driven through the full workflow conductor
+        // (not just the factory): routing ENABLED, only a HOSTED profile
+        // stored, and the node's classification (Secret, via the config's
+        // fail-closed ceiling — a workflow run carries no per-run
+        // classification today) is above the policy's off-device ceiling
+        // (Internal). The router REFUSES — a clean node failure, fail closed,
+        // NEVER a fallback to the classification-blind `resolve_model` — so
+        // the run fails and (like a "no model configured" failure) no
+        // worktree is ever allocated.
+        let (tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        // A models.toml IS configured, so a failure here proves out to be the
+        // ROUTING refusal, not the unrelated "no model configured" failure the
+        // OFF-path test above already covers.
+        write_models_toml(&paths, &["hosted-only"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-only", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        });
+        let executor = executor_with(&pool, &paths, factory, tmp.path());
+
+        let compiled = compile_yaml(AGENT_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(&pool, &compiled, None, &json!({}), Some(AGENT_MANIFEST))
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            WorkflowRunState::Failed,
+            "a routing refusal fails the node — and so the run — closed"
+        );
+        assert!(
+            leases(&pool).await.is_empty(),
+            "a routing refusal allocates no worktree: it fails before the worktree bind"
+        );
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "inspect")
+            .unwrap();
+        assert_eq!(node.state, NodeState::Failed);
+        drop(listener);
     }
 
     #[tokio::test]
@@ -3452,6 +3855,9 @@ steps:
             &self,
             _mode: AgentMode,
             model_policy: &str,
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
         ) -> Result<Box<dyn ModelDriver>, String> {
             let steps = match model_policy {
                 // The implementer: EDIT the worktree (no proposed_patch post — the

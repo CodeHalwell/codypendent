@@ -166,6 +166,15 @@ impl RuntimeExecutor {
         // here and its cancel seam fires the tokens the node executor registers (T9).
         let workflows = WorkflowHub::new();
         let workflow_cancellations = WorkflowRunCancellations::default();
+        // The Phase-7 routing seam, loaded from `<data_dir>/routing.toml` (absent
+        // ⇒ OFF). Bound to the shared fan-out so a recorded routing decision
+        // reaches attached clients live, exactly like the run's context note.
+        // Built BEFORE the workflow host so a workflow agent node's model
+        // selection goes through this SAME seam (closing the gap where a node
+        // used to resolve a model classification-blind, discarding its
+        // `model_policy`) — see `workflow_exec::ConfiguredModelDriverFactory`.
+        let routing = RoutingCoordinator::new(pool.clone(), RoutingConfig::load(&paths))
+            .with_subscriptions(subscriptions.clone());
         // The first workflow host this process builds: no existing drive-lock
         // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
@@ -179,13 +188,9 @@ impl RuntimeExecutor {
             blackboards.clone(),
             workflows.clone(),
             workflow_cancellations.clone(),
+            routing.clone(),
         );
         let promotion = PromotionStoreGateway::new(pool.clone());
-        // The Phase-7 routing seam, loaded from `<data_dir>/routing.toml` (absent
-        // ⇒ OFF). Bound to the shared fan-out so a recorded routing decision
-        // reaches attached clients live, exactly like the run's context note.
-        let routing = RoutingCoordinator::new(pool.clone(), RoutingConfig::load(&paths))
-            .with_subscriptions(subscriptions.clone());
         Self {
             pool,
             paths,
@@ -251,6 +256,7 @@ impl RuntimeExecutor {
             // publishes to — and is cancellable through — the shared instances (T9).
             self.workflows.clone(),
             self.workflow_cancellations.clone(),
+            self.routing.clone(),
         );
         self
     }
