@@ -2976,6 +2976,11 @@ mod tests {
             reduce(&mut state, Action::InputChar(c));
         }
         reduce(&mut state, Action::InputSubmit);
+        // Focus the SECOND row (qwen) — deliberately NOT the current model
+        // (gpt) — so the current-marker assertions below can only be
+        // satisfied by the list rows themselves, never by the (qwen-focused)
+        // detail panel.
+        reduce(&mut state, Action::SelectNext);
         assert!(matches!(state.overlay, Overlay::ModelPicker { .. }));
 
         let text = render_to_string(&state, 120, 40);
@@ -2985,8 +2990,27 @@ mod tests {
             text.contains("qwen2.5-coder"),
             "second row missing:\n{text}"
         );
-        // The row serving the active run is marked current.
-        assert!(text.contains('●'), "current marker missing:\n{text}");
+
+        // Row-scoped: the list's per-row current marker is the span
+        // immediately BEFORE the id ("● " then the id, contiguous — see the
+        // list-row `head` `Line`), distinct from the detail panel's "<id>  ●
+        // current" (marker AFTER the id) when the FOCUSED model happens to be
+        // current. Checking this precise adjacency — rather than whether a
+        // whole terminal LINE contains '●' — matters because ratatui lays
+        // the list and detail panel out as side-by-side columns sharing the
+        // same rows, so an unscoped whole-line check would also pass with the
+        // marker misapplied to the wrong row (or every row): here gpt is
+        // current and qwen is merely focused (by the `SelectNext` above), so
+        // only gpt's list row may show the leading marker.
+        assert!(
+            text.contains("● gpt-5.1-codex"),
+            "the list's current marker is missing from gpt-5.1-codex's row:\n{text}"
+        );
+        assert!(
+            !text.contains("● qwen2.5-coder"),
+            "the list must not mark the non-current model's row current:\n{text}"
+        );
+
         // Local/hosted + cost + context badges.
         assert!(text.contains("hosted"), "hosted badge missing:\n{text}");
         assert!(

@@ -969,16 +969,25 @@ fn submit_prompt(state: &mut AppState) {
             }
         }
         // Enter stages the focused model (advisory this task — MP2 wires it
-        // to actually pin the next run's model) and emits a status notice;
-        // `mem::take` already closed the picker (left the overlay `None`).
-        Overlay::ModelPicker { .. } => {
-            if let Some(card) = state.models.get(state.selected_model) {
-                let id = card.id.clone();
-                state.pending_model = Some(id.clone());
-                state.notice = Some((
-                    format!("model set to {id} — applies to your next run"),
-                    state.tick + 25,
-                ));
+        // to actually pin the next run's model) and emits a status notice.
+        // Re-derives the filtered list from the overlay's own `query` /
+        // `selected` (mirroring the palette arm above) rather than trusting
+        // `selected_model`: that field's `.unwrap_or(0)` fallback (see `nav`
+        // / `edit_prompt`) points at the full list's row 0 whenever the
+        // filter matches nothing, and a query with zero matches must stage
+        // nothing — not silently pick a model the picker isn't even
+        // showing. `mem::take` already closed the picker (left the overlay
+        // `None`).
+        Overlay::ModelPicker { query, selected } => {
+            if let Some(&idx) = filter_models(&state.models, &query).get(selected) {
+                if let Some(card) = state.models.get(idx) {
+                    let id = card.id.clone();
+                    state.pending_model = Some(id.clone());
+                    state.notice = Some((
+                        format!("model set to {id} — applies to your next run"),
+                        state.tick + 25,
+                    ));
+                }
             }
         }
         // Base view (`mem::take` left `None`): send the composer. A live run is
@@ -2809,6 +2818,43 @@ mod tests {
         assert!(
             notice.contains("next run"),
             "the notice explains staging is advisory: {notice}"
+        );
+    }
+
+    #[test]
+    fn model_picker_enter_with_zero_matches_stages_nothing() {
+        // Regression: `selected_model`'s `.unwrap_or(0)` fallback (see `nav`
+        // and `edit_prompt`) points at the full list's row 0 whenever the
+        // live query matches nothing — Enter must NOT silently stage that
+        // row (the list is showing "no matching model", not row 0).
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("local-qwen", "openai-compatible"),
+            model_card("hosted-gpt", "openai-compatible"),
+        ];
+        open_model_picker(&mut s);
+        for c in "zzz-no-such-model".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert!(
+            crate::state::filter_models(&s.models, "zzz-no-such-model").is_empty(),
+            "precondition: the query must match nothing"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(
+            s.overlay,
+            Overlay::None,
+            "the picker still closes (mirrors the palette's no-match submit)"
+        );
+        assert!(
+            s.pending_model.is_none(),
+            "a zero-match submit must not silently stage models[0]"
+        );
+        assert!(
+            s.notice.is_none(),
+            "a zero-match submit must not emit a staging notice"
         );
     }
 

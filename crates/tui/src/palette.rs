@@ -53,7 +53,9 @@ pub struct PaletteEntry {
     /// A one-line description of what the command does.
     pub description: &'static str,
     /// The single-key equivalent, shown as a hint (kept in sync with
-    /// [`crate::input`]).
+    /// [`crate::input`]) — `"—"` for a palette-only command with no
+    /// single-key binding (e.g. the model picker: MP1 deliberately gives it
+    /// none, leaving `m` free).
     pub key: &'static str,
 }
 
@@ -112,7 +114,9 @@ pub const COMMANDS: &[PaletteEntry] = &[
         command: PaletteCommand::Model,
         title: "Model picker",
         description: "browse selectable models and stage one for the next run",
-        key: "/model",
+        // Palette-only this task: no single-key equivalent (see the field's
+        // doc comment).
+        key: "—",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
