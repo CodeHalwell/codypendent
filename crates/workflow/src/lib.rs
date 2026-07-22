@@ -36,6 +36,7 @@
 //! scheduling, recovery, and lifecycle logic.
 
 pub mod agent;
+pub mod binding;
 pub mod blackboard;
 pub mod compile;
 pub mod conductor;
@@ -50,6 +51,7 @@ pub use agent::{
     parse_agent_profile, AgentBudget, AgentCompletion, AgentPermissions, AgentProfile,
     AgentProfileError,
 };
+pub use binding::{bind_with, normalize_tool_name, scan_input_refs};
 pub use blackboard::{
     BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
 };

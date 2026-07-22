@@ -21,6 +21,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde_json::Value;
+
+use crate::binding::{normalize_tool_name, scan_input_refs};
 use crate::model::{
     parse_definition, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy, WorkflowBudget,
     WorkflowDefinition, WorkflowInput, WorkspaceMode, SUPPORTED_SCHEMA_VERSION,
@@ -67,6 +70,15 @@ pub enum CompileError {
     /// A step declares a skill without an agent to apply it.
     #[error("step {0} declares a `skill` but has no `agent` to apply it")]
     SkillWithoutAgent(String),
+    /// A step's `with:` value interpolates an input the workflow never declares
+    /// (STEP 5.1 / T6). Caught at compile time so a placeholder typo fails before
+    /// a run starts rather than at node-execution time.
+    #[error("step `{step}` binds `with:` from undeclared input `{input}`")]
+    UnknownInputReference { step: String, input: String },
+    /// A step's `with:` value contains a malformed interpolation placeholder
+    /// (unterminated, or a non-`inputs.` reference — no expression language).
+    #[error("step `{step}` has a malformed `with:` binding: {detail}")]
+    MalformedBinding { step: String, detail: String },
     /// A step depends on itself.
     #[error("step {0} depends on itself")]
     SelfDependency(String),
@@ -168,7 +180,11 @@ impl CompiledWorkflow {
         for node in &self.nodes {
             match &node.action {
                 NodeAction::Tool { name } => {
-                    if !registry.has_tool(name) {
+                    // Resolve against the registry through the shared namespace
+                    // normalization (T6): a manifest may write `github.update-pull-request`
+                    // while the registry/runtime uses `github.update_pull_request`.
+                    // The error still reports the name the author wrote.
+                    if !registry.has_tool(&normalize_tool_name(name)) {
                         return Err(CompileError::UnknownTool {
                             step: node.id.clone(),
                             tool: name.clone(),
@@ -242,6 +258,11 @@ impl CompiledWorkflow {
             hasher.update(serde_json::to_vec(&node.approval).unwrap_or_default());
             hasher.update(b"\x05");
             hasher.update(serde_json::to_vec(&node.retry).unwrap_or_default());
+            // The tool-argument bindings affect what a tool node executes, so a
+            // changed `with:` map must change the signature (BTreeMap serializes
+            // in a stable key order).
+            hasher.update(b"\x06");
+            hasher.update(serde_json::to_vec(&node.with).unwrap_or_default());
             // Dependencies (order-independent).
             let mut deps = node.depends_on.clone();
             deps.sort();
@@ -292,6 +313,11 @@ pub struct CompiledNode {
     pub retry: RetryPolicy,
     /// The blackboard artifact kinds the node is declared to produce.
     pub outputs: Vec<String>,
+    /// Explicit tool-argument bindings for a tool node (T6), keyed by parameter
+    /// name; string values interpolate `${{ inputs.<name> }}` at execution time.
+    /// Empty for an agent node or a tool node using the executor's default
+    /// per-tool binding.
+    pub with: BTreeMap<String, Value>,
     /// The node's position in the compiled topological order.
     pub topo_order: usize,
 }
@@ -391,6 +417,11 @@ pub fn compile(definition: &WorkflowDefinition) -> Result<CompiledWorkflow, Comp
                 });
             }
         }
+        // A `with:` binding interpolates `${{ inputs.<name> }}` placeholders — the
+        // statically-detectable failures (a malformed placeholder, or a reference
+        // to an input the workflow never declares) are caught here (T6), so a
+        // binding typo fails at compile time rather than at node execution.
+        validate_with_bindings(step, &definition.inputs)?;
     }
 
     // Dependencies resolve, no self-loops. Deduplicate within a step so a repeated
@@ -465,6 +496,7 @@ pub fn compile(definition: &WorkflowDefinition) -> Result<CompiledWorkflow, Comp
             approval: step.approval,
             retry: step.retry.unwrap_or_default(),
             outputs: step.outputs.clone(),
+            with: step.with.clone(),
             topo_order: position[id],
         });
     }
@@ -477,6 +509,33 @@ pub fn compile(definition: &WorkflowDefinition) -> Result<CompiledWorkflow, Comp
         orchestration_reason: definition.orchestration_reason,
         nodes,
     })
+}
+
+/// Validate a step's `with:` bindings against the declared inputs (T6): every
+/// `${{ inputs.<name> }}` placeholder in a string value must reference an input
+/// the workflow declares, and each placeholder must be well-formed. A binding
+/// that references an undeclared input is [`CompileError::UnknownInputReference`];
+/// a malformed placeholder is [`CompileError::MalformedBinding`].
+fn validate_with_bindings(
+    step: &crate::model::WorkflowStep,
+    inputs: &BTreeMap<String, WorkflowInput>,
+) -> Result<(), CompileError> {
+    for value in step.with.values() {
+        let Value::String(text) = value else { continue };
+        let names = scan_input_refs(text).map_err(|detail| CompileError::MalformedBinding {
+            step: step.id.clone(),
+            detail,
+        })?;
+        for name in names {
+            if !inputs.contains_key(&name) {
+                return Err(CompileError::UnknownInputReference {
+                    step: step.id.clone(),
+                    input: name,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check that whatever budget fields are present are sane, and that a workflow
@@ -595,6 +654,7 @@ mod tests {
             approval: None,
             retry: None,
             outputs: Vec::new(),
+            with: BTreeMap::new(),
         }
     }
 
@@ -610,6 +670,7 @@ mod tests {
             approval: None,
             retry: None,
             outputs: Vec::new(),
+            with: BTreeMap::new(),
         }
     }
 
@@ -844,6 +905,54 @@ mod tests {
             .with_agent_role("worker")
             .with_tool("repository.test");
         assert!(compile_with_registry(&def, &registry).is_ok());
+    }
+
+    #[test]
+    fn compile_with_registry_resolves_a_hyphenated_tool_via_normalization() {
+        // The manifest writes the hyphenated `github.update-pull-request`; the
+        // registry (mirroring the runtime) knows the underscored
+        // `github.update_pull_request`. Normalization (T6) bridges them.
+        let mut step = tool_step("publish", &[]);
+        step.tool = Some("github.update-pull-request".to_owned());
+        let registry = SetRegistry::new().with_tool("github.update_pull_request");
+        assert!(
+            compile_with_registry(&definition(vec![step]), &registry).is_ok(),
+            "a hyphenated manifest tool id must resolve against the underscored registry name"
+        );
+    }
+
+    #[test]
+    fn rejects_a_with_binding_referencing_an_undeclared_input() {
+        // `${{ inputs.ghost }}` names an input the workflow never declares — a
+        // statically-detectable binding error caught at compile time (T6).
+        let mut step = tool_step("publish", &[]);
+        step.with = [(
+            "number".to_owned(),
+            serde_json::json!("${{ inputs.ghost }}"),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            compile(&definition(vec![step])).unwrap_err(),
+            CompileError::UnknownInputReference {
+                step: "publish".to_owned(),
+                input: "ghost".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn carries_with_bindings_onto_the_node_and_into_the_signature() {
+        let mut with_step = tool_step("t", &[]);
+        with_step.with = [("count".to_owned(), serde_json::json!(3))]
+            .into_iter()
+            .collect();
+        let bound = compile(&definition(vec![with_step])).unwrap();
+        assert_eq!(bound.node("t").unwrap().with["count"], serde_json::json!(3));
+
+        // A different binding is a different execution, so the signature changes.
+        let plain = compile(&definition(vec![tool_step("t", &[])])).unwrap();
+        assert_ne!(bound.signature(), plain.signature());
     }
 
     #[test]

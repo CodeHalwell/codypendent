@@ -31,6 +31,7 @@ mod blackboard;
 mod git;
 mod github;
 mod read_file;
+mod repository;
 mod salient;
 mod search;
 mod shell;
@@ -57,6 +58,7 @@ pub use github::{
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
 };
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
+pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};

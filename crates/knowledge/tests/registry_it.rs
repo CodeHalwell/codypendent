@@ -293,6 +293,7 @@ async fn register_builtins_registers_the_phase1_tools() {
         "shell.run",
         "git.diff",
         "git.apply_patch",
+        "repository.test",
     ] {
         assert!(names.contains(&expected), "missing built-in {expected}");
     }
@@ -323,9 +324,10 @@ async fn register_builtins_registers_the_phase1_tools() {
         .unwrap()
         .unwrap();
     assert_eq!(shell_before.id, shell_after.id);
-    // Seven tools (the five Phase-1 tools plus the two Phase-5 blackboard tools)
-    // plus the two commands (`/fix-ci`, `/update-docs`).
-    assert_eq!(registry.list(&pool).await.unwrap().len(), 9);
+    // Eight tools (the five Phase-1 tools, the Phase-5 `repository.test`
+    // verification tool, and the two Phase-5 blackboard tools) plus the two
+    // commands (`/fix-ci`, `/update-docs`).
+    assert_eq!(registry.list(&pool).await.unwrap().len(), 10);
 }
 
 #[tokio::test]

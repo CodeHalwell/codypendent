@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// The schema version this build understands. A manifest declaring a different
 /// `schema_version` is rejected by [`crate::compile`] rather than silently
@@ -103,6 +104,13 @@ pub struct WorkflowStep {
     /// The tool that performs this step, if it is a tool step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Explicit arguments for a tool step, keyed by the tool's parameter name.
+    /// String values may interpolate `${{ inputs.<name> }}` placeholders against
+    /// the run's typed inputs (Phase 5 T6, `crate::binding`); a non-string value
+    /// is passed through as-is. Absent (empty) for an agent step, or for a tool
+    /// step that relies on the executor's default per-tool argument binding.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub with: BTreeMap<String, Value>,
     /// A skill the agent applies (valid only on an agent step).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
