@@ -626,6 +626,7 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         objective: str(r, "objective"),
         mode: reconstructAgentMode(rec(r, "mode")),
         repository: optStr(r, "repository"),
+        model: optStr(r, "model"),
       };
     case "ResolveApproval":
       return {

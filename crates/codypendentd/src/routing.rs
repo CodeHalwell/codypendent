@@ -59,8 +59,8 @@ use codypendent_protocol::{
     Actor, AgentMode, DataClassification, EventBody, ModelId, RunId, SessionId,
 };
 use codypendent_routing::{
-    classify, ModelCapabilities, ModelProfile, RequiredCapabilities, Router, RoutingDecision,
-    RoutingError, RoutingPolicy, RoutingTransition, TaskNode, TaskSignals,
+    classify, ModelCapabilities, ModelLocation, ModelProfile, RequiredCapabilities, Router,
+    RoutingDecision, RoutingError, RoutingPolicy, RoutingTransition, TaskNode, TaskSignals,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -185,8 +185,10 @@ pub enum RoutingSeamError {
 }
 
 /// The outcome of a successful routing decision: the model chosen, the full
-/// [`RoutingDecision`] (recorded in the trace), and the [`TaskNode`] retained so
-/// a later [`RoutingCoordinator::escalate`] re-routes the SAME node.
+/// [`RoutingDecision`] (recorded in the trace), the [`TaskNode`] retained so a
+/// later [`RoutingCoordinator::escalate`] re-routes the SAME node, and the
+/// selected model's price (so the node-execution path can price MEASURED tokens
+/// into a cost — Phase 7 cost enforcement).
 #[derive(Debug, Clone)]
 pub struct RoutingSelection {
     pub decision: RoutingDecision,
@@ -196,6 +198,20 @@ pub struct RoutingSelection {
     /// the single-agent live loop (see [`RoutingCoordinator::escalate`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub node: TaskNode,
+    /// The selected model's MEASURED blended price per 1K tokens (USD), or `None`
+    /// when its price is UNMEASURED. The node-execution path multiplies a `Some`
+    /// price by the run's MEASURED total tokens to get the honest `cost_micros`
+    /// that `maximum_cost_usd` enforces against; a `None` keeps the node's cost
+    /// UNMEASURED (never charged) rather than fabricating a measured `0`.
+    ///
+    /// The measured-vs-unmeasured rule is `measured_price` (the single source of
+    /// truth): a benched HOSTED model's stored `0.0` is the bench's "could not
+    /// price this endpoint" sentinel ⇒ `None`, while a LOCAL model's `0.0` is a
+    /// genuine free price ⇒ `Some(0.0)`, and any real `> 0` rate ⇒ `Some(rate)`.
+    /// This applies the T1/T7 honesty invariant to price: an unmeasured price must
+    /// yield an unmeasured cost, never a fabricated free `0` that would silently
+    /// defeat the cost budget for the paid hosted models it matters most for.
+    pub price_per_1k_usd: Option<f64>,
 }
 
 impl RoutingSelection {
@@ -203,6 +219,37 @@ impl RoutingSelection {
     #[must_use]
     pub fn model(&self) -> &ModelId {
         &self.decision.model
+    }
+}
+
+/// Interpret a benched model's stored `cost_per_1k_tokens_usd` as a MEASURED
+/// price (`Some`) or an UNMEASURED one (`None`), applying the T1/T7 honesty
+/// invariant to price. **This is the single source of truth for the rule.**
+///
+/// `models bench` writes `cost_per_1k_tokens_usd: 0.0` for EVERY model — it is a
+/// LOCAL-bench harness and does not (cannot) measure a hosted endpoint's token
+/// price (see [`BenchOutcome::into_profile`](codypendent_runtime::bench::BenchOutcome::into_profile);
+/// the CLI warns when it benches a non-local endpoint). So a stored `0.0` means
+/// two very different things, disambiguated ONLY by where the model runs:
+///
+/// - **`Hosted` + `0.0` ⇒ `None`** (UNMEASURED): the bench could not price this
+///   paid endpoint, so we must NOT fabricate a measured `Some(0)` cost the budget
+///   would silently treat as free — the bug this guards against
+///   (`maximum_cost_usd` never firing for a benched hosted model). Unmeasured
+///   price ⇒ unmeasured cost.
+/// - **`Local` + `0.0` ⇒ `Some(0.0)`** (MEASURED): a local model is genuinely
+///   free — a real measured zero, distinct from an unmeasured `None`.
+/// - **any non-zero price ⇒ `Some(price)`** (MEASURED): a real rate is honest
+///   regardless of location (a metered local model, or a hosted profile
+///   hand-configured with a real `> 0` price — operator-configured hosted prices
+///   are future work, but such a price is already respected here).
+#[must_use]
+fn measured_price(location: ModelLocation, cost_per_1k_tokens_usd: f64) -> Option<f64> {
+    if matches!(location, ModelLocation::Hosted) && cost_per_1k_tokens_usd == 0.0 {
+        // Hosted + the bench's `0.0` sentinel: the price is UNMEASURED.
+        None
+    } else {
+        Some(cost_per_1k_tokens_usd)
     }
 }
 
@@ -302,10 +349,76 @@ impl RoutingCoordinator {
                     policy = %decision.policy_key, classifier = %decision.classifier_version,
                     "routing selected a model"
                 );
-                Ok(Some(RoutingSelection { decision, node }))
+                // The selected model's price, interpreted through the honesty
+                // invariant by `measured_price`: a benched HOSTED model's `0.0` is
+                // the bench's "unmeasured" sentinel (⇒ `None`, so the node path
+                // never fabricates a measured `Some(0)` cost the budget would treat
+                // as free), while a LOCAL model's `0.0` is genuinely free (⇒
+                // `Some(0.0)`) and any real `> 0` rate is measured. The router
+                // picked `decision.model` FROM `profiles`, so the profile is
+                // present; a missing one (the impossible "selected a model not in
+                // the pool") is defensively treated as UNMEASURED (`None`).
+                let price_per_1k_usd = profiles
+                    .iter()
+                    .find(|p| p.id == decision.model)
+                    .and_then(|p| measured_price(p.location, p.performance.cost_per_1k_tokens_usd));
+                Ok(Some(RoutingSelection {
+                    decision,
+                    node,
+                    price_per_1k_usd,
+                }))
             }
             Err(RoutingError::NoEligibleModel { reason }) => Err(RoutingSeamError::Refused(reason)),
             Err(other) => Err(RoutingSeamError::Refused(other.to_string())),
+        }
+    }
+
+    /// Validate an operator-**pinned** model (STEP MP2) against the
+    /// classification hard filter — the non-negotiable security boundary a pin
+    /// must never bypass.
+    ///
+    /// - **Routing OFF** (the default): `Ok(())`. No routing security filter is
+    ///   active, so the pin selects the model under the existing
+    ///   classification-blind Phase-1 posture — no worse than today.
+    /// - **Routing ON:** the pin must clear the SAME classification /
+    ///   off-device ceiling the router itself applies (built from the run's
+    ///   classification, or the operator-declared fail-closed config ceiling).
+    ///   An ineligible pin — a hosted model for classified data, or a model with
+    ///   no benchmarked profile proving it runs on-device — is **refused**
+    ///   ([`RoutingSeamError::Refused`]), exactly like a routing refusal, so the
+    ///   run fails CLOSED rather than leaking off-device. A pin overrides the
+    ///   router's *quality* judgment, never this *security* constraint.
+    pub async fn validate_pin(
+        &self,
+        mode: AgentMode,
+        node_kind: &str,
+        objective: &str,
+        estimated_input_tokens: u64,
+        run_classification: Option<DataClassification>,
+        pinned: &ModelId,
+    ) -> Result<(), RoutingSeamError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let profiles = self.eligible_profiles().await?;
+        let node = self.build_task_node(
+            mode,
+            node_kind,
+            objective,
+            estimated_input_tokens,
+            run_classification,
+        );
+        let router = Router::new(&profiles, &self.config.policy);
+        if router.model_passes_classification(pinned, &node) {
+            Ok(())
+        } else {
+            Err(RoutingSeamError::Refused(format!(
+                "pinned model {pinned} may not process this run's data \
+                 (classification {:?}): it is a hosted/off-device model above the \
+                 policy's ceiling, or it has no benchmarked profile proving it runs \
+                 on-device — run `codypendent models bench {pinned}` or pin a local model",
+                node.data_classification
+            )))
         }
     }
 
@@ -737,6 +850,14 @@ mod tests {
             &ModelId("cheap".into()),
             "cheapest-above-threshold"
         );
+        // The selection surfaces the SELECTED model's MEASURED price, so the node
+        // path can price measured tokens into an enforced cost (Phase 7). `cheap`
+        // is a HOSTED model with a real `> 0` price ($0.002/1k), so it is measured.
+        assert_eq!(
+            selection.price_per_1k_usd,
+            Some(0.002),
+            "the selection carries the chosen model's measured price"
+        );
         coord
             .record_decision(session, run, &selection.decision)
             .await
@@ -761,6 +882,74 @@ mod tests {
         assert!(
             note.contains("router/coding/1"),
             "note is attributable to the policy: {note}"
+        );
+    }
+
+    #[test]
+    fn measured_price_is_unmeasured_only_for_a_hosted_zero() {
+        // The honesty invariant applied to price (the single source of truth): a
+        // benched HOSTED model's `0.0` is the bench's "could not price this
+        // endpoint" sentinel ⇒ UNMEASURED (`None`, never charged); a LOCAL `0.0` is
+        // a genuine measured free price; and any real `> 0` rate is measured
+        // regardless of location.
+        assert_eq!(
+            measured_price(ModelLocation::Hosted, 0.0),
+            None,
+            "hosted + 0.0 is UNMEASURED — the bench cannot price a hosted endpoint"
+        );
+        assert_eq!(
+            measured_price(ModelLocation::Local, 0.0),
+            Some(0.0),
+            "local + 0.0 is a genuine measured free price"
+        );
+        assert_eq!(
+            measured_price(ModelLocation::Hosted, 3.0),
+            Some(3.0),
+            "a real >0 hosted price is measured (e.g. a hand-configured profile)"
+        );
+        assert_eq!(
+            measured_price(ModelLocation::Local, 2.0),
+            Some(2.0),
+            "a real >0 local price is measured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_benched_hosted_selection_carries_an_unmeasured_price() {
+        // THE fix at the seam: a benched HOSTED model (its stored
+        // `cost_per_1k_tokens_usd` is the bench's `0.0` "unmeasured" sentinel —
+        // `models bench` does not price a hosted endpoint) is selected, and the
+        // selection carries `price_per_1k_usd == None` (UNMEASURED). So the node
+        // path never fabricates a measured `Some(0)` cost `maximum_cost_usd` would
+        // silently treat as free. Contrast
+        // `routes_to_the_cheapest_model_above_threshold_and_records_it`, where the
+        // hosted model has a real `> 0` price and is therefore measured.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "https://hosted/v1",
+                profile("hosted-benched", ModelLocation::Hosted, 0.90, 0.0),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            data_classification: DataClassification::Internal,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+
+        let selection = coord
+            .select(AgentMode::Build, "agent", "do the work", 4_000, None)
+            .await
+            .unwrap()
+            .expect("routing ON selects the benched hosted model");
+        assert_eq!(selection.model(), &ModelId("hosted-benched".into()));
+        assert_eq!(
+            selection.price_per_1k_usd, None,
+            "a benched hosted model's 0.0 is the bench's UNMEASURED sentinel, not a \
+             fabricated free price"
         );
     }
 
@@ -846,6 +1035,179 @@ mod tests {
             matches!(err, RoutingSeamError::Refused(_)),
             "classified data with no eligible model fails closed, got {err:?}"
         );
+    }
+
+    // -- Pinned-model classification safety (STEP MP2) ----------------------
+
+    #[tokio::test]
+    async fn validate_pin_off_by_default_allows_any_model() {
+        // Routing OFF (the default): a pin is honored under the classification-
+        // blind Phase-1 posture — no security filter is active, so even a hosted
+        // model id validates with no stored profiles at all. No worse than today.
+        let (_dir, pool) = pool().await;
+        let coord = RoutingCoordinator::new(pool, RoutingConfig::default());
+        assert!(!coord.enabled());
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the payload",
+                4_000,
+                None,
+                &ModelId("hosted-anything".into()),
+            )
+            .await
+            .expect("routing OFF accepts any pin");
+    }
+
+    #[tokio::test]
+    async fn validate_pin_refuses_a_hosted_model_for_classified_data_fail_closed() {
+        // THE pinned-model leak test (STEP MP2): with routing ON, a run whose
+        // classification exceeds the policy's off-device ceiling must REFUSE a
+        // pinned HOSTED model. A pin overrides the router's *quality* judgment but
+        // never the classification hard filter — fail closed, exactly like a
+        // routing refusal, rather than run the classified data off-device. Same
+        // config as `secret_data_never_selects_a_hosted_model_through_the_seam`.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[
+                (
+                    "https://hosted/v1",
+                    profile("hosted-strong", ModelLocation::Hosted, 0.99, 0.001),
+                ),
+                (
+                    "http://localhost/v1",
+                    profile("local", ModelLocation::Local, 0.75, 0.010),
+                ),
+            ],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Internal),
+            data_classification: DataClassification::Secret,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        let err = coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the secret payload",
+                4_000,
+                None,
+                &ModelId("hosted-strong".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RoutingSeamError::Refused(_)),
+            "a hosted pin for Secret data fails closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_pin_allows_a_local_model_for_classified_data() {
+        // The counterpart: a LOCAL pinned model serves the same Secret data — it
+        // never leaves the device, so the classification filter admits it.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "http://localhost/v1",
+                profile("local", ModelLocation::Local, 0.75, 0.010),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Internal),
+            data_classification: DataClassification::Secret,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "handle the secret payload",
+                4_000,
+                None,
+                &ModelId("local".into()),
+            )
+            .await
+            .expect("a local pin serves classified data on-device");
+    }
+
+    #[tokio::test]
+    async fn validate_pin_refuses_an_unprofiled_model_when_routing_on() {
+        // With routing ON, a pin the profile store has never benchmarked cannot be
+        // proven on-device, so it fails closed — the operator must bench it (or pin
+        // a known-local model). This keeps an unknown pin from bypassing the
+        // security filter under the (opt-in) routing posture.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "http://localhost/v1",
+                profile("local", ModelLocation::Local, 0.75, 0.010),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            data_classification: DataClassification::Internal,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        let err = coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "fix the bug",
+                4_000,
+                None,
+                &ModelId("never-benched".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RoutingSeamError::Refused(_)),
+            "an unprofiled pin fails closed under routing, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_pin_allows_a_hosted_model_when_the_policy_permits() {
+        // A pin is not blanket-refused under routing: when the run's classification
+        // is within the policy's off-device ceiling, a hosted pin is admitted (the
+        // pin's whole point is to override the router's *quality* choice, which is
+        // fine once the security filter is satisfied).
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[(
+                "https://hosted/v1",
+                profile("hosted", ModelLocation::Hosted, 0.90, 0.005),
+            )],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            data_classification: DataClassification::Internal,
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+        coord
+            .validate_pin(
+                AgentMode::Build,
+                "agent",
+                "fix the bug",
+                4_000,
+                None,
+                &ModelId("hosted".into()),
+            )
+            .await
+            .expect("a hosted pin within the off-device ceiling is allowed");
     }
 
     #[tokio::test]

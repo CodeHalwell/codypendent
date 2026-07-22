@@ -291,11 +291,14 @@ impl<'a> DriverBenchTarget<'a> {
         }
     }
 
-    /// One scripted probe: send `prompt` and return the model's step.
+    /// One scripted probe: send `prompt` and return the model's step. The bench
+    /// estimates tokens from the response text (the driver seam surfaces no usage
+    /// for the bench's purposes), so the request's measured usage is discarded.
     async fn step(&self, prompt: &str) -> Result<ModelStep, String> {
         self.driver
             .next_step(&[TurnItem::Objective(prompt.to_string())])
             .await
+            .map(|outcome| outcome.step)
             .map_err(|e| format!("model driver error: {e}"))
     }
 }

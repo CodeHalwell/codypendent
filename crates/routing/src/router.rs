@@ -280,6 +280,29 @@ impl<'a> Router<'a> {
             .collect()
     }
 
+    /// The **security** hard filter in isolation: a hosted (non-local) model may
+    /// not process data above the policy's off-device ceiling. Factored out of
+    /// [`Self::is_eligible`] so the pinned-model path
+    /// ([`Self::model_passes_classification`]) enforces EXACTLY this rule as the
+    /// single source of truth — a user's explicit model pin (STEP MP2) overrides
+    /// the router's *quality* judgment (capabilities / size / utility) but never
+    /// this *privacy/security* constraint.
+    fn passes_classification(&self, model: &ModelProfile, node: &TaskNode) -> bool {
+        model.is_local() || self.policy.hosted_allows(node.data_classification)
+    }
+
+    /// Whether the model named `id` clears the **classification / off-device**
+    /// hard filter for `node` — the security constraint in isolation, and the
+    /// single source of truth the pinned-model path (STEP MP2) checks so a pin
+    /// can never route classified data to a hosted provider. An unknown id (no
+    /// stored profile) **fails closed**: without a profile the router cannot
+    /// prove the model runs on-device, so it is treated as ineligible.
+    #[must_use]
+    pub fn model_passes_classification(&self, id: &ModelId, node: &TaskNode) -> bool {
+        self.find(id)
+            .is_some_and(|m| self.passes_classification(m, node))
+    }
+
     /// The hard filters, in Chapter 09 order — **security/privacy first**, then
     /// capabilities, then size (capabilities cover size via the context/output
     /// minimums).
@@ -288,7 +311,7 @@ impl<'a> Router<'a> {
         //    above the policy's off-device ceiling. This runs before utility, so a
         //    classified node can never be scored against — let alone routed to — an
         //    ineligible provider.
-        if !model.is_local() && !self.policy.hosted_allows(node.data_classification) {
+        if !self.passes_classification(model, node) {
             return false;
         }
         // 2 + 3. Required capabilities, with the node's size *estimates* folded into

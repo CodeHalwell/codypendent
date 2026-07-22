@@ -16,8 +16,8 @@ use codypendent_cli::connection::Connection;
 use codypendent_eval::{Assertion, EvalCase};
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, ApprovalDecision, ApprovalId, BudgetDimension,
-    CommandBody, DaemonInstanceId, Envelope, EventBody, Payload, ProposedAction, Risk, RiskLevel,
-    RunDisposition, RunId, ServerHello, SessionEvent, SessionId, PROTOCOL_V1,
+    CommandBody, DaemonInstanceId, Envelope, EventBody, ModelId, Payload, ProposedAction, Risk,
+    RiskLevel, RunDisposition, RunId, ServerHello, SessionEvent, SessionId, PROTOCOL_V1,
 };
 use tokio::net::{UnixListener, UnixStream};
 
@@ -148,16 +148,19 @@ fn approval_resolved(
 
 /// Play the daemon's side of one `eval run` case: handshake; `CreateSession`
 /// -> `CommandAccepted` (session id on the envelope); `AttachSession` -> empty
-/// `Catchup`; `StartRun` -> `CommandAccepted` with a run id — and, reading the
-/// `repository` the command carried, WRITES INTO THAT CHECKOUT if `fix` is
-/// true, standing in for "the agent fixed the bug" (nothing else in this test
-/// runs an agent). Then streams `events`, substituting the real run id into
-/// any placeholder `RunId::nil()`-tagged event.
+/// `Catchup`; `StartRun` -> `CommandAccepted` with a run id — asserting the
+/// `StartRun` carries exactly `expected_model` (the fix under test: a routed
+/// model must be pinned onto `StartRun.model`, never silently dropped) — and,
+/// reading the `repository` the command carried, WRITES INTO THAT CHECKOUT if
+/// `fix` is true, standing in for "the agent fixed the bug" (nothing else in
+/// this test runs an agent). Then streams `events`, substituting the real run
+/// id into any placeholder `RunId::nil()`-tagged event.
 async fn mock_daemon(
     mut stream: UnixStream,
     session_id: SessionId,
     fix: bool,
     events: Vec<SessionEvent>,
+    expected_model: Option<ModelId>,
 ) {
     let hello = read_envelope(&mut stream).await.unwrap().unwrap();
     assert!(matches!(hello.payload, Payload::ClientHello(_)));
@@ -216,7 +219,16 @@ async fn mock_daemon(
 
     let start = read_envelope(&mut stream).await.unwrap().unwrap();
     let repository = match &expect_command(&start).body {
-        CommandBody::StartRun { repository, .. } => repository.clone().expect("repository set"),
+        CommandBody::StartRun {
+            repository, model, ..
+        } => {
+            assert_eq!(
+                *model, expected_model,
+                "StartRun.model must equal the model pinned for this case \
+                 (recorded == pinned == executed)"
+            );
+            repository.clone().expect("repository set")
+        }
         other => panic!("expected StartRun, got {other:?}"),
     };
     let run_id = RunId::new();
@@ -286,7 +298,12 @@ fn artifact_ref() -> codypendent_protocol::ArtifactRef {
     }
 }
 
-async fn drive(repository: &Path, fix: bool, case: &EvalCase) -> codypendent_eval::CaseResult {
+async fn drive(
+    repository: &Path,
+    fix: bool,
+    case: &EvalCase,
+    routed_model: Option<ModelId>,
+) -> codypendent_eval::CaseResult {
     let (socket, listener) = MockSocket::bind();
     let session_id = SessionId::new();
 
@@ -324,13 +341,14 @@ async fn drive(repository: &Path, fix: bool, case: &EvalCase) -> codypendent_eva
 
     let server_events = scripted.clone();
     let repo_for_server = repository.to_path_buf();
+    let expected_model = routed_model.clone();
     let server = tokio::spawn(async move {
         let (stream, _addr) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
             .expect("mock server accepted a connection in time")
             .expect("accept");
         let _ = &repo_for_server;
-        mock_daemon(stream, session_id, fix, server_events).await;
+        mock_daemon(stream, session_id, fix, server_events, expected_model).await;
     });
 
     let mut conn = Connection::connect(&socket.path)
@@ -338,7 +356,7 @@ async fn drive(repository: &Path, fix: bool, case: &EvalCase) -> codypendent_eva
         .expect("client connects to mock socket");
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        codypendent_cli::eval::run_case(&mut conn, case, repository),
+        codypendent_cli::eval::run_case(&mut conn, case, repository, routed_model),
     )
     .await
     .expect("run_case completed in time")
@@ -380,7 +398,9 @@ fn case(repository_revision: &str) -> EvalCase {
 #[tokio::test]
 async fn a_known_pass_case_passes() {
     let (repo, sha) = init_fixture_repo();
-    let result = drive(repo.path(), true, &case(&sha)).await;
+    // No `--policy` here — `routed_model: None` mirrors the `eval-smoke` CI
+    // path, and the mock asserts `StartRun.model == None` (see `mock_daemon`).
+    let result = drive(repo.path(), true, &case(&sha), None).await;
     assert!(
         result.passed(),
         "expected the fixed-checkout case to pass; failures: {:?}",
@@ -394,13 +414,31 @@ async fn a_known_fail_case_fails() {
     // both `TestsPass` (the bug is still there) and `FileChanged` (nothing
     // was touched).
     let (repo, sha) = init_fixture_repo();
-    let result = drive(repo.path(), false, &case(&sha)).await;
+    let result = drive(repo.path(), false, &case(&sha), None).await;
     assert!(
         !result.passed(),
         "expected the untouched-checkout case to fail"
     );
     assert!(result.failures().contains(&"tests-pass"));
     assert!(result.failures().contains(&"file-changed:src/lib.rs"));
+}
+
+#[tokio::test]
+async fn a_routed_model_is_pinned_onto_start_run() {
+    // THE fix under test (Codex P1 #2): when `--policy` has routed this case
+    // to a model, `run_case`/`run_case_over_connection` must pin EXACTLY that
+    // model onto `StartRun.model` — never `None` — so the model the daemon
+    // executes can never diverge from the model `report_json_with_routing`
+    // would record for this case. `mock_daemon` asserts the StartRun it
+    // receives carries `Some(routed_model)`.
+    let (repo, sha) = init_fixture_repo();
+    let routed_model = ModelId("routed-local-coder".to_string());
+    let result = drive(repo.path(), true, &case(&sha), Some(routed_model)).await;
+    assert!(
+        result.passed(),
+        "expected the fixed-checkout case to pass; failures: {:?}",
+        result.failures()
+    );
 }
 
 #[tokio::test]
@@ -453,7 +491,7 @@ async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
             .await
             .unwrap()
             .unwrap();
-        mock_daemon(stream, session_id, false, server_events).await;
+        mock_daemon(stream, session_id, false, server_events, None).await;
     });
 
     let mut conn = Connection::connect(&socket.path).await.unwrap();
@@ -463,6 +501,7 @@ async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
             &mut conn,
             &case("0".repeat(40).as_str()),
             repo.path(),
+            None,
         ),
     )
     .await

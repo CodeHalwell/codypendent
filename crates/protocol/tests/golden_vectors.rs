@@ -247,6 +247,7 @@ fn command_vectors() -> Vec<Vector> {
                 objective: "diagnose the failing test".to_string(),
                 mode: AgentMode::Build,
                 repository: Some("/home/user/project".to_string()),
+                model: Some(ModelId("claude-sonnet-5".to_string())),
             },
         ),
         vec_of(
@@ -518,6 +519,7 @@ fn envelope_vectors() -> Vec<Vector> {
                     objective: "diagnose the failing test".to_string(),
                     mode: AgentMode::Build,
                     repository: Some("/home/user/project".to_string()),
+                    model: Some(ModelId("claude-sonnet-5".to_string())),
                 },
             }),
         ),

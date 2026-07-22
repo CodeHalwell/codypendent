@@ -22,8 +22,8 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    AppState, DocFocus, DocLeaseState, LayoutMode, Overlay, PatchSummary, RunView, ToolCard,
-    ToolStatus, TranscriptEntry,
+    filter_models, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel,
+    Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -670,6 +670,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, theme, query, *selected);
         }
+        Overlay::ModelPicker { query, selected } => {
+            render_model_picker(frame, area, state, theme, query, *selected);
+        }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
         Overlay::DocEdit { buffer, .. } => {
@@ -821,6 +824,231 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             .wrap(Wrap { trim: false }),
         cols[1],
     );
+}
+
+/// The model picker (MP1): a filter line (the command-palette shape) over a
+/// two-column list+detail view (the [`render_skills`] template) — the
+/// selectable models on the left (current run's serving model marked), and a
+/// detail panel for the focused model's provider/location/cost/context on the
+/// right. Selecting a row stages it on [`AppState::pending_model`], which PINS
+/// the model for the run(s) the operator starts (STEP MP2 — a session default:
+/// one pick applies to this run and every subsequent one until changed). Colors
+/// are Theme tokens only (RULE 7).
+fn render_model_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Model picker ({}) ", state.models.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input (the
+    // command palette's shape).
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[1]);
+
+    // The active run's serving model, if any — marks the current row/detail.
+    let current = state.selected_run().and_then(|run| run.model.as_ref());
+
+    // Left: the filtered model list (id, current marker, provider + badges).
+    let matches = filter_models(&state.models, query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.models.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no models configured",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching model",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate() {
+        let card = &state.models[idx];
+        let is_selected = row == selected;
+        let is_current = current == Some(&card.id);
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                if is_current { "● " } else { "  " },
+                Style::default().fg(theme.status.success),
+            ),
+            Span::styled(
+                truncate(&card.id.0, 26),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        // Provider and badges each get their own line (rather than one long
+        // joined line) so they survive the list's fixed-width column without
+        // truncating the trailing badges off a narrow terminal.
+        let provider_line = Line::styled(
+            format!("      {}", card.provider),
+            Style::default().fg(theme.text.muted),
+        );
+        let badges_line = Line::styled(
+            format!("      {}", model_badges(card)),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, provider_line, badges_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail panel for the focused model.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(card) = state.focused_model() {
+        let is_current = current == Some(&card.id);
+        lines.push(Line::from(vec![
+            Span::styled(
+                card.id.0.clone(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            if is_current {
+                Span::styled(
+                    "  ● current".to_owned(),
+                    Style::default().fg(theme.status.success),
+                )
+            } else {
+                Span::raw("")
+            },
+        ]));
+        let field = |k: &str, v: String, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v, Style::default().fg(color)),
+            ])
+        };
+        lines.push(field(
+            "provider",
+            card.provider.clone(),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "location",
+            location_label(card.location).to_owned(),
+            theme.text.secondary,
+        ));
+        lines.push(field(
+            "cost",
+            cost_label(card.cost_per_1k_usd),
+            theme.status.warning,
+        ));
+        lines.push(field(
+            "context",
+            context_label(card.context_tokens),
+            theme.status.info,
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "  Enter stages this model for your next run",
+            Style::default().fg(theme.text.muted),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  no model selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · Enter stage · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// A model card's badges, space-joined: `local ✓` / `hosted` (or nothing when
+/// unprofiled), the measured cost per 1K tokens, and the declared context
+/// window — each rendered `—` when the model has no measured profile
+/// (best-effort; `models.toml` is the authoritative selectable list).
+fn model_badges(card: &ModelCard) -> String {
+    format!(
+        "{} · {} · {}",
+        location_label(card.location),
+        cost_label(card.cost_per_1k_usd),
+        context_label(card.context_tokens)
+    )
+}
+
+fn location_label(location: Option<ModelLocationLabel>) -> &'static str {
+    match location {
+        Some(ModelLocationLabel::Local) => "local ✓",
+        Some(ModelLocationLabel::Hosted) => "hosted",
+        None => "—",
+    }
+}
+
+fn cost_label(cost_per_1k_usd: Option<f64>) -> String {
+    match cost_per_1k_usd {
+        Some(cost) => format!("${cost}/1k"),
+        None => "—".to_owned(),
+    }
+}
+
+fn context_label(context_tokens: Option<u64>) -> String {
+    match context_tokens {
+        Some(tokens) => format!("{}k", tokens / 1000),
+        None => "—".to_owned(),
+    }
 }
 
 /// The memory browser (STEP 2.6): the visible-scope memories on the left, and a
@@ -2169,7 +2397,7 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::reduce::reduce;
-    use crate::state::{MemoryCard, Pane, SkillCard};
+    use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
         Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
@@ -2720,6 +2948,82 @@ mod tests {
         assert!(
             !filtered.contains("New run"),
             "non-match should be filtered out:\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn model_picker_snapshot_shows_rows_current_marker_and_badges() {
+        let mut state = running_build_state();
+        // `running_build_state` serves the run from "gpt-5.1-codex" (its
+        // ModelStreamDelta actor) — that row must render marked current.
+        state.models = vec![
+            ModelCard {
+                id: ModelId("gpt-5.1-codex".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: Some(ModelLocationLabel::Hosted),
+                cost_per_1k_usd: Some(0.03),
+                context_tokens: Some(200_000),
+            },
+            ModelCard {
+                id: ModelId("qwen2.5-coder".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: Some(ModelLocationLabel::Local),
+                cost_per_1k_usd: None,
+                context_tokens: Some(32_000),
+            },
+        ];
+        reduce(&mut state, Action::OpenPalette);
+        for c in "model".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        // Focus the SECOND row (qwen) — deliberately NOT the current model
+        // (gpt) — so the current-marker assertions below can only be
+        // satisfied by the list rows themselves, never by the (qwen-focused)
+        // detail panel.
+        reduce(&mut state, Action::SelectNext);
+        assert!(matches!(state.overlay, Overlay::ModelPicker { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("Model picker"), "title missing:\n{text}");
+        assert!(text.contains("gpt-5.1-codex"), "first row missing:\n{text}");
+        assert!(
+            text.contains("qwen2.5-coder"),
+            "second row missing:\n{text}"
+        );
+
+        // Row-scoped: the list's per-row current marker is the span
+        // immediately BEFORE the id ("● " then the id, contiguous — see the
+        // list-row `head` `Line`), distinct from the detail panel's "<id>  ●
+        // current" (marker AFTER the id) when the FOCUSED model happens to be
+        // current. Checking this precise adjacency — rather than whether a
+        // whole terminal LINE contains '●' — matters because ratatui lays
+        // the list and detail panel out as side-by-side columns sharing the
+        // same rows, so an unscoped whole-line check would also pass with the
+        // marker misapplied to the wrong row (or every row): here gpt is
+        // current and qwen is merely focused (by the `SelectNext` above), so
+        // only gpt's list row may show the leading marker.
+        assert!(
+            text.contains("● gpt-5.1-codex"),
+            "the list's current marker is missing from gpt-5.1-codex's row:\n{text}"
+        );
+        assert!(
+            !text.contains("● qwen2.5-coder"),
+            "the list must not mark the non-current model's row current:\n{text}"
+        );
+
+        // Local/hosted + cost + context badges.
+        assert!(text.contains("hosted"), "hosted badge missing:\n{text}");
+        assert!(
+            text.contains("local \u{2713}"),
+            "local badge missing:\n{text}"
+        );
+        assert!(text.contains("$0.03/1k"), "cost badge missing:\n{text}");
+        assert!(text.contains("200k"), "context badge missing:\n{text}");
+        // The unprofiled model's badges are omitted gracefully, never crash.
+        assert!(
+            text.contains("32k"),
+            "the profiled model's context missing:\n{text}"
         );
     }
 

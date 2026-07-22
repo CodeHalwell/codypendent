@@ -42,9 +42,9 @@ pub use reduce::reduce;
 pub use render::render;
 pub use state::{
     AppState, BlackboardItemCard, DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState,
-    DocSuggestionView, GraphEdgeCard, InputMode, LayoutMode, MemoryCard, Overlay, Pane,
-    PatchSummary, PendingApproval, RunView, SkillCard, StatusProjection, ToolCard, ToolStatus,
-    TranscriptEntry, WorkflowNodeCard,
+    DocSuggestionView, GraphEdgeCard, InputMode, LayoutMode, MemoryCard, ModelCard,
+    ModelLocationLabel, Overlay, Pane, PatchSummary, PendingApproval, RunView, SkillCard,
+    StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

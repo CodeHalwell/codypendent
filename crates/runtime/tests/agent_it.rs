@@ -26,8 +26,8 @@ use codypendent_protocol::{
     ToolOutcome,
 };
 use codypendent_runtime::agent::{
-    cancellation, ApprovalRequest, CancellationToken, FrameworkAgentRuntime, ModelStep, RunContext,
-    RunJournal, ScriptedDriver, WorkflowContext,
+    cancellation, ApprovalRequest, CancellationToken, FrameworkAgentRuntime, ModelStep, ModelUsage,
+    RunContext, RunJournal, ScriptedDriver, StepOutcome, WorkflowContext,
 };
 use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use codypendent_runtime::models::ModelRegistry;
@@ -286,7 +286,7 @@ async fn end_to_end_run_emits_full_event_sequence() {
             break;
         }
     }
-    let disposition = handle.await.unwrap().unwrap();
+    let disposition = handle.await.unwrap().unwrap().disposition;
 
     // The run completed.
     assert!(matches!(disposition, RunDisposition::Completed { .. }));
@@ -452,7 +452,8 @@ async fn client_disconnect_does_not_stop_run() {
     let disposition = runtime
         .execute_run(&driver, ctx, CancellationToken::never())
         .await
-        .unwrap();
+        .unwrap()
+        .disposition;
 
     assert!(matches!(disposition, RunDisposition::Completed { .. }));
     assert_eq!(
@@ -541,6 +542,95 @@ async fn execute_run_does_not_emit_a_second_run_started() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7 usage telemetry: measured per-request usage aggregates into the run
+// outcome; an all-unmeasured run stays honestly `None` (never a fabricated zero).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let runtime = build_runtime!(pool, store, broker, hub);
+
+    // A driver that reports MEASURED usage for every request. The run makes two
+    // requests (Say then Finish), so the outcome carries their saturating sum —
+    // the telemetry the `ModelRequestTrace` logs per request and the cost budget
+    // charges per node.
+    let per_request = ModelUsage {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        cost_micros: Some(1_000),
+    };
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "usage")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "read", AgentMode::Explore);
+    let driver = ScriptedDriver::new(vec![
+        ModelStep::Say("looking".to_string()),
+        ModelStep::Finish {
+            summary: "done".to_string(),
+        },
+    ])
+    .with_usage(per_request);
+    let ctx = RunContext::new(
+        session,
+        run,
+        "read",
+        AgentMode::Explore,
+        repo.clone(),
+        repo.clone(),
+    );
+    let outcome = runtime
+        .execute_run(&driver, ctx, CancellationToken::never())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.usage,
+        Some(ModelUsage {
+            prompt_tokens: 20,
+            completion_tokens: 10,
+            cost_micros: Some(2_000),
+        }),
+        "two measured requests sum into the run's aggregated usage"
+    );
+
+    // A plain driver reports NO usage: the run stays honestly UNMEASURED (`None`),
+    // never a fabricated zero — an all-unmeasured run behaves exactly as before.
+    let session2 = SessionId::new();
+    let run2 = RunId::new();
+    ledger::create_session(&pool, session2, "usage-none")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session2, run2, "read", AgentMode::Explore);
+    let plain = ScriptedDriver::new(vec![ModelStep::Finish {
+        summary: "done".to_string(),
+    }]);
+    let ctx2 = RunContext::new(
+        session2,
+        run2,
+        "read",
+        AgentMode::Explore,
+        repo.clone(),
+        repo.clone(),
+    );
+    let outcome2 = runtime
+        .execute_run(&plain, ctx2, CancellationToken::never())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome2.usage, None,
+        "an all-unmeasured run reports no usage (never a fabricated zero)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Explore mode cannot write: a patch proposal is denied by policy, run continues.
 // ---------------------------------------------------------------------------
 
@@ -607,7 +697,8 @@ index 0000000..1111111 100644
     let disposition = runtime
         .execute_run(&driver, ctx, CancellationToken::never())
         .await
-        .unwrap();
+        .unwrap()
+        .disposition;
 
     // The run still reaches Completed — a denial is not a run failure.
     assert!(matches!(disposition, RunDisposition::Completed { .. }));
@@ -705,7 +796,8 @@ async fn steering_applied_at_a_safe_point() {
     let disposition = runtime
         .execute_run(&driver, ctx, CancellationToken::never())
         .await
-        .unwrap();
+        .unwrap()
+        .disposition;
     assert!(matches!(disposition, RunDisposition::Completed { .. }));
 
     let mut labels: Vec<&str> = Vec::new();
@@ -784,7 +876,11 @@ async fn cancellation_reaches_cancelled_without_running_tools() {
         repo.clone(),
     );
 
-    let disposition = runtime.execute_run(&driver, ctx, token).await.unwrap();
+    let disposition = runtime
+        .execute_run(&driver, ctx, token)
+        .await
+        .unwrap()
+        .disposition;
     assert!(matches!(disposition, RunDisposition::Cancelled { .. }));
     assert_eq!(
         projections::load_run_state(&pool, run).await.unwrap(),
@@ -881,7 +977,8 @@ async fn cancellation_while_parked_on_approval_reaches_cancelled() {
         .await
         .expect("the run terminates promptly after cancellation")
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .disposition;
     assert!(matches!(disposition, RunDisposition::Cancelled { .. }));
     assert_eq!(
         projections::load_run_state(&pool, run).await.unwrap(),
@@ -1216,16 +1313,17 @@ impl codypendent_runtime::agent::ModelDriver for CapturingDriver {
     async fn next_step(
         &self,
         transcript: &[codypendent_runtime::agent::TurnItem],
-    ) -> anyhow::Result<ModelStep> {
+    ) -> anyhow::Result<StepOutcome> {
         *self.seen.lock().unwrap() = transcript.to_vec();
-        Ok(self
+        let step = self
             .steps
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(ModelStep::Finish {
                 summary: "done".to_string(),
-            }))
+            });
+        Ok(StepOutcome::unmeasured(step))
     }
 }
 

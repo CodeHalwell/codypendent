@@ -132,6 +132,7 @@
     "mode": {
       "type": "Build"
     },
+    "model": "claude-sonnet-5",
     "objective": "diagnose the failing test",
     "repository": "/home/user/project",
     "session_id": "20000000-0000-0000-0000-000000000001",

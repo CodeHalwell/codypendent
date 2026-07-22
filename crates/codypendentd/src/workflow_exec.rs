@@ -47,13 +47,18 @@
 //! baseline; a configured-but-unresolvable role is a clean node failure naming the
 //! role (never a silent default).
 //!
-//! **Budget enforcement (Phase 5 T8, STEP 5.5).** Each node's MEASURED cost (wall
-//! time + tool calls — the only dimensions the runtime honestly surfaces) is
-//! charged against the nested budgets ([`crate::workflow_exec`] measures,
-//! [`codypendent_workflow::budget`] decides): the node's own slice and the
-//! workflow envelope (summed from the durable per-node costs). Crossing 80% warns
-//! through the observer; exceeding blocks the node ([`NodeState::Blocked`]) and
-//! pauses the run for a human decision — an overrun is never silent.
+//! **Budget enforcement (Phase 5 T8, STEP 5.5; cost added in Phase 7).** Each
+//! node's MEASURED cost is charged against the nested budgets
+//! ([`crate::workflow_exec`] measures, [`codypendent_workflow::budget`] decides):
+//! the node's own slice and the workflow envelope (summed from the durable
+//! per-node costs). The measured dimensions are wall time and tool calls (always),
+//! plus **model spend** (micro-USD) — the usage a node's agent run reports through
+//! the `ModelDriver` seam, aggregated into the node's cost. Spend is charged only
+//! when a run reported it: a node that reported none contributes NO cost (a
+//! `None`, never a real `0`), so a `maximum_cost_usd` ceiling bites only when real
+//! usage backs it. Crossing 80% warns through the observer; exceeding blocks the
+//! node ([`NodeState::Blocked`]) and pauses the run for a human decision — an
+//! overrun is never silent.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +85,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
-    FrameworkModelDriver, ModelDriver, RunContext, WorkflowContext,
+    FrameworkModelDriver, ModelDriver, ModelUsage, RunContext, RunOutcome, WorkflowContext,
 };
 use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardPost};
 use codypendent_runtime::models::{resolve_model, ModelRegistry};
@@ -103,6 +108,7 @@ use crate::executor::{
     artifact_sink, artifact_store, bind_run_worktree, load_model_registry, resolve_github_repo,
     run_journal, run_writes_to_worktree, WorktreeReleaseGuard,
 };
+use crate::routing::{estimate_input_tokens, RoutingCoordinator};
 use crate::workflows::{DriveLockRegistry, WorkflowConductorHost};
 
 /// The stable dotted name of the GitHub update-pull-request runtime tool (mirrors
@@ -181,28 +187,104 @@ impl RepositoryTestRunner for ShellRepositoryTestRunner {
     }
 }
 
-/// Builds the model driver an agent node runs against. Production resolves a model
-/// from `models.toml` and builds a [`FrameworkModelDriver`]; a test returns a
-/// scripted driver so the agent-node path runs with no model or network.
+/// A built agent-node driver plus the price the node path uses to turn the run's
+/// MEASURED tokens into an enforced `cost_micros` (Phase 7). `price_per_1k_usd`
+/// is `Some(rate)` when the routing seam selected a model with a MEASURED price
+/// (a free local model's genuine `0.0`, or a real `> 0` rate) and `None` when the
+/// price is UNMEASURED — routing OFF, the Phase-1 resolve path, OR a benched
+/// HOSTED model whose token price `models bench` could not measure (its stored
+/// `0.0` is a sentinel, not a real free price; see `routing::measured_price`, the
+/// single source of truth for that rule). A `None` price keeps the node's cost
+/// UNMEASURED (never a fabricated zero), so `maximum_cost_usd` bites only when a
+/// real price backs real tokens.
+pub(crate) struct NodeDriver {
+    driver: Box<dyn ModelDriver>,
+    price_per_1k_usd: Option<f64>,
+}
+
+/// The node's MEASURED model spend in micro-USD, or `None` when it cannot be
+/// measured honestly. This is the Phase-7 cost seam: tokens are measured by the
+/// driver, and the price is applied HERE, where the routed model's rate is known.
+///
+/// * A driver that itself reported a cost wins (real provider billing beats an
+///   estimate) — none do today, but the seam honours it.
+/// * Otherwise `price_per_1k_usd × the run's MEASURED total tokens`, but ONLY
+///   when BOTH a price (a routing decision was made) AND measured tokens exist.
+/// * No price (routing OFF / Phase-1 resolve) OR no measured tokens ⇒ `None`
+///   (UNMEASURED — never a fabricated zero the budget could treat as spend).
+///
+/// A routed model priced at `0.0` (a free local model) over measured tokens
+/// yields `Some(0)`: a genuine measured zero, distinct from an unmeasured `None`.
+fn node_cost_micros(price_per_1k_usd: Option<f64>, usage: Option<ModelUsage>) -> Option<u64> {
+    // A cost the driver measured directly is authoritative.
+    if let Some(cost) = usage.and_then(|u| u.cost_micros) {
+        return Some(cost);
+    }
+    // Otherwise price the MEASURED tokens with the routed rate — both must exist.
+    let price = price_per_1k_usd?;
+    let total_tokens = usage.map(|u| u.prompt_tokens.saturating_add(u.completion_tokens))?;
+    Some(price_to_micros(price, total_tokens))
+}
+
+/// `price_per_1k_usd × total_tokens`, in micro-USD (the unit measured cost is
+/// charged in — mirrors the workflow budget's `usd_to_micros`). A non-finite or
+/// negative price (a nonsensical profile) prices `0`; the float→int cast
+/// saturates, so a huge figure never wraps to a spuriously small debit.
+fn price_to_micros(price_per_1k_usd: f64, total_tokens: u64) -> u64 {
+    if !price_per_1k_usd.is_finite() || price_per_1k_usd <= 0.0 {
+        return 0;
+    }
+    let usd = price_per_1k_usd * (total_tokens as f64) / 1000.0;
+    (usd * 1_000_000.0).round() as u64
+}
+
+/// Builds the model driver an agent node runs against. Production threads the
+/// node through the Phase-7 [`RoutingCoordinator`] seam — **mirroring
+/// [`RuntimeExecutor::execute`](crate::executor::RuntimeExecutor::execute)'s use
+/// of the seam exactly**: routing OFF resolves a model from `models.toml` as
+/// before (every existing workflow-exec test, none of which write a
+/// `routing.toml`, is unchanged); enabled, the classification hard-filter
+/// applies to this node and a refusal is a clean node failure, never a
+/// classification-blind fallback. A test returns a scripted driver so the
+/// agent-node path runs with no model or network.
 #[async_trait]
 pub(crate) trait NodeModelDriverFactory: Send + Sync {
-    /// Build a driver for `mode` under the node's resolved `model_policy` (T8), or
-    /// a human reason it could not (e.g. no model configured) — which the caller
-    /// turns into a clean node failure. The policy name is recorded on the run row
-    /// and passed here for provenance; actual model selection is unchanged (the
-    /// production factory still resolves via the daemon's configured policy —
-    /// per-workflow policy routing is a later task).
+    /// Build a driver for `mode` under the node's resolved `model_policy` (T8) —
+    /// with the routed model's price so the node path can enforce cost — or a
+    /// human reason it could not (e.g. no model configured, or the router
+    /// refused), which the caller turns into a clean node failure.
+    /// `objective`/`session_id`/`run_id` are the node's OWN already-created
+    /// agent-run identity (T8), threaded in so the production factory can feed
+    /// the routing seam (objective → classification/sizing) and record a
+    /// selection into THIS run's trace. The policy name is recorded on the run
+    /// row separately (by the caller) and passed here for provenance only:
+    /// there is no per-node-policy registry yet (a documented follow-up), so
+    /// every node routes under the ONE daemon-configured routing policy.
     async fn build(
         &self,
         mode: AgentMode,
         model_policy: &str,
-    ) -> Result<Box<dyn ModelDriver>, String>;
+        objective: &str,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<NodeDriver, String>;
 }
 
-/// The production factory: resolve a model from `<data_dir>/models.toml` and build
-/// the framework driver, exactly as [`RuntimeExecutor::execute`] does for a run.
+/// The production factory: routes through the Phase-7 [`RoutingCoordinator`]
+/// seam when enabled, falling back to resolving a model from
+/// `<data_dir>/models.toml` when it is not (`RoutingCoordinator::select`'s
+/// `Ok(None)`), then builds the framework driver — exactly as
+/// [`RuntimeExecutor::execute`](crate::executor::RuntimeExecutor::execute) does
+/// for a single-agent run.
 struct ConfiguredModelDriverFactory {
     paths: RuntimePaths,
+    /// The Phase-7 routing seam (STEP 7.2/7.3). Threading this into the
+    /// factory is what closes the gap this task fixes: before, an agent node
+    /// resolved a model classification-blind via `resolve_model`, discarding
+    /// `model_policy` entirely; now the SAME classification hard-filter +
+    /// fail-closed contract the single-agent executor uses applies to every
+    /// workflow agent node.
+    routing: RoutingCoordinator,
 }
 
 #[async_trait]
@@ -211,19 +293,71 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
         &self,
         mode: AgentMode,
         model_policy: &str,
-    ) -> Result<Box<dyn ModelDriver>, String> {
-        // The node's resolved policy name is recorded on the run row for
-        // provenance; model SELECTION stays whatever `resolve_model` does with the
-        // daemon's configured policy today (per-workflow policy routing is T14 —
-        // this task only threads the name through, never changes selection).
+        objective: &str,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<NodeDriver, String> {
+        // The node's resolved policy name (T8) is recorded on the run row by
+        // the caller (`create_agent_run`) for provenance only: there is no
+        // per-node-policy registry yet, so model SELECTION below routes under
+        // the ONE daemon-configured routing policy (a documented follow-up —
+        // see the module docs and `RoutingCoordinator`'s).
         let _requested_policy = model_policy;
         let (registry, policy) = load_model_registry(&self.paths)?;
-        let resolved = resolve_model(&registry, &policy, mode)
+        // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF — mirrors
+        // `RuntimeExecutor::execute`'s use of the seam EXACTLY: routing OFF
+        // returns `Ok(None)` and the model resolves the Phase-1 way (every
+        // existing workflow-exec test, none of which write a `routing.toml`,
+        // is unchanged); enabled, a refusal (classified data with no eligible
+        // local model) fails this node CLOSED rather than falling back to the
+        // classification-blind resolver below.
+        let routed = self
+            .routing
+            .select(
+                mode,
+                "agent",
+                objective,
+                estimate_input_tokens(objective),
+                // The workflow run carries no per-run classification today
+                // (mirrors `RunLaunch`); the coordinator falls back to its
+                // operator-declared, fail-closed ceiling. Deriving a real
+                // per-run classification is a documented follow-up.
+                None,
+            )
             .await
-            .map_err(|e| format!("no model configured: {e}"))?;
-        let driver = FrameworkModelDriver::from_registry(&registry, resolved.id)
+            .map_err(|e| format!("routing refused to place this node: {e}"))?;
+        // The routed model's price rides alongside the id (already interpreted
+        // through the honesty invariant by the seam: `Some` for a measured price,
+        // `None` for an UNMEASURED one — a benched HOSTED model whose price the
+        // bench could not measure) so the node path prices MEASURED tokens into an
+        // enforced cost. Routing OFF also leaves it `None` — the Phase-1 resolver
+        // is classification- AND price-blind, so the node's cost stays honestly
+        // UNMEASURED (never a fabricated zero), exactly as before this task.
+        let (model_id, price_per_1k_usd) = match routed {
+            Some(selection) => {
+                if let Err(error) = self
+                    .routing
+                    .record_decision(session_id, run_id, &selection.decision)
+                    .await
+                {
+                    warn!(%run_id, %error, "could not record the routing decision in the trace");
+                }
+                (selection.model().clone(), selection.price_per_1k_usd)
+            }
+            None => (
+                resolve_model(&registry, &policy, mode)
+                    .await
+                    .map_err(|e| format!("no model configured: {e}"))?
+                    .id,
+                None,
+            ),
+        };
+        let driver = FrameworkModelDriver::from_registry(&registry, model_id)
             .map_err(|e| format!("could not build model client: {e}"))?;
-        Ok(Box::new(driver))
+        Ok(NodeDriver {
+            driver: Box::new(driver),
+            price_per_1k_usd,
+        })
     }
 }
 
@@ -233,7 +367,11 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 /// rebuilt by `with_github` so agent nodes drive with the daemon's GitHub
 /// client (`drive_locks: Some(existing)` — reconfiguring an ALREADY-running
 /// host must carry its per-run drive-lock registry forward, not mint a fresh
-/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c).
+/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c). `routing` is
+/// the SAME [`RoutingCoordinator`] the single-agent executor uses (built once
+/// by the caller and threaded through both places), so a workflow agent node's
+/// model selection goes through the identical classification hard-filter +
+/// fail-closed contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workflow_host(
     pool: SqlitePool,
@@ -246,9 +384,11 @@ pub(crate) fn build_workflow_host(
     blackboards: BlackboardHub,
     workflows: WorkflowHub,
     cancellations: WorkflowRunCancellations,
+    routing: RoutingCoordinator,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
+        routing,
     });
     // The per-user workflow source directory a `StartWorkflow`-by-id (`/fix-ci`)
     // consults below the built-in and the repository scope (STEP 5.1.4). Following
@@ -635,15 +775,21 @@ impl AgentLoopNodeExecutor {
             ));
         }
 
-        // Build the model driver for the resolved mode + policy; a missing model is
-        // a clean node failure, not a hang. The created run is failed so it never
-        // sits non-terminal.
-        let driver = match self
+        // Build the model driver for the resolved mode + policy — threading the
+        // node's objective + its own run identity so the factory can feed the
+        // Phase-7 routing seam (when enabled) and record a selection into THIS
+        // run's trace. A missing model — or a routing refusal — is a clean node
+        // failure, not a hang. The created run is failed so it never sits
+        // non-terminal.
+        let NodeDriver {
+            driver,
+            price_per_1k_usd,
+        } = match self
             .driver_factory
-            .build(mode, &resolved.model_policy)
+            .build(mode, &resolved.model_policy, &objective, session_id, run_id)
             .await
         {
-            Ok(driver) => driver,
+            Ok(built) => built,
             Err(reason) => {
                 self.fail_run(run_id, session_id, &objective, &reason).await;
                 return NodeOutcome::failed(format!("agent node `{}`: {reason}", ctx.node.id));
@@ -683,7 +829,7 @@ impl AgentLoopNodeExecutor {
             binding,
         );
         let started = Instant::now();
-        let disposition = self
+        let outcome = self
             .drive_agent(
                 session_id,
                 run_id,
@@ -707,8 +853,13 @@ impl AgentLoopNodeExecutor {
         // node fails at harvest (an implementer that changed nothing produced no
         // patch). Reuses the agent loop's diff→artifact mechanism (`GitDiff` + the
         // `ArtifactSink`, the same content-addressed path `review_changeset` uses).
-        let proposed_patch = if matches!(disposition, Ok(RunDisposition::Completed { .. }))
-            && declares_proposed_patch(ctx.node)
+        let proposed_patch = if matches!(
+            outcome,
+            Ok(RunOutcome {
+                disposition: RunDisposition::Completed { .. },
+                ..
+            })
+        ) && declares_proposed_patch(ctx.node)
         {
             self.capture_proposed_patch(&operating_tree, run_id).await
         } else {
@@ -717,14 +868,22 @@ impl AgentLoopNodeExecutor {
 
         guard.release().await;
 
-        match disposition {
-            Ok(RunDisposition::Completed { .. }) => {
+        match outcome {
+            Ok(RunOutcome {
+                disposition: RunDisposition::Completed { .. },
+                usage,
+            }) => {
                 // The node's MEASURED cost: wall time + its tool-call count (from
-                // the run's durable tool-call trace). Only measured dimensions —
-                // never a fabricated token/USD figure.
+                // the run's durable tool-call trace) + the model spend, priced
+                // HERE where the routed model's rate is known — its
+                // `price_per_1k_usd` times the run's MEASURED total tokens. Only
+                // measured dimensions: cost is `None` (unmeasured, never charged)
+                // when no price is known (routing OFF) OR the run reported no
+                // tokens — never a fabricated token/USD figure.
                 let measured = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
+                    cost_micros: node_cost_micros(price_per_1k_usd, usage),
                 };
 
                 // Charge the measured cost against the nested budgets. Exceeding
@@ -772,13 +931,15 @@ impl AgentLoopNodeExecutor {
                     warnings,
                 }
             }
-            Ok(RunDisposition::Failed { reason }) => {
-                NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id))
-            }
-            Ok(RunDisposition::Cancelled { .. }) => {
-                NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id))
-            }
-            Ok(_) => NodeOutcome::failed(format!(
+            Ok(RunOutcome {
+                disposition: RunDisposition::Failed { reason },
+                ..
+            }) => NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id)),
+            Ok(RunOutcome {
+                disposition: RunDisposition::Cancelled { .. },
+                ..
+            }) => NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id)),
+            Ok(RunOutcome { .. }) => NodeOutcome::failed(format!(
                 "agent node `{}` reached an unknown disposition",
                 ctx.node.id
             )),
@@ -891,7 +1052,7 @@ impl AgentLoopNodeExecutor {
         node_id: &str,
         role: &str,
         driver: &dyn ModelDriver,
-    ) -> anyhow::Result<RunDisposition> {
+    ) -> anyhow::Result<RunOutcome> {
         let policy = if self.github.is_some() {
             PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()])
         } else {
@@ -952,9 +1113,9 @@ impl AgentLoopNodeExecutor {
         // cancelled if the run was cancelled before this node started (sticky), so a
         // retry never runs a fresh agent run to completion on a cancelled workflow.
         let (registration, token) = self.cancellations.register(workflow_run_id);
-        let disposition = runtime.execute_run(driver, run, token).await;
+        let outcome = runtime.execute_run(driver, run, token).await;
         self.cancellations.deregister(workflow_run_id, registration);
-        disposition
+        outcome
     }
 
     /// Reconcile a completed agent node's declared `outputs` against what it posted
@@ -1162,9 +1323,12 @@ impl AgentLoopNodeExecutor {
                 }
                 // The tool node's MEASURED cost (wall time + its tool-call count),
                 // charged against the workflow envelope. Exceeding blocks + pauses.
+                // A tool node runs no model request, so it reports no model spend:
+                // `cost_micros` is honestly unmeasured (`None`), never a real zero.
                 let measured = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
+                    cost_micros: None,
                 };
                 let warnings = match self.charge_node_budget(&limits, &others, &measured) {
                     Ok(warnings) => warnings,
@@ -2213,16 +2377,22 @@ mod tests {
     use crate::workflows::WorkflowConductorHost;
     use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
     use codypendent_protocol::ClientId;
-    use codypendent_runtime::agent::{ModelStep, ScriptedDriver};
+    use codypendent_runtime::agent::{ModelStep, ModelUsage, ScriptedDriver, StepOutcome};
     use codypendent_workflow::{
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
     };
     use serde_json::json;
 
     /// A factory that hands back a scripted driver — no model, no network — so the
-    /// agent-node path is exercised end to end in a test.
+    /// agent-node path is exercised end to end in a test. `usage`, when set,
+    /// scripts a MEASURED per-request usage so the cost budget path is driven
+    /// deterministically without a real provider. It reports NO routed price
+    /// (`price_per_1k_usd: None`), so a node's cost comes solely from any
+    /// driver-reported `cost_micros` — see [`PricedScriptedDriverFactory`] for the
+    /// routed-price path.
     struct ScriptedDriverFactory {
         steps: Vec<ModelStep>,
+        usage: Option<ModelUsage>,
     }
 
     #[async_trait]
@@ -2231,8 +2401,50 @@ mod tests {
             &self,
             _mode: AgentMode,
             _model_policy: &str,
-        ) -> Result<Box<dyn ModelDriver>, String> {
-            Ok(Box::new(ScriptedDriver::new(self.steps.clone())))
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
+        ) -> Result<NodeDriver, String> {
+            let mut driver = ScriptedDriver::new(self.steps.clone());
+            if let Some(usage) = self.usage {
+                driver = driver.with_usage(usage);
+            }
+            Ok(NodeDriver {
+                driver: Box::new(driver),
+                price_per_1k_usd: None,
+            })
+        }
+    }
+
+    /// A factory whose scripted driver reports token-only usage while the factory
+    /// itself supplies a routed model PRICE — the production shape once routing is
+    /// on: the live driver measures tokens (no price), and the node path prices
+    /// them with the routed model's rate. Lets a test drive `maximum_cost_usd`
+    /// enforcement from a real `price × tokens` cost without a model or network.
+    struct PricedScriptedDriverFactory {
+        steps: Vec<ModelStep>,
+        usage: Option<ModelUsage>,
+        price_per_1k_usd: Option<f64>,
+    }
+
+    #[async_trait]
+    impl NodeModelDriverFactory for PricedScriptedDriverFactory {
+        async fn build(
+            &self,
+            _mode: AgentMode,
+            _model_policy: &str,
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
+        ) -> Result<NodeDriver, String> {
+            let mut driver = ScriptedDriver::new(self.steps.clone());
+            if let Some(usage) = self.usage {
+                driver = driver.with_usage(usage);
+            }
+            Ok(NodeDriver {
+                driver: Box::new(driver),
+                price_per_1k_usd: self.price_per_1k_usd,
+            })
         }
     }
 
@@ -2257,17 +2469,18 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
-        ) -> anyhow::Result<ModelStep> {
-            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        ) -> anyhow::Result<StepOutcome> {
+            let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // The node is in flight and registered — fire the run's token, then
                 // hand back a non-terminal step so the loop re-checks cancellation.
                 self.cancellations.cancel(&self.run_id);
-                Ok(ModelStep::Say("thinking".to_string()))
+                ModelStep::Say("thinking".to_string())
             } else {
-                Ok(ModelStep::Finish {
+                ModelStep::Finish {
                     summary: "unreached".to_string(),
-                })
-            }
+                }
+            };
+            Ok(StepOutcome::unmeasured(step))
         }
     }
 
@@ -2282,12 +2495,18 @@ mod tests {
             &self,
             _mode: AgentMode,
             _model_policy: &str,
-        ) -> Result<Box<dyn ModelDriver>, String> {
-            Ok(Box::new(SelfCancelDriver {
-                cancellations: self.cancellations.clone(),
-                run_id: self.run_id.clone(),
-                fired: std::sync::atomic::AtomicBool::new(false),
-            }))
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
+        ) -> Result<NodeDriver, String> {
+            Ok(NodeDriver {
+                driver: Box::new(SelfCancelDriver {
+                    cancellations: self.cancellations.clone(),
+                    run_id: self.run_id.clone(),
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                }),
+                price_per_1k_usd: None,
+            })
         }
     }
 
@@ -2381,6 +2600,7 @@ steps:
                     summary: "found the cause".to_string(),
                 },
             ],
+            usage: None,
         })
     }
 
@@ -2540,10 +2760,14 @@ steps:
     async fn an_agent_node_fails_cleanly_with_no_model_configured() {
         // The production factory over a data dir with no models.toml: the driver
         // build fails BEFORE any worktree is allocated, so the node fails cleanly
-        // (never hangs) and the run is Failed — and no lease is leaked.
+        // (never hangs) and the run is Failed — and no lease is leaked. Routing
+        // stays OFF (the default `RoutingConfig`), so this also pins that the
+        // routing seam introduces no new failure mode on the OFF path — the
+        // failure is still "no model configured", exactly as before this task.
         let (tmp, pool, paths) = temp_env().await;
         let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
             paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), RoutingConfig::default()),
         });
         let executor = executor_with(&pool, &paths, factory, tmp.path());
 
@@ -2564,13 +2788,429 @@ steps:
         );
     }
 
+    // ------------------------------------------------------------------
+    // Phase-7 routing seam threaded through workflow agent nodes (T2): the
+    // production factory now routes through `RoutingCoordinator::select`
+    // exactly as `RuntimeExecutor::execute` does for a single-agent run —
+    // these pin the OFF-fallback, the classification hard filter, and the
+    // fail-closed refusal contract on the WORKFLOW path.
+    // ------------------------------------------------------------------
+
+    use crate::routing::RoutingConfig;
+    use codypendent_daemon::model_profiles::ModelProfileStore;
+    use codypendent_protocol::DataClassification;
+    use codypendent_routing::{
+        ModelCapabilities, ModelExecutionProfile, ModelLocation, ModelPerformance, ModelProfile,
+        RoutingPolicy, StructuredOutputSupport, ToolCallSupport,
+    };
+
+    /// Capabilities generous enough that they never themselves filter a
+    /// candidate out — these tests are about the CLASSIFICATION hard filter,
+    /// not capability fit (mirrors `routing.rs`'s own `caps` test helper; a
+    /// different module's private fixture, so this is its own small copy).
+    fn routing_seam_caps() -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tools: ToolCallSupport::Parallel,
+            parallel_tools: true,
+            structured_output: StructuredOutputSupport::Strict,
+            vision: false,
+            audio_input: false,
+            embeddings: false,
+            prompt_caching: false,
+            reasoning_controls: false,
+            context_tokens: Some(200_000),
+            output_tokens: Some(16_000),
+        }
+    }
+
+    /// A minimal [`ModelProfile`] fixture for the routing-seam tests below.
+    fn routing_seam_profile(
+        id: &str,
+        location: ModelLocation,
+        reliability: f64,
+        cost: f64,
+    ) -> ModelProfile {
+        ModelProfile {
+            id: codypendent_protocol::ModelId(id.to_string()),
+            location,
+            capabilities: routing_seam_caps(),
+            performance: ModelPerformance {
+                reliability,
+                cost_per_1k_tokens_usd: cost,
+                latency_ms_p50: 700.0,
+                task_class_success: std::collections::BTreeMap::new(),
+                failure_patterns: vec![],
+            },
+            execution: ModelExecutionProfile::default(),
+            bench: None,
+        }
+    }
+
+    /// Write a minimal `models.toml` with one `[[model]]` entry per `ids`, all
+    /// pointing at `addr` — an ephemeral, ALREADY-bound local listener, so
+    /// `FrameworkModelDriver::from_registry` can build a client for whichever
+    /// id the seam selects without ever dialing out (driver construction only
+    /// builds a client object; see `ModelRegistry::client_for`).
+    fn write_models_toml(paths: &RuntimePaths, ids: &[&str], addr: std::net::SocketAddr) {
+        let mut text = String::new();
+        for id in ids {
+            text.push_str(&format!(
+                "[[model]]\nid = \"{id}\"\nprovider = \"openai-compatible\"\n\
+                 base_url = \"http://{addr}/v1\"\nmodel = \"unused\"\napi_key_env = \"\"\n\n"
+            ));
+        }
+        std::fs::write(paths.data_dir.join("models.toml"), text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_factory_with_routing_off_resolves_the_phase_one_way() {
+        // Routing OFF (the default — no `routing.toml`, exactly the state of
+        // every other workflow-exec test): the production factory must still
+        // resolve a model exactly as it did before this task — via
+        // `resolve_model` against `<data_dir>/models.toml` — with the routing
+        // seam never entering the picture.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["local-default"], addr);
+
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), RoutingConfig::default()),
+        };
+        let built = factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "fix the off-by-one bug",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+            .expect("routing OFF resolves via the unchanged Phase-1 path");
+        assert_eq!(
+            built.driver.model_id(),
+            codypendent_protocol::ModelId("local-default".to_string()),
+            "routing OFF: the SAME model `resolve_model` would pick, unchanged"
+        );
+        assert_eq!(
+            built.price_per_1k_usd, None,
+            "routing OFF is price-blind: the node's cost stays UNMEASURED, exactly as before"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn configured_factory_secret_data_never_selects_a_hosted_model_through_the_seam() {
+        // THE workflow-path leak test (mirrors `routing::tests::
+        // secret_data_never_selects_a_hosted_model_through_the_seam`): a node
+        // whose real classification is Secret, under a policy that only allows
+        // Internal off-device, must never select a hosted model — even though
+        // the hosted model here is BOTH more reliable AND cheaper, so neither
+        // cost nor quality can explain local winning. ONLY the classification
+        // hard filter can. This is the security gap T2 closes: before, a
+        // workflow agent node resolved a model classification-blind.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["hosted-strong", "local"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-strong", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "http://localhost/v1",
+                &routing_seam_profile("local", ModelLocation::Local, 0.75, 0.010),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        };
+
+        let built = factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "handle the secret payload",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+            .expect("a local model can serve secret data");
+        assert_eq!(
+            built.driver.model_id(),
+            codypendent_protocol::ModelId("local".to_string()),
+            "Secret data stays on-device on the WORKFLOW path too: the hosted \
+             model is filtered before scoring"
+        );
+        assert_eq!(
+            built.price_per_1k_usd,
+            Some(0.010),
+            "routing ON surfaces the selected local model's measured price, so the \
+             node path can enforce cost against it"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_routed_benched_hosted_model_keeps_node_cost_unmeasured() {
+        // THE fix, end to end on the workflow path (mirrors the honesty matrix, but
+        // for the value the routing seam actually produces): a benched HOSTED model
+        // — its stored `cost_per_1k_tokens_usd` is the bench's `0.0` "unmeasured"
+        // sentinel, since `models bench` cannot price a hosted endpoint — is routed,
+        // and the seam surfaces `price_per_1k_usd == None`. So pricing the run's
+        // MEASURED tokens yields an UNMEASURED `NodeCost.cost_micros` (`None`),
+        // never a fabricated `Some(0)` that would let `maximum_cost_usd` silently
+        // never fire for a paid hosted model. Contrast
+        // `configured_factory_secret_data_never_selects_a_hosted_model_through_the_seam`,
+        // where a routed model with a real `> 0` price yields a measured cost, and
+        // `a_routed_node_prices_measured_tokens_and_the_cost_budget_fires`, where
+        // that measured cost fires the budget.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["hosted-benched"], addr);
+
+        // A benched hosted model: `models bench` stored `cost_per_1k_tokens_usd:
+        // 0.0` because it does not price a hosted endpoint (see `bench::into_profile`).
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-benched", ModelLocation::Hosted, 0.90, 0.0),
+            )
+            .await
+            .unwrap();
+
+        // A permissive-enough ceiling so the hosted model clears the classification
+        // filter and can actually be selected.
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Confidential,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Internal,
+        };
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        };
+
+        let built = factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "do the work",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+            .expect("routing ON selects the benched hosted model");
+        assert_eq!(
+            built.driver.model_id(),
+            codypendent_protocol::ModelId("hosted-benched".to_string()),
+            "the benched hosted model is the one selected"
+        );
+        // THE fix: a benched hosted model's price is UNMEASURED, not a fabricated 0.
+        assert_eq!(
+            built.price_per_1k_usd, None,
+            "a benched hosted model's 0.0 is the bench's UNMEASURED sentinel, not free"
+        );
+        // So pricing MEASURED tokens with it keeps the node cost UNMEASURED — the
+        // budget never charges a fabricated `Some(0)`, and `maximum_cost_usd` is not
+        // silently defeated for a paid hosted model.
+        let measured = ModelUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            cost_micros: None,
+        };
+        assert_eq!(
+            node_cost_micros(built.price_per_1k_usd, Some(measured)),
+            None,
+            "routed hosted (unmeasured price) over measured tokens ⇒ NodeCost.cost_micros None"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn configured_factory_secret_data_with_no_local_model_refuses_rather_than_leaks() {
+        // No local model + Secret data + a policy that only allows Internal
+        // off-device ⇒ the seam REFUSES (fail closed) — mirrors `routing::
+        // tests::secret_data_with_no_local_model_refuses_rather_than_leaks`.
+        // The factory's `build` returns `Err` naming the refusal, so the
+        // caller (`run_agent_node`) turns it into a clean node failure rather
+        // than silently falling back to the classification-blind
+        // `resolve_model`.
+        let (_tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        write_models_toml(&paths, &["hosted-only"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-only", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory = ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        };
+
+        // `NodeDriver` is not `Debug` (it holds a `Box<dyn ModelDriver>`), so
+        // `expect_err`/`unwrap_err` (which require it on the `Ok` side) do not
+        // apply here — match instead.
+        let error = match factory
+            .build(
+                AgentMode::Build,
+                "hosted-default",
+                "handle the secret payload",
+                SessionId::new(),
+                RunId::new(),
+            )
+            .await
+        {
+            Ok(_) => panic!("classified data with no eligible model must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("routing refused"),
+            "the failure names the routing refusal, not a silent fallback: {error}"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn an_agent_node_fails_closed_when_routing_refuses_rather_than_leaking() {
+        // The end-to-end contract, driven through the full workflow conductor
+        // (not just the factory): routing ENABLED, only a HOSTED profile
+        // stored, and the node's classification (Secret, via the config's
+        // fail-closed ceiling — a workflow run carries no per-run
+        // classification today) is above the policy's off-device ceiling
+        // (Internal). The router REFUSES — a clean node failure, fail closed,
+        // NEVER a fallback to the classification-blind `resolve_model` — so
+        // the run fails and (like a "no model configured" failure) no
+        // worktree is ever allocated.
+        let (tmp, pool, paths) = temp_env().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        // A models.toml IS configured, so a failure here proves out to be the
+        // ROUTING refusal, not the unrelated "no model configured" failure the
+        // OFF-path test above already covers.
+        write_models_toml(&paths, &["hosted-only"], addr);
+
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://hosted/v1",
+                &routing_seam_profile("hosted-only", ModelLocation::Hosted, 0.99, 0.001),
+            )
+            .await
+            .unwrap();
+
+        let policy = RoutingPolicy {
+            max_off_device: DataClassification::Internal,
+            ..RoutingPolicy::balanced()
+        };
+        let config = RoutingConfig {
+            enabled: true,
+            policy,
+            data_classification: DataClassification::Secret,
+        };
+        let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
+            paths: paths.clone(),
+            routing: RoutingCoordinator::new(pool.clone(), config),
+        });
+        let executor = executor_with(&pool, &paths, factory, tmp.path());
+
+        let compiled = compile_yaml(AGENT_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(&pool, &compiled, None, &json!({}), Some(AGENT_MANIFEST))
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            WorkflowRunState::Failed,
+            "a routing refusal fails the node — and so the run — closed"
+        );
+        assert!(
+            leases(&pool).await.is_empty(),
+            "a routing refusal allocates no worktree: it fails before the worktree bind"
+        );
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "inspect")
+            .unwrap();
+        assert_eq!(node.state, NodeState::Failed);
+        drop(listener);
+    }
+
     #[tokio::test]
     async fn a_tool_node_with_no_executor_binding_fails_legibly() {
         // A tool node whose (normalized) tool has no workflow tool-node executor
         // fails cleanly — `with:` lets its arguments bind, so the failure is the
         // dispatch, not the binding.
         let (tmp, pool, paths) = temp_env().await;
-        let factory = Arc::new(ScriptedDriverFactory { steps: vec![] });
+        let factory = Arc::new(ScriptedDriverFactory {
+            steps: vec![],
+            usage: None,
+        });
         let executor = executor_with(&pool, &paths, factory, tmp.path());
 
         let manifest = "\
@@ -2950,6 +3590,7 @@ steps:
                     summary: "read".to_string(),
                 },
             ],
+            usage: None,
         });
         let executor = executor_with(&pool, &paths, factory, &repo);
 
@@ -2994,7 +3635,16 @@ steps:
     /// A scripted-driver factory over an explicit step list, for the blackboard
     /// tests (which script `blackboard.post` tool calls rather than say/finish).
     fn factory(steps: Vec<ModelStep>) -> Arc<ScriptedDriverFactory> {
-        Arc::new(ScriptedDriverFactory { steps })
+        Arc::new(ScriptedDriverFactory { steps, usage: None })
+    }
+
+    /// A factory whose scripted driver reports a MEASURED per-request `usage`, so a
+    /// test drives real cost telemetry through the seam into the node's budget.
+    fn factory_with_usage(steps: Vec<ModelStep>, usage: ModelUsage) -> Arc<ScriptedDriverFactory> {
+        Arc::new(ScriptedDriverFactory {
+            steps,
+            usage: Some(usage),
+        })
     }
 
     /// One `blackboard.post` tool step with the given JSON args.
@@ -3409,7 +4059,10 @@ steps:
             &self,
             _mode: AgentMode,
             model_policy: &str,
-        ) -> Result<Box<dyn ModelDriver>, String> {
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
+        ) -> Result<NodeDriver, String> {
             let steps = match model_policy {
                 // The implementer: EDIT the worktree (no proposed_patch post — the
                 // daemon captures the diff).
@@ -3441,7 +4094,10 @@ steps:
                     },
                 ],
             };
-            Ok(Box::new(ScriptedDriver::new(steps)))
+            Ok(NodeDriver {
+                driver: Box::new(ScriptedDriver::new(steps)),
+                price_per_1k_usd: None,
+            })
         }
     }
 
@@ -3930,7 +4586,10 @@ steps:
             SubscriptionHub::new(),
             broker,
             github,
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
             repo.to_path_buf(),
             BlackboardHub::new(),
             cancellations.clone(),
@@ -4125,7 +4784,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let drive = {
@@ -4183,7 +4845,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let drive = {
@@ -4700,7 +5365,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4776,7 +5444,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4874,7 +5545,10 @@ steps:
             None,
             runner.clone(),
             ApprovalBroker::new(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4950,7 +5624,10 @@ steps:
             Some(github.clone()),
             ScriptedRepositoryTestRunner::new(vec![]),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -5013,7 +5690,10 @@ steps:
             Some(github.clone()),
             ScriptedRepositoryTestRunner::new(vec![]),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -5100,7 +5780,10 @@ steps:
             Some(Arc::new(FakeGitHub::default())),
             ScriptedRepositoryTestRunner::new(vec![]),
             ApprovalBroker::new(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         // A `github.update-pull-request` node with no `with:` and no `pull_request`
@@ -5647,6 +6330,305 @@ steps:
                 .nodes[0]
                 .state,
             NodeState::Blocked
+        );
+    }
+
+    /// Cost enforcement end to end (Phase 7): a node whose MEASURED model spend
+    /// (aggregated from the driver's per-request usage) exceeds its profile's
+    /// `maximum_cost_usd` slice is BLOCKED and the run is PAUSED; on resume without
+    /// raising the budget it re-blocks WITHOUT re-running the node — proving the
+    /// measured `cost_micros` round-trips through `cost_json` and the pre-gate.
+    #[tokio::test]
+    async fn a_node_exceeding_its_cost_budget_blocks_pauses_then_re_blocks_on_resume() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // A worker profile capped at 1 USD of model spend.
+        write_agent_profile(
+            &repo,
+            "worker.toml",
+            "agents.worker",
+            "role = \"worker\"\n\n[budget]\nmaximum_cost_usd = 1.0\n",
+        );
+        // The worker makes TWO model requests (a read, then finish); the driver
+        // reports 0.6 USD PER request, so the run's aggregated measured spend is
+        // 1.2 USD > the 1 USD slice → blocked on the cost dimension.
+        let usage = ModelUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cost_micros: Some(600_000),
+        };
+        let executor = executor_with(
+            &pool,
+            &paths,
+            factory_with_usage(
+                vec![
+                    ModelStep::CallTool {
+                        tool: "workspace.read_file".to_string(),
+                        args: json!({ "path": "README.md" }),
+                    },
+                    ModelStep::Finish {
+                        summary: "read once".to_string(),
+                    },
+                ],
+                usage,
+            ),
+            &repo,
+        );
+
+        let manifest = "\
+schema_version: 1
+id: cost
+version: 1
+budget:
+  maximum_agents: 1
+steps:
+  - id: work
+    agent:
+      role: worker
+";
+        let compiled = compile_yaml(manifest).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-cost-budget",
+                &json!({}),
+                Some(manifest),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let observer = BudgetObserver::default();
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &observer)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            WorkflowRunState::Paused,
+            "exceeding the cost budget pauses the run for a human decision"
+        );
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = &snapshot.nodes[0];
+        assert_eq!(node.state, NodeState::Blocked);
+        assert!(
+            node.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cost_micros"),
+            "the block names the exceeded cost dimension: {:?}",
+            node.error
+        );
+        // The MEASURED spend that tipped the node over is recorded and round-trips.
+        assert_eq!(
+            NodeCost::from_json(node.cost.as_ref().unwrap()).cost_micros,
+            Some(1_200_000),
+            "the aggregated measured spend is recorded in cost_json"
+        );
+        assert!(
+            observer.blocked.lock().unwrap().iter().any(|n| n == "work"),
+            "the cost block reached the observer"
+        );
+
+        // Resume without raising the budget: the pre-gate re-evaluates the
+        // PRESERVED measured cost (read back from cost_json) and re-blocks WITHOUT
+        // re-running — no new agent run, the run re-pauses. This is the honest
+        // proof the measured `cost_micros` survives serialization AND is charged.
+        let runs_before = count_runs(&pool).await;
+        let resumed = WorkflowConductor::new()
+            .resume(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed,
+            WorkflowRunState::Paused,
+            "a resume that did not raise the cost budget re-blocks and re-pauses"
+        );
+        assert_eq!(
+            count_runs(&pool).await,
+            runs_before,
+            "the cost re-block did NOT re-run the node (no new agent run created)"
+        );
+        assert_eq!(
+            WorkflowStore::new()
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .nodes[0]
+                .state,
+            NodeState::Blocked
+        );
+    }
+
+    /// The Phase-7 cost seam's honesty matrix, at the pure-function boundary: a
+    /// cost is MEASURED only when a price AND measured tokens both exist; a routed
+    /// free model over measured tokens is a genuine `Some(0)`; and an absent price
+    /// (routing OFF) or absent tokens stays UNMEASURED (`None`), never a fabricated
+    /// zero the budget could treat as spend.
+    #[test]
+    fn node_cost_is_priced_from_measured_tokens_and_unmeasured_without_a_price() {
+        // `price_to_micros` prices tokens exactly: $0.002/1k × 1500 tokens =
+        // $0.003 = 3_000 micro-USD.
+        assert_eq!(price_to_micros(0.002, 1500), 3_000);
+        // A free (local) model prices measured tokens at a genuine 0.
+        assert_eq!(price_to_micros(0.0, 1500), 0);
+        // A nonsensical price prices nothing (never a spurious debit).
+        assert_eq!(price_to_micros(f64::NAN, 1500), 0);
+        assert_eq!(price_to_micros(-1.0, 1500), 0);
+
+        let tokens_only = ModelUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            cost_micros: None,
+        };
+        // Price known + tokens measured ⇒ MEASURED cost = price × tokens.
+        assert_eq!(
+            node_cost_micros(Some(0.002), Some(tokens_only)),
+            Some(3_000),
+            "a routed price over measured tokens yields the enforced cost"
+        );
+        // A free routed model over measured tokens is a genuine measured zero,
+        // distinct from unmeasured.
+        assert_eq!(
+            node_cost_micros(Some(0.0), Some(tokens_only)),
+            Some(0),
+            "a free model's measured tokens cost a real 0, not None"
+        );
+        // No price (routing OFF) ⇒ UNMEASURED, never a fabricated zero.
+        assert_eq!(
+            node_cost_micros(None, Some(tokens_only)),
+            None,
+            "no price ⇒ cost unmeasured (the honesty invariant)"
+        );
+        // A price but NO measured tokens (the run reported no usage) ⇒ UNMEASURED.
+        assert_eq!(
+            node_cost_micros(Some(0.002), None),
+            None,
+            "a price without measured tokens cannot be priced honestly"
+        );
+        // A driver that itself measured a cost wins over the price estimate.
+        let driver_priced = ModelUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            cost_micros: Some(42),
+        };
+        assert_eq!(
+            node_cost_micros(Some(9.99), Some(driver_priced)),
+            Some(42),
+            "a driver-reported cost is authoritative over the routed-price estimate"
+        );
+    }
+
+    /// Cost enforcement from a ROUTED PRICE end to end (Phase 7 — the production
+    /// path this task wires): the driver measures TOKENS with NO cost (the live
+    /// shape), and the node path prices them with the routed model's rate. A node
+    /// whose `price × measured tokens` exceeds its `maximum_cost_usd` slice is
+    /// BLOCKED and the run PAUSED — proving `maximum_cost_usd` now FIRES on real
+    /// provider token usage + a price, not only on a driver-injected cost.
+    #[tokio::test]
+    async fn a_routed_node_prices_measured_tokens_and_the_cost_budget_fires() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // A worker capped at 1 USD of model spend.
+        write_agent_profile(
+            &repo,
+            "worker.toml",
+            "agents.worker",
+            "role = \"worker\"\n\n[budget]\nmaximum_cost_usd = 1.0\n",
+        );
+        // The live-driver shape: MEASURED tokens, UNMEASURED cost (`None`). The
+        // worker makes TWO requests (a read, then finish), each reporting 500
+        // tokens → 1000 aggregated. At the routed price of $2.00/1k the node's
+        // cost is 1000/1000 × $2.00 = $2.00 = 2_000_000 micro-USD > the $1.00
+        // slice → blocked on cost. The DRIVER reports no cost; the price is applied
+        // at the node boundary — the whole point of the decoupling.
+        let usage = ModelUsage {
+            prompt_tokens: 300,
+            completion_tokens: 200,
+            cost_micros: None,
+        };
+        let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(PricedScriptedDriverFactory {
+            steps: vec![
+                ModelStep::CallTool {
+                    tool: "workspace.read_file".to_string(),
+                    args: json!({ "path": "README.md" }),
+                },
+                ModelStep::Finish {
+                    summary: "read once".to_string(),
+                },
+            ],
+            usage: Some(usage),
+            price_per_1k_usd: Some(2.0),
+        });
+        let executor = executor_with(&pool, &paths, factory, &repo);
+
+        let manifest = "\
+schema_version: 1
+id: routed-cost
+version: 1
+budget:
+  maximum_agents: 1
+steps:
+  - id: work
+    agent:
+      role: worker
+";
+        let compiled = compile_yaml(manifest).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-routed-cost-budget",
+                &json!({}),
+                Some(manifest),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let observer = BudgetObserver::default();
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &observer)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            WorkflowRunState::Paused,
+            "a routed price × measured tokens over the slice pauses the run"
+        );
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = &snapshot.nodes[0];
+        assert_eq!(node.state, NodeState::Blocked);
+        assert!(
+            node.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cost_micros"),
+            "the block names the exceeded cost dimension: {:?}",
+            node.error
+        );
+        // The cost the budget charged was PRICED from measured tokens, not reported
+        // by the driver: $2.00/1k × 1000 tokens = 2_000_000 micro-USD.
+        assert_eq!(
+            NodeCost::from_json(node.cost.as_ref().unwrap()).cost_micros,
+            Some(2_000_000),
+            "the node cost is the routed price applied to the run's measured tokens"
+        );
+        assert!(
+            observer.blocked.lock().unwrap().iter().any(|n| n == "work"),
+            "the routed-cost block reached the observer"
         );
     }
 

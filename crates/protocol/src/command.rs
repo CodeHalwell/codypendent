@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
-use crate::ids::{ApprovalId, CommandId, DocumentId, RunId, SessionId, WorkspaceId};
+use crate::ids::{ApprovalId, CommandId, DocumentId, ModelId, RunId, SessionId, WorkspaceId};
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
 /// An idempotent, optionally revision-guarded request.
@@ -62,6 +62,17 @@ pub enum CommandBody {
         /// exactly as before this field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repository: Option<String>,
+        /// The model to **pin** this run to (STEP MP2): when the operator picks
+        /// a model in the `/model` picker, the run executes on exactly that
+        /// model instead of the router's/resolver's choice. A pin overrides the
+        /// daemon's *quality* judgment, never its *security* constraint — a
+        /// pinned hosted model for classified data is refused (fail-closed),
+        /// never silently run off-device (enforced in the executor). Mirrors
+        /// [`repository`](CommandBody::StartRun::repository): `#[serde(default)]`
+        /// keeps an older client (which sends none) working — the daemon then
+        /// resolves the model exactly as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelId>,
     },
     ResolveApproval {
         approval_id: ApprovalId,
@@ -379,6 +390,7 @@ mod tests {
             objective: "diagnose".to_string(),
             mode: AgentMode::Build,
             repository: None,
+            model: None,
         };
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(
@@ -387,6 +399,48 @@ mod tests {
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body, "a payload without the key defaults to None");
+    }
+
+    #[test]
+    fn start_run_pins_a_model_when_present_and_omits_it_when_absent() {
+        // A pinned model (STEP MP2) mirrors `repository`: present on the wire
+        // when set and reparsed exactly, absent (skipped) when None so an older
+        // client — and any run that lets the daemon resolve the model — keeps
+        // working unchanged.
+        let pinned = CommandBody::StartRun {
+            session_id: SessionId::new(),
+            objective: "diagnose".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: Some(ModelId("claude-sonnet-5".to_string())),
+        };
+        let json = serde_json::to_string(&pinned).expect("serialize");
+        assert!(
+            json.contains("claude-sonnet-5"),
+            "a pinned model is on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            pinned
+        );
+
+        let unpinned = CommandBody::StartRun {
+            session_id: SessionId::new(),
+            objective: "diagnose".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: None,
+        };
+        let json = serde_json::to_string(&unpinned).expect("serialize");
+        assert!(
+            !json.contains("model"),
+            "an absent pinned model is skipped on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            unpinned,
+            "a payload without the key defaults to None"
+        );
     }
 
     #[test]
@@ -411,6 +465,7 @@ mod tests {
             objective: "diagnose the failing test".to_string(),
             mode: AgentMode::Build,
             repository: Some("/home/user/project".to_string()),
+            model: Some(ModelId("claude-sonnet-5".to_string())),
         });
         round_trip(CommandBody::ResolveApproval {
             approval_id: ApprovalId::new(),

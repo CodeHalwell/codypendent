@@ -28,16 +28,67 @@
 //! pair) and is always empty; a `CitationCorrect` assertion in a case
 //! therefore always fails today — out of scope for this task, named in the
 //! report.
+//!
+//! # `--policy` routing (Phase 7's "routing⇄eval composition" follow-up)
+//!
+//! When `eval run` is given `--policy NAME`, [`route_cases`] resolves EVERY
+//! case's model through the real `codypendent-routing` engine — the same
+//! `Router`, the same classification hard filter, and the same persisted
+//! `model_profiles` the daemon's own routing seam
+//! (`codypendentd::routing::RoutingCoordinator`) reads — fail-closed: an
+//! unrecognized policy name, an empty profile store, or a case the router
+//! refuses to route all stop `eval run` BEFORE any case executes, with a
+//! clear, non-zero exit (never a silent fallback to the default model for a
+//! policy that was explicitly requested). The resolved model is additively
+//! recorded per case in the report ([`report_json_with_routing`]'s
+//! `routed_model` field) **and** pinned into that same case's own
+//! `StartRun.model` (MP2's pin field — see [`run_suite`], [`run_case`],
+//! [`run_case_over_connection`]): both read the SAME `(case_id, ModelId)`
+//! pairs [`route_cases`] returned, so the model the report says ran is always
+//! the model that actually ran — recorded == pinned == executed, one source
+//! of truth. This closes the previously-deferred execution-pin gap: before,
+//! every case sent `StartRun { model: None }` regardless of what the report
+//! claimed, so the daemon could silently resolve a *different* model than the
+//! one recorded, corrupting the experiment. When `--policy` is absent,
+//! `routed` is `None` and every case still sends `model: None`, byte-for-byte
+//! unchanged (the untouched `eval-smoke` CI path).
+//!
+//! **The pin never bypasses the daemon's own security filter.** The daemon
+//! honors a pinned model through MP2's `RoutingCoordinator::validate_pin`,
+//! which applies the identical classification hard filter
+//! (`Router::passes_classification`) the router itself used to select a
+//! model in the first place: a HOSTED model must clear the daemon's
+//! off-device ceiling, but a LOCAL model clears it unconditionally,
+//! regardless of classification or policy. [`eval_task_node`] deliberately
+//! classifies every case at the most restrictive [`DataClassification::Unknown`]
+//! (fail-closed, mirroring `RoutingCoordinator::build_task_node`'s own
+//! default), and the only named policy `eval run --policy` supports today
+//! (`balanced`, `max_off_device: Confidential`) does not admit `Unknown` data
+//! off-device — so [`route_cases`] can only ever select a LOCAL model. A
+//! local model's pin always clears `validate_pin`'s classification check
+//! (the `model.is_local() || …` short-circuit), independent of the daemon's
+//! own — possibly differently-configured — routing policy or classification
+//! ceiling. So this pin can never turn a case that used to run into one the
+//! daemon newly refuses. A future named policy whose `max_off_device` let
+//! `route_cases` select a HOSTED model would need to re-examine this
+//! invariant (see `route_cases_fails_closed_when_only_a_hosted_model_is_stored`
+//! here and the `validate_pin_*` tests in `codypendentd::routing`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Context;
+use codypendent_daemon::db::open_database;
+use codypendent_daemon::model_profiles::ModelProfileStore;
 use codypendent_eval::{Assertion, EvalCase, RunObservation, SuiteReport};
 use codypendent_protocol::{
-    AgentMode, ApprovalDecision, ApprovalId, BudgetDimension, ClientRole, CommandBody, EventBody,
-    Payload, ProposedAction, RunId, RunState, Subscription, WorkspaceId,
+    AgentMode, ApprovalDecision, ApprovalId, BudgetDimension, ClientRole, CommandBody,
+    DataClassification, EventBody, ModelId, Payload, ProposedAction, RunId, RunState, Subscription,
+    WorkspaceId,
+};
+use codypendent_routing::{
+    classify, ModelProfile, RequiredCapabilities, Router, RoutingPolicy, TaskNode, TaskSignals,
 };
 
 use crate::commands::{ensure_daemon, expect_catchup};
@@ -129,14 +180,198 @@ pub fn fixture_root(suite_dir: &Path, fixture_name: &str) -> anyhow::Result<Path
     Ok(root)
 }
 
+// --- Phase 7 routing⇄eval composition: `--policy` --------------------------
+
+/// The routing policies `eval run --policy` recognizes by name today. A full
+/// named-policy registry (e.g. sourced from a `routing-policies/` directory)
+/// is future work — see the roadmap's "routing⇄eval composition" note; for
+/// now this is [`RoutingPolicy::balanced`], the only named policy that exists
+/// anywhere in this codebase yet.
+const KNOWN_POLICIES: &[&str] = &["balanced"];
+
+/// Resolve `--policy NAME` to a [`RoutingPolicy`]. An unrecognized name is a
+/// hard error naming every policy that IS known — never a silent default —
+/// because a `--policy` that fails to resolve must stop `eval run`, not
+/// quietly route every case onto the daemon's default model.
+fn resolve_named_policy(name: &str) -> anyhow::Result<RoutingPolicy> {
+    match name {
+        "balanced" => Ok(RoutingPolicy::balanced()),
+        other => anyhow::bail!(
+            "eval: unknown routing policy `{other}` (known policies: {}); refusing rather than \
+             silently falling back to the default model",
+            KNOWN_POLICIES.join(", ")
+        ),
+    }
+}
+
+/// Route every case in `cases` to a model under the named `policy`, over the
+/// model profiles persisted at `<data_dir>/codypendent.db` — the same
+/// `model_profiles` store `codypendent models bench` writes and the daemon's
+/// own routing seam (`codypendentd::routing::RoutingCoordinator`) reads. The
+/// eval harness is a client, not the daemon, so there is no
+/// `RoutingCoordinator` to reuse directly; this consults
+/// [`codypendent_routing::Router`] itself, over the same persisted profiles
+/// and the same classification hard filter (see [`eval_task_node`]).
+///
+/// **Fails closed, before any case runs:** an unrecognized policy name, an
+/// empty profile store, or any single case the router refuses to route
+/// (`RoutingError::NoEligibleModel` — e.g. the hard filter excludes every
+/// stored model) all stop this with a clear error — `--policy` was
+/// explicitly requested, so a misconfiguration is never masked by silently
+/// falling back to the default model for some or all cases.
+///
+/// Returns the resolved `(case_id, ModelId)` pairs, in case order — recorded
+/// into the report by [`report_json_with_routing`] AND pinned into each
+/// case's own `StartRun.model` by [`run_suite`] (via [`routed_model_for_case`]),
+/// so the model selected here is the SAME model recorded and the SAME model
+/// executed — see this file's module doc for the classification-safety
+/// argument that makes pinning it safe.
+pub async fn route_cases(
+    paths: &codypendent_protocol::discovery::RuntimePaths,
+    cases: &[EvalCase],
+    policy_name: &str,
+) -> anyhow::Result<Vec<(String, ModelId)>> {
+    let policy = resolve_named_policy(policy_name)?;
+
+    let db_path = paths.data_dir.join("codypendent.db");
+    let pool = open_database(&db_path).await.with_context(|| {
+        format!(
+            "opening {} to read persisted model profiles",
+            db_path.display()
+        )
+    })?;
+    let stored = ModelProfileStore::new()
+        .list(&pool)
+        .await
+        .context("loading persisted model profiles")?;
+    if stored.is_empty() {
+        anyhow::bail!(
+            "eval: --policy {policy_name} requires measured model profiles, but none are \
+             persisted at {} — run `codypendent models bench <id>` first; refusing rather than \
+             silently falling back to the default model",
+            db_path.display()
+        );
+    }
+    let profiles: Vec<ModelProfile> = stored.into_iter().map(|entry| entry.profile).collect();
+    let router = Router::new(&profiles, &policy);
+
+    let mut decisions = Vec::with_capacity(cases.len());
+    for case in cases {
+        let node = eval_task_node(case);
+        match router.route(&node) {
+            Ok(decision) => decisions.push((case.id.clone(), decision.model)),
+            Err(error) => anyhow::bail!(
+                "eval: --policy {policy_name} could not route case `{}`: {error}; refusing \
+                 rather than silently falling back to the default model",
+                case.id
+            ),
+        }
+    }
+    Ok(decisions)
+}
+
+/// The [`TaskNode`] case `case` routes under: mode `build` (mirrors the
+/// `AgentMode::Build` every [`run_case_over_connection`] call starts with),
+/// node kind `"eval"`, the case's prompt as the objective, and — since
+/// `EvalCase` carries no per-case [`DataClassification`] — a fail-closed
+/// [`DataClassification::Unknown`] ceiling, exactly mirroring
+/// `codypendentd::routing::RoutingCoordinator::build_task_node`'s own
+/// fail-closed default: an eval case is never treated as low-sensitivity by
+/// default, so a policy that only allows local models off-device still
+/// routes eval cases to a local model rather than accidentally admitting a
+/// hosted one.
+fn eval_task_node(case: &EvalCase) -> TaskNode {
+    let estimated_input_tokens = ((case.prompt.len() as u64) / 4).max(256);
+    let classification = classify(&TaskSignals::from_objective(
+        "build",
+        "eval",
+        estimated_input_tokens,
+        &case.prompt,
+    ));
+    TaskNode {
+        classification,
+        required: RequiredCapabilities {
+            tools: true,
+            structured_output: true,
+            ..Default::default()
+        },
+        data_classification: DataClassification::Unknown,
+        estimated_input_tokens,
+        estimated_output_tokens: 4_000,
+    }
+}
+
+/// Serialize `report` to pretty JSON, additively merging `routed` (case id →
+/// routed [`ModelId`], from [`route_cases`]) into each matching case object
+/// as a new `routed_model` string field. [`SuiteReport`]/`CaseResult`'s own
+/// Rust shape is untouched — neither type gains a field, so every existing
+/// reader keeps working unmodified — only the JSON FILE gains an extra
+/// per-case key, which a reader that does not know it simply ignores
+/// (neither type derives `#[serde(deny_unknown_fields)]`). `routed` is
+/// `None` when `--policy` was not given, in which case the output is
+/// byte-for-byte identical to a plain `serde_json::to_string_pretty(report)`
+/// — the untouched `eval-smoke` CI path.
+pub fn report_json_with_routing(
+    report: &SuiteReport,
+    routed: Option<&[(String, ModelId)]>,
+) -> anyhow::Result<String> {
+    let Some(routed) = routed else {
+        return Ok(serde_json::to_string_pretty(report)?);
+    };
+    let by_case: HashMap<&str, String> = routed
+        .iter()
+        .map(|(case_id, model)| (case_id.as_str(), model.to_string()))
+        .collect();
+
+    let mut value = serde_json::to_value(report).context("serializing the suite report")?;
+    if let Some(results) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+        for case_value in results {
+            let case_id = case_value
+                .get("case_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let model = case_id.as_deref().and_then(|id| by_case.get(id)).cloned();
+            let Some(model) = model else { continue };
+            if let Some(obj) = case_value.as_object_mut() {
+                obj.insert("routed_model".to_string(), serde_json::Value::String(model));
+            }
+        }
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// `case_id`'s routed model, looked up from the SAME `(case_id, ModelId)`
+/// pairs [`route_cases`] returned and [`report_json_with_routing`] records
+/// into the report — the one source of truth [`run_suite`] pins into that
+/// case's `StartRun` (via [`run_case`]/[`run_case_over_connection`]), so the
+/// model recorded in the report and the model actually executed can never
+/// diverge. `None` when `routed` is `None` (no `--policy` was given — every
+/// case then sends `model: None`, unchanged) or when `case_id` has no entry
+/// (defensive; [`route_cases`] resolves every case or fails closed before any
+/// case runs, so this should not happen in practice).
+#[must_use]
+fn routed_model_for_case(routed: Option<&[(String, ModelId)]>, case_id: &str) -> Option<ModelId> {
+    routed?
+        .iter()
+        .find(|(id, _)| id == case_id)
+        .map(|(_, model)| model.clone())
+}
+
 /// Run every case in `cases` against fixture `fixture_root`, headlessly,
 /// returning the aggregate [`SuiteReport`]. Ensures a daemon once up front;
 /// each case gets its own fresh session/run/scratch checkout so cases never
 /// interfere with each other.
+///
+/// `routed` is the SAME `(case_id, ModelId)` pairs [`route_cases`] resolved
+/// (and [`report_json_with_routing`] records) — `None` when `--policy` was
+/// not given. Each case's routed model, if any, is pinned into its own
+/// `StartRun.model` (see [`routed_model_for_case`]), so the model this run
+/// executes on is always the model the report attributes to it.
 pub async fn run_suite(
     paths: &codypendent_protocol::discovery::RuntimePaths,
     cases: &[EvalCase],
     fixture_root: &Path,
+    routed: Option<&[(String, ModelId)]>,
 ) -> anyhow::Result<SuiteReport> {
     ensure_daemon(paths).await?;
     let mut results = Vec::with_capacity(cases.len());
@@ -147,7 +382,8 @@ pub async fn run_suite(
             .with_context(|| format!("preparing the fixture checkout for case {}", case.id))?;
 
         let mut conn = Connection::connect(&paths.socket_path).await?;
-        let result = run_case(&mut conn, case, &checkout).await?;
+        let routed_model = routed_model_for_case(routed, &case.id);
+        let result = run_case(&mut conn, case, &checkout, routed_model).await?;
         eprintln!(
             "eval: {} {}",
             case.id,
@@ -163,13 +399,16 @@ pub async fn run_suite(
 /// from `checkout`, then score. Split out from [`run_suite`]'s loop so a test
 /// can drive exactly this pipeline — wire observation AND repository
 /// inspection — against a hand-rolled mock daemon and a real (but tiny,
-/// throwaway) git checkout, without a live daemon or model.
+/// throwaway) git checkout, without a live daemon or model. `routed_model`
+/// (when `Some`) is the model this case is pinned to (see [`run_suite`]);
+/// `None` sends `StartRun { model: None }`, unchanged.
 pub async fn run_case(
     conn: &mut Connection,
     case: &EvalCase,
     checkout: &Path,
+    routed_model: Option<ModelId>,
 ) -> anyhow::Result<codypendent_eval::CaseResult> {
-    let mut obs = run_case_over_connection(conn, case, checkout).await?;
+    let mut obs = run_case_over_connection(conn, case, checkout, routed_model).await?;
     inspect_repository(checkout, case, &mut obs).await?;
     Ok(case.score(&obs))
 }
@@ -178,11 +417,14 @@ pub async fn run_case(
 /// attach as `Controller`, start the run, and stream events until it reaches a
 /// terminal state — building a [`RunObservation`] from the stream as it goes.
 /// Split out (like `commands::run_over_connection`) so a test can drive it
-/// against a hand-rolled mock daemon instead of a live one.
+/// against a hand-rolled mock daemon instead of a live one. `routed_model`
+/// (when `Some`) is pinned onto the `StartRun` this sends (see [`run_suite`]);
+/// `None` sends `StartRun { model: None }`, unchanged.
 pub async fn run_case_over_connection(
     conn: &mut Connection,
     case: &EvalCase,
     repository: &Path,
+    routed_model: Option<ModelId>,
 ) -> anyhow::Result<RunObservation> {
     conn.handshake("codypendent-eval", env!("CARGO_PKG_VERSION"), None)
         .await?;
@@ -225,6 +467,11 @@ pub async fn run_case_over_connection(
             objective: case.prompt.clone(),
             mode: AgentMode::Build,
             repository: Some(repository.to_string_lossy().into_owned()),
+            // `--policy` pins this case's routed model (Phase 7 routing⇄eval
+            // composition — see this module's doc); absent `--policy`,
+            // `routed_model` is `None` and the daemon resolves/routes as
+            // usual, exactly as before.
+            model: routed_model,
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {
@@ -528,4 +775,242 @@ async fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod policy_routing_tests {
+    use super::*;
+    use codypendent_routing::{
+        ModelCapabilities, ModelExecutionProfile, ModelLocation, ModelPerformance,
+        StructuredOutputSupport, ToolCallSupport,
+    };
+    use std::collections::BTreeMap;
+
+    fn paths_over(dir: &std::path::Path) -> codypendent_protocol::discovery::RuntimePaths {
+        let paths = codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        paths
+    }
+
+    fn caps() -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tools: ToolCallSupport::Parallel,
+            parallel_tools: true,
+            structured_output: StructuredOutputSupport::Strict,
+            vision: false,
+            audio_input: false,
+            embeddings: false,
+            prompt_caching: false,
+            reasoning_controls: false,
+            context_tokens: Some(200_000),
+            output_tokens: Some(16_000),
+        }
+    }
+
+    fn profile(id: &str, location: ModelLocation, reliability: f64) -> ModelProfile {
+        ModelProfile {
+            id: ModelId(id.to_string()),
+            location,
+            capabilities: caps(),
+            performance: ModelPerformance {
+                reliability,
+                cost_per_1k_tokens_usd: 0.01,
+                latency_ms_p50: 500.0,
+                task_class_success: BTreeMap::new(),
+                failure_patterns: vec![],
+            },
+            execution: ModelExecutionProfile::default(),
+            bench: None,
+        }
+    }
+
+    fn one_case() -> EvalCase {
+        EvalCase {
+            id: "case-a".to_string(),
+            repository_revision: "0".repeat(40),
+            prompt: "fix the failing test in paginate".to_string(),
+            policy: "coding-balanced".to_string(),
+            expected: vec![],
+            maximum_cost_usd: None,
+            maximum_duration_ms: None,
+            task_class: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn route_cases_selects_the_eligible_local_model_under_balanced() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_over(dir.path());
+        let pool = open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .unwrap();
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "http://localhost:11434/v1",
+                &profile("local-coder", ModelLocation::Local, 0.9),
+            )
+            .await
+            .unwrap();
+
+        let cases = vec![one_case()];
+        let routed = route_cases(&paths, &cases, "balanced").await.unwrap();
+        assert_eq!(
+            routed,
+            vec![("case-a".to_string(), ModelId("local-coder".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_cases_fails_closed_when_only_a_hosted_model_is_stored() {
+        // An eval case's classification is fail-closed `Unknown` (no per-case
+        // classification exists on `EvalCase`); `balanced`'s off-device
+        // ceiling is `Confidential`, strictly less sensitive than `Unknown`,
+        // so a hosted model is never eligible — proving the classification
+        // hard filter actually runs here, not just documented as intent.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_over(dir.path());
+        let pool = open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .unwrap();
+        ModelProfileStore::new()
+            .upsert(
+                &pool,
+                "https://api.example.com/v1",
+                &profile("hosted-model", ModelLocation::Hosted, 0.99),
+            )
+            .await
+            .unwrap();
+
+        let cases = vec![one_case()];
+        let error = route_cases(&paths, &cases, "balanced").await.unwrap_err();
+        assert!(
+            error.to_string().contains("could not route case"),
+            "error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_cases_fails_closed_when_no_profiles_are_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_over(dir.path());
+        // Ensure the DB (and its empty `model_profiles` table) exists, but
+        // nothing is stored in it.
+        open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .unwrap();
+
+        let cases = vec![one_case()];
+        let error = route_cases(&paths, &cases, "balanced").await.unwrap_err();
+        assert!(
+            error.to_string().contains("models bench"),
+            "error should point at the fix: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_cases_fails_closed_on_an_unrecognized_policy_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_over(dir.path());
+        let cases = vec![one_case()];
+        let error = route_cases(&paths, &cases, "nonexistent")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown routing policy"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn report_json_with_routing_is_unchanged_when_no_policy_was_used() {
+        let report = SuiteReport::new(vec![]);
+        let plain = serde_json::to_string_pretty(&report).unwrap();
+        let via_helper = report_json_with_routing(&report, None).unwrap();
+        assert_eq!(plain, via_helper);
+    }
+
+    #[test]
+    fn report_json_with_routing_additively_merges_the_routed_model() {
+        let case_result = codypendent_eval::CaseResult {
+            case_id: "case-a".to_string(),
+            assertion_results: vec![],
+            within_cost: true,
+            within_duration: true,
+        };
+        let report = SuiteReport::new(vec![case_result]);
+        let routed = vec![("case-a".to_string(), ModelId("local-coder".to_string()))];
+
+        let json = report_json_with_routing(&report, Some(&routed)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["results"][0]["routed_model"], "local-coder");
+        // The original shape still round-trips through `SuiteReport` (the
+        // extra key is additive, never breaking an existing reader).
+        let round_tripped: SuiteReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, report);
+    }
+
+    // -- `routed_model_for_case`: the pin `run_suite` sends, one source of --
+    // -- truth with what `report_json_with_routing` records --------------
+
+    #[test]
+    fn routed_model_for_case_is_none_when_policy_is_absent() {
+        // No `--policy` ⇒ `routed: None` ⇒ every case's `StartRun` sends
+        // `model: None`, byte-for-byte unchanged (the `eval-smoke` CI path).
+        assert_eq!(routed_model_for_case(None, "case-a"), None);
+    }
+
+    #[test]
+    fn routed_model_for_case_is_none_for_an_unrecognized_case_id() {
+        let routed = vec![("case-a".to_string(), ModelId("local-coder".to_string()))];
+        assert_eq!(routed_model_for_case(Some(&routed), "case-zzz"), None);
+    }
+
+    #[test]
+    fn routed_model_for_case_finds_the_matching_case_among_several() {
+        let routed = vec![
+            ("case-a".to_string(), ModelId("local-coder".to_string())),
+            ("case-b".to_string(), ModelId("local-strong".to_string())),
+        ];
+        assert_eq!(
+            routed_model_for_case(Some(&routed), "case-b"),
+            Some(ModelId("local-strong".to_string()))
+        );
+    }
+
+    #[test]
+    fn routed_model_for_case_matches_report_json_with_routings_recorded_model() {
+        // THE "one source of truth" property (Codex P1 #2 fix): the SAME
+        // `routed` pairs feed both the model `run_suite` pins into this
+        // case's `StartRun` (via `routed_model_for_case`) and the model
+        // `report_json_with_routing` records — so a report's `routed_model`
+        // can never name a different model than the one that actually ran.
+        let routed = vec![
+            ("case-a".to_string(), ModelId("local-coder".to_string())),
+            ("case-b".to_string(), ModelId("local-strong".to_string())),
+        ];
+        let pinned = routed_model_for_case(Some(&routed), "case-a");
+        assert_eq!(pinned, Some(ModelId("local-coder".to_string())));
+
+        let case_result = codypendent_eval::CaseResult {
+            case_id: "case-a".to_string(),
+            assertion_results: vec![],
+            within_cost: true,
+            within_duration: true,
+        };
+        let report = SuiteReport::new(vec![case_result]);
+        let json = report_json_with_routing(&report, Some(&routed)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let recorded = value["results"][0]["routed_model"]
+            .as_str()
+            .expect("routed_model is recorded");
+
+        assert_eq!(
+            pinned,
+            Some(ModelId(recorded.to_string())),
+            "the model pinned into this case's StartRun must equal the model \
+             recorded in the report"
+        );
+    }
 }

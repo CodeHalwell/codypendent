@@ -469,6 +469,7 @@ async fn observer_start_run_is_role_denied() {
                     objective: "diagnose".to_string(),
                     mode: AgentMode::Build,
                     repository: None,
+                    model: None,
                 },
                 "start-denied",
             )),
