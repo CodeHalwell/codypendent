@@ -101,8 +101,14 @@ pub struct DocumentSync {
     /// Opaque CRDT bytes. Serialized on the wire as a JSON array of byte values
     /// (see the [`byte_vec`] module) — the framing layer emits plain
     /// `serde_json`, so there is no base64 step; a client sends the raw bytes and
-    /// they round-trip as numbers. Large documents are exchanged as incremental
-    /// updates rather than full snapshots to stay under the frame-size bound.
+    /// they round-trip as numbers. Every sync currently carries a **full CRDT
+    /// snapshot** (`ExportMode::Snapshot`), not an incremental delta — the client
+    /// replica relies on this (an empty or lagged replica converges on the next
+    /// sync, and re-importing a snapshot is an idempotent no-op). If a future
+    /// change sends deltas to stay under the frame-size bound, the client replica
+    /// (`knowledge::docs::DocumentReplica`) must be updated in lockstep, or a
+    /// replica missing a delta's causal dependencies would silently fail to
+    /// converge.
     #[serde(with = "byte_vec")]
     pub update: Vec<u8>,
 }
@@ -136,9 +142,10 @@ pub struct DocumentLeaseGrant {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Serialize `Vec<u8>` as a JSON array of numbers (portable, no extra deps). The
-/// framing layer already bounds frame size, so document snapshots that would be
-/// large are exchanged as incremental updates, not full snapshots.
+/// Serialize `Vec<u8>` as a JSON array of numbers (portable, no extra deps).
+/// `DocumentSync.update` currently carries a full CRDT snapshot on every sync
+/// (see that field's docs); the framing layer bounds frame size, so a very large
+/// document is a known future scaling limit, not something deltas solve today.
 mod byte_vec {
     use serde::{Deserialize, Deserializer, Serializer};
 
