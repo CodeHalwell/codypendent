@@ -132,27 +132,48 @@ pub enum ModelStep {
     },
 }
 
-/// Provider-reported usage for one model request (Phase 7 telemetry). This is a
-/// MEASURED figure: a driver returns it (wrapped in `Some`) only when the
-/// provider actually reported usage for the request. `Some(ModelUsage::default())`
-/// is a real measured zero (e.g. a fully-cached response); a `None` at the seam
-/// (see [`StepOutcome::usage`]) is the distinct "this driver did not report
-/// usage" — the two must never be conflated, because the cost budget charges only
-/// measured spend and must never count an unmeasured request as a satisfying zero.
+/// Provider-reported usage for one model request (Phase 7 telemetry). A driver
+/// returns it (wrapped in `Some`) only when the provider actually reported usage
+/// for the request; a `None` at the seam (see [`StepOutcome::usage`]) is the
+/// distinct "this driver did not report usage" — never conflated, because the
+/// cost budget charges only measured spend and must never count an unmeasured
+/// request as a satisfying zero.
+///
+/// **Tokens and cost are DECOUPLED** (the T1-review root-cause fix): a request's
+/// TOKEN counts are measured whenever the provider reports them, but its monetary
+/// **cost is a separate `Option`**, because a token count and a dollar figure are
+/// measured at different layers. The live [`FrameworkModelDriver`] reads real
+/// token counts from the framework response but has no per-token price, so it
+/// reports `Some(ModelUsage { prompt_tokens, completion_tokens, cost_micros: None })`
+/// — tokens measured, cost UNMEASURED. The price lives with the routed model in
+/// the daemon's node-execution path, which is where `cost_micros` is actually
+/// computed (price × measured tokens). `cost_micros: Some(0)` is a real measured
+/// zero (a genuinely free — e.g. local — model); `cost_micros: None` is "cost not
+/// measured here", and the two must never be conflated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
-    /// Prompt (input) tokens the request consumed.
+    /// Prompt (input) tokens the request consumed (measured when the usage is
+    /// present at all).
     pub prompt_tokens: u64,
-    /// Completion (output) tokens the request produced.
+    /// Completion (output) tokens the request produced (measured when the usage
+    /// is present at all).
     pub completion_tokens: u64,
-    /// Measured spend for the request, in micro-USD (millionths of a dollar).
-    pub cost_micros: u64,
+    /// Measured spend for the request, in micro-USD (millionths of a dollar), or
+    /// `None` when the cost was not measured at this layer (e.g. the live driver,
+    /// which measures tokens but has no price — the price is applied downstream).
+    /// `Some(0)` is a genuine measured zero; `None` is "not measured", never a
+    /// fabricated zero the cost budget could treat as a satisfying spend.
+    pub cost_micros: Option<u64>,
 }
 
 impl ModelUsage {
     /// Element-wise saturating sum — accumulate one request's usage into a
-    /// running total. Saturating so a pathological total never wraps to a small
-    /// value that would let an exhausted budget keep going.
+    /// running total. Tokens sum as plain saturating counts; **cost sums as a
+    /// MEASURED value** ([`add_measured_cost`]): two unmeasured costs stay `None`,
+    /// any measured side carries through, so an all-unmeasured run keeps
+    /// `cost_micros == None` and is charged nothing (never a fabricated zero).
+    /// Saturating so a pathological total never wraps to a small value that would
+    /// let an exhausted budget keep going.
     #[must_use]
     pub fn saturating_add(&self, other: &Self) -> Self {
         Self {
@@ -160,8 +181,23 @@ impl ModelUsage {
             completion_tokens: self
                 .completion_tokens
                 .saturating_add(other.completion_tokens),
-            cost_micros: self.cost_micros.saturating_add(other.cost_micros),
+            cost_micros: add_measured_cost(self.cost_micros, other.cost_micros),
         }
+    }
+}
+
+/// Sum two optional MEASURED costs, preserving "not measured": two `None`s stay
+/// `None` (neither side measured a spend), while any measured side carries
+/// through (summing saturating when both are measured). Accumulating a run's
+/// per-request costs therefore charges only the spend actually reported, and an
+/// all-unmeasured run stays `None` — charged nothing. Mirrors the workflow
+/// crate's identical `NodeCost` rule, so the invariant holds at every layer.
+#[must_use]
+fn add_measured_cost(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
     }
 }
 
@@ -1959,10 +1995,13 @@ fn hash_json<T: Serialize>(value: &T) -> String {
 /// JSON value: objective, findings, actions, changes, verification, costs, and
 /// unresolved questions.
 ///
-/// `usage` is the run's AGGREGATED measured usage (Phase 7). When it is `None`
-/// (no request reported usage), the `tokens`/`cost_micros` costs render as
-/// `null` — an honest "not measured", never a real-looking `0` a reader could
-/// mistake for a free run.
+/// `usage` is the run's AGGREGATED measured usage (Phase 7). Tokens and cost
+/// render INDEPENDENTLY, honestly: `tokens` is `null` only when no request
+/// reported usage at all, and `cost_micros` is `null` whenever the cost was not
+/// measured — which is the norm at this layer, since the live driver measures
+/// tokens but the price is applied downstream (in the daemon's node path). So a
+/// live run typically renders real `tokens` with a `null` `cost_micros`; neither
+/// is ever a real-looking `0` a reader could mistake for a free run.
 fn build_chronicle(
     objective: &str,
     findings: &[String],
@@ -2242,16 +2281,15 @@ impl ModelDriver for FrameworkModelDriver {
             .await
             .map_err(|e| anyhow::anyhow!("model request failed: {e}"))?;
 
-        // Provider usage (Phase 7). The framework `ChatResponse` surfaces TOKEN
-        // counts (`response.usage_details`) but NO monetary cost, and the runtime
-        // configures no per-token price — so there is no MEASURED cost to report.
-        // [`ModelUsage`] bundles tokens and cost as ONE measured unit, and the
-        // cost budget must never treat an unmeasured cost as a satisfying zero, so
-        // a token-only reading cannot be surfaced without fabricating a zero cost.
-        // This path therefore stays honestly UNMEASURED (`usage: None`, via
-        // [`StepOutcome::unmeasured`]) until a price (or a provider cost field) is
-        // wired — which keeps the live path behaving exactly as before (cost
-        // simply not charged). Do NOT map this to a zero-cost `Some`.
+        // Provider usage (Phase 7). The framework `ChatResponse` surfaces real
+        // TOKEN counts on `response.usage_details` (the OpenAI-compatible chat
+        // path parses `prompt_tokens`/`completion_tokens`). We report those
+        // MEASURED tokens with an UNMEASURED cost (`cost_micros: None`): the
+        // driver has no per-token price, so the routed model's price is applied
+        // downstream in the daemon's node-execution path. When the provider
+        // reports no usage at all, this is honestly `None` — never a fabricated
+        // zero. Computed once and attached to whichever step the turn yields.
+        let usage = measured_usage(response.usage_details.as_ref());
 
         // A function call in the returned turn becomes a tool call.
         if let Some(message) = response.messages.last() {
@@ -2260,23 +2298,52 @@ impl ModelDriver for FrameworkModelDriver {
                     .parse_arguments()
                     .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
                     .unwrap_or(Value::Null);
-                return Ok(StepOutcome::unmeasured(ModelStep::CallTool {
-                    tool: call.name.clone(),
-                    args,
-                }));
+                return Ok(StepOutcome::new(
+                    ModelStep::CallTool {
+                        tool: call.name.clone(),
+                        args,
+                    },
+                    usage,
+                ));
             }
         }
 
         // Otherwise the completed turn is the final answer.
         let text = response.text();
-        Ok(StepOutcome::unmeasured(ModelStep::Finish {
-            summary: if text.is_empty() {
-                "run complete".to_string()
-            } else {
-                text
+        Ok(StepOutcome::new(
+            ModelStep::Finish {
+                summary: if text.is_empty() {
+                    "run complete".to_string()
+                } else {
+                    text
+                },
             },
-        }))
+            usage,
+        ))
     }
+}
+
+/// Map the framework chat response's [`UsageDetails`](agent_framework_core::types::UsageDetails)
+/// into a [`ModelUsage`] with MEASURED token counts and an UNMEASURED cost.
+///
+/// Tokens come straight from the provider (`input_token_count` →
+/// `prompt_tokens`, `output_token_count` → `completion_tokens`); a count the
+/// provider omitted reads `0`. **`cost_micros` is `None`**: tokens are measured
+/// here, but the monetary cost is not, because this layer has no per-token price
+/// (the routed model's price is applied in the daemon's node path). `None` in
+/// (the provider reported no usage object) ⇒ `None` out — honestly unmeasured,
+/// never a fabricated zero.
+#[cfg(feature = "provider-openai")]
+fn measured_usage(
+    usage_details: Option<&agent_framework_core::types::UsageDetails>,
+) -> Option<ModelUsage> {
+    usage_details.map(|details| ModelUsage {
+        prompt_tokens: details.input_token_count.unwrap_or(0),
+        completion_tokens: details.output_token_count.unwrap_or(0),
+        // Measured tokens, UNMEASURED cost — priced downstream where the routed
+        // model's rate is known. Never a fabricated zero.
+        cost_micros: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2355,7 +2422,7 @@ mod tests {
         let usage = ModelUsage {
             prompt_tokens: 100,
             completion_tokens: 20,
-            cost_micros: 4_500,
+            cost_micros: Some(4_500),
         };
         let measured = ScriptedDriver::new(vec![
             ModelStep::Say("hi".to_string()),
@@ -2422,6 +2489,47 @@ mod tests {
         assert!(replay.text().contains("[tool result: shell.run]"));
     }
 
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn framework_usage_details_map_to_measured_tokens_with_unmeasured_cost() {
+        use agent_framework_core::types::UsageDetails;
+        // The live driver's seam: the framework chat response's token counts map
+        // straight into `ModelUsage` tokens, and the cost stays UNMEASURED
+        // (`None`) — tokens are measured here, the price is applied downstream.
+        let details = UsageDetails {
+            input_token_count: Some(120),
+            output_token_count: Some(34),
+            total_token_count: Some(154),
+            ..Default::default()
+        };
+        let usage = measured_usage(Some(&details)).expect("present usage maps to Some");
+        assert_eq!(usage.prompt_tokens, 120, "input tokens are measured");
+        assert_eq!(usage.completion_tokens, 34, "output tokens are measured");
+        assert_eq!(
+            usage.cost_micros, None,
+            "cost is UNMEASURED at the driver — never a fabricated zero"
+        );
+
+        // A response with NO usage object is honestly unmeasured (`None`), never a
+        // fabricated zero — behaving exactly as before usage was surfaced.
+        assert_eq!(
+            measured_usage(None),
+            None,
+            "no provider usage ⇒ unmeasured, not a zero"
+        );
+
+        // A partial usage object still reports the tokens it has; a missing count
+        // reads 0 (a measured-present usage), distinct from the whole thing absent.
+        let partial = UsageDetails {
+            output_token_count: Some(9),
+            ..Default::default()
+        };
+        let usage = measured_usage(Some(&partial)).unwrap();
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 9);
+        assert_eq!(usage.cost_micros, None);
+    }
+
     #[test]
     fn chronicle_has_the_chapter20_shape() {
         // An UNMEASURED run: the token/cost costs render as null ("not measured"),
@@ -2452,10 +2560,31 @@ mod tests {
             Some(ModelUsage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
-                cost_micros: 4_500,
+                cost_micros: Some(4_500),
             }),
         );
         assert_eq!(measured["costs"]["tokens"], 120);
         assert_eq!(measured["costs"]["cost_micros"], 4_500);
+
+        // The DECOUPLED live-driver reality: tokens measured, cost UNMEASURED.
+        // Tokens render as a real number while `cost_micros` stays `null` — the
+        // two are independent, and a null cost is never a real-looking zero.
+        let tokens_only = build_chronicle(
+            "diagnose",
+            &[],
+            &[],
+            &[],
+            1,
+            Some(ModelUsage {
+                prompt_tokens: 30,
+                completion_tokens: 12,
+                cost_micros: None,
+            }),
+        );
+        assert_eq!(tokens_only["costs"]["tokens"], 42);
+        assert!(
+            tokens_only["costs"]["cost_micros"].is_null(),
+            "measured tokens with an unmeasured cost render cost as null, not zero"
+        );
     }
 }

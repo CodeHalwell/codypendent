@@ -185,8 +185,10 @@ pub enum RoutingSeamError {
 }
 
 /// The outcome of a successful routing decision: the model chosen, the full
-/// [`RoutingDecision`] (recorded in the trace), and the [`TaskNode`] retained so
-/// a later [`RoutingCoordinator::escalate`] re-routes the SAME node.
+/// [`RoutingDecision`] (recorded in the trace), the [`TaskNode`] retained so a
+/// later [`RoutingCoordinator::escalate`] re-routes the SAME node, and the
+/// selected model's price (so the node-execution path can price MEASURED tokens
+/// into a cost — Phase 7 cost enforcement).
 #[derive(Debug, Clone)]
 pub struct RoutingSelection {
     pub decision: RoutingDecision,
@@ -196,6 +198,14 @@ pub struct RoutingSelection {
     /// the single-agent live loop (see [`RoutingCoordinator::escalate`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub node: TaskNode,
+    /// The selected model's blended price per 1K tokens (USD), from its stored
+    /// [`ModelProfile`]'s measured performance. The node-execution path multiplies
+    /// this by the run's MEASURED total tokens to get the honest `cost_micros`
+    /// that `maximum_cost_usd` enforces against. Always a real number for a routed
+    /// model (a local model's is legitimately `0.0`, a genuinely free run); it is
+    /// only the ABSENCE of a routing decision (routing OFF) that leaves cost
+    /// unpriced — never a value here.
+    pub price_per_1k_usd: f64,
 }
 
 impl RoutingSelection {
@@ -302,7 +312,21 @@ impl RoutingCoordinator {
                     policy = %decision.policy_key, classifier = %decision.classifier_version,
                     "routing selected a model"
                 );
-                Ok(Some(RoutingSelection { decision, node }))
+                // The selected model's measured price, carried so the node path
+                // can price MEASURED tokens into an enforced cost. The router
+                // picked `decision.model` FROM `profiles`, so the profile is
+                // present; its `cost_per_1k_tokens_usd` is always a real number
+                // (a local model's is legitimately `0.0`). A defensive `0.0`
+                // covers the impossible "selected a model not in the pool".
+                let price_per_1k_usd = profiles
+                    .iter()
+                    .find(|p| p.id == decision.model)
+                    .map_or(0.0, |p| p.performance.cost_per_1k_tokens_usd);
+                Ok(Some(RoutingSelection {
+                    decision,
+                    node,
+                    price_per_1k_usd,
+                }))
             }
             Err(RoutingError::NoEligibleModel { reason }) => Err(RoutingSeamError::Refused(reason)),
             Err(other) => Err(RoutingSeamError::Refused(other.to_string())),
@@ -736,6 +760,13 @@ mod tests {
             selection.model(),
             &ModelId("cheap".into()),
             "cheapest-above-threshold"
+        );
+        // The selection surfaces the SELECTED model's price, so the node path can
+        // price measured tokens into an enforced cost (Phase 7). `cheap` is
+        // $0.002/1k in its profile.
+        assert_eq!(
+            selection.price_per_1k_usd, 0.002,
+            "the selection carries the chosen model's measured price"
         );
         coord
             .record_decision(session, run, &selection.decision)

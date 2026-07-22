@@ -564,7 +564,7 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
     let per_request = ModelUsage {
         prompt_tokens: 10,
         completion_tokens: 5,
-        cost_micros: 1_000,
+        cost_micros: Some(1_000),
     };
     let session = SessionId::new();
     let run = RunId::new();
@@ -596,7 +596,7 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
         Some(ModelUsage {
             prompt_tokens: 20,
             completion_tokens: 10,
-            cost_micros: 2_000,
+            cost_micros: Some(2_000),
         }),
         "two measured requests sum into the run's aggregated usage"
     );
