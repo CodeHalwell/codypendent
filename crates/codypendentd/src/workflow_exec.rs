@@ -47,13 +47,18 @@
 //! baseline; a configured-but-unresolvable role is a clean node failure naming the
 //! role (never a silent default).
 //!
-//! **Budget enforcement (Phase 5 T8, STEP 5.5).** Each node's MEASURED cost (wall
-//! time + tool calls — the only dimensions the runtime honestly surfaces) is
-//! charged against the nested budgets ([`crate::workflow_exec`] measures,
-//! [`codypendent_workflow::budget`] decides): the node's own slice and the
-//! workflow envelope (summed from the durable per-node costs). Crossing 80% warns
-//! through the observer; exceeding blocks the node ([`NodeState::Blocked`]) and
-//! pauses the run for a human decision — an overrun is never silent.
+//! **Budget enforcement (Phase 5 T8, STEP 5.5; cost added in Phase 7).** Each
+//! node's MEASURED cost is charged against the nested budgets
+//! ([`crate::workflow_exec`] measures, [`codypendent_workflow::budget`] decides):
+//! the node's own slice and the workflow envelope (summed from the durable
+//! per-node costs). The measured dimensions are wall time and tool calls (always),
+//! plus **model spend** (micro-USD) — the usage a node's agent run reports through
+//! the `ModelDriver` seam, aggregated into the node's cost. Spend is charged only
+//! when a run reported it: a node that reported none contributes NO cost (a
+//! `None`, never a real `0`), so a `maximum_cost_usd` ceiling bites only when real
+//! usage backs it. Crossing 80% warns through the observer; exceeding blocks the
+//! node ([`NodeState::Blocked`]) and pauses the run for a human decision — an
+//! overrun is never silent.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +85,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
-    FrameworkModelDriver, ModelDriver, RunContext, WorkflowContext,
+    FrameworkModelDriver, ModelDriver, RunContext, RunOutcome, WorkflowContext,
 };
 use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardPost};
 use codypendent_runtime::models::{resolve_model, ModelRegistry};
@@ -683,7 +688,7 @@ impl AgentLoopNodeExecutor {
             binding,
         );
         let started = Instant::now();
-        let disposition = self
+        let outcome = self
             .drive_agent(
                 session_id,
                 run_id,
@@ -707,8 +712,13 @@ impl AgentLoopNodeExecutor {
         // node fails at harvest (an implementer that changed nothing produced no
         // patch). Reuses the agent loop's diff→artifact mechanism (`GitDiff` + the
         // `ArtifactSink`, the same content-addressed path `review_changeset` uses).
-        let proposed_patch = if matches!(disposition, Ok(RunDisposition::Completed { .. }))
-            && declares_proposed_patch(ctx.node)
+        let proposed_patch = if matches!(
+            outcome,
+            Ok(RunOutcome {
+                disposition: RunDisposition::Completed { .. },
+                ..
+            })
+        ) && declares_proposed_patch(ctx.node)
         {
             self.capture_proposed_patch(&operating_tree, run_id).await
         } else {
@@ -717,14 +727,20 @@ impl AgentLoopNodeExecutor {
 
         guard.release().await;
 
-        match disposition {
-            Ok(RunDisposition::Completed { .. }) => {
+        match outcome {
+            Ok(RunOutcome {
+                disposition: RunDisposition::Completed { .. },
+                usage,
+            }) => {
                 // The node's MEASURED cost: wall time + its tool-call count (from
-                // the run's durable tool-call trace). Only measured dimensions —
-                // never a fabricated token/USD figure.
+                // the run's durable tool-call trace) + the model spend the run
+                // actually reported through the usage seam. Only measured
+                // dimensions — cost is `None` (unmeasured, never charged) unless
+                // the driver reported it, never a fabricated token/USD figure.
                 let measured = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
+                    cost_micros: usage.map(|u| u.cost_micros),
                 };
 
                 // Charge the measured cost against the nested budgets. Exceeding
@@ -772,13 +788,15 @@ impl AgentLoopNodeExecutor {
                     warnings,
                 }
             }
-            Ok(RunDisposition::Failed { reason }) => {
-                NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id))
-            }
-            Ok(RunDisposition::Cancelled { .. }) => {
-                NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id))
-            }
-            Ok(_) => NodeOutcome::failed(format!(
+            Ok(RunOutcome {
+                disposition: RunDisposition::Failed { reason },
+                ..
+            }) => NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id)),
+            Ok(RunOutcome {
+                disposition: RunDisposition::Cancelled { .. },
+                ..
+            }) => NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id)),
+            Ok(RunOutcome { .. }) => NodeOutcome::failed(format!(
                 "agent node `{}` reached an unknown disposition",
                 ctx.node.id
             )),
@@ -891,7 +909,7 @@ impl AgentLoopNodeExecutor {
         node_id: &str,
         role: &str,
         driver: &dyn ModelDriver,
-    ) -> anyhow::Result<RunDisposition> {
+    ) -> anyhow::Result<RunOutcome> {
         let policy = if self.github.is_some() {
             PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()])
         } else {
@@ -952,9 +970,9 @@ impl AgentLoopNodeExecutor {
         // cancelled if the run was cancelled before this node started (sticky), so a
         // retry never runs a fresh agent run to completion on a cancelled workflow.
         let (registration, token) = self.cancellations.register(workflow_run_id);
-        let disposition = runtime.execute_run(driver, run, token).await;
+        let outcome = runtime.execute_run(driver, run, token).await;
         self.cancellations.deregister(workflow_run_id, registration);
-        disposition
+        outcome
     }
 
     /// Reconcile a completed agent node's declared `outputs` against what it posted
@@ -1162,9 +1180,12 @@ impl AgentLoopNodeExecutor {
                 }
                 // The tool node's MEASURED cost (wall time + its tool-call count),
                 // charged against the workflow envelope. Exceeding blocks + pauses.
+                // A tool node runs no model request, so it reports no model spend:
+                // `cost_micros` is honestly unmeasured (`None`), never a real zero.
                 let measured = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
+                    cost_micros: None,
                 };
                 let warnings = match self.charge_node_budget(&limits, &others, &measured) {
                     Ok(warnings) => warnings,
@@ -2213,16 +2234,19 @@ mod tests {
     use crate::workflows::WorkflowConductorHost;
     use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
     use codypendent_protocol::ClientId;
-    use codypendent_runtime::agent::{ModelStep, ScriptedDriver};
+    use codypendent_runtime::agent::{ModelStep, ModelUsage, ScriptedDriver, StepOutcome};
     use codypendent_workflow::{
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
     };
     use serde_json::json;
 
     /// A factory that hands back a scripted driver — no model, no network — so the
-    /// agent-node path is exercised end to end in a test.
+    /// agent-node path is exercised end to end in a test. `usage`, when set,
+    /// scripts a MEASURED per-request usage so the cost budget path is driven
+    /// deterministically without a real provider.
     struct ScriptedDriverFactory {
         steps: Vec<ModelStep>,
+        usage: Option<ModelUsage>,
     }
 
     #[async_trait]
@@ -2232,7 +2256,11 @@ mod tests {
             _mode: AgentMode,
             _model_policy: &str,
         ) -> Result<Box<dyn ModelDriver>, String> {
-            Ok(Box::new(ScriptedDriver::new(self.steps.clone())))
+            let mut driver = ScriptedDriver::new(self.steps.clone());
+            if let Some(usage) = self.usage {
+                driver = driver.with_usage(usage);
+            }
+            Ok(Box::new(driver))
         }
     }
 
@@ -2257,17 +2285,18 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
-        ) -> anyhow::Result<ModelStep> {
-            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        ) -> anyhow::Result<StepOutcome> {
+            let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // The node is in flight and registered — fire the run's token, then
                 // hand back a non-terminal step so the loop re-checks cancellation.
                 self.cancellations.cancel(&self.run_id);
-                Ok(ModelStep::Say("thinking".to_string()))
+                ModelStep::Say("thinking".to_string())
             } else {
-                Ok(ModelStep::Finish {
+                ModelStep::Finish {
                     summary: "unreached".to_string(),
-                })
-            }
+                }
+            };
+            Ok(StepOutcome::unmeasured(step))
         }
     }
 
@@ -2381,6 +2410,7 @@ steps:
                     summary: "found the cause".to_string(),
                 },
             ],
+            usage: None,
         })
     }
 
@@ -2570,7 +2600,10 @@ steps:
         // fails cleanly — `with:` lets its arguments bind, so the failure is the
         // dispatch, not the binding.
         let (tmp, pool, paths) = temp_env().await;
-        let factory = Arc::new(ScriptedDriverFactory { steps: vec![] });
+        let factory = Arc::new(ScriptedDriverFactory {
+            steps: vec![],
+            usage: None,
+        });
         let executor = executor_with(&pool, &paths, factory, tmp.path());
 
         let manifest = "\
@@ -2950,6 +2983,7 @@ steps:
                     summary: "read".to_string(),
                 },
             ],
+            usage: None,
         });
         let executor = executor_with(&pool, &paths, factory, &repo);
 
@@ -2994,7 +3028,16 @@ steps:
     /// A scripted-driver factory over an explicit step list, for the blackboard
     /// tests (which script `blackboard.post` tool calls rather than say/finish).
     fn factory(steps: Vec<ModelStep>) -> Arc<ScriptedDriverFactory> {
-        Arc::new(ScriptedDriverFactory { steps })
+        Arc::new(ScriptedDriverFactory { steps, usage: None })
+    }
+
+    /// A factory whose scripted driver reports a MEASURED per-request `usage`, so a
+    /// test drives real cost telemetry through the seam into the node's budget.
+    fn factory_with_usage(steps: Vec<ModelStep>, usage: ModelUsage) -> Arc<ScriptedDriverFactory> {
+        Arc::new(ScriptedDriverFactory {
+            steps,
+            usage: Some(usage),
+        })
     }
 
     /// One `blackboard.post` tool step with the given JSON args.
@@ -3930,7 +3973,10 @@ steps:
             SubscriptionHub::new(),
             broker,
             github,
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
             repo.to_path_buf(),
             BlackboardHub::new(),
             cancellations.clone(),
@@ -4125,7 +4171,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let drive = {
@@ -4183,7 +4232,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let drive = {
@@ -4700,7 +4752,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4776,7 +4831,10 @@ steps:
             None,
             runner.clone(),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4874,7 +4932,10 @@ steps:
             None,
             runner.clone(),
             ApprovalBroker::new(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -4950,7 +5011,10 @@ steps:
             Some(github.clone()),
             ScriptedRepositoryTestRunner::new(vec![]),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -5013,7 +5077,10 @@ steps:
             Some(github.clone()),
             ScriptedRepositoryTestRunner::new(vec![]),
             broker.clone(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         let manifest = "\
@@ -5100,7 +5167,10 @@ steps:
             Some(Arc::new(FakeGitHub::default())),
             ScriptedRepositoryTestRunner::new(vec![]),
             ApprovalBroker::new(),
-            Arc::new(ScriptedDriverFactory { steps: vec![] }),
+            Arc::new(ScriptedDriverFactory {
+                steps: vec![],
+                usage: None,
+            }),
         );
 
         // A `github.update-pull-request` node with no `with:` and no `pull_request`
@@ -5637,6 +5707,140 @@ steps:
             count_runs(&pool).await,
             runs_before,
             "the re-block did NOT re-run the node (no new agent run created)"
+        );
+        assert_eq!(
+            WorkflowStore::new()
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .nodes[0]
+                .state,
+            NodeState::Blocked
+        );
+    }
+
+    /// Cost enforcement end to end (Phase 7): a node whose MEASURED model spend
+    /// (aggregated from the driver's per-request usage) exceeds its profile's
+    /// `maximum_cost_usd` slice is BLOCKED and the run is PAUSED; on resume without
+    /// raising the budget it re-blocks WITHOUT re-running the node — proving the
+    /// measured `cost_micros` round-trips through `cost_json` and the pre-gate.
+    #[tokio::test]
+    async fn a_node_exceeding_its_cost_budget_blocks_pauses_then_re_blocks_on_resume() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // A worker profile capped at 1 USD of model spend.
+        write_agent_profile(
+            &repo,
+            "worker.toml",
+            "agents.worker",
+            "role = \"worker\"\n\n[budget]\nmaximum_cost_usd = 1.0\n",
+        );
+        // The worker makes TWO model requests (a read, then finish); the driver
+        // reports 0.6 USD PER request, so the run's aggregated measured spend is
+        // 1.2 USD > the 1 USD slice → blocked on the cost dimension.
+        let usage = ModelUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cost_micros: 600_000,
+        };
+        let executor = executor_with(
+            &pool,
+            &paths,
+            factory_with_usage(
+                vec![
+                    ModelStep::CallTool {
+                        tool: "workspace.read_file".to_string(),
+                        args: json!({ "path": "README.md" }),
+                    },
+                    ModelStep::Finish {
+                        summary: "read once".to_string(),
+                    },
+                ],
+                usage,
+            ),
+            &repo,
+        );
+
+        let manifest = "\
+schema_version: 1
+id: cost
+version: 1
+budget:
+  maximum_agents: 1
+steps:
+  - id: work
+    agent:
+      role: worker
+";
+        let compiled = compile_yaml(manifest).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-cost-budget",
+                &json!({}),
+                Some(manifest),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let observer = BudgetObserver::default();
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &observer)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            WorkflowRunState::Paused,
+            "exceeding the cost budget pauses the run for a human decision"
+        );
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = &snapshot.nodes[0];
+        assert_eq!(node.state, NodeState::Blocked);
+        assert!(
+            node.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cost_micros"),
+            "the block names the exceeded cost dimension: {:?}",
+            node.error
+        );
+        // The MEASURED spend that tipped the node over is recorded and round-trips.
+        assert_eq!(
+            NodeCost::from_json(node.cost.as_ref().unwrap()).cost_micros,
+            Some(1_200_000),
+            "the aggregated measured spend is recorded in cost_json"
+        );
+        assert!(
+            observer.blocked.lock().unwrap().iter().any(|n| n == "work"),
+            "the cost block reached the observer"
+        );
+
+        // Resume without raising the budget: the pre-gate re-evaluates the
+        // PRESERVED measured cost (read back from cost_json) and re-blocks WITHOUT
+        // re-running — no new agent run, the run re-pauses. This is the honest
+        // proof the measured `cost_micros` survives serialization AND is charged.
+        let runs_before = count_runs(&pool).await;
+        let resumed = WorkflowConductor::new()
+            .resume(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed,
+            WorkflowRunState::Paused,
+            "a resume that did not raise the cost budget re-blocks and re-pauses"
+        );
+        assert_eq!(
+            count_runs(&pool).await,
+            runs_before,
+            "the cost re-block did NOT re-run the node (no new agent run created)"
         );
         assert_eq!(
             WorkflowStore::new()

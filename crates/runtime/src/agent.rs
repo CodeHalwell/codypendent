@@ -132,6 +132,82 @@ pub enum ModelStep {
     },
 }
 
+/// Provider-reported usage for one model request (Phase 7 telemetry). This is a
+/// MEASURED figure: a driver returns it (wrapped in `Some`) only when the
+/// provider actually reported usage for the request. `Some(ModelUsage::default())`
+/// is a real measured zero (e.g. a fully-cached response); a `None` at the seam
+/// (see [`StepOutcome::usage`]) is the distinct "this driver did not report
+/// usage" — the two must never be conflated, because the cost budget charges only
+/// measured spend and must never count an unmeasured request as a satisfying zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    /// Prompt (input) tokens the request consumed.
+    pub prompt_tokens: u64,
+    /// Completion (output) tokens the request produced.
+    pub completion_tokens: u64,
+    /// Measured spend for the request, in micro-USD (millionths of a dollar).
+    pub cost_micros: u64,
+}
+
+impl ModelUsage {
+    /// Element-wise saturating sum — accumulate one request's usage into a
+    /// running total. Saturating so a pathological total never wraps to a small
+    /// value that would let an exhausted budget keep going.
+    #[must_use]
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            cost_micros: self.cost_micros.saturating_add(other.cost_micros),
+        }
+    }
+}
+
+/// One step produced by a [`ModelDriver`], plus the MEASURED usage for the
+/// request that produced it. `usage` is `None` when the driver did not report
+/// usage for this request (unmeasured — never charged), `Some` when it did
+/// (a `Some(ModelUsage::default())` being a real measured zero). Keeping the two
+/// distinct at the seam is what lets the budget honour the "never charge an
+/// unmeasured cost" invariant end to end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepOutcome {
+    /// The next step the model wants to take.
+    pub step: ModelStep,
+    /// The provider-reported usage for this request, or `None` if unmeasured.
+    pub usage: Option<ModelUsage>,
+}
+
+impl StepOutcome {
+    /// A step paired with its (optional, measured) usage.
+    #[must_use]
+    pub fn new(step: ModelStep, usage: Option<ModelUsage>) -> Self {
+        Self { step, usage }
+    }
+
+    /// A step whose request reported NO usage — the honest default for a driver
+    /// (or a request) that does not surface provider usage. Distinct from a
+    /// `Some(ModelUsage::default())` measured zero.
+    #[must_use]
+    pub fn unmeasured(step: ModelStep) -> Self {
+        Self { step, usage: None }
+    }
+}
+
+/// The result of driving a run to a terminal disposition: the disposition plus
+/// the run's AGGREGATED measured usage. `usage` is `None` when NO request in the
+/// run reported usage (the run's cost is unmeasured — the budget charges it
+/// nothing), and `Some(total)` summing only the requests that did report — so an
+/// unreported request contributes nothing rather than a fabricated zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunOutcome {
+    /// How the run terminated.
+    pub disposition: RunDisposition,
+    /// The run's aggregated measured usage, or `None` if wholly unmeasured.
+    pub usage: Option<ModelUsage>,
+}
+
 /// Produces the next [`ModelStep`] from the conversation so far. The loop is
 /// written entirely against this trait, so it runs identically with a scripted
 /// driver (tests) or a live framework client.
@@ -141,8 +217,10 @@ pub trait ModelDriver: Send + Sync {
     /// per-request trace metadata.
     fn model_id(&self) -> ModelId;
 
-    /// Given the conversation so far, produce the next step.
-    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<ModelStep>;
+    /// Given the conversation so far, produce the next step and the MEASURED
+    /// usage for the request that produced it (see [`StepOutcome`]). A driver
+    /// that cannot measure usage returns `usage: None` — never a fabricated zero.
+    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<StepOutcome>;
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -151,20 +229,36 @@ pub trait ModelDriver: Send + Sync {
 pub struct ScriptedDriver {
     steps: Mutex<std::collections::VecDeque<ModelStep>>,
     model_id: ModelId,
+    /// The MEASURED usage this driver reports for every request. `None` (the
+    /// default) makes the driver honestly "unmeasured", exactly like today's
+    /// code — its requests contribute no cost. [`with_usage`](Self::with_usage)
+    /// scripts a measured usage so a test can exercise the cost path.
+    usage: Option<ModelUsage>,
 }
 
 impl ScriptedDriver {
-    /// A scripted driver that yields `steps` in order.
+    /// A scripted driver that yields `steps` in order, reporting NO usage (the
+    /// honest default — an unmeasured driver, as today).
     pub fn new(steps: Vec<ModelStep>) -> Self {
         Self {
             steps: Mutex::new(steps.into_iter().collect()),
             model_id: ModelId("scripted".to_string()),
+            usage: None,
         }
     }
 
     /// Set the reported model id (defaults to `scripted`).
     pub fn with_model(mut self, model_id: ModelId) -> Self {
         self.model_id = model_id;
+        self
+    }
+
+    /// Script a MEASURED per-request usage: every `next_step` then reports this
+    /// `usage` (wrapped in `Some`), so a test can drive real token/cost telemetry
+    /// through the seam and the budget. Without this the driver reports `None`
+    /// (unmeasured).
+    pub fn with_usage(mut self, usage: ModelUsage) -> Self {
+        self.usage = Some(usage);
         self
     }
 }
@@ -175,11 +269,14 @@ impl ModelDriver for ScriptedDriver {
         self.model_id.clone()
     }
 
-    async fn next_step(&self, _transcript: &[TurnItem]) -> anyhow::Result<ModelStep> {
-        let mut queue = self.steps.lock().expect("scripted driver mutex poisoned");
-        Ok(queue.pop_front().unwrap_or(ModelStep::Finish {
-            summary: "scripted run complete".to_string(),
-        }))
+    async fn next_step(&self, _transcript: &[TurnItem]) -> anyhow::Result<StepOutcome> {
+        let step = {
+            let mut queue = self.steps.lock().expect("scripted driver mutex poisoned");
+            queue.pop_front().unwrap_or(ModelStep::Finish {
+                summary: "scripted run complete".to_string(),
+            })
+        };
+        Ok(StepOutcome::new(step, self.usage))
     }
 }
 
@@ -467,23 +564,23 @@ impl RunJournal {
 // Trace metadata (Chapter 13 groundwork)
 // ---------------------------------------------------------------------------
 
-/// Per-model-request trace metadata. Phase 1 records the model id, a request
-/// hash, latency, and placeholder token/cost figures; richer accounting is
-/// Chapter 13's concern.
+/// Per-model-request trace metadata: the model id, a request hash, latency, and
+/// the request's MEASURED usage (Phase 7). `usage` is `Some` only when the driver
+/// reported provider usage for the request and `None` when it did not — an
+/// unmeasured request, never a fabricated zero. (Zero token/cost figures here
+/// would have meant "not measured"; the [`Option`] makes that honest and
+/// unambiguous.)
 #[derive(Debug, Clone)]
 pub struct ModelRequestTrace {
     /// The model that served the request.
     pub model_id: ModelId,
     /// A hex SHA-256 over the request transcript.
     pub request_hash: String,
-    /// Prompt tokens (placeholder in Phase 1).
-    pub prompt_tokens: u64,
-    /// Completion tokens (placeholder in Phase 1).
-    pub completion_tokens: u64,
+    /// The provider-reported usage for this request, or `None` if the driver did
+    /// not surface usage (unmeasured — distinct from a measured zero).
+    pub usage: Option<ModelUsage>,
     /// Round-trip latency in milliseconds.
     pub latency_ms: u128,
-    /// Estimated cost in micro-currency units (placeholder in Phase 1).
-    pub cost_micros: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -609,12 +706,17 @@ impl FrameworkAgentRuntime {
     /// review node (change-set), then the present node (chronicle +
     /// `RunCompleted`). Every state transition and event is persisted before it
     /// is published.
+    ///
+    /// Returns a [`RunOutcome`]: the terminal disposition plus the run's
+    /// AGGREGATED measured usage (Phase 7) — `None` when no request reported
+    /// usage, so a caller (a workflow node) charges cost only when it was
+    /// actually measured, never a fabricated zero.
     pub async fn execute_run(
         &self,
         driver: &dyn ModelDriver,
         run: RunContext,
         cancel: CancellationToken,
-    ) -> anyhow::Result<RunDisposition> {
+    ) -> anyhow::Result<RunOutcome> {
         let mut run = run;
         let model_id = driver.model_id();
         let run_actor = Actor::Agent {
@@ -641,6 +743,10 @@ impl FrameworkAgentRuntime {
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
         let mut model_requests: u64 = 0;
+        // The run's AGGREGATED measured usage (Phase 7): starts `None` and stays
+        // `None` unless a request actually reports usage. An unmeasured run keeps
+        // it `None`, so the cost budget charges nothing — the honesty invariant.
+        let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
         let mut wall_clock_warned = false;
 
@@ -682,28 +788,37 @@ impl FrameworkAgentRuntime {
             }
 
             let started = Instant::now();
-            let step = match driver.next_step(&transcript).await {
-                Ok(step) => step,
+            let StepOutcome {
+                step,
+                usage: step_usage,
+            } = match driver.next_step(&transcript).await {
+                Ok(outcome) => outcome,
                 Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
             };
             model_requests += 1;
+            // Fold MEASURED usage into the run total. A request that reported usage
+            // accumulates; a request that did NOT (`None`) contributes nothing and
+            // must never turn an unmeasured total into a real zero — so an
+            // all-unmeasured run keeps `usage == None` and is charged no cost,
+            // exactly as today's code behaves. This is the honesty invariant.
+            if let Some(step_usage) = step_usage {
+                let total = usage.get_or_insert_with(ModelUsage::default);
+                *total = total.saturating_add(&step_usage);
+            }
             let trace = ModelRequestTrace {
                 model_id: model_id.clone(),
                 request_hash: hash_json(&transcript),
-                // Token/cost fields are structurally present but UNPOPULATED: the
-                // `ModelDriver` seam does not surface provider usage yet. Zero
-                // here means "not measured", never "free" — real accounting needs
-                // usage plumbed through the driver trait (tracked for Phase 7's
-                // budget ledger).
-                prompt_tokens: 0,
-                completion_tokens: 0,
+                // This request's MEASURED usage (Phase 7): `Some` iff the driver
+                // surfaced provider usage, else `None` (unmeasured — never a
+                // fabricated zero).
+                usage: step_usage,
                 latency_ms: started.elapsed().as_millis(),
-                cost_micros: 0,
             };
             tracing::debug!(
                 model = %trace.model_id,
                 request_hash = %trace.request_hash,
                 latency_ms = trace.latency_ms,
+                usage = ?trace.usage,
                 "model request"
             );
 
@@ -758,6 +873,7 @@ impl FrameworkAgentRuntime {
             &actions,
             &changes,
             model_requests,
+            usage,
         );
         let chronicle_ref = self
             .sink
@@ -796,7 +912,7 @@ impl FrameworkAgentRuntime {
         )
         .await?;
 
-        Ok(disposition)
+        Ok(RunOutcome { disposition, usage })
     }
 
     // -- event helpers -----------------------------------------------------
@@ -1842,13 +1958,26 @@ fn hash_json<T: Serialize>(value: &T) -> String {
 /// Fold the run's observations into a [Chapter 20 `SessionChronicle`]-shaped
 /// JSON value: objective, findings, actions, changes, verification, costs, and
 /// unresolved questions.
+///
+/// `usage` is the run's AGGREGATED measured usage (Phase 7). When it is `None`
+/// (no request reported usage), the `tokens`/`cost_micros` costs render as
+/// `null` — an honest "not measured", never a real-looking `0` a reader could
+/// mistake for a free run.
 fn build_chronicle(
     objective: &str,
     findings: &[String],
     actions: &[Value],
     changes: &[Value],
     model_requests: u64,
+    usage: Option<ModelUsage>,
 ) -> Value {
+    let (tokens, cost_micros) = match usage {
+        Some(usage) => (
+            json!(usage.prompt_tokens.saturating_add(usage.completion_tokens)),
+            json!(usage.cost_micros),
+        ),
+        None => (Value::Null, Value::Null),
+    };
     json!({
         "objective": objective,
         "specification": Value::Null,
@@ -1860,8 +1989,8 @@ fn build_chronicle(
         "verification": [],
         "costs": {
             "model_requests": model_requests,
-            "tokens": 0,
-            "cost_micros": 0,
+            "tokens": tokens,
+            "cost_micros": cost_micros,
         },
         "unresolved": [],
     })
@@ -2100,7 +2229,7 @@ impl ModelDriver for FrameworkModelDriver {
         self.model_id.clone()
     }
 
-    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<ModelStep> {
+    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
         use agent_framework_core::types::ChatOptions;
 
@@ -2113,6 +2242,17 @@ impl ModelDriver for FrameworkModelDriver {
             .await
             .map_err(|e| anyhow::anyhow!("model request failed: {e}"))?;
 
+        // Provider usage (Phase 7). The framework `ChatResponse` surfaces TOKEN
+        // counts (`response.usage_details`) but NO monetary cost, and the runtime
+        // configures no per-token price — so there is no MEASURED cost to report.
+        // [`ModelUsage`] bundles tokens and cost as ONE measured unit, and the
+        // cost budget must never treat an unmeasured cost as a satisfying zero, so
+        // a token-only reading cannot be surfaced without fabricating a zero cost.
+        // This path therefore stays honestly UNMEASURED (`usage: None`, via
+        // [`StepOutcome::unmeasured`]) until a price (or a provider cost field) is
+        // wired — which keeps the live path behaving exactly as before (cost
+        // simply not charged). Do NOT map this to a zero-cost `Some`.
+
         // A function call in the returned turn becomes a tool call.
         if let Some(message) = response.messages.last() {
             if let Some(call) = message.function_calls().into_iter().next() {
@@ -2120,22 +2260,22 @@ impl ModelDriver for FrameworkModelDriver {
                     .parse_arguments()
                     .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
                     .unwrap_or(Value::Null);
-                return Ok(ModelStep::CallTool {
+                return Ok(StepOutcome::unmeasured(ModelStep::CallTool {
                     tool: call.name.clone(),
                     args,
-                });
+                }));
             }
         }
 
         // Otherwise the completed turn is the final answer.
         let text = response.text();
-        Ok(ModelStep::Finish {
+        Ok(StepOutcome::unmeasured(ModelStep::Finish {
             summary: if text.is_empty() {
                 "run complete".to_string()
             } else {
                 text
             },
-        })
+        }))
     }
 }
 
@@ -2186,19 +2326,46 @@ mod tests {
                 summary: "done".to_string(),
             },
         ]);
-        assert_eq!(
-            driver.next_step(&[]).await.unwrap(),
-            ModelStep::Say("hi".to_string())
-        );
+        let first = driver.next_step(&[]).await.unwrap();
+        assert_eq!(first.step, ModelStep::Say("hi".to_string()));
+        // A plain scripted driver reports NO usage (unmeasured, as today).
+        assert_eq!(first.usage, None);
         assert!(matches!(
-            driver.next_step(&[]).await.unwrap(),
+            driver.next_step(&[]).await.unwrap().step,
             ModelStep::Finish { .. }
         ));
         // Draining past the end keeps yielding Finish, never hangs.
         assert!(matches!(
-            driver.next_step(&[]).await.unwrap(),
+            driver.next_step(&[]).await.unwrap().step,
             ModelStep::Finish { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn scripted_driver_with_usage_reports_measured_usage() {
+        // Without `with_usage`, every request is unmeasured (`None`) — the honest
+        // default that charges no cost, exactly as today's code.
+        let plain = ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }]);
+        assert_eq!(plain.next_step(&[]).await.unwrap().usage, None);
+
+        // With `with_usage`, every request reports the scripted MEASURED usage —
+        // the seam that feeds the `ModelRequestTrace` and the run's cost total.
+        let usage = ModelUsage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            cost_micros: 4_500,
+        };
+        let measured = ScriptedDriver::new(vec![
+            ModelStep::Say("hi".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_usage(usage);
+        assert_eq!(measured.next_step(&[]).await.unwrap().usage, Some(usage));
+        assert_eq!(measured.next_step(&[]).await.unwrap().usage, Some(usage));
     }
 
     #[test]
@@ -2257,17 +2424,38 @@ mod tests {
 
     #[test]
     fn chronicle_has_the_chapter20_shape() {
+        // An UNMEASURED run: the token/cost costs render as null ("not measured"),
+        // never a real-looking zero a reader could mistake for a free run.
         let chronicle = build_chronicle(
             "diagnose",
             &["found it".to_string()],
             &[action_digest("shell.run", "succeeded", None)],
             &[],
             3,
+            None,
         );
         assert_eq!(chronicle["objective"], "diagnose");
         assert_eq!(chronicle["investigations"][0], "found it");
         assert_eq!(chronicle["actions"][0]["tool"], "shell.run");
         assert_eq!(chronicle["costs"]["model_requests"], 3);
+        assert!(chronicle["costs"]["tokens"].is_null());
+        assert!(chronicle["costs"]["cost_micros"].is_null());
         assert!(chronicle.get("unresolved").is_some());
+
+        // A MEASURED run records the aggregated tokens + micro-USD spend.
+        let measured = build_chronicle(
+            "diagnose",
+            &[],
+            &[],
+            &[],
+            2,
+            Some(ModelUsage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cost_micros: 4_500,
+            }),
+        );
+        assert_eq!(measured["costs"]["tokens"], 120);
+        assert_eq!(measured["costs"]["cost_micros"], 4_500);
     }
 }
