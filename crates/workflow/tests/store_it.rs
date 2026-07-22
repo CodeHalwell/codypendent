@@ -712,3 +712,68 @@ async fn set_run_state_if_legal_only_applies_from_the_given_states() {
         "still Running — neither call above touched it"
     );
 }
+
+#[tokio::test]
+async fn the_terminal_write_cas_does_not_clobber_a_concurrently_cancelled_run() {
+    // T9 review Finding A: the driver's terminal-state write (end of `run_observed`)
+    // is a CAS gated on the run still being `Running`, so a `CancelWorkflow` — already
+    // accepted, the client told OK — that commits `Cancelled` in the window between
+    // the frontier loop's last read and the terminal write is NOT clobbered back to
+    // `Completed`/`Failed`. This exercises the exact primitive `run_observed` uses in
+    // exactly that scenario (the break→write window has no in-driver hook to inject
+    // at, so the CAS is proven directly, and the pre-fix unconditional write is shown
+    // to clobber for contrast).
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+    let id = store
+        .create_run(&pool, &compiled, None, &json!({}), None)
+        .await
+        .unwrap();
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Running)
+        .await
+        .unwrap();
+
+    // A concurrent, already-accepted cancel commits `Cancelled` (as
+    // `WorkflowConductor::cancel` does), racing the driver's about-to-run terminal
+    // write.
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Cancelled)
+        .await
+        .unwrap();
+
+    // The driver's terminal write — now a CAS gated on `Running` — affects 0 rows and
+    // leaves the run `Cancelled`: the accepted cancel wins.
+    let affected = store
+        .set_run_state_if_legal(
+            &pool,
+            &id,
+            &[WorkflowRunState::Running],
+            WorkflowRunState::Completed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        affected, 0,
+        "the terminal write must not apply once the run has left Running"
+    );
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Cancelled,
+        "the accepted cancel survives the terminal write"
+    );
+
+    // Contrast — the pre-fix UNCONDITIONAL write is the bug: a plain `set_run_state`
+    // WOULD clobber `Cancelled` → `Completed`, silently reverting the accepted cancel.
+    // The CAS above is exactly what closes this.
+    store
+        .set_run_state(&pool, &id, WorkflowRunState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.snapshot(&pool, &id).await.unwrap().unwrap().run.state,
+        WorkflowRunState::Completed,
+        "an unconditional write clobbers Cancelled — the behaviour the CAS prevents"
+    );
+}

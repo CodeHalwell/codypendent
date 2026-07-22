@@ -273,12 +273,17 @@ pub(crate) fn build_workflow_host(
 /// machinery `CancelRun` uses — not `CancellationToken::never()`, which left a
 /// workflow node's agent run uninterruptible before T9.
 ///
-/// **Sticky.** Once a run is cancelled, a node that registers *afterwards* (a
-/// multi-attempt node re-entering `drive_agent` on retry) is born already cancelled,
-/// so a cancelled run never drives a fresh agent run to completion. The entry is
-/// pruned when the run's drive fully drains ([`finish`](Self::finish), called by the
-/// host after every drive) or, for a run cancelled while paused (no in-flight node),
-/// by `cancel` itself. Cheap to clone — an `Arc` over the shared registry.
+/// **Sticky (best-effort).** Once a run is cancelled, a node that registers
+/// *afterwards* (a multi-attempt node re-entering `drive_agent` on retry) is
+/// *usually* born already cancelled, so a cancelled run does not drive a fresh agent
+/// run to completion. The one gap: `cancel` prunes the entry when it holds zero
+/// in-flight handles (correct for a paused/pending run — the terminal run will never
+/// register again, and it avoids a per-cancelled-run leak), so a retry landing in the
+/// sub-millisecond `deregister`→`register` gap of `run_node`'s retry loop can run once
+/// (the run still ends `Cancelled` — only wasted work, correct final state). Default
+/// retry (`attempts: 1`) has no such window. The entry is otherwise pruned when the
+/// run's drive fully drains ([`finish`](Self::finish), called by the host after every
+/// drive). Cheap to clone — an `Arc` over the shared registry.
 #[derive(Clone, Default)]
 pub(crate) struct WorkflowRunCancellations {
     inner: Arc<Mutex<HashMap<String, RunCancelState>>>,

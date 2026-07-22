@@ -437,9 +437,34 @@ impl WorkflowDriver {
         } else {
             WorkflowRunState::Failed
         };
-        self.store
-            .set_run_state(pool, workflow_run_id, final_state)
+        // A CAS (not an unconditional write), mirroring the Blocked branch's "a
+        // concurrent cancel must win" above: `cancel` deliberately does not take the
+        // per-run drive lock (P5-D3), so a `CancelWorkflow` — already accepted, the
+        // client told OK — can commit `Cancelled` in the window between the frontier
+        // loop's last read (which saw `Running`, so the loop broke on an empty ready
+        // set rather than the top-of-round cancel check) and this write. An
+        // unconditional write would clobber that `Cancelled` (or a raced `Paused`)
+        // back to `Completed`/`Failed`, silently reverting the accepted cancel. Gating
+        // on `Running` means this only applies while the run is still ours to finish;
+        // if it affects 0 rows, the run was concurrently moved out of `Running` — that
+        // state wins, so report the run's actual (re-read) current state.
+        let affected = self
+            .store
+            .set_run_state_if_legal(
+                pool,
+                workflow_run_id,
+                &[WorkflowRunState::Running],
+                final_state,
+            )
             .await?;
+        if affected == 0 {
+            let current = self
+                .store
+                .snapshot(pool, workflow_run_id)
+                .await?
+                .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+            return Ok(current.run.state);
+        }
         Ok(final_state)
     }
 

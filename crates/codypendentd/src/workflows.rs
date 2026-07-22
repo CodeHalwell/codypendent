@@ -237,6 +237,16 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                 // (the driver's own Pending→Running is an internal node/run write;
                 // this is the run-phase signal). Idempotent full-state, so a paused
                 // run that never actually advances simply re-announces its phase below.
+                //
+                // Ordering caveat (T9 review Finding C): this publish PRECEDES the
+                // driver persisting `Running` (which happens inside `conductor.drive`'s
+                // `try_transition_to_running`), so a subscriber attaching in that tiny
+                // window can miss the Running phase in BOTH this live event and a
+                // snapshot read (which would still show Pending). It is cosmetic — the
+                // authoritative NODE transitions that follow are unaffected, and the
+                // run-phase badge self-corrects on the next phase change (or a re-read)
+                // — so the run-phase signal is best-effort by design; node state, not
+                // the badge, is the source of truth for progress.
                 host.publish_run_phase(&run_id, WorkflowRunState::Running);
                 match host
                     .conductor
