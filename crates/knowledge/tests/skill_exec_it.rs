@@ -51,7 +51,9 @@ fn write_skill_with_script(dir: &Path) {
 
 /// Like [`write_skill_with_script`] but with **no** `commands` permission, so the
 /// derived profile denies subprocess — a shebang script cannot launch its
-/// interpreter (fails closed).
+/// interpreter (fails closed). Only its `#[cfg(target_os = "macos")]` test consumes
+/// it, so the helper is macOS-only too — otherwise it is dead code on other targets.
+#[cfg(target_os = "macos")]
 fn write_skill_without_subprocess(dir: &Path) {
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     let manifest = "schema_version = 1\n\
