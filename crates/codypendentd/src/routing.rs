@@ -29,12 +29,23 @@
 //! leaking off-device. Enabled-but-no-profiles is likewise an error, not a
 //! bypass: the operator must `codypendent models bench` a model first.
 //!
-//! ## The classification path (non-negotiable)
+//! ## The classification path (non-negotiable) — fail closed
 //!
-//! The run's real [`DataClassification`] is threaded into every [`TaskNode`]
-//! ([`RoutingCoordinator::build_task_node`]), so the engine's `is_eligible` hard
-//! filter refuses off-device routing before scoring. See
-//! `secret_data_never_selects_a_hosted_model_through_the_seam`.
+//! Every [`TaskNode`] is stamped with a [`DataClassification`]
+//! ([`RoutingCoordinator::build_task_node`]) so the engine's `is_eligible` hard
+//! filter refuses off-device routing before scoring. That classification is the
+//! per-run value when a caller can derive one, falling back to the
+//! operator-declared per-scope ceiling in `routing.toml` — which itself
+//! **defaults fail-closed to [`DataClassification::Unknown`]** (the most
+//! restrictive rank). So enabling routing without declaring a classification
+//! keeps work **local-only**, never silently off-device (an under-classification
+//! would let classified data reach a hosted model even though the filter itself
+//! is correct). `RunLaunch` carries no per-run classification today, so the
+//! single-agent executor passes `None` and the config ceiling governs; deriving a
+//! real per-run classification (e.g. from a run's declared scope/inputs) is a
+//! documented follow-up, gated behind that same fail-closed default. Pinned by
+//! `secret_data_never_selects_a_hosted_model_through_the_seam` and
+//! `undeclared_classification_defaults_fail_closed_to_local`.
 
 use std::sync::Arc;
 
@@ -67,11 +78,17 @@ pub struct RoutingConfig {
     /// The versioned policy the router optimizes under (λ weights, quality
     /// threshold, escalation chain, off-device ceiling).
     pub policy: RoutingPolicy,
-    /// The run/scope's declared data classification — the most sensitive data a
-    /// routed task handles. Passed into the `TaskNode` so a hosted model is
-    /// hard-filtered before scoring when this exceeds the policy's off-device
-    /// ceiling. Defaults to [`DataClassification::Internal`], matching the
-    /// artifact store's default sensitivity.
+    /// The **operator-declared per-scope classification ceiling** — the most
+    /// sensitive data runs under this scope are asserted to handle. It is the
+    /// FALLBACK threaded into the `TaskNode` when a call supplies no per-run
+    /// classification (see [`RoutingCoordinator::select`]).
+    ///
+    /// **Fail-closed default:** [`DataClassification::Unknown`] — the most
+    /// restrictive rank (`rank() == 4`, above `Secret`). An operator who enables
+    /// routing without declaring a ceiling therefore gets **local-only** routing
+    /// (hosted models are filtered for undeclared data), never silent off-device
+    /// routing. To permit hosted models the operator must explicitly declare a
+    /// lower ceiling (e.g. `Internal`) in `routing.toml`, an affirmative act.
     pub data_classification: DataClassification,
 }
 
@@ -80,7 +97,9 @@ impl Default for RoutingConfig {
         Self {
             enabled: false,
             policy: RoutingPolicy::balanced(),
-            data_classification: DataClassification::Internal,
+            // Fail closed: undeclared data is treated as most-restrictive, so
+            // enabling routing without a classification keeps work local.
+            data_classification: DataClassification::Unknown,
         }
     }
 }
@@ -118,9 +137,10 @@ impl RoutingConfig {
             Ok(file) => Self {
                 enabled: file.enabled,
                 policy: file.policy.unwrap_or_else(RoutingPolicy::balanced),
+                // Fail closed when the operator declared no ceiling.
                 data_classification: file
                     .data_classification
-                    .unwrap_or(DataClassification::Internal),
+                    .unwrap_or(DataClassification::Unknown),
             },
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "invalid routing.toml; routing stays OFF");
@@ -243,15 +263,22 @@ impl RoutingCoordinator {
     /// Select a model for a task node, or `Ok(None)` when routing is OFF (the
     /// caller then resolves a model the Phase-1 way — unchanged baseline).
     ///
-    /// `classification` is the run's real [`DataClassification`], threaded into
-    /// the `TaskNode` so the engine hard-filters hosted providers for classified
-    /// data before any scoring.
+    /// `run_classification` is the run's real [`DataClassification`] when the
+    /// caller can derive one, threaded into the `TaskNode` so the engine
+    /// hard-filters hosted providers for classified data before any scoring. When
+    /// it is `None` (no per-run signal available), the coordinator falls back to
+    /// the operator-declared [`RoutingConfig::data_classification`] ceiling, which
+    /// itself **defaults fail-closed** to [`DataClassification::Unknown`] — so an
+    /// undeclared run never becomes hosted-eligible by default. The per-run value,
+    /// when present, always wins over the config ceiling (a caller cannot
+    /// accidentally *lower* sensitivity by omitting it).
     pub async fn select(
         &self,
         mode: AgentMode,
         node_kind: &str,
         objective: &str,
         estimated_input_tokens: u64,
+        run_classification: Option<DataClassification>,
     ) -> Result<Option<RoutingSelection>, RoutingSeamError> {
         if !self.config.enabled {
             return Ok(None);
@@ -260,7 +287,13 @@ impl RoutingCoordinator {
         if profiles.is_empty() {
             return Err(RoutingSeamError::NoProfiles);
         }
-        let node = self.build_task_node(mode, node_kind, objective, estimated_input_tokens);
+        let node = self.build_task_node(
+            mode,
+            node_kind,
+            objective,
+            estimated_input_tokens,
+            run_classification,
+        );
         let router = Router::new(&profiles, &self.config.policy);
         match router.route(&node) {
             Ok(decision) => {
@@ -346,15 +379,17 @@ impl RoutingCoordinator {
     /// Build a [`TaskNode`] from a run's task signals — the classification path.
     /// The rule-based classifier (version-stamped, recorded in the decision) maps
     /// mode + node kind + input size + objective keywords to a task class; the
-    /// required capabilities are derived from the mode; and the run's real
-    /// `data_classification` (from config) is threaded in so the security hard
-    /// filter can refuse off-device routing.
+    /// required capabilities are derived from the mode; and the node's
+    /// `data_classification` is the per-run value when supplied, else the
+    /// operator-declared config ceiling (fail-closed [`DataClassification::Unknown`]
+    /// by default) — so the security hard filter can refuse off-device routing.
     fn build_task_node(
         &self,
         mode: AgentMode,
         node_kind: &str,
         objective: &str,
         estimated_input_tokens: u64,
+        run_classification: Option<DataClassification>,
     ) -> TaskNode {
         let classification = classify(&TaskSignals::from_objective(
             mode_str(mode),
@@ -365,7 +400,9 @@ impl RoutingCoordinator {
         TaskNode {
             classification,
             required: required_capabilities(mode),
-            data_classification: self.config.data_classification,
+            // Per-run wins over the config ceiling; the config ceiling itself
+            // defaults fail-closed, so an undeclared run is never under-classified.
+            data_classification: run_classification.unwrap_or(self.config.data_classification),
             estimated_input_tokens,
             estimated_output_tokens: estimated_output_tokens(mode),
         }
@@ -631,7 +668,7 @@ mod tests {
         let coord = RoutingCoordinator::new(pool, RoutingConfig::default());
         assert!(!coord.enabled());
         let selection = coord
-            .select(AgentMode::Build, "agent", "fix the bug", 4_000)
+            .select(AgentMode::Build, "agent", "fix the bug", 4_000, None)
             .await
             .unwrap();
         assert!(
@@ -649,7 +686,7 @@ mod tests {
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
-            .select(AgentMode::Build, "agent", "fix the bug", 4_000)
+            .select(AgentMode::Build, "agent", "fix the bug", 4_000, None)
             .await
             .unwrap_err();
         assert!(matches!(err, RoutingSeamError::NoProfiles));
@@ -685,7 +722,13 @@ mod tests {
         let (session, run) = seed_session_run(&pool).await;
 
         let selection = coord
-            .select(AgentMode::Build, "agent", "fix the off-by-one bug", 4_000)
+            .select(
+                AgentMode::Build,
+                "agent",
+                "fix the off-by-one bug",
+                4_000,
+                None,
+            )
             .await
             .unwrap()
             .expect("routing ON selects a model");
@@ -725,9 +768,11 @@ mod tests {
     async fn secret_data_never_selects_a_hosted_model_through_the_seam() {
         // THE seam-level leak test: a run whose real classification is Secret,
         // under a policy that only allows Internal off-device, must never select a
-        // hosted model — the local one is chosen even though the hosted one is
-        // strictly better. The hard filter runs in the engine, but this proves the
-        // daemon threads the real classification INTO it.
+        // hosted model. The hosted model here is BOTH strictly more reliable AND
+        // strictly CHEAPER than the local one (hosted $0.001/1k < local $0.010/1k),
+        // so neither cost nor quality can explain local winning — ONLY the
+        // classification hard filter (fed the run's real Secret classification by
+        // the daemon) can.
         let (_dir, pool) = pool().await;
         store_profiles(
             &pool,
@@ -738,7 +783,7 @@ mod tests {
                 ),
                 (
                     "http://localhost/v1",
-                    profile("local", ModelLocation::Local, 0.75, 0.0),
+                    profile("local", ModelLocation::Local, 0.75, 0.010),
                 ),
             ],
         )
@@ -756,6 +801,7 @@ mod tests {
                 "agent",
                 "handle the secret payload",
                 4_000,
+                None,
             )
             .await
             .unwrap()
@@ -792,6 +838,7 @@ mod tests {
                 "agent",
                 "handle the secret payload",
                 4_000,
+                None,
             )
             .await
             .unwrap_err();
@@ -834,7 +881,13 @@ mod tests {
         let (session, run) = seed_session_run(&pool).await;
 
         let selection = coord
-            .select(AgentMode::Build, "agent", "fix the failing test", 4_000)
+            .select(
+                AgentMode::Build,
+                "agent",
+                "fix the failing test",
+                4_000,
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -923,7 +976,7 @@ mod tests {
             RoutingCoordinator::new(pool.clone(), config).with_prober(Arc::new(DenyToolsProber));
 
         let selection = coord
-            .select(AgentMode::Build, "agent", "fix the bug", 4_000)
+            .select(AgentMode::Build, "agent", "fix the bug", 4_000, None)
             .await
             .unwrap()
             .unwrap();
@@ -938,5 +991,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached, Some(caps(200_000, ToolCallSupport::None)));
+    }
+
+    #[tokio::test]
+    async fn undeclared_classification_defaults_fail_closed_to_local() {
+        // Fail-closed pin: routing ON, NO classification declared (the config
+        // default is `Unknown`, the most-restrictive rank), and NO per-run value
+        // (`select(.., None)`). The hosted model is cheaper AND more reliable, but
+        // an undeclared run must NOT be treated as low-sensitivity — it stays
+        // local. An operator who enables routing without declaring a ceiling never
+        // silently gets off-device routing.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[
+                (
+                    "https://hosted/v1",
+                    profile("hosted-cheap", ModelLocation::Hosted, 0.99, 0.001),
+                ),
+                (
+                    "http://localhost/v1",
+                    profile("local", ModelLocation::Local, 0.75, 0.010),
+                ),
+            ],
+        )
+        .await;
+        // `..RoutingConfig::default()` leaves `data_classification` at the
+        // fail-closed `Unknown` default; the balanced policy allows only up to
+        // `Confidential` off-device, so `Unknown` (rank 4) is refused off-device.
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Confidential),
+            ..RoutingConfig::default()
+        };
+        assert_eq!(config.data_classification, DataClassification::Unknown);
+        let coord = RoutingCoordinator::new(pool, config);
+
+        let selection = coord
+            .select(AgentMode::Build, "agent", "do the work", 4_000, None)
+            .await
+            .unwrap()
+            .expect("a local model can serve undeclared data");
+        assert_eq!(
+            selection.model(),
+            &ModelId("local".into()),
+            "undeclared data defaults fail-closed: hosted is filtered even though cheaper + better"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_run_classification_overrides_the_config_ceiling() {
+        // A caller that CAN derive a per-run classification passes it, and it wins
+        // over the config ceiling. Here the config ceiling is permissive (Public),
+        // but the per-run value is Secret ⇒ the hosted model is still filtered.
+        let (_dir, pool) = pool().await;
+        store_profiles(
+            &pool,
+            &[
+                (
+                    "https://hosted/v1",
+                    profile("hosted", ModelLocation::Hosted, 0.99, 0.001),
+                ),
+                (
+                    "http://localhost/v1",
+                    profile("local", ModelLocation::Local, 0.75, 0.010),
+                ),
+            ],
+        )
+        .await;
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(vec![], DataClassification::Internal),
+            data_classification: DataClassification::Public, // permissive ceiling
+        };
+        let coord = RoutingCoordinator::new(pool, config);
+
+        let selection = coord
+            .select(
+                AgentMode::Build,
+                "agent",
+                "handle secrets",
+                4_000,
+                Some(DataClassification::Secret), // the real per-run value wins
+            )
+            .await
+            .unwrap()
+            .expect("local serves the secret run");
+        assert_eq!(
+            selection.model(),
+            &ModelId("local".into()),
+            "the per-run Secret classification overrides the permissive config ceiling"
+        );
+    }
+
+    #[test]
+    fn load_ignores_a_garbage_routing_toml_and_stays_off() {
+        // A malformed `routing.toml` must leave routing OFF (warn, never panic) —
+        // an optimization seam must not break runs on a broken config file.
+        let dir = tempdir().unwrap();
+        let paths =
+            codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join("routing.toml"),
+            "this is not = valid [ toml ][[",
+        )
+        .unwrap();
+        let config = RoutingConfig::load(&paths);
+        assert!(!config.enabled, "a garbage routing.toml leaves routing OFF");
+        assert_eq!(
+            config.data_classification,
+            DataClassification::Unknown,
+            "and the fail-closed classification default holds"
+        );
+    }
+
+    #[test]
+    fn load_is_off_when_routing_toml_is_absent() {
+        let dir = tempdir().unwrap();
+        let paths =
+            codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        assert!(!RoutingConfig::load(&paths).enabled);
+    }
+
+    #[test]
+    fn load_reads_an_enabled_routing_toml() {
+        // The happy path parses: an enabled seam with a declared classification.
+        let dir = tempdir().unwrap();
+        let paths =
+            codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join("routing.toml"),
+            r#"
+enabled = true
+
+[data_classification]
+type = "Internal"
+
+[policy]
+name = "coding"
+version = 3
+quality_threshold = 0.7
+max_off_device = { type = "Confidential" }
+
+[policy.lambdas]
+cost = 1.0
+latency = 0.05
+privacy = 0.5
+failure = 0.5
+"#,
+        )
+        .unwrap();
+        let config = RoutingConfig::load(&paths);
+        assert!(config.enabled);
+        assert_eq!(config.data_classification, DataClassification::Internal);
+        assert_eq!(config.policy.registry_key(), "router/coding/3");
     }
 }

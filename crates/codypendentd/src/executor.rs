@@ -361,6 +361,10 @@ impl RuntimeExecutor {
                 "agent",
                 &launch.objective,
                 estimate_input_tokens(&launch.objective),
+                // `RunLaunch` carries no per-run classification, so the coordinator
+                // falls back to its operator-declared, fail-closed ceiling. Deriving
+                // a real per-run classification is a documented follow-up.
+                None,
             )
             .await
             .map_err(|e| format!("routing refused to place this run: {e}"))?;

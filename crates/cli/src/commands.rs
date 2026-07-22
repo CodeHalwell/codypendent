@@ -1923,6 +1923,20 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
         .with_context(|| format!("building a model client for `{id}`"))?;
     let target = DriverBenchTarget::new(&driver, default_bench_description());
 
+    // The persisted profile's location is derived from the endpoint (fail-closed
+    // to hosted). `models bench` is a LOCAL-model harness; warn loudly when it is
+    // pointed at a non-local endpoint rather than silently mislabelling it.
+    if matches!(
+        codypendent_runtime::bench::endpoint_location(&endpoint),
+        codypendent_routing::ModelLocation::Hosted
+    ) {
+        eprintln!(
+            "models bench: WARNING — `{endpoint}` is not a local endpoint; the profile will be \
+             stored as HOSTED (so the routing hard filter still applies) and its token price is \
+             not measured. `models bench` is intended for local models."
+        );
+    }
+
     eprintln!("models bench: measuring `{id}` at {endpoint} (this drives the model)...");
     let profile = {
         let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
@@ -1965,7 +1979,11 @@ async fn bench_to_store(
     let outcome = codypendent_runtime::bench::run_bench(target, options)
         .await
         .map_err(|reason| anyhow::anyhow!("bench failed: {reason}"))?;
-    let profile = outcome.into_profile();
+    // Derive the location from the endpoint — never assume local. A non-local
+    // endpoint stored as `Local` would short-circuit the routing hard filter
+    // (`endpoint_location` fails closed to `Hosted`).
+    let location = codypendent_runtime::bench::endpoint_location(endpoint);
+    let profile = outcome.into_profile(location);
     codypendent_daemon::model_profiles::ModelProfileStore::new()
         .upsert(pool, endpoint, &profile)
         .await
@@ -2080,6 +2098,29 @@ mod models_bench_tests {
         assert_eq!(stored, profile);
         // The measured bench survived (50 tok/s from 100 tokens over 2.0s warm).
         assert!((stored.bench.unwrap().tokens_per_second - 50.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn benching_a_non_local_endpoint_stores_hosted_not_local() {
+        // Finding-2 pin: a cloud endpoint must NOT be persisted as local (which
+        // would short-circuit the routing hard filter). `bench_to_store` derives
+        // the location from the endpoint (fail-closed to hosted).
+        let dir = tempfile::tempdir().unwrap();
+        let pool = codypendent_daemon::db::open_database(&dir.path().join("codypendent.db"))
+            .await
+            .unwrap();
+        let profile = bench_to_store(
+            &pool,
+            "https://api.openai.com/v1",
+            &ScriptedTarget,
+            BenchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !profile.is_local(),
+            "a non-local base_url is stored as hosted, so the classification filter still applies"
+        );
     }
 }
 

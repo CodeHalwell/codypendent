@@ -109,21 +109,30 @@ pub struct BenchOutcome {
 }
 
 impl BenchOutcome {
-    /// Assemble a [`ModelProfile`] from this outcome for persistence: a **local**
-    /// model whose declared capabilities are the probe result and whose measured
-    /// `LocalBench` is the bench. The performance seed is honest and minimal —
-    /// reliability is the measured coding-eval score (the best single objective
-    /// signal the bench produces), cost is `0` (a local model), and median
-    /// latency is the measured time-to-first-token plus one generation. Observed
-    /// per-task-class success accrues later from eval + trace data; this is the
-    /// bench-time baseline the router starts from, never a fabricated figure.
+    /// Assemble a [`ModelProfile`] from this outcome for persistence, at the
+    /// caller-supplied [`ModelLocation`].
+    ///
+    /// **`location` is load-bearing for security and must be derived, never
+    /// assumed.** The routing hard filter keys off `is_local()` — a hosted model
+    /// wrongly stamped `Local` short-circuits the classification filter and
+    /// becomes eligible for *any* data. The caller derives it from the endpoint
+    /// ([`endpoint_location`], fail-closed to [`ModelLocation::Hosted`] for a
+    /// non-local or unparseable `base_url`); this method never picks a default.
+    ///
+    /// The performance seed is honest and minimal — reliability is the measured
+    /// coding-eval score (the best single objective signal the bench produces),
+    /// median latency is the measured time-to-first-token plus one generation, and
+    /// `cost_per_1k_tokens_usd` is `0` (this is the *local*-bench harness; a hosted
+    /// endpoint's real token price is not something the harness measures — the CLI
+    /// warns when it benches a non-local endpoint). Observed per-task-class success
+    /// accrues later from eval + trace data; this is the bench-time baseline.
     #[must_use]
-    pub fn into_profile(self) -> ModelProfile {
+    pub fn into_profile(self, location: ModelLocation) -> ModelProfile {
         let latency_ms_p50 = self.local_bench.time_to_first_token_ms
             + generation_ms(self.local_bench.tokens_per_second);
         ModelProfile {
             id: self.model_id,
-            location: ModelLocation::Local,
+            location,
             capabilities: self.capabilities,
             performance: ModelPerformance {
                 reliability: self.local_bench.coding_eval_score,
@@ -135,6 +144,58 @@ impl BenchOutcome {
             execution: ModelExecutionProfile::default(),
             bench: Some(self.local_bench),
         }
+    }
+}
+
+/// Classify an endpoint `base_url` as [`ModelLocation::Local`] or `Hosted` for
+/// the routing security filter (STEP 7.2). **Fail closed:** only a loopback
+/// (`localhost`, `127.0.0.0/8`, `::1`) or RFC-1918 private-range host
+/// (`10/8`, `172.16/12`, `192.168/16`) is `Local`; every other host — a public
+/// IP, a domain, or a `base_url` that cannot be parsed — is `Hosted`, so a cloud
+/// endpoint can never be persisted as local and slip past the classification
+/// hard filter.
+#[must_use]
+pub fn endpoint_location(base_url: &str) -> ModelLocation {
+    match host_from_base_url(base_url) {
+        Some(host) if is_local_host(host) => ModelLocation::Local,
+        _ => ModelLocation::Hosted,
+    }
+}
+
+/// The bare host of a `scheme://[user@]host[:port]/path` URL (userinfo and port
+/// stripped, IPv6 brackets removed), or `None` when no host is present.
+fn host_from_base_url(base_url: &str) -> Option<&str> {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any `user[:pass]@` userinfo.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if authority.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6 literal: the host is between the brackets, port follows `]`.
+    if let Some(after) = authority.strip_prefix('[') {
+        return after.split(']').next().filter(|h| !h.is_empty());
+    }
+    // `host[:port]`: strip a trailing numeric port only.
+    let host = authority.rsplit_once(':').map_or(authority, |(h, port)| {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    });
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `host` is a loopback or private-range address (or `localhost`).
+fn is_local_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
     }
 }
 
@@ -432,15 +493,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_profile_builds_a_local_profile_seeded_from_the_bench() {
+    async fn into_profile_uses_the_supplied_location_never_a_default() {
         let outcome = run_bench(&mock(), BenchOptions::default()).await.unwrap();
-        let profile = outcome.into_profile();
-        assert!(profile.is_local());
-        assert_eq!(profile.performance.cost_per_1k_tokens_usd, 0.0);
-        // Reliability seed is the measured coding-eval score.
-        assert!((profile.performance.reliability - 0.6).abs() < 1e-9);
-        // The measured bench is carried verbatim.
-        assert_eq!(profile.bench.as_ref().unwrap().tokens_per_second, 50.0);
+        // Local when told local...
+        let local = outcome.clone().into_profile(ModelLocation::Local);
+        assert!(local.is_local());
+        assert_eq!(local.performance.cost_per_1k_tokens_usd, 0.0);
+        assert!((local.performance.reliability - 0.6).abs() < 1e-9);
+        assert_eq!(local.bench.as_ref().unwrap().tokens_per_second, 50.0);
+        // ...and Hosted when told hosted — no hardcoded `Local` to leak past the filter.
+        let hosted = outcome.into_profile(ModelLocation::Hosted);
+        assert!(!hosted.is_local());
+    }
+
+    #[test]
+    fn endpoint_location_is_local_only_for_loopback_and_private_hosts() {
+        for local in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:11434/v1",
+            "http://10.0.0.5:1234/v1",
+            "http://192.168.1.9/v1",
+            "http://172.16.4.2:9000/v1",
+        ] {
+            assert_eq!(endpoint_location(local), ModelLocation::Local, "{local}");
+        }
+        // Fail closed: public IPs, domains, and anything unparseable are Hosted —
+        // a cloud endpoint can never be stored as local.
+        for hosted in [
+            "https://api.openai.com/v1",
+            "https://192.168.1.9.evil.com/v1", // the host is a domain, not the IP
+            "http://8.8.8.8/v1",
+            "https://together.xyz/v1",
+            "not-a-url",
+            "",
+        ] {
+            assert_eq!(endpoint_location(hosted), ModelLocation::Hosted, "{hosted}");
+        }
     }
 
     #[tokio::test]
