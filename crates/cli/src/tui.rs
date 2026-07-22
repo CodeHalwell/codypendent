@@ -42,13 +42,13 @@ use codypendent_knowledge::{
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Catchup, ClientId, ClientRole, CodeNodeId, Command, CommandBody,
-    CommandId, DocumentEditLease, DocumentId, DocumentSync, Envelope, Payload, RepositoryId,
-    SessionEvent, SessionId, Subscription, WorkspaceId,
+    CommandId, DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload,
+    RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard,
+    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, ModelCard, ModelLocationLabel, SkillCard,
+    TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,9 @@ pub async fn run(
     state.docs = projections.docs;
     state.edges = projections.edges;
     state.blackboard = projections.blackboard;
+    // MP1: seed the model-picker projection (models.toml + any measured
+    // profile from `model_profiles`), exactly like the projections above.
+    state.models = load_model_cards(paths).await;
     // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
     // repository's declared workflow manifests, then overlay each workflow's
     // LATEST durable run — its per-node live state, measured cost, and
@@ -1184,6 +1187,105 @@ async fn load_knowledge(
     }
 }
 
+/// Seed the model-picker projection (MP1): every model configured in
+/// `<data_dir>/models.toml` (the authoritative selectable list — STEP 1.9),
+/// enriched with its measured profile from the `model_profiles` table
+/// (migration 0014) when one exists, matched by `(id, base_url)` — a profile
+/// row is keyed by `(model_id, endpoint)`, and `base_url` is a model's
+/// endpoint. This is the CLI's job precisely because the TUI crate performs no
+/// I/O and never depends on `codypendent-routing`; the mapping happens here
+/// and nowhere else, exactly as [`load_knowledge`] maps the other browsers'
+/// projections.
+///
+/// Never fails the TUI: a missing/unparsable `models.toml` degrades to an
+/// empty picker (with a stderr note); an unopenable database or a profile-list
+/// failure degrades every model to its **id-only fallback** (every badge
+/// absent) since profiles are best-effort enrichment, not the selectable list
+/// itself.
+async fn load_model_cards(paths: &RuntimePaths) -> Vec<ModelCard> {
+    use codypendent_daemon::model_profiles::ModelProfileStore;
+    use codypendent_runtime::models::load_models;
+
+    let models_path = paths.data_dir.join("models.toml");
+    let configs = match load_models(&models_path) {
+        Ok(configs) => configs,
+        Err(error) => {
+            eprintln!(
+                "codypendent: model picker unavailable (reading {}: {error})",
+                models_path.display()
+            );
+            return Vec::new();
+        }
+    };
+    if configs.is_empty() {
+        return Vec::new();
+    }
+
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = match knowledge_db::open(&database_path).await {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            eprintln!(
+                "codypendent: model profiles unavailable (opening {}: {error}); \
+                 models still list, id-only",
+                database_path.display()
+            );
+            None
+        }
+    };
+
+    let mut profiles: HashMap<(ModelId, String), codypendent_routing::ModelProfile> =
+        HashMap::new();
+    if let Some(pool) = &pool {
+        match ModelProfileStore::new().list(pool).await {
+            Ok(stored) => {
+                for entry in stored {
+                    profiles.insert(
+                        (entry.profile.id.clone(), entry.endpoint.clone()),
+                        entry.profile,
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("codypendent: could not list model profiles: {error}");
+            }
+        }
+    }
+    if let Some(pool) = pool {
+        pool.close().await;
+    }
+
+    configs
+        .into_iter()
+        .map(|config| model_card(config, &profiles))
+        .collect()
+}
+
+/// Map one configured [`ModelConfig`](codypendent_runtime::models::ModelConfig)
+/// into a [`ModelCard`], enriching it with its measured profile (matched by
+/// `(id, base_url)`) when `profiles` has one — an id-only fallback (every
+/// badge `None`) otherwise, so an unprofiled model still selects, just without
+/// badges.
+fn model_card(
+    config: codypendent_runtime::models::ModelConfig,
+    profiles: &HashMap<(ModelId, String), codypendent_routing::ModelProfile>,
+) -> ModelCard {
+    let profile = profiles.get(&(config.id.clone(), config.base_url.clone()));
+    ModelCard {
+        id: config.id,
+        provider: config.provider,
+        location: profile.map(|profile| {
+            if profile.is_local() {
+                ModelLocationLabel::Local
+            } else {
+                ModelLocationLabel::Hosted
+            }
+        }),
+        cost_per_1k_usd: profile.map(|profile| profile.performance.cost_per_1k_tokens_usd),
+        context_tokens: profile.and_then(|profile| profile.capabilities.context_tokens),
+    }
+}
+
 /// Project each visible-scope document (snapshot + pending suggestions) into a
 /// [`DocCard`]. A per-document read failure logs and skips that document; the
 /// browser degrades to what it could load rather than failing.
@@ -2123,6 +2225,113 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// MP1: `model_card` maps a configured model to its measured profile when
+    /// one exists at the SAME endpoint (a profile is keyed by
+    /// `(model_id, endpoint)`), and falls back to an id-only card (every badge
+    /// `None`) when it does not — `models.toml` is the authoritative
+    /// selectable list, so an unprofiled model still appears.
+    #[test]
+    fn model_card_matches_a_profile_by_id_and_endpoint_or_falls_back_id_only() {
+        use codypendent_routing::{
+            EditProtocol, ModelCapabilities, ModelExecutionProfile, ModelLocation,
+            ModelPerformance, ModelProfile, SchemaRepairPolicy, StructuredOutputSupport,
+            ToolCallSupport,
+        };
+        use std::collections::BTreeMap;
+
+        let hosted = codypendent_runtime::models::ModelConfig {
+            id: ModelId("hosted-default".into()),
+            provider: "openai-compatible".to_owned(),
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model: "gpt-5.1-codex".to_owned(),
+            api_key_env: "OPENAI_API_KEY".to_owned(),
+        };
+        // Same id, but the profile below is measured against a DIFFERENT
+        // endpoint — must not match (proves the lookup keys on the pair, not
+        // just the id).
+        let same_id_other_endpoint = codypendent_runtime::models::ModelConfig {
+            id: ModelId("hosted-default".into()),
+            provider: "openai-compatible".to_owned(),
+            base_url: "https://other.example.com/v1".to_owned(),
+            model: "gpt-5.1-codex".to_owned(),
+            api_key_env: String::new(),
+        };
+        let unprofiled = codypendent_runtime::models::ModelConfig {
+            id: ModelId("local-default".into()),
+            provider: "openai-compatible".to_owned(),
+            base_url: "http://localhost:11434/v1".to_owned(),
+            model: "qwen2.5-coder:14b".to_owned(),
+            api_key_env: String::new(),
+        };
+
+        let profile = ModelProfile {
+            id: ModelId("hosted-default".into()),
+            location: ModelLocation::Hosted,
+            capabilities: ModelCapabilities {
+                streaming: true,
+                tools: ToolCallSupport::Parallel,
+                parallel_tools: true,
+                structured_output: StructuredOutputSupport::Strict,
+                vision: false,
+                audio_input: false,
+                embeddings: false,
+                prompt_caching: true,
+                reasoning_controls: false,
+                context_tokens: Some(200_000),
+                output_tokens: Some(8_192),
+            },
+            performance: ModelPerformance {
+                reliability: 0.9,
+                cost_per_1k_tokens_usd: 0.03,
+                latency_ms_p50: 500.0,
+                task_class_success: BTreeMap::new(),
+                failure_patterns: vec![],
+            },
+            execution: ModelExecutionProfile {
+                preferred_tool_count: 8,
+                edit_protocol: EditProtocol::StructuredPatch,
+                context_layout: "system-context-history".to_owned(),
+                reasoning_budget: None,
+                schema_repair: SchemaRepairPolicy::Reprompt,
+            },
+            bench: None,
+        };
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            (
+                ModelId("hosted-default".into()),
+                "https://api.openai.com/v1".to_owned(),
+            ),
+            profile,
+        );
+
+        let hosted_card = model_card(hosted, &profiles);
+        assert_eq!(hosted_card.id, ModelId("hosted-default".into()));
+        assert_eq!(hosted_card.provider, "openai-compatible");
+        assert_eq!(hosted_card.location, Some(ModelLocationLabel::Hosted));
+        assert!(
+            (hosted_card.cost_per_1k_usd.unwrap() - 0.03).abs() < 1e-9,
+            "cost should round-trip: {:?}",
+            hosted_card.cost_per_1k_usd
+        );
+        assert_eq!(hosted_card.context_tokens, Some(200_000));
+
+        let other_endpoint_card = model_card(same_id_other_endpoint, &profiles);
+        assert_eq!(
+            other_endpoint_card.location, None,
+            "a profile at a different endpoint must not match"
+        );
+
+        let unprofiled_card = model_card(unprofiled, &profiles);
+        assert_eq!(unprofiled_card.id, ModelId("local-default".into()));
+        assert_eq!(
+            unprofiled_card.location, None,
+            "no profile row: an id-only fallback"
+        );
+        assert!(unprofiled_card.cost_per_1k_usd.is_none());
+        assert!(unprofiled_card.context_tokens.is_none());
     }
 
     #[test]

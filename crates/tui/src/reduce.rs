@@ -14,8 +14,8 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent};
 use crate::state::{
-    AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, Overlay, Pane,
-    PatchSummary, PendingApproval, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_models, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
+    Overlay, Pane, PatchSummary, PendingApproval, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -575,6 +575,18 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, count, delta);
             return;
         }
+        Overlay::ModelPicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_models(&state.models, query);
+            step(selected, indices.len(), delta);
+            // Keep `selected_model` resolved to the same card the filtered
+            // cursor points at, so `focused_model()` (the detail panel, and
+            // Enter's staging) reads it without re-deriving the filter.
+            state.selected_model = indices.get(*selected).copied().unwrap_or(0);
+            return;
+        }
         _ => {}
     }
     // Base view: a pending approval owns the arrows (move between stacked
@@ -859,9 +871,23 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // Same shape as the palette: editing the model picker's query changes
+        // the filtered set, so the selection returns to the top.
+        Overlay::ModelPicker { query, selected } => {
+            edit(query);
+            *selected = 0;
+        }
         // The base view: text lands in the persistent composer draft.
         Overlay::None => edit(&mut state.composer),
         _ => {}
+    }
+    // Keep `selected_model` resolved to the new top-of-filter card (mirrors
+    // the reset above, against the full list — see `AppState::selected_model`).
+    if let Overlay::ModelPicker { query, .. } = &state.overlay {
+        state.selected_model = filter_models(&state.models, query)
+            .first()
+            .copied()
+            .unwrap_or(0);
     }
 }
 
@@ -942,6 +968,19 @@ fn submit_prompt(state: &mut AppState) {
                 run_palette_command(state, entry.command);
             }
         }
+        // Enter stages the focused model (advisory this task — MP2 wires it
+        // to actually pin the next run's model) and emits a status notice;
+        // `mem::take` already closed the picker (left the overlay `None`).
+        Overlay::ModelPicker { .. } => {
+            if let Some(card) = state.models.get(state.selected_model) {
+                let id = card.id.clone();
+                state.pending_model = Some(id.clone());
+                state.notice = Some((
+                    format!("model set to {id} — applies to your next run"),
+                    state.tick + 25,
+                ));
+            }
+        }
         // Base view (`mem::take` left `None`): send the composer. A live run is
         // steered; otherwise the message starts a fresh run. The draft clears
         // either way.
@@ -987,6 +1026,13 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Edges => state.overlay = Overlay::Edges,
         PaletteCommand::Workflow => state.overlay = Overlay::Workflow,
         PaletteCommand::Blackboard => state.overlay = Overlay::Blackboard,
+        PaletteCommand::Model => {
+            state.selected_model = 0;
+            state.overlay = Overlay::ModelPicker {
+                query: String::new(),
+                selected: 0,
+            };
+        }
         PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
         PaletteCommand::Help => state.overlay = Overlay::Help,
         PaletteCommand::Detach => state.should_detach = true,
@@ -2637,6 +2683,143 @@ mod tests {
         }
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.layout, LayoutMode::Workspace);
+    }
+
+    fn model_card(id: &str, provider: &str) -> crate::state::ModelCard {
+        crate::state::ModelCard {
+            id: ModelId(id.to_owned()),
+            provider: provider.to_owned(),
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }
+    }
+
+    /// Open the model picker via the palette front door: `/` → filter "model"
+    /// → Enter. Every other test below starts from this.
+    fn open_model_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "model".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn palette_opens_the_model_picker() {
+        let mut s = AppState::new();
+        s.models = vec![model_card("local-qwen", "openai-compatible")];
+        open_model_picker(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ModelPicker {
+                query: String::new(),
+                selected: 0,
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn model_picker_navigation_moves_selection_and_resolves_the_focused_card() {
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("local-qwen", "openai-compatible"),
+            model_card("hosted-gpt", "openai-compatible"),
+        ];
+        open_model_picker(&mut s);
+        assert_eq!(s.selected_model, 0);
+
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(
+            s.overlay,
+            Overlay::ModelPicker {
+                query: String::new(),
+                selected: 1,
+            }
+        );
+        assert_eq!(
+            s.selected_model, 1,
+            "the resolved index tracks the filtered cursor"
+        );
+        assert_eq!(
+            s.focused_model().map(|c| c.id.0.as_str()),
+            Some("hosted-gpt")
+        );
+
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_model, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_model, 0);
+        assert_eq!(
+            s.focused_model().map(|c| c.id.0.as_str()),
+            Some("local-qwen")
+        );
+    }
+
+    #[test]
+    fn model_picker_filters_by_id_substring_and_resets_selection() {
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("local-qwen", "openai-compatible"),
+            model_card("hosted-gpt", "openai-compatible"),
+        ];
+        open_model_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // move onto "hosted-gpt" first
+        assert_eq!(s.selected_model, 1);
+
+        for c in "qwen".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // Filtering narrows the list to "local-qwen" and resets the cursor to
+        // its top, resolving `selected_model` back to the matching full-list
+        // index rather than leaving it pointing at the no-longer-visible row.
+        match &s.overlay {
+            Overlay::ModelPicker { query, selected } => {
+                assert_eq!(query, "qwen");
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected the model picker, got {other:?}"),
+        }
+        assert_eq!(s.selected_model, 0);
+        assert_eq!(
+            s.focused_model().map(|c| c.id.0.as_str()),
+            Some("local-qwen")
+        );
+    }
+
+    #[test]
+    fn model_picker_enter_stages_the_focused_model_and_emits_a_notice() {
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("local-qwen", "openai-compatible"),
+            model_card("hosted-gpt", "openai-compatible"),
+        ];
+        open_model_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // focus "hosted-gpt"
+        reduce(&mut s, Action::InputSubmit); // stage it
+
+        assert_eq!(s.overlay, Overlay::None, "the picker closes on select");
+        assert_eq!(s.pending_model, Some(ModelId("hosted-gpt".to_owned())));
+        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
+        assert!(
+            notice.contains("hosted-gpt"),
+            "the notice names the staged model: {notice}"
+        );
+        assert!(
+            notice.contains("next run"),
+            "the notice explains staging is advisory: {notice}"
+        );
+    }
+
+    #[test]
+    fn model_picker_escape_closes_without_staging() {
+        let mut s = AppState::new();
+        s.models = vec![model_card("local-qwen", "openai-compatible")];
+        open_model_picker(&mut s);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.pending_model.is_none(), "Esc must not stage anything");
     }
 
     #[test]

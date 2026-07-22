@@ -33,6 +33,8 @@ pub enum PaletteCommand {
     Workflow,
     /// Open the blackboard view.
     Blackboard,
+    /// Open the model picker (MP1).
+    Model,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -105,6 +107,12 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Blackboard",
         description: "view workflow artifacts (findings, decisions, evidence)",
         key: "B",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Model,
+        title: "Model picker",
+        description: "browse selectable models and stage one for the next run",
+        key: "/model",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
@@ -185,6 +193,14 @@ mod tests {
     #[test]
     fn a_nonsense_query_matches_nothing() {
         assert!(filtered("zzzzz").is_empty());
+    }
+
+    #[test]
+    fn filters_to_the_model_picker_command() {
+        // MP1: "/model" opens the picker via the palette front door.
+        let model = filtered("model");
+        assert_eq!(model.len(), 1);
+        assert_eq!(model[0].command, PaletteCommand::Model);
     }
 
     #[test]

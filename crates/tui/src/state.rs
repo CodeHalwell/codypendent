@@ -143,6 +143,15 @@ pub enum Overlay {
     /// directly (Edit) or lands as a suggestion (Suggest). `block_id` is the block
     /// the edit targets, captured when the prompt opened.
     DocEdit { block_id: String, buffer: String },
+    /// The model picker (MP1): a fuzzy-filterable list of the models
+    /// selectable for a run (see [`AppState::models`]), opened from the
+    /// command palette's `/model` entry. `query` filters by id/provider
+    /// substring; `selected` indexes the filtered results (reset to 0
+    /// whenever the query changes) — the same shape as [`Overlay::Palette`].
+    /// Marks the model serving the active run as current; `Enter` stages the
+    /// focused row on [`AppState::pending_model`] (advisory only this task —
+    /// MP2 wires it to actually pin the next run's model).
+    ModelPicker { query: String, selected: usize },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -565,6 +574,68 @@ pub struct BlackboardItemCard {
     pub superseded: bool,
 }
 
+/// Where a model-picker card's model runs (MP1). A tui-local mirror of just
+/// the two labels `codypendent_routing::ModelLocation` carries — the `tui`
+/// crate speaks only `codypendent-protocol` and must never depend on
+/// `codypendent-routing` (STEP 1.12 RULE 1), so this is a self-contained copy
+/// the CLI harness maps a measured model profile's location onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLocationLabel {
+    /// On-device (embedded, subprocess, or LAN service treated as local).
+    Local,
+    /// Off-device (a hosted/cloud provider).
+    Hosted,
+}
+
+/// A model-picker card (MP1): one selectable model from `models.toml`,
+/// enriched with its measured profile from the `model_profiles` table when one
+/// exists. Self-contained — the TUI never depends on `codypendent-routing`;
+/// the CLI harness maps a `ModelConfig` (plus any matching measured profile)
+/// into this shape, exactly as it maps a `RegistryItem` into a [`SkillCard`].
+/// "current" is not a field here: the [`Overlay::ModelPicker`] browser
+/// computes it at render by comparing `id` to the active run's serving model
+/// (`RunView::model`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCard {
+    /// The model's id, as configured in `models.toml`.
+    pub id: ModelId,
+    /// The wire-protocol adapter this model uses (e.g. `"openai-compatible"`
+    /// — the only value Phase 1 supports; see `ModelConfig::provider`).
+    pub provider: String,
+    /// Where the model runs, when a measured profile exists. `None` when the
+    /// model has no `model_profiles` row (badges are best-effort;
+    /// `models.toml` is the authoritative selectable list — STEP 1.9).
+    pub location: Option<ModelLocationLabel>,
+    /// The measured blended cost per 1K tokens, in USD, when a profile
+    /// exists.
+    pub cost_per_1k_usd: Option<f64>,
+    /// The model's declared context window, in tokens, when a profile
+    /// exists.
+    pub context_tokens: Option<u64>,
+}
+
+/// The indices into `models` whose id or provider case-insensitively contains
+/// `query` — the model picker's substring filter, in list order (mirrors
+/// [`crate::palette::filtered`]'s shape, adapted to instance data rather than
+/// a static table). An empty query matches every model. A free function
+/// (rather than an `AppState` method) so a caller already holding a live
+/// borrow of `AppState::overlay` can pass `&state.models` directly alongside
+/// it without a borrow conflict.
+#[must_use]
+pub(crate) fn filter_models(models: &[ModelCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    models
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| {
+            needle.is_empty()
+                || card.id.0.to_lowercase().contains(&needle)
+                || card.provider.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -650,6 +721,21 @@ pub struct AppState {
     pub blackboard: Vec<BlackboardItemCard>,
     /// Index into `blackboard` of the focused item.
     pub selected_item: usize,
+    /// The model-picker projection (MP1): every model configured in
+    /// `models.toml`, enriched with its measured profile from
+    /// `model_profiles` when one exists, mapped to a self-contained
+    /// [`ModelCard`] by the CLI harness. Populated once at attach; the
+    /// [`Overlay::ModelPicker`] browser reads it.
+    pub models: Vec<ModelCard>,
+    /// Index into `models` of the focused card — kept resolved to the
+    /// picker's live filtered selection by the reducer, so
+    /// [`AppState::focused_model`] reads uniformly with every other
+    /// browser's `focused_*` accessor.
+    pub selected_model: usize,
+    /// The model staged from the picker (`Enter` on a row). Advisory only
+    /// this task (MP1) — nothing yet reads it to change routing behavior; a
+    /// later task (MP2) wires it to pin the next run's model.
+    pub pending_model: Option<ModelId>,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -716,6 +802,9 @@ impl AppState {
             selected_node: 0,
             blackboard: Vec::new(),
             selected_item: 0,
+            models: Vec::new(),
+            selected_model: 0,
+            pending_model: None,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
@@ -737,9 +826,10 @@ impl AppState {
                 InputMode::Editing
             }
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The palette filters on printable keys but stays arrow-navigable, so
-            // it has its own input mode (see [`crate::input::map_palette_key`]).
-            Overlay::Palette { .. } => InputMode::Palette,
+            // The palette and the model picker both filter on printable keys
+            // while staying arrow-navigable, so they share this input mode
+            // (see [`crate::input::map_palette_key`]).
+            Overlay::Palette { .. } | Overlay::ModelPicker { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`
             // mode.
@@ -843,6 +933,12 @@ impl AppState {
     #[must_use]
     pub fn focused_item(&self) -> Option<&BlackboardItemCard> {
         self.blackboard.get(self.selected_item)
+    }
+
+    /// The focused model-picker card, if any.
+    #[must_use]
+    pub fn focused_model(&self) -> Option<&ModelCard> {
+        self.models.get(self.selected_model)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.
