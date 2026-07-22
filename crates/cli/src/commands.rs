@@ -1236,13 +1236,14 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 /// BEFORE any case runs, with a non-zero exit and a clear message — never a
 /// silent fallback to the default model for a policy that was explicitly
 /// requested. The resolved model is additively recorded per case in the
-/// report (see [`crate::eval::report_json_with_routing`]). This selects and
-/// validates the model; it does not yet pin the daemon's `StartRun`
-/// execution to it — `StartRun` carries no model field, so the run itself
-/// still resolves a model the way it always has (see `crate::eval`'s module
-/// doc for the full, honest scope of what "routes" means here today). When
-/// `--policy` is absent, behavior is byte-for-byte unchanged (the default
-/// model — the `eval-smoke` CI path).
+/// report (see [`crate::eval::report_json_with_routing`]) **and** pinned into
+/// that same case's own `StartRun.model` (see [`crate::eval::run_suite`]) —
+/// both are fed the SAME routing result below, so the model the report says
+/// ran is always the model that actually ran (see `crate::eval`'s module doc
+/// for the classification-safety argument that makes this pin safe). When
+/// `--policy` is absent, behavior is byte-for-byte unchanged — every case
+/// still sends `model: None` and the daemon resolves/routes as usual (the
+/// `eval-smoke` CI path).
 pub async fn eval_run(
     paths: &RuntimePaths,
     suite: &str,
@@ -1275,7 +1276,12 @@ pub async fn eval_run(
     };
 
     let fixture_root = crate::eval::fixture_root(&suite_dir, "tiny-crate")?;
-    let suite_report = crate::eval::run_suite(paths, &cases, &fixture_root).await?;
+    // The SAME `routed` result pins each case's `StartRun.model` below AND
+    // feeds the report's `routed_model` field — one source of truth, so the
+    // report can never misattribute which model ran (see `crate::eval`'s
+    // module doc).
+    let suite_report =
+        crate::eval::run_suite(paths, &cases, &fixture_root, routed.as_deref()).await?;
 
     let json = crate::eval::report_json_with_routing(&suite_report, routed.as_deref())?;
     std::fs::write(report, json)
