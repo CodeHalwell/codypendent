@@ -65,7 +65,9 @@ pub use compile::{
     CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
 };
 pub use conductor::{ConductorError, RecoveryReport, WorkflowConductor};
-pub use drive::{NodeContext, NodeExecutor, NodeObserver, NodeOutcome, WorkflowDriver};
+pub use drive::{
+    NodeContext, NodeExecutor, NodeObserver, NodeOutcome, NodeTransition, WorkflowDriver,
+};
 pub use model::{
     parse_definition, AgentRef, ApprovalPolicy, OrchestrationReason, ParseError, RetryPolicy,
     WorkflowBudget, WorkflowDefinition, WorkflowInput, WorkflowStep, WorkspaceMode, WorkspaceSpec,

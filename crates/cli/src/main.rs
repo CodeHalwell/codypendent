@@ -241,6 +241,21 @@ enum WorkflowCommand {
         #[arg(long)]
         node: String,
     },
+    /// Cancel a workflow run (Phase 5 T9): a cooperative drain — the driver stops
+    /// launching new nodes, any in-flight node's agent run is interrupted, remaining
+    /// pending nodes are skipped, and the run lands cancelled (terminal — no resume).
+    Cancel {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+    },
+    /// Watch a workflow run's live node lifecycle (Phase 5 T9): prints the run's
+    /// current snapshot (each node's state, cost, and any failure/block reason), then
+    /// streams each node transition and run-phase change until the run reaches a
+    /// terminal state (or the stream is interrupted).
+    Watch {
+        /// The durable workflow-run id.
+        workflow_run_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -566,6 +581,12 @@ async fn main() -> anyhow::Result<()> {
                 workflow_run_id,
                 node,
             } => commands::workflow_retry(&paths, workflow_run_id, node).await,
+            WorkflowCommand::Cancel { workflow_run_id } => {
+                commands::workflow_cancel(&paths, workflow_run_id).await
+            }
+            WorkflowCommand::Watch { workflow_run_id } => {
+                commands::workflow_watch(&paths, workflow_run_id).await
+            }
         },
         TopCommand::Docs { command } => match command {
             DocsCommand::Publish {

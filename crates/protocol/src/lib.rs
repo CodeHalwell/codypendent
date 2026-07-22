@@ -26,6 +26,7 @@ pub mod ids;
 pub mod input;
 pub mod run;
 pub mod version;
+pub mod workflow;
 
 pub use artifact::{ArtifactRef, DataClassification};
 pub use blackboard::BlackboardItemView;
@@ -58,3 +59,6 @@ pub use run::{
     RunDisposition, RunState, ToolOutcome,
 };
 pub use version::{ProtocolVersion, PROTOCOL_V1};
+pub use workflow::{
+    WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
+};

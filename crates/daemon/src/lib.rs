@@ -22,5 +22,6 @@ pub mod projections;
 pub mod promotion;
 pub mod recovery;
 pub mod subscriptions;
+pub mod workflow_stream;
 pub mod workflows;
 pub mod worktrees;

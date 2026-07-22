@@ -39,19 +39,27 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use codypendent_daemon::workflows::{
-    PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest, StartWorkflowRequest,
-    WorkflowLifecycle, WorkflowLifecycleFuture, WorkflowStartFuture, WorkflowStarter,
+use codypendent_daemon::workflow_stream::{
+    ReadWorkflowRunRequest, WorkflowHub, WorkflowReadFuture, WorkflowReader,
 };
-use codypendent_protocol::CodypendentError;
+use codypendent_daemon::workflows::{
+    CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
+    StartWorkflowRequest, WorkflowLifecycle, WorkflowLifecycleFuture, WorkflowStartFuture,
+    WorkflowStarter,
+};
+use codypendent_protocol::{
+    CodypendentError, WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
+    WorkflowRunSnapshot as ProtocolWorkflowRunSnapshot,
+};
 use codypendent_workflow::{
     compile_yaml, BudgetWarning, ConductorError, NodeExecutor, NodeObserver, NodeState,
-    WorkflowConductor, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    NodeTransition, WorkflowConductor, WorkflowNodeRecord, WorkflowRunState, WorkflowStore,
+    WorkflowStoreError,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use crate::workflow_exec::load_agent_profiles;
+use crate::workflow_exec::{load_agent_profiles, WorkflowRunCancellations};
 
 /// The per-run drive-lock registry a [`WorkflowConductorHost`] holds: one async
 /// lock per in-flight run id, so no two drives advance one run at once.
@@ -78,6 +86,16 @@ pub struct WorkflowConductorHost<E> {
     /// `WorkflowStarter` and `WorkflowLifecycle` seams the server pulls out), so
     /// start / resume / retry / recovery all serialize on the same lock per run.
     drive_locks: DriveLockRegistry,
+    /// The per-run node-lifecycle fan-out (T9): the drive's [`PublishingNodeObserver`]
+    /// publishes each node transition here, and this host publishes run-phase changes
+    /// here, so a client's `Subscription::Workflow` forwarder delivers them. Shared
+    /// with the server (which subscribes) via the executor's hub — a fresh empty hub
+    /// in a test host whose events no client observes.
+    workflows: WorkflowHub,
+    /// In-flight node agent-run cancellation handles (T9), shared with the node
+    /// executor (which registers) so the [`cancel`](WorkflowLifecycle::cancel) seam
+    /// interrupts an in-flight node's agent run.
+    cancellations: WorkflowRunCancellations,
 }
 
 // Manual `Clone` so the host clones regardless of whether `E: Clone` — only
@@ -89,6 +107,8 @@ impl<E> Clone for WorkflowConductorHost<E> {
             node_executor: self.node_executor.clone(),
             conductor: self.conductor,
             drive_locks: self.drive_locks.clone(),
+            workflows: self.workflows.clone(),
+            cancellations: self.cancellations.clone(),
         }
     }
 }
@@ -122,7 +142,30 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
             node_executor,
             conductor: WorkflowConductor::new(),
             drive_locks,
+            // A fresh (empty) hub + cancellation registry by default — a test host's
+            // observability goes nowhere and its cancel seam fires nothing. Production
+            // replaces both with the shared ones via [`with_streaming`] so the server
+            // and node executor meet the host (T9).
+            workflows: WorkflowHub::new(),
+            cancellations: WorkflowRunCancellations::default(),
         }
+    }
+
+    /// Bind the host to the SHARED node-lifecycle hub (its drives publish
+    /// transitions + run-phase changes here, and the server subscribes to it) and
+    /// the SHARED cancellation registry (its cancel seam fires the in-flight node
+    /// agent-run tokens the node executor registered) — T9. The assembly's
+    /// `build_workflow_host` calls this so all three (server, host, node executor)
+    /// meet on one hub + one registry; a test host keeps the fresh empty defaults.
+    #[must_use]
+    pub(crate) fn with_streaming(
+        mut self,
+        workflows: WorkflowHub,
+        cancellations: WorkflowRunCancellations,
+    ) -> Self {
+        self.workflows = workflows;
+        self.cancellations = cancellations;
+        self
     }
 
     /// This host's shared per-run drive-lock registry, so a caller
@@ -177,25 +220,57 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                         return;
                     }
                 }
-                // A per-run observer records each node-lifecycle transition (the
-                // seam the client-facing `Subscription::Workflow` stream will later
-                // publish from); today it surfaces node progress in the daemon log.
-                let observer = LoggingNodeObserver {
-                    run_id: run_id.clone(),
-                };
+                // A per-run observer records each node-lifecycle transition: the
+                // logging observer (daemon log) COMPOSED with a publishing observer
+                // that fans each transition out to `Subscription::Workflow`
+                // subscribers (T9 — compose, don't replace).
+                let observer = (
+                    LoggingNodeObserver {
+                        run_id: run_id.clone(),
+                    },
+                    PublishingNodeObserver {
+                        run_id: run_id.clone(),
+                        hub: host.workflows.clone(),
+                    },
+                );
+                // The run is about to advance — announce it Running to subscribers
+                // (the driver's own Pending→Running is an internal node/run write;
+                // this is the run-phase signal). Idempotent full-state, so a paused
+                // run that never actually advances simply re-announces its phase below.
+                host.publish_run_phase(&run_id, WorkflowRunState::Running);
                 match host
                     .conductor
                     .drive(&host.pool, &run_id, host.node_executor.as_ref(), &observer)
                     .await
                 {
                     Ok(state) => {
+                        // Announce the stopping phase (Completed / Failed / Paused /
+                        // Cancelled) to subscribers.
+                        host.publish_run_phase(&run_id, state);
                         info!(run = %run_id, state = state.as_str(), "workflow run driven to a stopping state")
                     }
                     Err(error) => warn!(run = %run_id, %error, "workflow run drive ended in error"),
                 }
+                // The drive has fully drained — drop any cancellation entry for this
+                // run so a cancelled run's sticky registry entry does not linger (T9).
+                host.cancellations.finish(&run_id);
             }
             host.prune_run_lock(&run_id, lock);
         });
+    }
+
+    /// Publish a run-phase change to the run's `Subscription::Workflow` subscribers
+    /// (T9). Best-effort: with no subscribers (or the executor-less test host's empty
+    /// hub) it is a silent no-op; the durable store remains the record a late
+    /// subscriber reconstructs its baseline from.
+    fn publish_run_phase(&self, workflow_run_id: &str, state: WorkflowRunState) {
+        self.workflows.publish(
+            workflow_run_id,
+            WorkflowEvent::RunPhaseChanged {
+                workflow_run_id: workflow_run_id.to_owned(),
+                phase: run_state_to_wire(state),
+            },
+        );
     }
 
     /// The per-run drive lock, created on first use.
@@ -416,6 +491,57 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
             Ok(())
         })
     }
+
+    fn cancel(&self, request: CancelWorkflowRequest) -> WorkflowLifecycleFuture<'_> {
+        let host = self.clone();
+        Box::pin(async move {
+            // Validate + drain through the conductor FIRST (a terminal run rejects
+            // cleanly, without side effects): flip the run `Cancelled` — a live driver
+            // observes it at its next scheduling boundary and stops launching further
+            // nodes, exactly like pause — and mark every still-`Pending` node
+            // `Skipped`. Like `pause` (P5-D3) this deliberately does NOT take the
+            // per-run drive lock: cancel writes the run state + the disjoint pending
+            // node rows, never the in-flight node's row, so there is no
+            // "in-flight executor overwrites the mutation" hazard — and taking the
+            // lock would make cancel block until the whole drive finished, breaking
+            // the cooperative "stops at the next boundary" contract.
+            let skipped = host
+                .conductor
+                .cancel(&host.pool, &request.workflow_run_id)
+                .await
+                .map_err(conductor_error_to_protocol)?;
+            // Interrupt any in-flight node's agent run through the SAME cancellation
+            // machinery `CancelRun` uses — recording `Cancelled` does not by itself
+            // stop the runtime loop, so fire its token (a no-op when no node is in
+            // flight, e.g. a paused run cancelled).
+            host.cancellations.cancel(&request.workflow_run_id);
+            // Publish the cancel drain to live subscribers: each newly-skipped node's
+            // view, then the Cancelled run phase. A late subscriber instead
+            // reconstructs both from the snapshot (both are persisted), so the live and
+            // catch-up paths agree.
+            if !skipped.is_empty() {
+                if let Ok(Some(snapshot)) = WorkflowStore::new()
+                    .snapshot(&host.pool, &request.workflow_run_id)
+                    .await
+                {
+                    for node_id in &skipped {
+                        if let Some(record) = snapshot.nodes.iter().find(|n| &n.node_id == node_id)
+                        {
+                            host.workflows.publish(
+                                &request.workflow_run_id,
+                                WorkflowEvent::NodeTransitioned(node_record_to_wire(
+                                    &request.workflow_run_id,
+                                    record,
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+            host.publish_run_phase(&request.workflow_run_id, WorkflowRunState::Cancelled);
+            Ok(())
+        })
+    }
 }
 
 /// Map a [`ConductorError`] to the wire [`CodypendentError`] a client branches on
@@ -437,23 +563,164 @@ fn conductor_error_to_protocol(error: ConductorError) -> CodypendentError {
     CodypendentError::new(code, message, retryable)
 }
 
-/// Records each node-lifecycle transition of one run (STEP 5.2 node-lifecycle
-/// events over the observer). The [`NodeObserver`] callback carries only the node,
-/// state, and attempt, so the observer is bound to its run id. Today it emits a
-/// structured tracing event per transition — node progress observable in the
-/// daemon log; the same seam is what a client-facing `Subscription::Workflow`
-/// stream (like the document CRDT-sync stream) will publish from.
+/// Publishes each node-lifecycle transition of one run to its
+/// `Subscription::Workflow` subscribers (T9) — the client-facing half of the
+/// observer seam, composed alongside the [`LoggingNodeObserver`]. Every transition
+/// carries the node's **full** current view (state, attempt, measured cost,
+/// failure/block reason, budget warnings), captured synchronously from the
+/// [`NodeTransition`] the driver reports (the callback is sync — it cannot re-read
+/// the store — but the store write that preceded it holds the same values, so this
+/// is persist-before-publish). A client merges each delivery by `node_id`.
+struct PublishingNodeObserver {
+    run_id: String,
+    hub: WorkflowHub,
+}
+
+impl NodeObserver for PublishingNodeObserver {
+    fn on_transition(&self, transition: NodeTransition<'_>) {
+        let view = WorkflowNodeView {
+            workflow_run_id: self.run_id.clone(),
+            node_id: transition.node_id.to_owned(),
+            state: node_state_to_wire(transition.state),
+            attempt: transition.attempt,
+            cost: transition.cost.cloned(),
+            error: transition.error.map(str::to_owned),
+            warnings: transition
+                .warnings
+                .iter()
+                .map(render_budget_warning)
+                .collect(),
+        };
+        self.hub
+            .publish(&self.run_id, WorkflowEvent::NodeTransitioned(view));
+    }
+
+    // `on_budget_warning` / `on_attempt_failed` / `on_recovery_reset` are the logging
+    // observer's concern: the warnings already ride the `Completed` transition above
+    // (so the published node view carries them), and per-attempt failure history /
+    // recovery resets are not the latest durable node fact the graph view shows. The
+    // publisher keeps the trait's no-op defaults for them.
+}
+
+/// Map the workflow crate's durable [`NodeState`] to the wire
+/// [`WorkflowNodeState`] a client renders (T9).
+fn node_state_to_wire(state: NodeState) -> WorkflowNodeState {
+    match state {
+        NodeState::Pending => WorkflowNodeState::Pending,
+        NodeState::Running => WorkflowNodeState::Running,
+        NodeState::WaitingApproval => WorkflowNodeState::WaitingApproval,
+        NodeState::Blocked => WorkflowNodeState::Blocked,
+        NodeState::Completed => WorkflowNodeState::Completed,
+        NodeState::Failed => WorkflowNodeState::Failed,
+        NodeState::Skipped => WorkflowNodeState::Skipped,
+    }
+}
+
+/// Map the workflow crate's durable [`WorkflowRunState`] to the wire
+/// [`WorkflowRunPhase`] a client renders (T9).
+fn run_state_to_wire(state: WorkflowRunState) -> WorkflowRunPhase {
+    match state {
+        WorkflowRunState::Pending => WorkflowRunPhase::Pending,
+        WorkflowRunState::Running => WorkflowRunPhase::Running,
+        WorkflowRunState::Paused => WorkflowRunPhase::Paused,
+        WorkflowRunState::Completed => WorkflowRunPhase::Completed,
+        WorkflowRunState::Failed => WorkflowRunPhase::Failed,
+        WorkflowRunState::Cancelled => WorkflowRunPhase::Cancelled,
+    }
+}
+
+/// Pre-render a budget warning for the wire (T9) — the same fields the logging
+/// observer emits, as one human line.
+fn render_budget_warning(warning: &BudgetWarning) -> String {
+    format!(
+        "{} {} at {}/{} (80%)",
+        warning.scope.as_str(),
+        warning.dimension.as_str(),
+        warning.used,
+        warning.limit
+    )
+}
+
+/// Project one durable node record into the wire [`WorkflowNodeView`] (T9), used for
+/// both the cancel-drain `Skipped` publishes and the `ReadWorkflowRun` snapshot.
+fn node_record_to_wire(workflow_run_id: &str, record: &WorkflowNodeRecord) -> WorkflowNodeView {
+    WorkflowNodeView {
+        workflow_run_id: workflow_run_id.to_owned(),
+        node_id: record.node_id.clone(),
+        state: node_state_to_wire(record.state),
+        attempt: record.attempt,
+        cost: record.cost.clone(),
+        error: record.error.clone(),
+        // Warnings are transient history the observer relays live, not a durable node
+        // fact — a snapshot/skip view carries none.
+        warnings: Vec::new(),
+    }
+}
+
+/// Reads a durable workflow run's observability snapshot for a `ReadWorkflowRun`
+/// command (T9) — the daemon's [`WorkflowReader`] seam over the workflow store on the
+/// shared pool. The catch-up baseline a client folds a `Subscription::Workflow` live
+/// stream on top of; reconstructed from the store, so a late subscriber after a
+/// daemon restart still gets a truthful snapshot.
+pub(crate) struct WorkflowRunReader {
+    pool: SqlitePool,
+}
+
+impl WorkflowRunReader {
+    #[must_use]
+    pub(crate) fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+impl WorkflowReader for WorkflowRunReader {
+    fn read(&self, request: ReadWorkflowRunRequest) -> WorkflowReadFuture<'_> {
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            match WorkflowStore::new()
+                .snapshot(&pool, &request.workflow_run_id)
+                .await
+            {
+                Ok(Some(snapshot)) => Ok(ProtocolWorkflowRunSnapshot {
+                    workflow_run_id: request.workflow_run_id.clone(),
+                    phase: run_state_to_wire(snapshot.run.state),
+                    nodes: snapshot
+                        .nodes
+                        .iter()
+                        .map(|record| node_record_to_wire(&request.workflow_run_id, record))
+                        .collect(),
+                }),
+                // A run either exists or it does not — unlike a board, whose own board
+                // is simply empty. A missing run is a legible rejection.
+                Ok(None) => Err(CodypendentError::new(
+                    "workflow.run-not-found",
+                    format!("no workflow run {}", request.workflow_run_id),
+                    false,
+                )),
+                Err(error) => Err(CodypendentError::new(
+                    "workflow.store-error",
+                    format!("could not read the workflow run: {error}"),
+                    true,
+                )),
+            }
+        })
+    }
+}
+
+/// Records each node-lifecycle transition of one run in the daemon log (STEP 5.2).
+/// Bound to its run id; composed alongside the [`PublishingNodeObserver`] over one
+/// drive (T9 — compose, don't replace), so node progress is both logged and streamed.
 struct LoggingNodeObserver {
     run_id: String,
 }
 
 impl NodeObserver for LoggingNodeObserver {
-    fn on_transition(&self, node_id: &str, state: NodeState, attempt: u32) {
+    fn on_transition(&self, transition: NodeTransition<'_>) {
         info!(
             run = %self.run_id,
-            node = %node_id,
-            state = state.as_str(),
-            attempt,
+            node = %transition.node_id,
+            state = transition.state.as_str(),
+            attempt = transition.attempt,
             "workflow node transition"
         );
     }
@@ -700,6 +967,184 @@ steps:
             .await
             .expect_err("cannot resume a completed run");
         assert_eq!(resume_err.code, "workflow.illegal-transition");
+    }
+
+    #[tokio::test]
+    async fn cancel_a_running_run_skips_pending_nodes_and_rejects_a_later_resume() {
+        // A running run (its `inspect` node held in flight, `verify` still pending) is
+        // cancelled: the run lands `Cancelled`, the pending `verify` becomes
+        // `Skipped`, and a subsequent resume is rejected (Cancelled is terminal). This
+        // is the daemon-seam drain (T9); the interrupted-agent-run half is proven at
+        // the `AgentLoopNodeExecutor` level (workflow_exec tests).
+        let (_tmp, pool) = temp_pool().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(GatedExecutor::new("inspect", gate.clone()));
+        let host = WorkflowConductorHost::new(pool.clone(), executor.clone());
+
+        let run_id = host.start(start_request("cmd-cancel")).await.unwrap();
+        wait_for_node_state(&pool, &run_id, "inspect", NodeState::Running).await;
+
+        // Cancel while `inspect` is in flight and `verify` is still pending.
+        host.cancel(CancelWorkflowRequest {
+            workflow_run_id: run_id.clone(),
+            client_id: ClientId::new(),
+        })
+        .await
+        .expect("cancel accepted");
+
+        // The run is Cancelled and the pending node is Skipped immediately (cancel is
+        // synchronous; the in-flight node drains in the background).
+        let snap = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.run.state, WorkflowRunState::Cancelled);
+        assert_eq!(
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == "verify")
+                .unwrap()
+                .state,
+            NodeState::Skipped,
+            "the still-pending node was skipped"
+        );
+
+        // Resuming a cancelled (terminal) run is rejected — no resume from Cancelled.
+        let resume_err = host
+            .resume(ResumeWorkflowRequest {
+                workflow_run_id: run_id.clone(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect_err("cannot resume a cancelled run");
+        assert_eq!(resume_err.code, "workflow.illegal-transition");
+
+        // Let the gated in-flight node drain so the drive task winds down cleanly.
+        gate.notify_one();
+        wait_for_node_state(&pool, &run_id, "inspect", NodeState::Completed).await;
+        // The run stays Cancelled after the drive drains (never resurrected).
+        assert_eq!(
+            WorkflowStore::new()
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run
+                .state,
+            WorkflowRunState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_run_subscriber_gets_a_snapshot_then_the_subsequent_transitions() {
+        // T9 catch-up/idempotency: a client subscribing MID-RUN reads the run
+        // snapshot as its baseline, then folds the live node transitions on top.
+        // Folding snapshot + subsequent transitions reconstructs the full run with no
+        // gaps (verify's transitions arrive live) and no harmful duplicates (each node
+        // ends in exactly one state).
+        let (_tmp, pool) = temp_pool().await;
+        let hub = WorkflowHub::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(GatedExecutor::new("inspect", gate.clone()));
+        // Share the hub (its drive publishes transitions here) via `with_streaming`.
+        let host = WorkflowConductorHost::new(pool.clone(), executor.clone())
+            .with_streaming(hub.clone(), WorkflowRunCancellations::default());
+
+        let run_id = host.start(start_request("cmd-sub")).await.unwrap();
+        wait_for_node_state(&pool, &run_id, "inspect", NodeState::Running).await;
+
+        // Subscribe mid-run (inspect running, verify pending), then read the snapshot
+        // baseline over the reader seam — the same order a watch client uses.
+        let mut rx = hub.subscribe(run_id.clone());
+        let reader = WorkflowRunReader::new(pool.clone());
+        let snapshot = reader
+            .read(ReadWorkflowRunRequest {
+                workflow_run_id: run_id.clone(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("snapshot read");
+        assert_eq!(snapshot.phase, WorkflowRunPhase::Running);
+        // Seed a folded view from the baseline.
+        let mut folded: HashMap<String, WorkflowNodeState> = snapshot
+            .nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.state))
+            .collect();
+        assert_eq!(folded.get("inspect"), Some(&WorkflowNodeState::Running));
+        assert_eq!(folded.get("verify"), Some(&WorkflowNodeState::Pending));
+
+        // Release the gated node — the run drives to completion.
+        gate.notify_one();
+        wait_for_state(&pool, &run_id, WorkflowRunState::Completed).await;
+
+        // Fold the live stream on top of the baseline until the run-completed phase.
+        let mut run_completed = false;
+        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            match event {
+                WorkflowEvent::NodeTransitioned(view) => {
+                    folded.insert(view.node_id, view.state);
+                }
+                WorkflowEvent::RunPhaseChanged {
+                    phase: WorkflowRunPhase::Completed,
+                    ..
+                } => {
+                    run_completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            run_completed,
+            "the run-completed phase reached the subscriber"
+        );
+        // Snapshot + subsequent transitions ⇒ every node Completed (no gaps).
+        assert_eq!(folded.get("inspect"), Some(&WorkflowNodeState::Completed));
+        assert_eq!(folded.get("verify"), Some(&WorkflowNodeState::Completed));
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_after_a_restart_gets_a_truthful_snapshot() {
+        // T9 durability: the node records + transitions ARE the record — a fresh
+        // reader (standing in for a subscriber attaching after a daemon restart) reads
+        // a truthful snapshot straight from the durable store, no in-memory state
+        // needed. Here a run is driven to completion, then a brand-new reader
+        // reconstructs its terminal snapshot.
+        let (_tmp, pool) = temp_pool().await;
+        let host = host_with(pool.clone(), FakeExecutor::default());
+        let run_id = host.start(start_request("cmd-restart")).await.unwrap();
+        wait_for_state(&pool, &run_id, WorkflowRunState::Completed).await;
+
+        // A FRESH reader over the same durable pool (as a restarted daemon would build)
+        // reconstructs the run's terminal snapshot.
+        let reader = WorkflowRunReader::new(pool.clone());
+        let snapshot = reader
+            .read(ReadWorkflowRunRequest {
+                workflow_run_id: run_id.clone(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("snapshot read");
+        assert_eq!(snapshot.phase, WorkflowRunPhase::Completed);
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|n| n.state == WorkflowNodeState::Completed),
+            "every node's terminal state is reconstructed from the store"
+        );
+
+        // An unknown run is a legible rejection, not an empty snapshot.
+        let err = reader
+            .read(ReadWorkflowRunRequest {
+                workflow_run_id: "wfrun-nope".to_owned(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect_err("unknown run rejected");
+        assert_eq!(err.code, "workflow.run-not-found");
     }
 
     #[tokio::test]

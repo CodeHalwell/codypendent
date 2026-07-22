@@ -935,6 +935,45 @@ impl WorkflowStore {
             .await?;
         Ok(())
     }
+
+    /// Mark every still-`Pending` node of a run `Skipped` — the cancel drain (T9):
+    /// a cancelled run's un-started nodes will never run, so they land in the one
+    /// no-producer terminal node state a `CancelWorkflow` newly produces (alongside
+    /// a `Cancelled` run). Stamps `ended_at`. Nodes that are `Running` (an in-flight
+    /// attempt) are left untouched — those are interrupted through the agent-run
+    /// cancellation machinery and drain via the driver, not skipped here — as are
+    /// already-terminal nodes. Returns how many nodes were skipped, in caller order
+    /// so the daemon can publish a `Skipped` transition for each newly-skipped node.
+    pub async fn skip_pending_nodes(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        // The ids about to be skipped, read before the update so the caller learns
+        // exactly which nodes newly transitioned (a re-run cancel finds none).
+        let skipped: Vec<String> =
+            sqlx::query_scalar("SELECT node_id FROM workflow_nodes WHERE workflow_run_id = ? AND state = 'pending' ORDER BY topo_order")
+                .bind(workflow_run_id)
+                .fetch_all(pool)
+                .await?;
+        if skipped.is_empty() {
+            return Ok(skipped);
+        }
+        sqlx::query(
+            "UPDATE workflow_nodes SET state = 'skipped', ended_at = ? \
+             WHERE workflow_run_id = ? AND state = 'pending'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(workflow_run_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(workflow_run_id)
+            .execute(pool)
+            .await?;
+        Ok(skipped)
+    }
 }
 
 /// A deterministic workflow-run id derived from a command's idempotency key, so a

@@ -86,6 +86,13 @@ pub struct RetryWorkflowNodeRequest {
     pub client_id: ClientId,
 }
 
+/// A client's request to cancel a durable workflow run (T9).
+#[derive(Debug, Clone)]
+pub struct CancelWorkflowRequest {
+    pub workflow_run_id: String,
+    pub client_id: ClientId,
+}
+
 /// The future a [`WorkflowLifecycle`] method returns: the synchronous outcome of
 /// the lifecycle mutation (the actual driving continues in the background), or a
 /// structured [`CodypendentError`] the server rejects with. Boxed so the trait
@@ -114,4 +121,11 @@ pub trait WorkflowLifecycle: Send + Sync {
     /// dependents), then drive it onward in the background. An error on an unknown
     /// node or a changed graph.
     fn retry_node(&self, request: RetryWorkflowNodeRequest) -> WorkflowLifecycleFuture<'_>;
+    /// Cancel a run (T9): a cooperative drain (a live driver stops launching further
+    /// nodes), every still-`Pending` node becomes `Skipped`, any in-flight node's
+    /// agent run is interrupted through the same cancellation machinery `CancelRun`
+    /// uses, and the run lands `Cancelled` (terminal — no resume). Idempotent on an
+    /// already-cancelled run; an error (`workflow.illegal-transition`) on a
+    /// completed/failed run.
+    fn cancel(&self, request: CancelWorkflowRequest) -> WorkflowLifecycleFuture<'_>;
 }

@@ -186,4 +186,30 @@ pub trait RunExecutor: Send + Sync {
     fn blackboard_hub(&self) -> Option<crate::blackboard::BlackboardHub> {
         None
     }
+
+    /// The assembly-provided [`WorkflowReader`](crate::workflow_stream::WorkflowReader)
+    /// that projects a workflow run's observability snapshot for an accepted
+    /// `ReadWorkflowRun` command (Phase 5 STEP 5.2 / T9). Bundled with the executor
+    /// like the workflow seams — it names the `codypendent-workflow` store and the
+    /// pool, which only the assembly can. The default `None` leaves snapshot reads
+    /// unwired: the executor-less server and the daemon's own tests then reject
+    /// `ReadWorkflowRun` with `workflow.transport-unavailable`.
+    fn workflow_reader(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::workflow_stream::WorkflowReader>> {
+        None
+    }
+
+    /// The per-run node-lifecycle fan-out
+    /// ([`WorkflowHub`](crate::workflow_stream::WorkflowHub)) the workflow host
+    /// publishes node transitions through and the server subscribes a client's
+    /// `Subscription::Workflow` forwarder to (Phase 5 STEP 5.2 / T9). Returned here —
+    /// rather than created fresh by the server like the document hub — because the
+    /// *publisher* is the workflow host + observer deep inside the executor, not a
+    /// command the server intercepts, so both sides must share the executor's hub
+    /// (exactly as the blackboard hub is shared). The default `None` leaves the server
+    /// to create its own fresh (never-published) hub — the executor-less path.
+    fn workflow_hub(&self) -> Option<crate::workflow_stream::WorkflowHub> {
+        None
+    }
 }

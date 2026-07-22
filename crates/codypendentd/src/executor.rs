@@ -32,6 +32,7 @@ use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
+use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::WorktreeManager;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
@@ -52,8 +53,8 @@ use tracing::{error, info, warn};
 use crate::blackboard::WorkflowBlackboardReader;
 use crate::promotion::PromotionStoreGateway;
 use crate::scan;
-use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor};
-use crate::workflows::WorkflowConductorHost;
+use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
+use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
 
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
@@ -116,6 +117,16 @@ pub struct RuntimeExecutor {
     /// publisher is the agent loop inside the executor, so it cannot be a
     /// server-created fresh hub the way the document hub is.
     blackboards: BlackboardHub,
+    /// The per-run node-lifecycle fan-out (Phase 5 STEP 5.2 / T9). Owned here for the
+    /// same reason as `blackboards`: the publisher is the workflow host + observer
+    /// inside the executor, so the server subscribes a client's
+    /// `Subscription::Workflow` forwarder to THIS hub (via [`RunExecutor::workflow_hub`]).
+    workflows: WorkflowHub,
+    /// The in-flight node agent-run cancellation registry (T9). Owned here — and
+    /// carried across a `with_github` rebuild like `drive_locks` — so a
+    /// `CancelWorkflow` fires the token the node executor registered, even if the host
+    /// was reconfigured after the drive started.
+    workflow_cancellations: WorkflowRunCancellations,
 }
 
 impl RuntimeExecutor {
@@ -142,6 +153,11 @@ impl RuntimeExecutor {
         // The per-run blackboard fan-out, shared with every workflow agent node so
         // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
         let blackboards = BlackboardHub::new();
+        // The per-run node-lifecycle fan-out + the in-flight node cancellation
+        // registry, shared with the workflow host so its drives publish transitions
+        // here and its cancel seam fires the tokens the node executor registers (T9).
+        let workflows = WorkflowHub::new();
+        let workflow_cancellations = WorkflowRunCancellations::default();
         // The first workflow host this process builds: no existing drive-lock
         // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
@@ -153,6 +169,8 @@ impl RuntimeExecutor {
             None,
             startup_repository_root.clone(),
             blackboards.clone(),
+            workflows.clone(),
+            workflow_cancellations.clone(),
         );
         let promotion = PromotionStoreGateway::new(pool.clone());
         Self {
@@ -168,6 +186,8 @@ impl RuntimeExecutor {
             repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             promotion,
             blackboards,
+            workflows,
+            workflow_cancellations,
         }
     }
 
@@ -212,6 +232,11 @@ impl RuntimeExecutor {
             Some(drive_locks),
             self.startup_repository_root.clone(),
             self.blackboards.clone(),
+            // Carry the SAME node-lifecycle hub + cancellation registry forward (like
+            // `drive_locks`), so a drive that started under the OLD host still
+            // publishes to — and is cancellable through — the shared instances (T9).
+            self.workflows.clone(),
+            self.workflow_cancellations.clone(),
         );
         self
     }
@@ -716,6 +741,19 @@ impl RunExecutor for RuntimeExecutor {
         // published deep inside the workflow executor, reach the server's
         // `Subscription::Blackboard` forwarders (Phase 5 STEP 5.3).
         Some(self.blackboards.clone())
+    }
+
+    fn workflow_reader(&self) -> Option<Arc<dyn WorkflowReader>> {
+        // Read a durable run's observability snapshot for a `ReadWorkflowRun` command
+        // over the workflow store on the shared pool (Phase 5 STEP 5.2 / T9).
+        Some(Arc::new(WorkflowRunReader::new(self.pool.clone())))
+    }
+
+    fn workflow_hub(&self) -> Option<WorkflowHub> {
+        // The server reuses THIS hub (rather than a fresh one) so node transitions,
+        // published by the workflow host's observer deep inside the executor, reach the
+        // server's `Subscription::Workflow` forwarders (Phase 5 STEP 5.2 / T9).
+        Some(self.workflows.clone())
     }
 }
 

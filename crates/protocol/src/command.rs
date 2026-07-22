@@ -207,6 +207,35 @@ pub enum CommandBody {
         /// The node id to re-drive from (its transitive dependents reset with it).
         node_id: String,
     },
+    /// Cancel a durable workflow run (Phase 5 STEP 5.2 / T9 — the missing control:
+    /// pause/resume/retry exist, cancel did not). Like `PauseWorkflow`, handled at
+    /// the connection level and gated to the
+    /// [`Controller`](crate::handshake::ClientRole::Controller) role. A cooperative
+    /// drain (mirroring pause): the driver stops launching further nodes, any
+    /// in-flight node's agent run is interrupted through the same cancellation
+    /// machinery `CancelRun` uses, every still-`Pending` node becomes `Skipped`, and
+    /// the run lands `Cancelled` — a **terminal** state (no resume from `Cancelled`;
+    /// a later resume/pause is rejected `workflow.illegal-transition`). Idempotent on
+    /// an already-cancelled run; a daemon without workflow transport rejects it
+    /// `workflow.transport-unavailable`.
+    CancelWorkflow {
+        workflow_run_id: String,
+    },
+    /// Read a durable workflow run's observability snapshot (Phase 5 STEP 5.2 / T9):
+    /// the run's current phase plus every node's full current view (state, attempt,
+    /// measured cost, failure/block reason, budget warnings), in topological order.
+    /// Like `ReadBlackboard`, intercepted at the connection level (a workflow run
+    /// lives in its own durable store outside the session ledger) and served through
+    /// the assembly's `WorkflowReader` seam; the daemon replies
+    /// [`WorkflowRunSnapshot`](crate::envelope::Payload::WorkflowRunSnapshot). This
+    /// is the catch-up baseline a client folds a `Subscription::Workflow` live stream
+    /// on top of; reconstructed from the store, so a late subscriber after a restart
+    /// still gets a truthful baseline. A **read** — any attached client (an Observer
+    /// included) may issue it. An unknown run is rejected `workflow.run-not-found`; a
+    /// daemon without workflow transport rejects it `workflow.transport-unavailable`.
+    ReadWorkflowRun {
+        workflow_run_id: String,
+    },
     /// Draft a candidate for the evaluation-gated promotion pipeline (Phase 7
     /// STEP 7.5 — nothing promotes itself, ADR-010).
     ///
@@ -441,6 +470,12 @@ mod tests {
         round_trip(CommandBody::RetryWorkflowNode {
             workflow_run_id: "wfrun-abc123".to_string(),
             node_id: "verify".to_string(),
+        });
+        round_trip(CommandBody::CancelWorkflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        });
+        round_trip(CommandBody::ReadWorkflowRun {
+            workflow_run_id: "wfrun-abc123".to_string(),
         });
         round_trip(CommandBody::ProposePromotion {
             kind: "router".to_string(),

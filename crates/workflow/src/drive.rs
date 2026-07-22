@@ -131,10 +131,55 @@ pub trait NodeExecutor: Send + Sync {
     async fn execute(&self, ctx: NodeContext<'_>) -> NodeOutcome;
 }
 
+/// The full detail of one node-state transition the driver reports to a
+/// [`NodeObserver`] (T9). It carries not just the new `state` and `attempt` but the
+/// node's **measured cost** and **failure/block reason** at that transition, and any
+/// **budget warnings** raised while charging it — everything a client-facing
+/// `WorkflowNodeView` needs, captured synchronously at the transition (the observer
+/// callback is sync, so it cannot re-read the store, and the store write that
+/// preceded this call has the same values). Fields not applicable to a state are
+/// absent (a `Running` transition carries no cost/error; a `Completed` carries cost
+/// and any warnings; a `Failed`/`Blocked` carries the reason).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeTransition<'a> {
+    /// The node that transitioned.
+    pub node_id: &'a str,
+    /// The state it entered.
+    pub state: NodeState,
+    /// The 1-based attempt the transition is for.
+    pub attempt: u32,
+    /// The node's measured cost, when the transition records one (`Completed`,
+    /// `Blocked`), else `None`.
+    pub cost: Option<&'a Value>,
+    /// The failure/block reason, when the transition carries one (`Failed`,
+    /// `Blocked`), else `None`.
+    pub error: Option<&'a str>,
+    /// Budget dimensions that crossed 80% while charging this node (relayed on the
+    /// `Completed` transition); empty otherwise.
+    pub warnings: &'a [BudgetWarning],
+}
+
+impl<'a> NodeTransition<'a> {
+    /// A bare transition into `state` on `attempt`, with no cost/error/warnings —
+    /// the shape a `Running` transition (and most tests) uses.
+    #[must_use]
+    pub fn new(node_id: &'a str, state: NodeState, attempt: u32) -> Self {
+        Self {
+            node_id,
+            state,
+            attempt,
+            cost: None,
+            error: None,
+            warnings: &[],
+        }
+    }
+}
+
 /// Observes each node-state transition as the driver records it — the seam the
-/// daemon fills to emit `WorkflowNodeTransitioned` ledger events. A no-op
-/// implementation is provided for `()`, so a caller that does not observe passes
-/// `&()`.
+/// daemon fills to publish `WorkflowNodeTransitioned` events to a run's subscribers
+/// (T9). A no-op implementation is provided for `()`, so a caller that does not
+/// observe passes `&()`; a `(A, B)` tuple composes two observers (the daemon runs a
+/// logging observer and a publishing one over one drive — compose, don't replace).
 ///
 /// Beyond durable state transitions, the driver reports three kinds of progress
 /// that are *not* durable node state (they are history, not the latest fact), so
@@ -143,11 +188,13 @@ pub trait NodeExecutor: Send + Sync {
 /// will retry — the durable `error` column keeps only the latest/terminal
 /// reason, so the per-attempt history goes here), and a **recovery reset** (a
 /// node left `Running`/`Blocked` by an interrupted drive, reset to re-drive).
-/// All three have default no-op bodies, so an existing observer (and `()`) is
-/// unaffected; the daemon's logging observer overrides them.
+/// All three have default no-op bodies, so an observer that only cares about
+/// transitions (and `()`) is unaffected; the daemon's logging observer overrides
+/// them.
 pub trait NodeObserver: Send + Sync {
-    /// Called after the driver records `node_id` entering `state` on `attempt`.
-    fn on_transition(&self, node_id: &str, state: NodeState, attempt: u32);
+    /// Called after the driver records the [`NodeTransition`] durably (so a
+    /// publisher observes persist-before-publish).
+    fn on_transition(&self, transition: NodeTransition<'_>);
 
     /// A budget dimension crossed 80% while charging `node_id` on `attempt`
     /// (the node stayed within budget — this is a warning, not a block).
@@ -165,7 +212,33 @@ pub trait NodeObserver: Send + Sync {
 }
 
 impl NodeObserver for () {
-    fn on_transition(&self, _node_id: &str, _state: NodeState, _attempt: u32) {}
+    fn on_transition(&self, _transition: NodeTransition<'_>) {}
+}
+
+/// Compose two observers over one drive: every callback fans out to both, in
+/// order. Lets the daemon run its logging observer alongside a publishing observer
+/// without either knowing about the other (T9: compose, don't replace).
+impl<A: NodeObserver, B: NodeObserver> NodeObserver for (A, B) {
+    fn on_transition(&self, transition: NodeTransition<'_>) {
+        self.0.on_transition(transition);
+        self.1.on_transition(transition);
+    }
+
+    fn on_budget_warning(&self, node_id: &str, warning: BudgetWarning, attempt: u32) {
+        // `BudgetWarning` is `Copy`, so both observers get their own value.
+        self.0.on_budget_warning(node_id, warning, attempt);
+        self.1.on_budget_warning(node_id, warning, attempt);
+    }
+
+    fn on_attempt_failed(&self, node_id: &str, attempt: u32, error: &str) {
+        self.0.on_attempt_failed(node_id, attempt, error);
+        self.1.on_attempt_failed(node_id, attempt, error);
+    }
+
+    fn on_recovery_reset(&self, node_id: &str, attempt: u32) {
+        self.0.on_recovery_reset(node_id, attempt);
+        self.1.on_recovery_reset(node_id, attempt);
+    }
 }
 
 /// Drives a durable workflow run to a terminal state through a [`NodeExecutor`].
@@ -448,7 +521,7 @@ impl WorkflowDriver {
                     None,
                 )
                 .await?;
-            observer.on_transition(&node.id, NodeState::Running, attempt);
+            observer.on_transition(NodeTransition::new(&node.id, NodeState::Running, attempt));
 
             let outcome = executor
                 .execute(NodeContext {
@@ -474,12 +547,23 @@ impl WorkflowDriver {
                             cost.as_ref(),
                         )
                         .await?;
-                    observer.on_transition(&node.id, NodeState::Completed, attempt);
-                    // Relay any 80%-threshold budget warnings the executor raised
-                    // while charging this node — a client (today, the daemon log)
-                    // learns the run nears a ceiling. Success is not withheld.
-                    for warning in warnings {
-                        observer.on_budget_warning(&node.id, warning, attempt);
+                    // The Completed transition carries the node's measured cost and
+                    // any budget warnings, so a publishing observer builds the full
+                    // node view in one synchronous call (T9).
+                    observer.on_transition(NodeTransition {
+                        node_id: &node.id,
+                        state: NodeState::Completed,
+                        attempt,
+                        cost: cost.as_ref(),
+                        error: None,
+                        warnings: &warnings,
+                    });
+                    // Also relay each 80%-threshold budget warning on its own — the
+                    // daemon's logging observer (and T8's tests) consume this
+                    // per-warning callback; a publisher reads them off the transition
+                    // above instead.
+                    for warning in &warnings {
+                        observer.on_budget_warning(&node.id, *warning, attempt);
                     }
                     return Ok(());
                 }
@@ -502,7 +586,14 @@ impl WorkflowDriver {
                             Some(&error),
                         )
                         .await?;
-                    observer.on_transition(&node.id, NodeState::Blocked, attempt);
+                    observer.on_transition(NodeTransition {
+                        node_id: &node.id,
+                        state: NodeState::Blocked,
+                        attempt,
+                        cost: cost.as_ref(),
+                        error: Some(&error),
+                        warnings: &[],
+                    });
                     // Pause only from `Running` (a concurrent cancel must win): the
                     // conditional write never clobbers a state that already moved.
                     self.store
@@ -547,7 +638,14 @@ impl WorkflowDriver {
                             Some(&error),
                         )
                         .await?;
-                    observer.on_transition(&node.id, NodeState::Failed, attempt);
+                    observer.on_transition(NodeTransition {
+                        node_id: &node.id,
+                        state: NodeState::Failed,
+                        attempt,
+                        cost: None,
+                        error: Some(&error),
+                        warnings: &[],
+                    });
                     return Ok(());
                 }
             }
@@ -625,11 +723,12 @@ mod tests {
     }
 
     impl NodeObserver for RecordingObserver {
-        fn on_transition(&self, node_id: &str, state: NodeState, attempt: u32) {
-            self.seen
-                .lock()
-                .unwrap()
-                .push((node_id.to_owned(), state, attempt));
+        fn on_transition(&self, transition: NodeTransition<'_>) {
+            self.seen.lock().unwrap().push((
+                transition.node_id.to_owned(),
+                transition.state,
+                transition.attempt,
+            ));
         }
 
         fn on_budget_warning(

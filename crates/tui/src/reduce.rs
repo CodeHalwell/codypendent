@@ -181,7 +181,35 @@ pub fn reduce(state: &mut AppState, action: Action) {
         } => on_lease_granted(state, document_id, lease_id),
         Action::DocumentLeaseBlocked => on_lease_blocked(state),
 
+        // --- Workflow-graph live overlay (Phase 5 T9) ---
+        Action::WorkflowNodeUpdated {
+            node_id,
+            state: node_state,
+            cost,
+            error,
+        } => apply_workflow_node_update(state, &node_id, node_state, cost, error),
+
         Action::NoOp => {}
+    }
+}
+
+/// Overlay a live workflow node transition onto the graph-view cards (Phase 5 T9):
+/// every card matching `node_id` takes the transition's pre-rendered `state` / `cost`
+/// / `error`, so the view reflects the run advancing instead of the forever-`pending`
+/// pre-run placeholders. Idempotent overwrite (a re-delivered transition writes the
+/// same values), keyed by node id — the fold the CLI harness feeds after folding a
+/// `Payload::WorkflowEvent`.
+fn apply_workflow_node_update(
+    state: &mut AppState,
+    node_id: &str,
+    node_state: String,
+    cost: String,
+    error: String,
+) {
+    for card in state.workflow.iter_mut().filter(|card| card.id == node_id) {
+        card.state = node_state.clone();
+        card.cost = cost.clone();
+        card.error = error.clone();
     }
 }
 
@@ -2232,6 +2260,57 @@ mod tests {
         }
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::Workflow);
+    }
+
+    #[test]
+    fn a_live_workflow_transition_overlays_the_matching_graph_card() {
+        // T9: a live node transition folds into the graph view — the forever-`pending`
+        // placeholder becomes the run's real state/cost/error, so `node_state_color`'s
+        // non-pending branches come alive. Only the matching node id is touched.
+        let mut s = AppState::new();
+        s.workflow = vec![node("inspect"), node("verify")];
+
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "inspect".to_owned(),
+                state: "completed".to_owned(),
+                cost: "12s · 3 tool calls".to_owned(),
+                error: "—".to_owned(),
+            },
+        );
+
+        let inspect = s.workflow.iter().find(|c| c.id == "inspect").unwrap();
+        assert_eq!(inspect.state, "completed");
+        assert_eq!(inspect.cost, "12s · 3 tool calls");
+        assert_eq!(inspect.error, "—");
+        // The other node is untouched by the transition.
+        let verify = s.workflow.iter().find(|c| c.id == "verify").unwrap();
+        assert_eq!(verify.state, "pending");
+
+        // A failing transition carries its reason, and the fold is idempotent — a
+        // re-delivered transition writes the same values (overlap is harmless).
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "verify".to_owned(),
+                state: "failed".to_owned(),
+                cost: "—".to_owned(),
+                error: "the test command exited 1".to_owned(),
+            },
+        );
+        reduce(
+            &mut s,
+            Action::WorkflowNodeUpdated {
+                node_id: "verify".to_owned(),
+                state: "failed".to_owned(),
+                cost: "—".to_owned(),
+                error: "the test command exited 1".to_owned(),
+            },
+        );
+        let verify = s.workflow.iter().find(|c| c.id == "verify").unwrap();
+        assert_eq!(verify.state, "failed");
+        assert_eq!(verify.error, "the test command exited 1");
     }
 
     fn item(kind: &str) -> crate::state::BlackboardItemCard {

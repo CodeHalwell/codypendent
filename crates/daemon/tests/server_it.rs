@@ -759,11 +759,12 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
 
 #[tokio::test]
 async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
-    // Phase 5 STEP 5.2: pause/resume/retry are intercepted like `StartWorkflow`, but
-    // controlling a run requires the `Controller` role (matching agent-run
-    // cancel/pause/resume). A Contributor is role-denied; a Controller gets past the
-    // gate but the daemon's own test server injects no lifecycle seam, so the command
-    // is rejected `workflow.transport-unavailable` rather than crashing the connection.
+    // Phase 5 STEP 5.2 / T9: pause/resume/retry/cancel are intercepted like
+    // `StartWorkflow`, but controlling a run requires the `Controller` role (matching
+    // agent-run cancel/pause/resume). A Contributor is role-denied; a Controller gets
+    // past the gate but the daemon's own test server injects no lifecycle seam, so the
+    // command is rejected `workflow.transport-unavailable` rather than crashing the
+    // connection. An Observer is denied cancel too (role checked before the seam).
     let tmp = tempfile::tempdir().unwrap();
     let (paths, task) = start_server(&tmp).await;
 
@@ -828,6 +829,13 @@ async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
             },
             "retry-controller",
         ),
+        (
+            // Cancel is Controller-gated through the same seam (T9).
+            CommandBody::CancelWorkflow {
+                workflow_run_id: "wfrun-1".to_string(),
+            },
+            "cancel-controller",
+        ),
     ] {
         let reply = send_recv(
             &mut stream,
@@ -840,6 +848,36 @@ async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
             }
             other => panic!("expected transport-unavailable for {key}, got {other:?}"),
         }
+    }
+
+    // An Observer cannot cancel a run (T9): role is checked before the seam, so the
+    // read-only role is denied regardless of transport.
+    let observer = ClientId::new();
+    let mut obs_stream = connect(&paths).await;
+    handshake(&mut obs_stream, observer).await;
+    bind_role(
+        &mut obs_stream,
+        observer,
+        ClientRole::Observer,
+        "obs-cancel-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut obs_stream,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::CancelWorkflow {
+                    workflow_run_id: "wfrun-1".to_string(),
+                },
+                "cancel-observer",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied for an Observer cancel, got {other:?}"),
     }
 
     shutdown(stream, task).await;

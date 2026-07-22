@@ -15,7 +15,8 @@ use codypendent_knowledge::{
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DocumentId, Payload,
-    PromotionAction, SessionId, Subscription, WorkspaceId,
+    PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView, WorkflowRunPhase,
+    WorkflowRunSnapshot, WorkspaceId,
 };
 
 use crate::client;
@@ -884,6 +885,232 @@ pub async fn workflow_retry(
         "retry",
     )
     .await
+}
+
+/// `codypendent workflow cancel <RUN_ID>` (Phase 5 T9). A cooperative drain — the
+/// driver stops launching new nodes, any in-flight node's agent run is interrupted,
+/// pending nodes are skipped, and the run lands cancelled (terminal — no resume).
+pub async fn workflow_cancel(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    lifecycle_command(
+        paths,
+        CommandBody::CancelWorkflow { workflow_run_id },
+        "cancel",
+    )
+    .await
+}
+
+/// `codypendent workflow watch <RUN_ID>` (Phase 5 T9): print the run's current
+/// observability snapshot, then stream each node transition + run-phase change until
+/// the run reaches a terminal phase. Attaches a `Subscription::Workflow` forwarder to
+/// a throwaway session (the connection-level anchor a per-run subscription needs),
+/// reads the snapshot as the baseline over the SAME connection, then folds the live
+/// stream — the catch-up/idempotency contract (subscribe-then-snapshot, merge by
+/// node id). Does not start a daemon: watching only makes sense against a live run.
+pub async fn workflow_watch(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    workflow_watch_over_connection(&mut conn, workflow_run_id, &mut stdout).await
+}
+
+/// The connected core of [`workflow_watch`], split out for testability like
+/// [`workflow_run_over_connection`]: handshake, create + attach a throwaway session
+/// carrying the `Subscription::Workflow` forwarder, read the snapshot baseline, then
+/// stream live events until a terminal run phase.
+pub async fn workflow_watch_over_connection<W: Write>(
+    conn: &mut Connection,
+    workflow_run_id: String,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+
+    // A per-run subscription forwarder spawns only on a valid session attach (the
+    // connection-level anchor); create a throwaway session as the Observer to carry
+    // it. Subscribe BEFORE reading the snapshot so no transition is missed between
+    // the read and the subscribe (the catch-up contract).
+    let create_reply = conn
+        .send_command(CommandBody::CreateSession {
+            workspace: WorkspaceId::new(),
+            title: format!("watch {workflow_run_id}"),
+        })
+        .await?;
+    let session_id = match &create_reply.payload {
+        Payload::CommandAccepted { .. } => create_reply.session_id.ok_or_else(|| {
+            anyhow::anyhow!("daemon accepted CreateSession but sent no session id")
+        })?,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("CreateSession rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to CreateSession: {other:?}"),
+    };
+    conn.send_command(CommandBody::AttachSession {
+        session_id,
+        last_seen_sequence: None,
+        subscriptions: vec![Subscription::Workflow {
+            workflow_run_id: workflow_run_id.clone(),
+        }],
+        requested_role: ClientRole::Observer,
+    })
+    .await?;
+
+    // The catch-up baseline: the run's current phase + every node's view.
+    let snapshot_reply = conn
+        .send_command(CommandBody::ReadWorkflowRun {
+            workflow_run_id: workflow_run_id.clone(),
+        })
+        .await?;
+    match snapshot_reply.payload {
+        Payload::WorkflowRunSnapshot { snapshot, .. } => {
+            render_workflow_snapshot(out, &snapshot)?;
+            if snapshot_phase_is_terminal(snapshot.phase) {
+                // Already finished — nothing to stream.
+                return Ok(());
+            }
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "ReadWorkflowRun rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to ReadWorkflowRun: {other:?}"),
+    }
+
+    // Fold the live stream until a terminal run phase (or the daemon closes).
+    while let Some(envelope) = conn.next_envelope().await? {
+        if let Payload::WorkflowEvent { event } = envelope.payload {
+            // Route only this run's events (the frame is not session-scoped).
+            if workflow_event_run_id(&event) != Some(workflow_run_id.as_str()) {
+                continue;
+            }
+            render_workflow_event(out, &event)?;
+            if let WorkflowEvent::RunPhaseChanged { phase, .. } = &event {
+                if snapshot_phase_is_terminal(*phase) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a run phase is terminal (the watch stream ends there).
+fn snapshot_phase_is_terminal(phase: WorkflowRunPhase) -> bool {
+    matches!(
+        phase,
+        WorkflowRunPhase::Completed | WorkflowRunPhase::Failed | WorkflowRunPhase::Cancelled
+    )
+}
+
+/// The run id a live workflow event belongs to.
+fn workflow_event_run_id(event: &WorkflowEvent) -> Option<&str> {
+    match event {
+        WorkflowEvent::NodeTransitioned(view) => Some(view.workflow_run_id.as_str()),
+        WorkflowEvent::RunPhaseChanged {
+            workflow_run_id, ..
+        } => Some(workflow_run_id.as_str()),
+        _ => None,
+    }
+}
+
+/// Print a run snapshot as a human header + one line per node.
+fn render_workflow_snapshot<W: Write>(
+    out: &mut W,
+    snapshot: &WorkflowRunSnapshot,
+) -> anyhow::Result<()> {
+    writeln!(
+        out,
+        "workflow run {} — {}",
+        snapshot.workflow_run_id,
+        run_phase_label(snapshot.phase)
+    )?;
+    for node in &snapshot.nodes {
+        writeln!(out, "  {}", node_view_line(node))?;
+    }
+    Ok(())
+}
+
+/// Print one live workflow event as a human line.
+fn render_workflow_event<W: Write>(out: &mut W, event: &WorkflowEvent) -> anyhow::Result<()> {
+    match event {
+        WorkflowEvent::NodeTransitioned(view) => writeln!(out, "  {}", node_view_line(view))?,
+        WorkflowEvent::RunPhaseChanged { phase, .. } => {
+            writeln!(out, "run {}", run_phase_label(*phase))?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A one-line human rendering of a node's view (state, attempt, cost, error).
+fn node_view_line(view: &WorkflowNodeView) -> String {
+    let mut line = format!("{}: {}", view.node_id, node_state_label(view));
+    if view.attempt > 1 {
+        line.push_str(&format!(" (attempt {})", view.attempt));
+    }
+    if let Some(cost) = &view.cost {
+        if let Some(rendered) = render_cost(cost) {
+            line.push_str(&format!(" · {rendered}"));
+        }
+    }
+    if let Some(error) = &view.error {
+        line.push_str(&format!(" — {error}"));
+    }
+    line
+}
+
+/// The wire node state as a lowercase label.
+fn node_state_label(view: &WorkflowNodeView) -> &'static str {
+    use codypendent_protocol::WorkflowNodeState::*;
+    match view.state {
+        Pending => "pending",
+        Running => "running",
+        WaitingApproval => "waiting_approval",
+        Blocked => "blocked",
+        Completed => "completed",
+        Failed => "failed",
+        Skipped => "skipped",
+        _ => "unknown",
+    }
+}
+
+/// The wire run phase as a lowercase label.
+fn run_phase_label(phase: WorkflowRunPhase) -> &'static str {
+    match phase {
+        WorkflowRunPhase::Pending => "pending",
+        WorkflowRunPhase::Running => "running",
+        WorkflowRunPhase::Paused => "paused",
+        WorkflowRunPhase::Completed => "completed",
+        WorkflowRunPhase::Failed => "failed",
+        WorkflowRunPhase::Cancelled => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`) as a human
+/// string, or `None` when empty. Only measured dimensions — never a fabricated
+/// token/USD figure (T8).
+fn render_cost(cost: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(secs) = cost.get("wall_time_secs").and_then(|v| v.as_u64()) {
+        parts.push(format!("{secs}s"));
+    }
+    if let Some(calls) = cost.get("tool_calls").and_then(|v| v.as_u64()) {
+        let unit = if calls == 1 {
+            "tool call"
+        } else {
+            "tool calls"
+        };
+        parts.push(format!("{calls} {unit}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
 }
 
 /// Send one workflow lifecycle command to a *running* daemon (it does not start

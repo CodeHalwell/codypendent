@@ -186,6 +186,46 @@ impl WorkflowConductor {
         }
     }
 
+    /// Cancel a run (STEP 5.2 / T9 — the control pause/resume/retry left missing).
+    /// A cooperative drain mirroring [`pause`](Self::pause): flip the run to
+    /// [`Cancelled`](WorkflowRunState::Cancelled) so a live driver stops launching
+    /// further nodes at its next scheduling boundary, and mark every still-`Pending`
+    /// node [`Skipped`](crate::store::NodeState::Skipped) (they will never run). An
+    /// in-flight node's agent run is interrupted separately, at the daemon layer,
+    /// through the same cancellation machinery `CancelRun` uses — this crate is
+    /// daemon-free and cannot reach it, so the caller fires the token.
+    ///
+    /// Returns the node ids newly skipped, so the caller can publish a transition
+    /// for each. `Cancelled` is **terminal**: cancelling an already-cancelled run is
+    /// an idempotent no-op (no nodes newly skipped), and cancelling a
+    /// completed/failed run is an
+    /// [`IllegalTransition`](ConductorError::IllegalTransition).
+    ///
+    /// Order matters: the run is flipped to `Cancelled` **before** the pending nodes
+    /// are skipped, so the driver sees the cancel and stops promptly; a node the
+    /// driver races into `Running` in that window is left for token cancellation, not
+    /// wrongly skipped.
+    pub async fn cancel(
+        &self,
+        pool: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<Vec<String>, ConductorError> {
+        match self.state(pool, workflow_run_id).await? {
+            WorkflowRunState::Pending | WorkflowRunState::Running | WorkflowRunState::Paused => {
+                self.store
+                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Cancelled)
+                    .await?;
+                let skipped = self.store.skip_pending_nodes(pool, workflow_run_id).await?;
+                Ok(skipped)
+            }
+            WorkflowRunState::Cancelled => Ok(Vec::new()),
+            terminal => Err(ConductorError::IllegalTransition {
+                action: "cancelled",
+                state: terminal.as_str(),
+            }),
+        }
+    }
+
     /// Validate that a run may be resumed — that it is [`Paused`] — and flip it
     /// to [`Running`](WorkflowRunState::Running), so the daemon can reply to a
     /// `ResumeWorkflow` command *synchronously* (accepted / rejected) and then
@@ -595,6 +635,68 @@ steps:
                 state: "completed"
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_skips_pending_nodes_and_cancels_the_run() {
+        // A paused run (its node `a` completed, `b`/`c` still pending) is cancelled:
+        // the run lands `Cancelled` and every still-pending node becomes `Skipped`.
+        let (_tmp, pool) = temp_pool().await;
+        let store = WorkflowStore::new();
+        let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        let conductor = WorkflowConductor::new();
+
+        let pauser = FakeExecutor::pausing_after(pool.clone(), "a");
+        conductor.drive(&pool, &run_id, &pauser, &()).await.unwrap();
+
+        let skipped = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert_eq!(skipped, vec!["b".to_string(), "c".to_string()]);
+
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(snap.run.state, WorkflowRunState::Cancelled);
+        let state_of = |id: &str| {
+            snap.nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .map(|n| n.state)
+                .unwrap()
+        };
+        assert_eq!(state_of("a"), NodeState::Completed, "a already completed");
+        assert_eq!(state_of("b"), NodeState::Skipped);
+        assert_eq!(state_of("c"), NodeState::Skipped);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_idempotent_and_a_terminal_run_rejects() {
+        let (_tmp, pool) = temp_pool().await;
+        let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        let conductor = WorkflowConductor::new();
+
+        // First cancel of a fresh (pending) run skips all three nodes.
+        let skipped = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert_eq!(skipped.len(), 3);
+        // A second cancel is an idempotent no-op — the run is already cancelled,
+        // nothing newly skipped.
+        let again = conductor.cancel(&pool, &run_id).await.unwrap();
+        assert!(again.is_empty(), "re-cancel skips nothing: {again:?}");
+
+        // A COMPLETED run cannot be cancelled.
+        let done = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        conductor
+            .drive(&pool, &done, &FakeExecutor::default(), &())
+            .await
+            .unwrap();
+        let err = conductor.cancel(&pool, &done).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConductorError::IllegalTransition {
+                    action: "cancelled",
+                    state: "completed"
+                }
+            ),
+            "expected illegal-transition, got {err:?}"
+        );
     }
 
     #[tokio::test]

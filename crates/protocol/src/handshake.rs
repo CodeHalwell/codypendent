@@ -109,6 +109,19 @@ pub enum Subscription {
     /// revision arrives as its own delivery, so no watermark is needed). Mirrors
     /// [`Document`](Subscription::Document)'s per-id hub, keyed by workflow run.
     Blackboard { workflow_run_id: String },
+    /// A workflow run's live node-lifecycle stream (Phase 5 STEP 5.2 / T9): as the
+    /// driver advances the graph, the daemon fans each
+    /// [`WorkflowEvent`](crate::workflow::WorkflowEvent) out to subscribers over a
+    /// per-run hub, delivered as
+    /// [`Payload::WorkflowEvent`](crate::envelope::Payload::WorkflowEvent). A
+    /// subscriber's baseline comes from the run snapshot command
+    /// ([`ReadWorkflowRun`](crate::command::CommandBody::ReadWorkflowRun)); this
+    /// stream carries the post-subscribe node transitions + run-phase changes it
+    /// merges by `node_id` (each transition is full-state, so an overlap is a
+    /// harmless re-write — no watermark). Mirrors
+    /// [`Blackboard`](Subscription::Blackboard)'s per-run hub, keyed by workflow
+    /// run.
+    Workflow { workflow_run_id: String },
     #[serde(other)]
     Unknown,
 }
@@ -196,6 +209,15 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Subscription>(&json).expect("deserialize"),
             blackboard
+        );
+        // The per-run workflow observability subscription (T9) round-trips too.
+        let workflow = Subscription::Workflow {
+            workflow_run_id: "wfrun-abc123".to_string(),
+        };
+        let json = serde_json::to_string(&workflow).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<Subscription>(&json).expect("deserialize"),
+            workflow
         );
     }
 

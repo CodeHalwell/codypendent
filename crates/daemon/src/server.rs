@@ -47,9 +47,10 @@ use crate::promotion::{
     RollbackPromotionRequest,
 };
 use crate::subscriptions::SubscriptionHub;
+use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
-    PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest, StartWorkflowRequest,
-    WorkflowLifecycle, WorkflowStarter,
+    CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
+    StartWorkflowRequest, WorkflowLifecycle, WorkflowStarter,
 };
 
 /// Heartbeat cadence advertised in `ServerHello` and used to probe idle clients.
@@ -121,6 +122,17 @@ pub struct ServerState {
     /// rejected `workflow.transport-unavailable`); the assembly injects a
     /// `codypendent-workflow`-backed implementation over the pool.
     pub blackboard_reader: Option<Arc<dyn BlackboardReader>>,
+    /// Per-workflow-run node-lifecycle fan-out: the workflow host publishes each
+    /// node transition (and run-phase change) here, and a client's
+    /// `Subscription::Workflow` forwarder delivers from it (Phase 5 STEP 5.2 / T9).
+    /// Reuses the executor's own hub (the publisher is the driver inside the
+    /// executor), or a fresh empty one in a lib-only / test embedding.
+    pub workflows: WorkflowHub,
+    /// Reads a durable run's observability snapshot for an accepted `ReadWorkflowRun`
+    /// (Phase 5 STEP 5.2 / T9). `None` in a lib-only / test embedding (the command is
+    /// then rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub workflow_reader: Option<Arc<dyn WorkflowReader>>,
     /// Computes an accepted `PublishDocument` command's plan, parks its approval,
     /// and (once approved) executes it (Phase 4 STEP 4.4). `None` in a lib-only /
     /// test embedding (the command is then rejected
@@ -224,6 +236,15 @@ pub async fn run_with_executor_on(
         .as_ref()
         .and_then(|e| e.blackboard_hub())
         .unwrap_or_default();
+    // The workflow observability seams, bundled with the executor exactly like the
+    // blackboard ones: the per-run node-lifecycle hub is REUSED from the executor
+    // (the publisher is the driver inside it, so both sides must share one hub),
+    // and the snapshot reader is pulled out for `ReadWorkflowRun` (T9).
+    let workflow_reader = executor.as_ref().and_then(|e| e.workflow_reader());
+    let workflows = executor
+        .as_ref()
+        .and_then(|e| e.workflow_hub())
+        .unwrap_or_default();
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
@@ -235,6 +256,7 @@ pub async fn run_with_executor_on(
         let hub = subscriptions.clone();
         let doc_hub = documents.clone();
         let board_hub = blackboards.clone();
+        let workflow_hub = workflows.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -249,6 +271,7 @@ pub async fn run_with_executor_on(
                 hub.prune_idle();
                 doc_hub.prune_idle();
                 board_hub.prune_idle();
+                workflow_hub.prune_idle();
             }
         })
     };
@@ -277,6 +300,8 @@ pub async fn run_with_executor_on(
         promotion,
         blackboards,
         blackboard_reader,
+        workflows,
+        workflow_reader,
     });
 
     #[cfg(unix)]
@@ -1075,6 +1100,37 @@ async fn handle_request(
                         send(writer, &reply).await?;
                     }
                 }
+                // Cancel is the missing control (pause/resume/retry existed; T9): a
+                // cooperative drain, Controller-gated like the others, through the same
+                // `WorkflowLifecycle` seam. The seam performs the synchronous state
+                // change (run → Cancelled, pending nodes → Skipped) and interrupts any
+                // in-flight node agent run, so the reply is a fast accept/reject.
+                CommandBody::CancelWorkflow { workflow_run_id } => {
+                    if let Some(lifecycle) =
+                        workflow_control_seam(state, conn, writer, &request, "cancel").await?
+                    {
+                        let reply = match lifecycle
+                            .cancel(CancelWorkflowRequest {
+                                workflow_run_id: workflow_run_id.clone(),
+                                client_id: conn.client_id_or(request.client_id),
+                            })
+                            .await
+                        {
+                            Ok(()) => Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                        send(writer, &reply).await?;
+                    }
+                }
                 // A promotion candidate lives in its own durable store outside
                 // the session ledger — so, like `StartWorkflow`, it is
                 // intercepted here and applied through the assembly's
@@ -1338,6 +1394,41 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // Reading a workflow run's observability snapshot is intercepted at the
+                // connection level like `ReadBlackboard` (the run lives in its own
+                // durable store outside the session ledger). A READ — any client (an
+                // Observer included) may issue it — so it carries no role gate, only the
+                // transport check (Phase 5 STEP 5.2 / T9). It is the catch-up baseline a
+                // client folds a `Subscription::Workflow` live stream on top of.
+                CommandBody::ReadWorkflowRun { workflow_run_id } => {
+                    let Some(reader) = state.workflow_reader.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "workflow.transport-unavailable",
+                                "workflow transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let read = ReadWorkflowRunRequest {
+                        workflow_run_id: workflow_run_id.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match reader.read(read).await {
+                        Ok(snapshot) => Envelope::reply_to(
+                            &request,
+                            Payload::WorkflowRunSnapshot {
+                                command_id: command.command_id,
+                                snapshot,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -1565,6 +1656,14 @@ async fn handle_attach(
                     client_id,
                 )))
             }
+            Subscription::Workflow { workflow_run_id } => {
+                let receiver = state.workflows.subscribe(workflow_run_id.clone());
+                Some(tokio::spawn(forward_workflow_events(
+                    Arc::clone(writer),
+                    receiver,
+                    client_id,
+                )))
+            }
             _ => None,
         })
         .collect();
@@ -1707,6 +1806,33 @@ async fn forward_blackboard_posts(
                 }
             }
             // Slow consumer: skip the dropped span; the next read reconverges.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Forward a workflow run's live node-lifecycle events to one subscribed client,
+/// framing each as a [`Payload::WorkflowEvent`] (Phase 5 STEP 5.2 / T9). Never
+/// blocks the publisher: a lagging receiver skips the dropped span (its next
+/// snapshot read reconverges — each node transition is full-state, merged by
+/// `node_id`) and a vanished client ends the task. Workflow events are not
+/// session-scoped, so the frame carries no `session_id`; the client routes by the
+/// event's own `workflow_run_id`. Mirrors [`forward_blackboard_posts`].
+async fn forward_workflow_events(
+    writer: SharedWriter,
+    mut receiver: broadcast::Receiver<codypendent_protocol::WorkflowEvent>,
+    client_id: ClientId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let envelope = Envelope::request(client_id, Payload::WorkflowEvent { event });
+                if send(&writer, &envelope).await.is_err() {
+                    break; // client gone
+                }
+            }
+            // Slow consumer: skip the dropped span; the next snapshot reconverges.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }

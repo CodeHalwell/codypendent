@@ -55,8 +55,9 @@
 //! through the observer; exceeding blocks the node ([`NodeState::Blocked`]) and
 //! pauses the run for a human decision — an overrun is never silent.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -67,6 +68,7 @@ use codypendent_daemon::policy::{
     Capability, CommandScope, Decision, EvalContext, PathScope, PolicyEngine, GITHUB_API_ENDPOINT,
 };
 use codypendent_daemon::subscriptions::SubscriptionHub;
+use codypendent_daemon::workflow_stream::WorkflowHub;
 use codypendent_daemon::worktrees::WorktreeManager;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::model::UpdatePullRequest;
@@ -77,8 +79,8 @@ use codypendent_protocol::{
     RunDisposition, RunId, RunState, SessionId, ToolOutcome,
 };
 use codypendent_runtime::agent::{
-    mode_overlay, CancellationToken, FrameworkAgentRuntime, FrameworkModelDriver, ModelDriver,
-    RunContext, WorkflowContext,
+    cancellation, mode_overlay, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
+    FrameworkModelDriver, ModelDriver, RunContext, WorkflowContext,
 };
 use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardPost};
 use codypendent_runtime::models::{resolve_model, ModelRegistry};
@@ -232,6 +234,8 @@ pub(crate) fn build_workflow_host(
     drive_locks: Option<DriveLockRegistry>,
     startup_repository: PathBuf,
     blackboards: BlackboardHub,
+    workflows: WorkflowHub,
+    cancellations: WorkflowRunCancellations,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
@@ -245,12 +249,111 @@ pub(crate) fn build_workflow_host(
         factory,
         startup_repository,
         blackboards,
+        // The node executor shares the cancellation registry the host's cancel seam
+        // fires (T9), so a `CancelWorkflow` interrupts the in-flight node's agent run.
+        cancellations.clone(),
     );
-    match drive_locks {
+    let host = match drive_locks {
         Some(drive_locks) => {
             WorkflowConductorHost::with_drive_locks(pool, Arc::new(executor), drive_locks)
         }
         None => WorkflowConductorHost::new(pool, Arc::new(executor)),
+    };
+    // Give the host the SAME node-lifecycle hub (its observer + run-phase changes
+    // publish here) and cancellation registry (its cancel seam fires here) the node
+    // executor and the server share (T9).
+    host.with_streaming(workflows, cancellations)
+}
+
+/// Live cancellation handles for in-flight workflow **node** agent runs, keyed by
+/// workflow-run id (T9). [`AgentLoopNodeExecutor::drive_agent`] registers a handle
+/// before it drives a node's agent loop and removes it after; a `CancelWorkflow`
+/// (through [`WorkflowConductorHost`]'s cancel seam) fires every handle for a run so
+/// the in-flight node's agent run is interrupted through the **same** cancellation
+/// machinery `CancelRun` uses — not `CancellationToken::never()`, which left a
+/// workflow node's agent run uninterruptible before T9.
+///
+/// **Sticky.** Once a run is cancelled, a node that registers *afterwards* (a
+/// multi-attempt node re-entering `drive_agent` on retry) is born already cancelled,
+/// so a cancelled run never drives a fresh agent run to completion. The entry is
+/// pruned when the run's drive fully drains ([`finish`](Self::finish), called by the
+/// host after every drive) or, for a run cancelled while paused (no in-flight node),
+/// by `cancel` itself. Cheap to clone — an `Arc` over the shared registry.
+#[derive(Clone, Default)]
+pub(crate) struct WorkflowRunCancellations {
+    inner: Arc<Mutex<HashMap<String, RunCancelState>>>,
+}
+
+/// One run's cancellation bookkeeping in [`WorkflowRunCancellations`].
+#[derive(Default)]
+struct RunCancelState {
+    /// Whether the run has been cancelled (sticky, so a later registration is born
+    /// cancelled).
+    cancelled: bool,
+    /// A monotonic id source so each registration is removable independently.
+    next_id: u64,
+    /// The live handles for this run's in-flight node agent runs.
+    handles: HashMap<u64, CancellationHandle>,
+}
+
+impl WorkflowRunCancellations {
+    /// Register an in-flight node's agent run and get the token to drive it with.
+    /// The token is born cancelled if the run is already cancelled (sticky). Returns
+    /// the registration id to [`deregister`](Self::deregister) with once the drive
+    /// returns.
+    fn register(&self, workflow_run_id: &str) -> (u64, CancellationToken) {
+        let (handle, token) = cancellation();
+        let mut map = self.lock();
+        let entry = map.entry(workflow_run_id.to_owned()).or_default();
+        entry.next_id += 1;
+        let id = entry.next_id;
+        if entry.cancelled {
+            handle.cancel();
+        }
+        entry.handles.insert(id, handle);
+        (id, token)
+    }
+
+    /// Remove a registered handle once its node's agent run has returned. A drained,
+    /// never-cancelled run's entry is dropped so the map does not grow per run ever
+    /// driven; a cancelled run's entry is kept (sticky) so a retry is born cancelled
+    /// — the host's [`finish`](Self::finish) drops it once the whole drive drains.
+    fn deregister(&self, workflow_run_id: &str, id: u64) {
+        let mut map = self.lock();
+        if let Some(entry) = map.get_mut(workflow_run_id) {
+            entry.handles.remove(&id);
+            if entry.handles.is_empty() && !entry.cancelled {
+                map.remove(workflow_run_id);
+            }
+        }
+    }
+
+    /// Fire every in-flight node's token for `workflow_run_id` and mark the run
+    /// cancelled (sticky). Idempotent. When no node is in flight (a paused run
+    /// cancelled), the terminal run will never register again, so the entry is
+    /// dropped immediately rather than left to linger.
+    pub(crate) fn cancel(&self, workflow_run_id: &str) {
+        let mut map = self.lock();
+        let entry = map.entry(workflow_run_id.to_owned()).or_default();
+        entry.cancelled = true;
+        for handle in entry.handles.values() {
+            handle.cancel();
+        }
+        if entry.handles.is_empty() {
+            map.remove(workflow_run_id);
+        }
+    }
+
+    /// Drop a run's entry once its drive has fully drained (the host calls this after
+    /// a drive returns), so a cancelled run's sticky entry does not linger.
+    pub(crate) fn finish(&self, workflow_run_id: &str) {
+        self.lock().remove(workflow_run_id);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RunCancelState>> {
+        self.inner
+            .lock()
+            .expect("workflow cancellations mutex poisoned")
     }
 }
 
@@ -279,6 +382,11 @@ pub struct AgentLoopNodeExecutor {
     /// the repository's test command through the `shell.run` path; a test injects a
     /// scripted runner so the tool-node/approval/retry logic runs without a process.
     tool_runner: Arc<dyn RepositoryTestRunner>,
+    /// In-flight node agent-run cancellation handles, keyed by workflow-run id (T9).
+    /// `drive_agent` registers a node's agent run here and drives it with the
+    /// resulting token, so a `CancelWorkflow` interrupts it. Shared with the
+    /// [`WorkflowConductorHost`] whose cancel seam fires the handles.
+    cancellations: WorkflowRunCancellations,
 }
 
 impl AgentLoopNodeExecutor {
@@ -292,6 +400,7 @@ impl AgentLoopNodeExecutor {
         driver_factory: Arc<dyn NodeModelDriverFactory>,
         startup_repository: PathBuf,
         blackboards: BlackboardHub,
+        cancellations: WorkflowRunCancellations,
     ) -> Self {
         Self {
             pool,
@@ -303,6 +412,7 @@ impl AgentLoopNodeExecutor {
             startup_repository,
             blackboards,
             tool_runner: Arc::new(ShellRepositoryTestRunner),
+            cancellations,
         }
     }
 
@@ -767,9 +877,18 @@ impl AgentLoopNodeExecutor {
                 run = run.with_github_repo(repo);
             }
         }
-        runtime
-            .execute_run(driver, run, CancellationToken::never())
-            .await
+        // Register this node's agent run for cancellation and drive it with the
+        // resulting token — NOT `CancellationToken::never()`, which left a workflow
+        // node's agent run uninterruptible (T9). A `CancelWorkflow` fires the token
+        // through the shared registry, so the in-flight loop relinquishes at its next
+        // safe point (agent.rs's per-step cancel check / approval-parking select),
+        // exactly as a `CancelRun` stops a plain run. The token is born already
+        // cancelled if the run was cancelled before this node started (sticky), so a
+        // retry never runs a fresh agent run to completion on a cancelled workflow.
+        let (registration, token) = self.cancellations.register(workflow_run_id);
+        let disposition = runtime.execute_run(driver, run, token).await;
+        self.cancellations.deregister(workflow_run_id, registration);
+        disposition
     }
 
     /// Reconcile a completed agent node's declared `outputs` against what it posted
@@ -1680,6 +1799,61 @@ mod tests {
         }
     }
 
+    /// A driver that, on its first step, cancels its own workflow run through the
+    /// shared registry — then returns a NON-terminal `Say`, so the agent loop
+    /// iterates and its top-of-iteration cancel check fires. It stands in for the
+    /// production timing where a `CancelWorkflow` lands while a node's agent run is
+    /// in flight (the node is already registered, so the fired token is THIS run's),
+    /// deterministically — no gate/spawn coordination needed.
+    struct SelfCancelDriver {
+        cancellations: WorkflowRunCancellations,
+        run_id: String,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ModelDriver for SelfCancelDriver {
+        fn model_id(&self) -> codypendent_protocol::ModelId {
+            codypendent_protocol::ModelId("self-cancel".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[codypendent_runtime::agent::TurnItem],
+        ) -> anyhow::Result<ModelStep> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // The node is in flight and registered — fire the run's token, then
+                // hand back a non-terminal step so the loop re-checks cancellation.
+                self.cancellations.cancel(&self.run_id);
+                Ok(ModelStep::Say("thinking".to_string()))
+            } else {
+                Ok(ModelStep::Finish {
+                    summary: "unreached".to_string(),
+                })
+            }
+        }
+    }
+
+    struct SelfCancelDriverFactory {
+        cancellations: WorkflowRunCancellations,
+        run_id: String,
+    }
+
+    #[async_trait]
+    impl NodeModelDriverFactory for SelfCancelDriverFactory {
+        async fn build(
+            &self,
+            _mode: AgentMode,
+            _model_policy: &str,
+        ) -> Result<Box<dyn ModelDriver>, String> {
+            Ok(Box::new(SelfCancelDriver {
+                cancellations: self.cancellations.clone(),
+                run_id: self.run_id.clone(),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }))
+        }
+    }
+
     // A plain agent node with NO declared outputs — the shared manifest for the
     // worktree/repository/recovery tests, whose concern is the run lifecycle, not
     // the STEP 5.3 declared-output harvest (a node with no declared outputs
@@ -1728,6 +1902,25 @@ steps:
         factory: Arc<dyn NodeModelDriverFactory>,
         startup_repository: &Path,
     ) -> AgentLoopNodeExecutor {
+        executor_with_cancellations(
+            pool,
+            paths,
+            factory,
+            startup_repository,
+            WorkflowRunCancellations::default(),
+        )
+    }
+
+    /// Like [`executor_with`], but sharing a caller-supplied cancellation registry so
+    /// a test can pre-cancel a run and assert the in-flight node's agent run is
+    /// interrupted (T9).
+    fn executor_with_cancellations(
+        pool: &SqlitePool,
+        paths: &RuntimePaths,
+        factory: Arc<dyn NodeModelDriverFactory>,
+        startup_repository: &Path,
+        cancellations: WorkflowRunCancellations,
+    ) -> AgentLoopNodeExecutor {
         AgentLoopNodeExecutor::new(
             pool.clone(),
             paths.clone(),
@@ -1737,6 +1930,7 @@ steps:
             factory,
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
+            cancellations,
         )
     }
 
@@ -1851,6 +2045,58 @@ steps:
         let rows = leases(&pool).await;
         assert_eq!(rows.len(), 1, "one worktree lease for the agent node");
         assert_eq!(rows[0].2, "released");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_workflow_interrupts_an_in_flight_node_agent_run() {
+        // T9: `CancelWorkflow` interrupts a node's agent run through the SAME
+        // cancellation machinery `CancelRun` uses. Firing the shared registry for a
+        // run makes the token the node drives with born already cancelled, so the
+        // agent loop relinquishes at its first safe point (agent.rs's per-step cancel
+        // check) and the node fails cleanly with a cancelled reason — proof the token
+        // reaches the agent run (before T9 the node drove with
+        // `CancellationToken::never()`, uninterruptible).
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let cancellations = WorkflowRunCancellations::default();
+
+        let compiled = compile_yaml(AGENT_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(
+                &pool,
+                &compiled,
+                None,
+                &json!({ "pull_request": 7 }),
+                Some(AGENT_MANIFEST),
+            )
+            .await
+            .unwrap();
+
+        // The driver cancels its own in-flight run mid-loop (the production timing:
+        // the node is registered before its agent run starts, so the fired token is
+        // this run's), then the loop's top-of-iteration cancel check interrupts it.
+        let factory = Arc::new(SelfCancelDriverFactory {
+            cancellations: cancellations.clone(),
+            run_id: run_id.clone(),
+        });
+        let executor =
+            executor_with_cancellations(&pool, &paths, factory, &repo, cancellations.clone());
+
+        let outcome = executor
+            .execute(NodeContext {
+                workflow_run_id: &run_id,
+                node: compiled.node("inspect").unwrap(),
+                attempt: 1,
+            })
+            .await;
+
+        match outcome {
+            NodeOutcome::Failed { error } => assert!(
+                error.contains("cancel"),
+                "the node failure names cancellation: {error}"
+            ),
+            other => panic!("expected a cancelled node failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2647,6 +2893,7 @@ steps:
             factory,
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
+            WorkflowRunCancellations::default(),
         )
         .with_test_runner(runner)
     }
@@ -3237,9 +3484,12 @@ steps:
     }
 
     impl codypendent_workflow::NodeObserver for BudgetObserver {
-        fn on_transition(&self, node_id: &str, state: NodeState, _attempt: u32) {
-            if state == NodeState::Blocked {
-                self.blocked.lock().unwrap().push(node_id.to_owned());
+        fn on_transition(&self, transition: codypendent_workflow::NodeTransition<'_>) {
+            if transition.state == NodeState::Blocked {
+                self.blocked
+                    .lock()
+                    .unwrap()
+                    .push(transition.node_id.to_owned());
             }
         }
         fn on_budget_warning(

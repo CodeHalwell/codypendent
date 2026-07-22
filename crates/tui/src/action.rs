@@ -138,6 +138,27 @@ pub enum Action {
     /// visible notice — the presence-lite "someone else is editing" signal.
     DocumentLeaseBlocked,
 
+    /// A live workflow node transition, projected by the CLI harness after it folded
+    /// an incoming `Payload::WorkflowEvent` (Phase 5 T9). Overlays the matching
+    /// workflow-graph card's live `state` / `cost` / `error` (each pre-rendered by the
+    /// harness), so the graph view's `node_state_color` branches come alive as the run
+    /// advances. The whole subscription/rendering stays in the harness (which owns the
+    /// socket); the reducer folds the ready projection by node id — idempotent
+    /// overwrite, so an overlap between the snapshot baseline and the live stream is a
+    /// harmless re-write.
+    WorkflowNodeUpdated {
+        /// The node (step) id to overlay — matches [`WorkflowNodeCard::id`].
+        node_id: String,
+        /// The node's live state, pre-rendered (e.g. `running` / `completed` /
+        /// `skipped`).
+        state: String,
+        /// The node's measured cost, pre-rendered (e.g. `"12s · 3 tool calls"`), or
+        /// `"—"` when none.
+        cost: String,
+        /// The node's failure/block reason, pre-rendered, or `"—"` when none.
+        error: String,
+    },
+
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
     /// Flip between the chat single-column and the workspace panes (`F2`).
