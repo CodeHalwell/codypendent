@@ -14,6 +14,7 @@ mod documents;
 mod executor;
 mod promotion;
 mod publish;
+mod routing;
 mod scan;
 mod workflow_exec;
 mod workflows;

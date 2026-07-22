@@ -135,6 +135,11 @@ enum TopCommand {
         #[command(subcommand)]
         command: EvalCommand,
     },
+    /// Measure and manage model profiles for the router (Phase 7 STEP 7.2).
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
     /// Drive a learnable artifact through the evaluation-gated promotion
     /// pipeline (Phase 7 STEP 7.5) — nothing promotes itself (ADR-010).
     Promote {
@@ -347,6 +352,20 @@ enum EvalCommand {
         /// Where to write the `SuiteReport` JSON.
         #[arg(long)]
         report: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// Benchmark a local model configured in `models.toml` and persist its
+    /// measured profile (Phase 7 STEP 7.2.2): tokens/sec, time-to-first-token,
+    /// warm-up, memory, context limit, structured-output reliability, tool-call
+    /// accuracy, and a small coding-eval score. The router reads these MEASURED
+    /// numbers (never vibes). Also caches the first-use capability probe.
+    Bench {
+        /// The `models.toml` model id to benchmark (its `base_url` is the
+        /// endpoint the profile + probe are keyed under).
+        id: String,
     },
 }
 
@@ -627,6 +646,9 @@ async fn main() -> anyhow::Result<()> {
                 policy,
                 report,
             } => commands::eval_run(&paths, &suite, policy, &report).await,
+        },
+        TopCommand::Models { command } => match command {
+            ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
         },
         TopCommand::Promote { command } => match command {
             PromoteCommand::Propose {

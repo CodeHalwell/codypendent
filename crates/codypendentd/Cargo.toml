@@ -15,6 +15,10 @@ path = "src/main.rs"
 codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }
 codypendent-protocol = { workspace = true }
+# The Phase-7 utility router (behind the default-OFF routing seam in
+# `src/routing.rs`): `Router::route`/`escalate`, `TaskNode`, the security hard
+# filter, and the classifier this assembly builds a `TaskNode` for.
+codypendent-routing = { workspace = true }
 codypendent-knowledge = { workspace = true }
 codypendent-integrations = { workspace = true }
 codypendent-workflow = { workspace = true }
@@ -25,7 +29,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# Parses the `<data_dir>/routing.toml` registry item that enables the Phase-7
+# routing seam (default OFF), the `models.toml` precedent.
+toml = { workspace = true }
 chrono = { workspace = true }
 # uuid: per-run worktree lease ids (T5) + the docs-publish scratch-worktree
 # directory name (Phase 4 STEP 4.4). thiserror: publish-path error types.

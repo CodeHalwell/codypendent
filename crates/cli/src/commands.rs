@@ -1877,6 +1877,212 @@ steps:
     }
 }
 
+// ---------------------------------------------------------------------------
+// `codypendent models bench <id>` (Phase 7 STEP 7.2.2)
+// ---------------------------------------------------------------------------
+
+/// `codypendent models bench <id>`: measure the local model `id` (configured in
+/// `<data_dir>/models.toml`) and persist its measured profile + first-use
+/// capability probe to the daemon's `model_profiles` store (migration 0014), so
+/// the router reads MEASURED numbers.
+///
+/// This is an **offline measurement/maintenance command**: unlike the run/eval
+/// commands (which drive the daemon over the socket), it opens the migrated
+/// database directly — the same way the daemon does — because it writes the
+/// `model_profiles` table the live daemon only *reads* (and only when routing is
+/// enabled, default OFF). SQLite WAL + the shared `busy_timeout` make the
+/// concurrent open safe.
+pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    use codypendent_runtime::agent::FrameworkModelDriver;
+    use codypendent_runtime::bench::{BenchOptions, DriverBenchTarget};
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    // Resolve the model's endpoint from models.toml (the profile + probe key).
+    let models_path = paths.data_dir.join("models.toml");
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    let config = configs
+        .iter()
+        .find(|c| c.id.0 == id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model `{id}` is not configured in {}",
+                models_path.display()
+            )
+        })?
+        .clone();
+    let endpoint = config.base_url.clone();
+
+    // Build a real client for the model and a bench target over it. The model-
+    // driver seam does not surface streaming/usage or the endpoint's advertised
+    // capabilities, so the target is described with conservative declared
+    // capabilities (a real capability-discovery probe against the endpoint is a
+    // documented future seam); the timing + scripted-probe numbers are measured.
+    let registry = ModelRegistry::new(configs);
+    let driver = FrameworkModelDriver::from_registry(&registry, config.id.clone())
+        .with_context(|| format!("building a model client for `{id}`"))?;
+    let target = DriverBenchTarget::new(&driver, default_bench_description());
+
+    eprintln!("models bench: measuring `{id}` at {endpoint} (this drives the model)...");
+    let profile = {
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .context("opening the database to persist the model profile")?;
+        bench_to_store(&pool, &endpoint, &target, BenchOptions::default()).await?
+    };
+
+    let bench = profile
+        .bench
+        .as_ref()
+        .expect("a benched profile carries a LocalBench");
+    println!(
+        "measured `{id}` (persisted to model_profiles @ {endpoint}):\n  \
+         tokens/sec: {:.1}\n  time-to-first-token: {:.0} ms\n  warm-up: {:.0} ms\n  \
+         memory: {} MB\n  context limit: {}\n  structured-output reliability: {:.2}\n  \
+         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}",
+        bench.tokens_per_second,
+        bench.time_to_first_token_ms,
+        bench.warmup_ms,
+        bench.memory_mb,
+        bench.context_limit,
+        bench.structured_output_reliability,
+        bench.tool_call_accuracy,
+        bench.coding_eval_score,
+    );
+    Ok(())
+}
+
+/// Run the bench against `target` and persist the measured profile to the store,
+/// returning the persisted profile. The persistence core, split from
+/// [`models_bench`] so a test drives it with a scripted target and a temp DB
+/// (no model, no network).
+async fn bench_to_store(
+    pool: &sqlx::SqlitePool,
+    endpoint: &str,
+    target: &dyn codypendent_runtime::bench::BenchTarget,
+    options: codypendent_runtime::bench::BenchOptions,
+) -> anyhow::Result<codypendent_routing::ModelProfile> {
+    let outcome = codypendent_runtime::bench::run_bench(target, options)
+        .await
+        .map_err(|reason| anyhow::anyhow!("bench failed: {reason}"))?;
+    let profile = outcome.into_profile();
+    codypendent_daemon::model_profiles::ModelProfileStore::new()
+        .upsert(pool, endpoint, &profile)
+        .await
+        .context("persisting the measured model profile")?;
+    Ok(profile)
+}
+
+/// The conservative declared capabilities a benched local model is described
+/// with until a real endpoint capability-discovery probe exists (the model-
+/// driver seam surfaces none): streaming (OpenAI-compatible endpoints stream),
+/// single tool calls, best-effort JSON mode, and an unadvertised (unbounded)
+/// context window. Documented as declared, not measured.
+fn default_bench_description() -> codypendent_runtime::bench::TargetDescription {
+    use codypendent_routing::{ModelCapabilities, StructuredOutputSupport, ToolCallSupport};
+    codypendent_runtime::bench::TargetDescription {
+        capabilities: ModelCapabilities {
+            streaming: true,
+            tools: ToolCallSupport::Single,
+            parallel_tools: false,
+            structured_output: StructuredOutputSupport::JsonMode,
+            vision: false,
+            audio_input: false,
+            embeddings: false,
+            prompt_caching: false,
+            reasoning_controls: false,
+            context_tokens: None,
+            output_tokens: None,
+        },
+        context_limit: 0,
+        memory_mb: 0,
+    }
+}
+
+#[cfg(test)]
+mod models_bench_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use codypendent_protocol::ModelId;
+    use codypendent_routing::{ModelCapabilities, StructuredOutputSupport, ToolCallSupport};
+    use codypendent_runtime::bench::{
+        BenchOptions, BenchTarget, GenerationSample, TargetDescription,
+    };
+    use std::time::Duration;
+
+    /// A local scripted bench target (the CLI need not depend on the runtime's
+    /// test-only mock): returns fixed numbers so `bench_to_store`'s persistence
+    /// wiring runs with no model or network.
+    struct ScriptedTarget;
+
+    #[async_trait]
+    impl BenchTarget for ScriptedTarget {
+        fn model_id(&self) -> ModelId {
+            ModelId("qwen-local".into())
+        }
+        async fn describe(&self) -> Result<TargetDescription, String> {
+            Ok(TargetDescription {
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tools: ToolCallSupport::Parallel,
+                    parallel_tools: true,
+                    structured_output: StructuredOutputSupport::JsonMode,
+                    vision: false,
+                    audio_input: false,
+                    embeddings: false,
+                    prompt_caching: false,
+                    reasoning_controls: false,
+                    context_tokens: Some(128_000),
+                    output_tokens: Some(8_192),
+                },
+                context_limit: 128_000,
+                memory_mb: 9_200,
+            })
+        }
+        async fn timed_generation(&self, warm: bool) -> Result<GenerationSample, String> {
+            Ok(GenerationSample {
+                tokens: 100,
+                time_to_first_token: Duration::from_millis(if warm { 180 } else { 400 }),
+                total: Duration::from_millis(if warm { 2_000 } else { 2_500 }),
+            })
+        }
+        async fn structured_output_probe(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(8))
+        }
+        async fn tool_call_probe(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(7))
+        }
+        async fn coding_eval(&self, n: u32) -> Result<u32, String> {
+            Ok(n.min(6))
+        }
+    }
+
+    #[tokio::test]
+    async fn bench_to_store_measures_and_persists_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = codypendent_daemon::db::open_database(&dir.path().join("codypendent.db"))
+            .await
+            .unwrap();
+        let endpoint = "http://localhost:11434/v1";
+
+        let profile = bench_to_store(&pool, endpoint, &ScriptedTarget, BenchOptions::default())
+            .await
+            .unwrap();
+        assert!(profile.is_local());
+        assert_eq!(profile.id, ModelId("qwen-local".into()));
+
+        // It is durably persisted and reads back identically.
+        let stored = codypendent_daemon::model_profiles::ModelProfileStore::new()
+            .get(&pool, &ModelId("qwen-local".into()), endpoint)
+            .await
+            .unwrap()
+            .expect("the benched profile is persisted");
+        assert_eq!(stored, profile);
+        // The measured bench survived (50 tok/s from 100 tokens over 2.0s warm).
+        assert!((stored.bench.unwrap().tokens_per_second - 50.0).abs() < 1e-6);
+    }
+}
+
 #[cfg(test)]
 mod plugin_tests {
     use super::*;

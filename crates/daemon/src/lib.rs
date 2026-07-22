@@ -17,6 +17,7 @@ pub mod blackboard;
 pub mod commands;
 pub mod documents;
 pub mod executor;
+pub mod model_profiles;
 pub mod policy;
 pub mod projections;
 pub mod promotion;

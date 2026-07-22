@@ -30,6 +30,16 @@ codypendent-sandbox = { workspace = true }
 # STEP 7.1) so a suite scores against the objective RunObservation this client
 # builds from a headless run's own wire event stream.
 codypendent-eval = { workspace = true }
+# `codypendent models bench <id>` (Phase 7 STEP 7.2.2) measures a local model
+# with the runtime bench harness and persists the profile through the daemon's
+# `ModelProfileStore` (migration 0014) — an offline measurement/maintenance
+# command over `model_profiles`, opening the DB the same migrated way the daemon
+# does (WAL + busy_timeout make the concurrent open safe).
+codypendent-daemon = { workspace = true }
+codypendent-runtime = { workspace = true }
+# The measured `ModelProfile` the bench produces and persists (its types are
+# named in `models_bench`); a leaf crate, no cycle.
+codypendent-routing = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

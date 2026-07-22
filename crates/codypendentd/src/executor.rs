@@ -52,6 +52,7 @@ use tracing::{error, info, warn};
 
 use crate::blackboard::WorkflowBlackboardReader;
 use crate::promotion::PromotionStoreGateway;
+use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
 use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
@@ -127,6 +128,13 @@ pub struct RuntimeExecutor {
     /// `CancelWorkflow` fires the token the node executor registered, even if the host
     /// was reconfigured after the drive started.
     workflow_cancellations: WorkflowRunCancellations,
+    /// The Phase-7 routing seam (STEP 7.2/7.3), **default OFF**. When the
+    /// `<data_dir>/routing.toml` registry item enables it, [`Self::execute`] asks
+    /// the router which model to run a task on (recording the decision in the
+    /// trace) instead of the Phase-1 [`resolve_model`]; when it is absent/disabled
+    /// the run resolves a model exactly as before. Bound to the shared
+    /// subscription hub so a recorded routing note reaches attached clients live.
+    routing: RoutingCoordinator,
 }
 
 impl RuntimeExecutor {
@@ -173,6 +181,11 @@ impl RuntimeExecutor {
             workflow_cancellations.clone(),
         );
         let promotion = PromotionStoreGateway::new(pool.clone());
+        // The Phase-7 routing seam, loaded from `<data_dir>/routing.toml` (absent
+        // ⇒ OFF). Bound to the shared fan-out so a recorded routing decision
+        // reaches attached clients live, exactly like the run's context note.
+        let routing = RoutingCoordinator::new(pool.clone(), RoutingConfig::load(&paths))
+            .with_subscriptions(subscriptions.clone());
         Self {
             pool,
             paths,
@@ -188,6 +201,7 @@ impl RuntimeExecutor {
             blackboards,
             workflows,
             workflow_cancellations,
+            routing,
         }
     }
 
@@ -332,10 +346,42 @@ impl RuntimeExecutor {
     /// the caller must fail it cleanly.
     async fn execute(&self, launch: &RunLaunch, token: CancellationToken) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
-        let resolved = resolve_model(&registry, &policy, launch.mode)
+        // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When routing is
+        // enabled the router picks the model from the measured profile store and
+        // the decision is recorded in the run trace; when it is disabled (the
+        // default, and the state in every existing test — none writes a
+        // `routing.toml`) this returns `None` and the model is resolved exactly
+        // as before. A refusal (classified data with no eligible model) fails the
+        // run CLOSED here rather than leaking off-device through the
+        // classification-blind Phase-1 resolver.
+        let routed = self
+            .routing
+            .select(
+                launch.mode,
+                "agent",
+                &launch.objective,
+                estimate_input_tokens(&launch.objective),
+            )
             .await
-            .map_err(|e| format!("no model configured: {e}"))?;
-        let model_id = resolved.id;
+            .map_err(|e| format!("routing refused to place this run: {e}"))?;
+        let model_id = match routed {
+            Some(selection) => {
+                if let Err(error) = self
+                    .routing
+                    .record_decision(launch.session_id, launch.run_id, &selection.decision)
+                    .await
+                {
+                    warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
+                }
+                selection.model().clone()
+            }
+            None => {
+                resolve_model(&registry, &policy, launch.mode)
+                    .await
+                    .map_err(|e| format!("no model configured: {e}"))?
+                    .id
+            }
+        };
         info!(run_id = %launch.run_id, model = %model_id, "resolved model; executing run");
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
