@@ -98,6 +98,54 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
                 CapabilityRequest::Command("git".into()),
             ],
         ),
+        // The Phase-5 blackboard tools (STEP 5.3): a workflow agent's only channel
+        // for sharing typed results. They target the run's own artifact board — not
+        // the filesystem, a command, the network, or a secret — so they request no
+        // capability (risk `Safe`); their access is gated by being offered solely
+        // inside a workflow node, not by a policy scope. Registered here so they
+        // render in the Skill Studio alongside the other built-ins.
+        tool(
+            "blackboard.post",
+            "Post a typed artifact (finding, decision, hypothesis, code_location, proposed_patch, \
+             test_result, document_draft, open_question) to the workflow blackboard so downstream \
+             agents can build on it. Claim-like kinds require evidence; pass `supersedes` to \
+             correct a prior artifact. Available only inside a workflow agent node.",
+            &[
+                "post a finding to the blackboard",
+                "record a decision for other agents",
+                "share a result with the workflow",
+                "supersede a prior blackboard artifact",
+            ],
+            &[
+                "blackboard",
+                "post",
+                "finding",
+                "artifact",
+                "workflow",
+                "handoff",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "blackboard.query",
+            "Read the workflow blackboard — the typed artifacts other agents posted — optionally \
+             filtered by kind. Available only inside a workflow agent node.",
+            &[
+                "read the blackboard",
+                "see what other agents found",
+                "query workflow findings",
+                "check the blackboard for decisions",
+            ],
+            &[
+                "blackboard",
+                "query",
+                "read",
+                "findings",
+                "workflow",
+                "artifacts",
+            ],
+            Vec::new(),
+        ),
     ]
 }
 

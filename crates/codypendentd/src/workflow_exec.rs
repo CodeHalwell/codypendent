@@ -36,6 +36,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
+use codypendent_daemon::blackboard::BlackboardHub;
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::worktrees::WorktreeManager;
@@ -45,15 +46,18 @@ use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{Actor, AgentMode, EventBody, RunDisposition, RunId, SessionId};
 use codypendent_runtime::agent::{
     CancellationToken, FrameworkAgentRuntime, FrameworkModelDriver, ModelDriver, RunContext,
+    WorkflowContext,
 };
 use codypendent_runtime::models::{resolve_model, ModelRegistry};
 use codypendent_workflow::{
-    NodeAction, NodeContext, NodeExecutor, NodeOutcome, WorkflowStore, WorkspaceMode,
+    BlackboardKind, BlackboardStore, NodeAction, NodeContext, NodeExecutor, NodeOutcome,
+    WorkflowStore, WorkspaceMode,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+use crate::blackboard::AssemblyBlackboardChannel;
 use crate::executor::{
     artifact_sink, artifact_store, bind_run_worktree, load_model_registry, resolve_github_repo,
     run_journal, run_writes_to_worktree, WorktreeReleaseGuard,
@@ -101,6 +105,7 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 /// client (`drive_locks: Some(existing)` — reconfiguring an ALREADY-running
 /// host must carry its per-run drive-lock registry forward, not mint a fresh
 /// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workflow_host(
     pool: SqlitePool,
     paths: RuntimePaths,
@@ -109,6 +114,7 @@ pub(crate) fn build_workflow_host(
     github: Option<Arc<dyn GitHubApi>>,
     drive_locks: Option<DriveLockRegistry>,
     startup_repository: PathBuf,
+    blackboards: BlackboardHub,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
@@ -121,6 +127,7 @@ pub(crate) fn build_workflow_host(
         github,
         factory,
         startup_repository,
+        blackboards,
     );
     match drive_locks {
         Some(drive_locks) => {
@@ -146,9 +153,15 @@ pub struct AgentLoopNodeExecutor {
     /// Resolved once at construction, never from `current_dir()` at node-execution
     /// time (the P5-D1 defect).
     startup_repository: PathBuf,
+    /// The per-run blackboard fan-out (Phase 5 STEP 5.3): an agent's `blackboard.post`
+    /// applies to the store on the pool and is published here so the server's
+    /// `Subscription::Blackboard` forwarders deliver it. Shared with the executor
+    /// and the server (one hub, so publisher and subscriber meet).
+    blackboards: BlackboardHub,
 }
 
 impl AgentLoopNodeExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: SqlitePool,
         paths: RuntimePaths,
@@ -157,6 +170,7 @@ impl AgentLoopNodeExecutor {
         github: Option<Arc<dyn GitHubApi>>,
         driver_factory: Arc<dyn NodeModelDriverFactory>,
         startup_repository: PathBuf,
+        blackboards: BlackboardHub,
     ) -> Self {
         Self {
             pool,
@@ -166,6 +180,7 @@ impl AgentLoopNodeExecutor {
             github,
             driver_factory,
             startup_repository,
+            blackboards,
         }
     }
 
@@ -268,6 +283,9 @@ impl AgentLoopNodeExecutor {
                 mode,
                 &repository,
                 &operating_tree,
+                ctx.workflow_run_id,
+                &ctx.node.id,
+                role,
                 driver.as_ref(),
             )
             .await;
@@ -275,6 +293,18 @@ impl AgentLoopNodeExecutor {
 
         match disposition {
             Ok(RunDisposition::Completed { .. }) => {
+                // Declared-output harvest (STEP 5.3): the node's compiled `outputs`
+                // are blackboard artifact kinds downstream nodes depend on, so a
+                // completed agent that posted none of a declared kind FAILS the node
+                // — a silent absence would starve its dependents. A node with no
+                // declared outputs harvests trivially.
+                if let Err(missing) = self.harvest_declared_outputs(ctx).await {
+                    return NodeOutcome::failed(format!(
+                        "agent node `{}` completed but did not post its declared output(s) to the \
+                         blackboard: {missing} (post each with the blackboard.post tool)",
+                        ctx.node.id
+                    ));
+                }
                 info!(node = %ctx.node.id, run = %run_id, "workflow agent node completed");
                 NodeOutcome::Completed {
                     agent_run_id: Some(run_id.to_string()),
@@ -375,6 +405,9 @@ impl AgentLoopNodeExecutor {
         mode: AgentMode,
         repository: &Path,
         worktree: &Path,
+        workflow_run_id: &str,
+        node_id: &str,
+        role: &str,
         driver: &dyn ModelDriver,
     ) -> anyhow::Result<RunDisposition> {
         let policy = if self.github.is_some() {
@@ -393,6 +426,13 @@ impl AgentLoopNodeExecutor {
         if let Some(github) = &self.github {
             runtime = runtime.with_github(github.clone());
         }
+        // Wire the blackboard channel so this node's agent can post/query its run's
+        // board (STEP 5.3). The channel writes the store on the pool and fans each
+        // post out over the shared hub; without this the tools are not offered.
+        runtime = runtime.with_blackboard(Arc::new(AssemblyBlackboardChannel::new(
+            self.pool.clone(),
+            self.blackboards.clone(),
+        )));
         // The agent operates ENTIRELY within `worktree`: the policy read/search
         // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH the
         // worktree, so a write and its read-back hit the same tree (read-your-
@@ -406,7 +446,14 @@ impl AgentLoopNodeExecutor {
             mode,
             worktree.to_path_buf(),
             worktree.to_path_buf(),
-        );
+        )
+        // Bind the run to its workflow node: the ambient identity the `blackboard.*`
+        // tools need — the run's board and the server-built author (STEP 5.3).
+        .with_workflow(WorkflowContext {
+            workflow_run_id: workflow_run_id.to_string(),
+            node_id: node_id.to_string(),
+            agent_role: role.to_string(),
+        });
         // The GitHub target is repository IDENTITY (`R`), NOT the policy read root —
         // a worktree shares R's remotes, but R is the stable slug source.
         if self.github.is_some() {
@@ -417,6 +464,60 @@ impl AgentLoopNodeExecutor {
         runtime
             .execute_run(driver, run, CancellationToken::never())
             .await
+    }
+
+    /// Reconcile a completed agent node's declared `outputs` against what it posted
+    /// (STEP 5.3): for each distinct declared kind, the run's live board must hold at
+    /// least one item of that kind authored by THIS node (matched on the
+    /// server-built `author.node_id`). Returns `Err(list)` naming the declared kinds
+    /// with no such live item — the node then fails, so a downstream node never
+    /// starves on a promised-but-absent artifact. A node with no declared outputs
+    /// succeeds trivially.
+    async fn harvest_declared_outputs(&self, ctx: &NodeContext<'_>) -> Result<(), String> {
+        if ctx.node.outputs.is_empty() {
+            return Ok(());
+        }
+        let store = BlackboardStore::new();
+        let mut missing: Vec<String> = Vec::new();
+        // Distinct declared kinds, preserving declaration order for a legible reason.
+        let mut seen: Vec<&str> = Vec::new();
+        for declared in &ctx.node.outputs {
+            if seen.contains(&declared.as_str()) {
+                continue;
+            }
+            seen.push(declared);
+
+            // The compiler validated declared outputs against the blackboard kinds,
+            // so an unparseable kind here is defensive — treat it as unmet.
+            let Some(kind) = BlackboardKind::parse_kind(declared) else {
+                missing.push(declared.clone());
+                continue;
+            };
+            let items = match store
+                .query(&self.pool, ctx.workflow_run_id, Some(kind), false)
+                .await
+            {
+                Ok(items) => items,
+                Err(error) => {
+                    // A board read failure at harvest is a node infrastructure
+                    // failure, surfaced as an unmet output rather than a false pass.
+                    warn!(node = %ctx.node.id, %error, "could not read the board at harvest");
+                    missing.push(declared.clone());
+                    continue;
+                }
+            };
+            let authored_here = items.iter().any(|item| {
+                item.author.get("node_id").and_then(Value::as_str) == Some(ctx.node.id.as_str())
+            });
+            if !authored_here {
+                missing.push(declared.clone());
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing.join(", "))
+        }
     }
 
     /// Fail a created-but-undriven (or infrastructure-failed) agent run cleanly, so
@@ -471,8 +572,12 @@ fn synthesize_agent_objective(
         "You are the `{role}` agent executing step `{node_id}` of workflow `{workflow_id}`."
     );
     if !outputs.is_empty() {
+        // Declared outputs are blackboard artifact kinds the node MUST post via the
+        // `blackboard.post` tool — downstream nodes read them from the board, and a
+        // completed node that posted none is failed at harvest (STEP 5.3).
         objective.push_str(&format!(
-            " Produce these declared outputs: {}.",
+            " Post these declared outputs to the blackboard with the `blackboard.post` tool \
+             (one artifact per kind, claim-like kinds with supporting evidence): {}.",
             outputs.join(", ")
         ));
     }
@@ -504,7 +609,26 @@ mod tests {
         }
     }
 
+    // A plain agent node with NO declared outputs — the shared manifest for the
+    // worktree/repository/recovery tests, whose concern is the run lifecycle, not
+    // the STEP 5.3 declared-output harvest (a node with no declared outputs
+    // harvests trivially, so a say-then-finish driver still completes).
     const AGENT_MANIFEST: &str = "\
+schema_version: 1
+id: review
+version: 1
+budget:
+  maximum_agents: 1
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+";
+
+    // An agent node that DECLARES a `finding` output — the manifest for the STEP 5.3
+    // blackboard-post + declared-output-harvest tests: a completed node must have
+    // posted a live `finding` authored by it, or it fails.
+    const AGENT_MANIFEST_WITH_OUTPUT: &str = "\
 schema_version: 1
 id: review
 version: 1
@@ -541,6 +665,7 @@ steps:
             None,
             factory,
             startup_repository.to_path_buf(),
+            BlackboardHub::new(),
         )
     }
 
@@ -1079,5 +1204,184 @@ steps:
             "the isolated node must read back its own worktree; a repository read \
              scope would deny the out-of-tree path"
         );
+    }
+
+    /// A scripted-driver factory over an explicit step list, for the blackboard
+    /// tests (which script `blackboard.post` tool calls rather than say/finish).
+    fn factory(steps: Vec<ModelStep>) -> Arc<ScriptedDriverFactory> {
+        Arc::new(ScriptedDriverFactory { steps })
+    }
+
+    /// One `blackboard.post` tool step with the given JSON args.
+    fn post_step(args: Value) -> ModelStep {
+        ModelStep::CallTool {
+            tool: "blackboard.post".to_string(),
+            args,
+        }
+    }
+
+    /// STEP 5.3 test 1: an agent node scripting `blackboard.post` with evidence
+    /// lands a finding on its run's board, authored server-side by the node
+    /// (role + node id), and the node completes — the data the TUI seam reads.
+    #[tokio::test]
+    async fn an_agent_node_posts_a_finding_authored_by_the_node() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let executor = executor_with(
+            &pool,
+            &paths,
+            factory(vec![
+                post_step(json!({
+                    "kind": "finding",
+                    "payload": { "summary": "the parser drops trailing commas" },
+                    "confidence": 0.9,
+                    "evidence": [{ "path": "src/parse.rs", "line": 42 }],
+                })),
+                ModelStep::Finish {
+                    summary: "posted the finding".to_string(),
+                },
+            ]),
+            &repo,
+        );
+
+        let compiled = compile_yaml(AGENT_MANIFEST_WITH_OUTPUT).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(
+                &pool,
+                &compiled,
+                None,
+                &json!({}),
+                Some(AGENT_MANIFEST_WITH_OUTPUT),
+            )
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        // The finding is on the run's live board — the surface the TUI seam queries.
+        let items = BlackboardStore::new()
+            .query(&pool, &run_id, Some(BlackboardKind::Finding), false)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "the declared finding landed");
+        // Author is built server-side from the node's run context, never the model.
+        assert_eq!(
+            items[0].author.get("node_id").and_then(Value::as_str),
+            Some("inspect")
+        );
+        assert_eq!(
+            items[0].author.get("role").and_then(Value::as_str),
+            Some("investigator")
+        );
+        assert_eq!(items[0].confidence, Some(0.9));
+    }
+
+    /// STEP 5.3 test 2: a node declaring `outputs: [finding]` whose agent never
+    /// posts one FAILS at harvest (a say-then-finish driver that would otherwise
+    /// complete). The board stays empty; the node is `Failed`.
+    #[tokio::test]
+    async fn a_declared_output_never_posted_fails_the_node_at_harvest() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // say_finish drives the loop to a clean Completed disposition — so the ONLY
+        // thing that can fail the node is the declared-output harvest.
+        let executor = executor_with(&pool, &paths, say_finish_factory(), &repo);
+
+        let compiled = compile_yaml(AGENT_MANIFEST_WITH_OUTPUT).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(
+                &pool,
+                &compiled,
+                None,
+                &json!({}),
+                Some(AGENT_MANIFEST_WITH_OUTPUT),
+            )
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Failed);
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "inspect")
+            .unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Failed,
+            "a completed agent that posted no declared output fails at harvest"
+        );
+        let items = BlackboardStore::new()
+            .query(&pool, &run_id, Some(BlackboardKind::Finding), true)
+            .await
+            .unwrap();
+        assert!(items.is_empty(), "nothing was posted");
+    }
+
+    /// STEP 5.3 test 3: the evidence-required refusal surfaces to the agent as a
+    /// correctable tool error — a first `finding` post with no evidence is refused
+    /// (nothing lands), a second with evidence lands, and the node completes. Only
+    /// the second artifact exists on the board.
+    #[tokio::test]
+    async fn evidence_required_refusal_is_correctable_then_the_post_lands() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let executor = executor_with(
+            &pool,
+            &paths,
+            factory(vec![
+                // A claim-like finding without evidence — refused (not fatal).
+                post_step(json!({ "kind": "finding", "payload": { "summary": "x" } })),
+                // The corrective re-post with evidence — lands.
+                post_step(json!({
+                    "kind": "finding",
+                    "payload": { "summary": "x" },
+                    "evidence": [{ "path": "a.rs" }],
+                })),
+                ModelStep::Finish {
+                    summary: "posted after adding evidence".to_string(),
+                },
+            ]),
+            &repo,
+        );
+
+        let compiled = compile_yaml(AGENT_MANIFEST_WITH_OUTPUT).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(
+                &pool,
+                &compiled,
+                None,
+                &json!({}),
+                Some(AGENT_MANIFEST_WITH_OUTPUT),
+            )
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        // Exactly ONE finding exists across all revisions: the first (no evidence)
+        // was refused, the second landed.
+        let all = BlackboardStore::new()
+            .query(&pool, &run_id, Some(BlackboardKind::Finding), true)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1, "only the evidence-bearing post landed");
     }
 }

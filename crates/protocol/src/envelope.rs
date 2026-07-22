@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::blackboard::BlackboardItemView;
 use crate::catchup::Catchup;
 use crate::command::Command;
 use crate::document::{DocumentLeaseGrant, DocumentSync};
@@ -141,6 +142,21 @@ pub enum Payload {
         command_id: CommandId,
         candidate_id: String,
     },
+    /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
+    /// artifacts on the workflow run's board. A distinct reply from
+    /// `CommandAccepted` because the client needs the items back, not just an
+    /// acknowledgement.
+    BlackboardItems {
+        command_id: CommandId,
+        items: Vec<BlackboardItemView>,
+    },
+    /// One blackboard artifact that just landed on a run's board, delivered to the
+    /// clients subscribed to it (`Subscription::Blackboard`) as the run's agents
+    /// post/supersede (Phase 5 STEP 5.3). The item carries its own
+    /// `workflow_run_id`, so — like [`DocumentSync`](Payload::DocumentSync) — the
+    /// frame is not session-scoped; a receiver merges it into the run's board by id
+    /// (a superseding revision arrives as its own delivery).
+    BlackboardPosted(BlackboardItemView),
     /// A persisted session event published to a subscribed client.
     Event(SessionEvent),
     /// A collaborative document's CRDT sync update, delivered to the clients
@@ -401,6 +417,46 @@ mod tests {
                 assert_eq!(candidate_id, "cand-0192abcd");
             }
             other => panic!("expected PromotionProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blackboard_payloads_round_trip() {
+        use crate::blackboard::BlackboardItemView;
+        use serde_json::json;
+
+        let item = BlackboardItemView {
+            id: "0192-item".to_string(),
+            workflow_run_id: "wfrun-abc".to_string(),
+            kind: "finding".to_string(),
+            payload: json!({ "summary": "root cause found" }),
+            author: json!({ "role": "investigator", "node_id": "diagnose" }),
+            confidence: Some(0.9),
+            evidence: vec![json!({ "path": "src/lib.rs", "line": 7 })],
+            revision: 2,
+            superseded_by: None,
+        };
+
+        // The read-command reply carries a list of items.
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::BlackboardItems {
+            command_id,
+            items: vec![item.clone()],
+        }) {
+            Payload::BlackboardItems {
+                command_id: id,
+                items,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(items, vec![item.clone()]);
+            }
+            other => panic!("expected BlackboardItems, got {other:?}"),
+        }
+
+        // The subscription delivers one posted item.
+        match round_trip_payload(Payload::BlackboardPosted(item.clone())) {
+            Payload::BlackboardPosted(delivered) => assert_eq!(delivered, item),
+            other => panic!("expected BlackboardPosted, got {other:?}"),
         }
     }
 

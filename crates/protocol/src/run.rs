@@ -144,6 +144,27 @@ pub enum ProposedAction {
         /// docs/publish`).
         git_action: String,
     },
+    /// Post a typed artifact to a workflow run's blackboard (Phase 5 STEP 5.3) —
+    /// the run-scoped coordination channel a workflow's agents share. Always
+    /// permitted by policy within a workflow run (the `blackboard.post` tool is
+    /// only offered when the run is a workflow node), but recorded as a proposed
+    /// action so every board write is traced like any other tool call. Not a
+    /// filesystem, repository, or remote write — it targets only the run's own
+    /// board, so it never reaches the approval gate.
+    BlackboardPost {
+        /// The workflow run whose board is written (server-derived from the run
+        /// context, never model-supplied).
+        workflow_run_id: String,
+        /// The artifact kind being posted (`finding`, `decision`, …).
+        kind: String,
+    },
+    /// Query a workflow run's blackboard (Phase 5 STEP 5.3). A read of the run's
+    /// own coordination channel; always permitted by policy within a workflow run
+    /// and recorded so every board access is traced.
+    BlackboardQuery {
+        /// The workflow run whose board is read (server-derived).
+        workflow_run_id: String,
+    },
     #[serde(other)]
     Unknown,
 }

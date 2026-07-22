@@ -9,10 +9,11 @@
 //!
 //! [`RunExecutor`]: codypendent_daemon::executor::RunExecutor
 
+mod blackboard;
 mod documents;
 mod executor;
-mod publish;
 mod promotion;
+mod publish;
 mod scan;
 mod workflow_exec;
 mod workflows;
@@ -99,8 +100,9 @@ async fn main() -> anyhow::Result<()> {
     // the 4th `new` arg) and as the document-publish root (Phase 4 STEP 4.4 —
     // a document has no per-command repository field the way `StartRun` does,
     // so publication uses this same startup root, as the code-graph scan does).
-    let mut executor = RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
-        .with_repository_root(workdir);
+    let mut executor =
+        RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
+            .with_repository_root(workdir);
 
     // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
     // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the

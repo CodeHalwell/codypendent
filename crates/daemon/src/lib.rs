@@ -13,6 +13,7 @@ pub mod server;
 // Phase 1
 pub mod approvals;
 pub mod artifacts;
+pub mod blackboard;
 pub mod commands;
 pub mod documents;
 pub mod executor;
