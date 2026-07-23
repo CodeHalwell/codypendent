@@ -237,6 +237,26 @@ pub struct PendingApproval {
     pub run_id: Option<RunId>,
 }
 
+/// A run's current derived activity — never fetched, always folded from the
+/// event stream (STEP 1.12 RULE 2): the reducer transitions it as it folds
+/// run-state, streamed model text, and tool-lifecycle events, so the renderer
+/// always has an explanation for a run that would otherwise look paused
+/// between transcript updates. Defaults to [`RunActivity::Idle`] (a fresh run
+/// has not started preparing yet).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RunActivity {
+    /// Not running: queued, paused, awaiting approval/input, or terminal.
+    #[default]
+    Idle,
+    /// Preparing or running, with no model text streaming and no tool in
+    /// flight — the agent is composing its next step.
+    Thinking,
+    /// Model text is actively streaming into the transcript.
+    Streaming,
+    /// A tool is executing; carries the tool's name.
+    RunningTool(String),
+}
+
 /// Everything known about one run, and its transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
@@ -244,6 +264,11 @@ pub struct RunView {
     pub objective: String,
     pub mode: AgentMode,
     pub state: RunState,
+    /// The run's derived live-activity status: sets/clears as the reducer
+    /// folds run-state, streaming, and tool-lifecycle events; the renderer
+    /// shows it as a dim status row so a run is never silently paused with
+    /// no explanation.
+    pub activity: RunActivity,
     /// The model serving the run, learned from agent-authored events.
     pub model: Option<ModelId>,
     /// The worktree name, once known.
@@ -273,6 +298,7 @@ impl RunView {
             objective,
             mode,
             state: RunState::Queued,
+            activity: RunActivity::Idle,
             model: None,
             worktree: None,
             context_percent: None,

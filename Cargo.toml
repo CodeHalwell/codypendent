@@ -86,6 +86,10 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time", "process", "fs", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Stream combinators. `StreamExt::next` drives the framework `ChatStream`
+# (`ChatClient::get_streaming_response`) in the runtime's live model driver;
+# pulled in only with the runtime's `provider-openai` feature.
+futures = "0.3"
 
 # Identifiers and time
 uuid = { version = "1", features = ["v7", "serde"] }
