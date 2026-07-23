@@ -237,7 +237,13 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 None => state.selected_run_mut(),
             };
             if let Some(run) = target {
-                AppState::push_entry(run, TranscriptEntry::Note { text });
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Note {
+                        text,
+                        expanded: false,
+                    },
+                );
             }
         }
         EventBody::SessionClosed => state.session_closed = true,
@@ -655,6 +661,7 @@ fn expand_selected(state: &mut AppState) {
             match entry {
                 TranscriptEntry::Tool(card) => card.expanded = !card.expanded,
                 TranscriptEntry::Patch(patch) => patch.expanded = !patch.expanded,
+                TranscriptEntry::Note { expanded, .. } => *expanded = !*expanded,
                 _ => {}
             }
         }
@@ -1324,6 +1331,88 @@ mod tests {
             1,
             "A is unchanged by the session note"
         );
+    }
+
+    #[test]
+    fn a_long_note_folds_by_default_and_expand_toggles_it() {
+        // Mirrors the ToolCard/Patch fold pattern (Chapter 07 transcript
+        // declutter fix): a NoteAppended folds into Note{expanded:false}
+        // regardless of length, and the same Action::Expand that toggles a
+        // tool card or patch also toggles a selected note.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let long_text = "line one\nline two\nline three\nline four".to_owned();
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: long_text.clone(),
+                run_id: Some(run_id),
+            }),
+        );
+        let TranscriptEntry::Note { text, expanded } = &s.runs[0].transcript[0] else {
+            unreachable!("NoteAppended must fold into a Note entry")
+        };
+        assert_eq!(text, &long_text);
+        assert!(!expanded, "a note starts folded, same as a fresh tool card");
+
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = 0;
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+            unreachable!()
+        };
+        assert!(*expanded, "Expand toggles a selected note's expanded state");
+
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+            unreachable!()
+        };
+        assert!(!*expanded, "Expand toggles it back off");
+    }
+
+    #[test]
+    fn a_short_note_folds_the_same_way_as_a_long_one() {
+        // `reduce` does not special-case note length — every NoteAppended folds
+        // into Note{expanded:false} identically. "A short note stays inline" is
+        // purely a render-layer decision (see render.rs's note_lines), not a
+        // different shape here; Expand still flips this note's state too.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+            unreachable!("NoteAppended must fold into a Note entry")
+        };
+        assert!(!expanded, "every note starts unexpanded, short or long");
+
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = 0;
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+            unreachable!()
+        };
+        assert!(*expanded, "Expand flips it regardless of length");
     }
 
     #[test]

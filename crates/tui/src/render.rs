@@ -401,8 +401,8 @@ fn entry_lines<'a>(
             let (label, color) = disposition_display(disposition, theme);
             out.push(head(format!("● {label}"), color));
         }
-        TranscriptEntry::Note { text } => {
-            out.push(head(format!("• note: {text}"), theme.text.secondary));
+        TranscriptEntry::Note { text, expanded } => {
+            note_lines(text, *expanded, theme, selected, out)
         }
         TranscriptEntry::Unsupported { label } => {
             out.push(head(format!("? {label}"), theme.text.muted));
@@ -504,6 +504,47 @@ fn patch_lines<'a>(
             "    review as a change set; applies only via approval",
             Style::default().fg(theme.text.muted),
         ));
+    }
+}
+
+/// Notes at or under this many lines render inline, unchanged; a longer note
+/// folds (mirrors [`ToolCard`]/[`PatchSummary`] — the Chapter 07
+/// transcript-declutter fix). Applies to ANY note generically — nothing here
+/// special-cases the run-context manifest or a curated-memory note.
+const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
+
+fn note_lines<'a>(
+    text: &'a str,
+    expanded: bool,
+    theme: &Theme,
+    selected: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    let head_style = if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(theme.text.secondary)
+    };
+    let line_count = text.lines().count();
+    if line_count <= NOTE_INLINE_LINE_THRESHOLD {
+        out.push(Line::styled(format!("• note: {text}"), head_style));
+        return;
+    }
+    let marker = if expanded { "▾" } else { "▸" };
+    out.push(Line::styled(
+        format!(
+            "{marker} note: {} ({line_count} lines)",
+            first_non_empty_line(text)
+        ),
+        head_style,
+    ));
+    if expanded {
+        for line in text.lines() {
+            out.push(Line::styled(
+                format!("    {line}"),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
     }
 }
 
@@ -2392,6 +2433,12 @@ fn short_id(id: &impl std::fmt::Display) -> String {
     s.chars().take(8).collect()
 }
 
+/// The first non-blank line of `text`, or `""` if every line is blank — the
+/// label a folded note's collapsed head shows.
+fn first_non_empty_line(text: &str) -> &str {
+    text.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2672,6 +2719,70 @@ mod tests {
         let text = render_to_string(&state, 110, 34);
         assert!(text.contains("workspace.read_file"), "tool name:\n{text}");
         assert!(text.contains("2048 bytes"), "artifact detail:\n{text}");
+    }
+
+    #[test]
+    fn long_note_folds_by_default_and_expand_reveals_the_body() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        let note = "first line of the note\nsecond line\nthird line\nfourth line".to_owned();
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: note,
+                run_id: Some(run_id),
+            }),
+        );
+        state.focus = Pane::Transcript;
+        let last = state.runs[0].transcript.len() - 1;
+        state.runs[0].transcript_selected = last;
+
+        let collapsed = render_to_string(&state, 110, 34);
+        assert!(
+            collapsed.contains("▸ note: first line of the note (4 lines)"),
+            "collapsed head:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("fourth line"),
+            "the full body must not show while collapsed:\n{collapsed}"
+        );
+
+        reduce(&mut state, Action::Expand);
+        let expanded = render_to_string(&state, 110, 34);
+        assert!(
+            expanded.contains("▾ note: first line of the note (4 lines)"),
+            "expanded head:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("fourth line"),
+            "the full body shows once expanded:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn short_note_renders_inline() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+
+        let text = render_to_string(&state, 110, 34);
+        assert!(
+            text.contains("• note: remembered: the test command is cargo test"),
+            "a short note renders inline, unfolded:\n{text}"
+        );
+        // `running_build_state` already has a (separately foldable) tool card, so
+        // check the note's own head carries no fold marker rather than scanning
+        // the whole transcript for the marker glyphs.
+        assert!(
+            !text.contains("▸ note:") && !text.contains("▾ note:"),
+            "a short note carries no fold marker:\n{text}"
+        );
     }
 
     #[test]

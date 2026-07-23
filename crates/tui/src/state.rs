@@ -216,8 +216,10 @@ pub enum TranscriptEntry {
     },
     /// The run's terminal marker.
     Completed { disposition: RunDisposition },
-    /// A note appended to the session.
-    Note { text: String },
+    /// A note appended to the session. Long/multiline notes fold by default,
+    /// mirroring [`ToolCard`]/[`PatchSummary`]; `expanded` is client-only view
+    /// state — it is never part of the `NoteAppended` wire event.
+    Note { text: String, expanded: bool },
     /// A forward-compatibility placeholder for an event this build does not
     /// understand (protocol RULE 1: render, do not crash).
     Unsupported { label: String },
