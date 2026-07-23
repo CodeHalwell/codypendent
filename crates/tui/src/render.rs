@@ -23,7 +23,8 @@ use codypendent_protocol::{
 use crate::reduce::capability_label;
 use crate::state::{
     filter_models, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel,
-    Overlay, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    Overlay, PatchSummary, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
+    TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -211,17 +212,24 @@ const COMPOSER_HEIGHT: u16 = 3;
 
 /// The conversation: the selected run's transcript, full width, as the primary
 /// surface. Its title names the session + active run (and a run counter when
-/// several are live, switchable with Ctrl-↑/↓).
+/// several are live, switchable with Ctrl-↑/↓), plus the header chrome
+/// (Task 4, codex chat shell) naming what's serving the run: `model · mode[ ·
+/// cost]`.
 fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let session = state.session_title.as_deref().unwrap_or("Codypendent");
     let title = match state.selected_run() {
         Some(run) if state.runs.len() > 1 => format!(
-            "{session} — {} [{}/{}]",
+            "{session} — {} [{}/{}]{}",
             truncate(&run.objective, 36),
             state.selected_run + 1,
-            state.runs.len()
+            state.runs.len(),
+            header_chrome(run, &state.status()),
         ),
-        Some(run) => format!("{session} — {}", truncate(&run.objective, 44)),
+        Some(run) => format!(
+            "{session} — {}{}",
+            truncate(&run.objective, 44),
+            header_chrome(run, &state.status()),
+        ),
         None => session.to_owned(),
     };
     let block = pane_block(&title, true, theme);
@@ -260,6 +268,25 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         .wrap(Wrap { trim: false })
         .scroll((offset, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The conversation header's `model · mode[ · cost]` chrome (Task 4, codex
+/// chat shell), appended to the pane title after the session/objective so
+/// the operator sees what's serving the run without opening the run-detail
+/// pane. `mode` is always known once a run exists (`RunView::mode` isn't
+/// optional) and is the floor; `model` (learned from the agent actor) and
+/// `cost` (from the status projection's cost budget) are each left out
+/// entirely — never a `—`/`$0.00` placeholder — until known.
+fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = &run.model {
+        parts.push(model.to_string());
+    }
+    parts.push(mode_label(run.mode).to_owned());
+    if let Some(cost) = status.cost_minor {
+        parts.push(format_cost(Some(cost)));
+    }
+    format!(" · {}", parts.join(" · "))
 }
 
 /// The largest useful scroll offset: total wrapped rows minus the viewport
@@ -352,6 +379,11 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
     // producing any agent cell never emits a lone header with nothing under
     // it.
     let mut awaiting_header = false;
+    // Turn spacing (Task 4, codex chat shell): a blank line before every
+    // `User` turn after the first, so consecutive turns breathe instead of
+    // reading as one undifferentiated scroll. The opening turn needs no
+    // leading gap.
+    let mut seen_user_turn = false;
     for (idx, entry) in run.transcript.iter().enumerate() {
         let selected = focused && idx == run.transcript_selected;
         // Task 4: the streaming caret belongs on the newest entry only, and
@@ -365,6 +397,10 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
             TranscriptEntry::Model { .. } | TranscriptEntry::Tool(_) | TranscriptEntry::Patch(_)
         );
         if matches!(entry, TranscriptEntry::User { .. }) {
+            if seen_user_turn {
+                lines.push(Line::raw(""));
+            }
+            seen_user_turn = true;
             awaiting_header = true;
         } else if is_agent_cell && awaiting_header {
             lines.push(Line::styled(
@@ -3054,6 +3090,97 @@ mod tests {
             out.matches("⏺ codypendent").count(),
             1,
             "header appears exactly once for the whole turn:\n{out}"
+        );
+    }
+
+    /// Task 4 (codex chat shell): the conversation header names the serving
+    /// model and the run's mode, joined `model · mode`, so the operator sees
+    /// both without opening the run-detail pane. `running_build_state` learns
+    /// "gpt-5.1-codex" from the agent actor but never fires a cost budget
+    /// event, so cost stays unknown — it must be left out entirely rather
+    /// than shown as a `$0.00`/`—` placeholder.
+    #[test]
+    fn the_conversation_header_shows_model_and_mode() {
+        let state = running_build_state();
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("gpt-5.1-codex · Build"),
+            "model · mode header:\n{text}"
+        );
+        assert!(
+            !text.contains('$'),
+            "unknown cost omitted, not a placeholder:\n{text}"
+        );
+    }
+
+    /// A fresh run has a mode but no model learned yet — the header shows
+    /// the mode alone (joined onto the title by one separator), with no
+    /// extra slot or separator standing in for the still-unknown model/cost.
+    #[test]
+    fn the_header_shows_mode_alone_before_a_model_is_learned() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Ask,
+            }),
+        );
+        let out = render_to_string(&s, 100, 20);
+        let header_row = out.lines().next().expect("a top row");
+        assert!(
+            header_row.contains("· Ask"),
+            "mode shown in the header:\n{header_row}"
+        );
+        assert_eq!(
+            header_row.matches('·').count(),
+            1,
+            "one separator for the one known field — no slot for model/cost:\n{header_row}"
+        );
+    }
+
+    /// Task 4 (codex chat shell): a blank line separates turns after the
+    /// first so the conversation breathes, instead of reading as one
+    /// undifferentiated scroll. The reducer doesn't yet drive a second
+    /// `User` turn onto a live run (steering acks as `Steering`, not
+    /// `User` — see `TranscriptEntry::User`'s doc comment), so this pushes
+    /// the follow-up turn directly to exercise the render-side spacing rule
+    /// in isolation from that reducer wiring.
+    #[test]
+    fn a_blank_line_separates_turns_after_the_first() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "alpha".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s.runs[0].transcript.push(TranscriptEntry::User {
+            text: "beta".to_owned(),
+        });
+        let out = render_to_string(&s, 80, 20);
+        let rows: Vec<&str> = out.lines().collect();
+        // Search for the turn marker itself (not just the bare word), so a
+        // match can't land on the pane title — which also shows the
+        // objective ("alpha") and would otherwise be mistaken for the
+        // transcript row.
+        let alpha_row = rows
+            .iter()
+            .position(|r| r.contains("› alpha"))
+            .expect("first turn rendered");
+        let beta_row = rows
+            .iter()
+            .position(|r| r.contains("› beta"))
+            .expect("second turn rendered");
+        assert_eq!(
+            beta_row,
+            alpha_row + 2,
+            "exactly one blank row separates the turns:\n{out}"
         );
     }
 
