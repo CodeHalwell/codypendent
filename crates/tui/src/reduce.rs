@@ -237,15 +237,58 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 Some(run_id) => state.run_mut(run_id),
                 None => state.selected_run_mut(),
             };
-            if let Some(run) = target {
-                AppState::push_entry(
-                    run,
-                    TranscriptEntry::Note {
-                        text,
+            let Some(run) = target else { return };
+
+            // Backstage fold (Task 2): the context manifest and curated-memory
+            // writes are real, but not part of the visible conversation. The
+            // daemon labels both by the note's own text prefix (context:
+            // `crates/knowledge/src/context.rs`'s `=== CONTEXT` manifest
+            // header; memory: `executor.rs`'s `remembered: {statement}`), so
+            // classify on that prefix and fold into the run's single
+            // `Backstage` entry (find-or-push, update counts) instead of a
+            // visible `Note` cell. Every other note falls through to the
+            // existing declutter fold below, unchanged.
+            let is_context = text.starts_with("=== CONTEXT");
+            let is_memory = text.trim_start().starts_with("remembered:");
+            if is_context || is_memory {
+                let existing = run.transcript.iter_mut().find_map(|entry| match entry {
+                    TranscriptEntry::Backstage { .. } => Some(entry),
+                    _ => None,
+                });
+                let backstage = match existing {
+                    Some(TranscriptEntry::Backstage {
+                        context_lines,
+                        memory_updates,
+                        raw,
+                        ..
+                    }) => {
+                        if is_context {
+                            *context_lines = Some(text.lines().count());
+                        }
+                        if is_memory {
+                            *memory_updates += 1;
+                        }
+                        raw.push(text);
+                        return; // folded into the existing entry — no visible Note
+                    }
+                    _ => TranscriptEntry::Backstage {
+                        context_lines: is_context.then(|| text.lines().count()),
+                        memory_updates: is_memory as usize,
+                        raw: vec![text],
                         expanded: false,
                     },
-                );
+                };
+                AppState::push_entry(run, backstage);
+                return;
             }
+
+            AppState::push_entry(
+                run,
+                TranscriptEntry::Note {
+                    text,
+                    expanded: false,
+                },
+            );
         }
         EventBody::SessionClosed => state.session_closed = true,
 
@@ -690,6 +733,7 @@ fn expand_selected(state: &mut AppState) {
                 TranscriptEntry::Tool(card) => card.expanded = !card.expanded,
                 TranscriptEntry::Patch(patch) => patch.expanded = !patch.expanded,
                 TranscriptEntry::Note { expanded, .. } => *expanded = !*expanded,
+                TranscriptEntry::Backstage { expanded, .. } => *expanded = !*expanded,
                 _ => {}
             }
         }
@@ -1432,6 +1476,8 @@ mod tests {
         // into Note{expanded:false} identically. "A short note stays inline" is
         // purely a render-layer decision (see render.rs's note_lines), not a
         // different shape here; Expand still flips this note's state too.
+        // (Not a `remembered:`/`=== CONTEXT` note — those fold into
+        // `Backstage` instead, covered by the backstage-fold tests below.)
         let mut s = AppState::new();
         let run_id = RunId::new();
         reduce(
@@ -1445,7 +1491,7 @@ mod tests {
         reduce(
             &mut s,
             system_ev(EventBody::NoteAppended {
-                text: "remembered: the test command is cargo test".to_owned(),
+                text: "the test command is cargo test".to_owned(),
                 run_id: Some(run_id),
             }),
         );
@@ -1463,6 +1509,118 @@ mod tests {
             unreachable!()
         };
         assert!(*expanded, "Expand flips it regardless of length");
+    }
+
+    #[test]
+    fn context_and_memory_notes_fold_into_backstage_not_visible_notes() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\nline\nline\nline".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        // No visible Note cells; exactly one Backstage entry with the right counts.
+        assert!(
+            !s.runs[0]
+                .transcript
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::Note { .. })),
+            "context/memory notes must never create a visible Note cell"
+        );
+        let bs = s.runs[0].transcript.iter().find_map(|e| match e {
+            TranscriptEntry::Backstage {
+                context_lines,
+                memory_updates,
+                ..
+            } => Some((*context_lines, *memory_updates)),
+            _ => None,
+        });
+        assert_eq!(bs, Some((Some(4), 1)));
+    }
+
+    #[test]
+    fn an_ordinary_note_still_renders_as_a_note_cell() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "a plain observation".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        assert!(s.runs[0]
+            .transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Note { .. })));
+    }
+
+    #[test]
+    fn expand_toggles_a_selected_backstage_entry() {
+        // Mirrors the Note/Tool/Patch expand pattern: the same Action::Expand
+        // that toggles a selected note also toggles a selected Backstage entry.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        let idx = s.runs[0]
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Backstage { .. }))
+            .expect("a Backstage entry was folded in");
+
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = idx;
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Backstage { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(*expanded, "Expand opens the selected Backstage entry");
+
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Backstage { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(!*expanded, "Expand toggles it back off");
     }
 
     #[test]

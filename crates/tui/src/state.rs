@@ -222,6 +222,25 @@ pub enum TranscriptEntry {
     /// mirroring [`ToolCard`]/[`PatchSummary`]; `expanded` is client-only view
     /// state — it is never part of the `NoteAppended` wire event.
     Note { text: String, expanded: bool },
+    /// Folded backstage material for the run: the context manifest and
+    /// curated-memory writes, which are real but not part of the visible
+    /// conversation. Rendered as one dim, expandable line instead of a
+    /// visible [`TranscriptEntry::Note`] cell — at most one per run (later
+    /// `NoteAppended`s of either kind update the same entry's counts/`raw`
+    /// rather than creating another). Entirely client-only view state; never
+    /// part of the wire (the underlying `NoteAppended` events are unchanged).
+    Backstage {
+        /// The most recently seen context manifest's line count, or `None`
+        /// if this run has not received one.
+        context_lines: Option<usize>,
+        /// How many curated-memory (`remembered:`) notes have folded in.
+        memory_updates: usize,
+        /// The full text of every folded note, in arrival order — revealed
+        /// when `expanded`.
+        raw: Vec<String>,
+        /// Whether the raw bodies are shown below the summary line.
+        expanded: bool,
+    },
     /// A forward-compatibility placeholder for an event this build does not
     /// understand (protocol RULE 1: render, do not crash).
     Unsupported { label: String },

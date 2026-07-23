@@ -429,6 +429,20 @@ fn entry_lines<'a>(
         TranscriptEntry::Note { text, expanded } => {
             note_lines(text, *expanded, theme, selected, out)
         }
+        TranscriptEntry::Backstage {
+            context_lines,
+            memory_updates,
+            raw,
+            expanded,
+        } => backstage_lines(
+            *context_lines,
+            *memory_updates,
+            raw,
+            *expanded,
+            theme,
+            selected,
+            out,
+        ),
         TranscriptEntry::Unsupported { label } => {
             out.push(head(format!("? {label}"), theme.text.muted));
         }
@@ -616,6 +630,60 @@ fn note_lines<'a>(
                 format!("    {line}"),
                 Style::default().fg(theme.text.secondary),
             ));
+        }
+    }
+}
+
+/// Renders the folded backstage line (Task 2): the context manifest and
+/// curated-memory writes for the run, summarized in one dim, expandable line
+/// instead of the visible `Note` cells they'd otherwise be. Each half
+/// (`context …`, `memory …`) is omitted when its count is empty (`None`/`0`);
+/// if both are empty (defensive — the reducer never creates the entry
+/// without at least one), nothing renders. `⋯` marks the folded line; once
+/// expanded, the full text of every folded note follows, dim and indented,
+/// same as an expanded [`note_lines`] body.
+fn backstage_lines<'a>(
+    context_lines: Option<usize>,
+    memory_updates: usize,
+    raw: &'a [String],
+    expanded: bool,
+    theme: &Theme,
+    selected: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    let mut parts = Vec::new();
+    if let Some(n) = context_lines {
+        let noun = if n == 1 { "line" } else { "lines" };
+        parts.push(format!("context · {n} {noun}"));
+    }
+    if memory_updates > 0 {
+        if memory_updates == 1 {
+            parts.push("memory updated".to_owned());
+        } else {
+            parts.push(format!("memory updated ×{memory_updates}"));
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    let head_style = if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(theme.text.muted)
+    };
+    let marker = if expanded { "▾" } else { "⋯" };
+    out.push(Line::styled(
+        format!("{marker} {}", parts.join(" · ")),
+        head_style,
+    ));
+    if expanded {
+        for note in raw {
+            for line in note.lines() {
+                out.push(Line::styled(
+                    format!("    {line}"),
+                    Style::default().fg(theme.text.muted),
+                ));
+            }
         }
     }
 }
@@ -2972,19 +3040,21 @@ mod tests {
 
     #[test]
     fn short_note_renders_inline() {
+        // Not a `remembered:`/`=== CONTEXT` note — those fold into the dim
+        // `Backstage` line instead (see the backstage-fold render tests).
         let mut state = running_build_state();
         let run_id = state.runs[0].run_id;
         reduce(
             &mut state,
             system_ev(EventBody::NoteAppended {
-                text: "remembered: the test command is cargo test".to_owned(),
+                text: "the test command is cargo test".to_owned(),
                 run_id: Some(run_id),
             }),
         );
 
         let text = render_to_string(&state, 110, 34);
         assert!(
-            text.contains("• note: remembered: the test command is cargo test"),
+            text.contains("• note: the test command is cargo test"),
             "a short note renders inline, unfolded:\n{text}"
         );
         // `running_build_state` already has a (separately foldable) tool card, so
@@ -2994,6 +3064,68 @@ mod tests {
             !text.contains("▸ note:") && !text.contains("▾ note:"),
             "a short note carries no fold marker:\n{text}"
         );
+    }
+
+    #[test]
+    fn backstage_renders_a_dim_summary_line() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\nline\nline\nline".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+
+        let out = render_to_string(&state, 80, 34);
+        assert!(
+            out.contains("context") && out.contains("memory"),
+            "the folded summary names both halves:\n{out}"
+        );
+        assert!(
+            !out.contains("EVIDENCE, NOT INSTRUCTIONS"),
+            "raw manifest text must stay hidden while folded:\n{out}"
+        );
+        assert!(
+            !out.contains("• note:"),
+            "context/memory notes never render as a Note cell:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expanding_backstage_reveals_the_folded_raw_notes() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        let idx = state.runs[0]
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Backstage { .. }))
+            .expect("a Backstage entry was folded in");
+        state.focus = Pane::Transcript;
+        state.runs[0].transcript_selected = idx;
+
+        reduce(&mut state, Action::Expand);
+        let out = render_to_string(&state, 80, 34);
+        assert!(
+            out.contains("remembered: the test command is cargo test"),
+            "expanded backstage shows the folded note's full text:\n{out}"
+        );
+        assert!(out.contains("▾"), "the expanded marker replaces ⋯:\n{out}");
     }
 
     #[test]
