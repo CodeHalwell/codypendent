@@ -411,7 +411,8 @@ async fn repository_map_renders_apis_and_tests() {
     let map = repository_map(&pool, repo).await.unwrap();
     let rendered = map.render();
 
-    // Public API surface is present.
+    // Public API surface is present — this fixture's crate-root module sits
+    // well under the sample cap, so every top-level API name still surfaces.
     assert!(
         rendered.contains("compute"),
         "public fn in map:\n{rendered}"
@@ -421,10 +422,22 @@ async fn repository_map_renders_apis_and_tests() {
         "public type in map:\n{rendered}"
     );
     assert!(rendered.contains("MAX"), "public const in map:\n{rendered}");
-    // Test names are present and labelled.
+    // The crate-root module's count line reflects its 4 API symbols (Engine,
+    // Runnable, MAX, compute) and 0 tests directly (tests live in the `tests`
+    // module, folded from the fixture's `#[cfg(test)] mod tests`).
     assert!(
-        rendered.contains("test engine_ticks"),
-        "test name in map:\n{rendered}"
+        rendered.contains("module (crate root) — 4 APIs, 0 tests"),
+        "crate-root count line:\n{rendered}"
+    );
+    // Tests are now summarized by COUNT, not individually named — the
+    // declutter fix (Fix 2) stops rendering every test name verbatim.
+    assert!(
+        rendered.contains("module tests — 0 APIs, 1 tests"),
+        "the tests module's count line:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("engine_ticks"),
+        "individual test names must no longer be rendered:\n{rendered}"
     );
     // The change surface slot renders (empty stub in v1).
     assert!(rendered.contains("change surface: (none)"));

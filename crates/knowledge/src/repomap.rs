@@ -63,6 +63,27 @@ pub struct ApiSymbol {
 /// The single synthetic package name used in v1.
 const CRATE_PACKAGE: &str = "crate";
 
+/// Cap on the API names sampled per module before folding the remainder into a
+/// `(+K more)` tail. [`RepositoryMap::render`] is a bounded SUMMARY, not a dump:
+/// a module with hundreds of symbols still contributes only a handful of lines —
+/// the agent has `workspace.read_file`/search tools for the rest (the Chapter 07
+/// transcript-declutter fix; a flat per-symbol render once flooded a run's
+/// opening context with ~25 KB for a repository of a few thousand symbols).
+const MAX_SAMPLED_APIS_PER_MODULE: usize = 8;
+
+/// Cap on the modules rendered per package before folding the remainder into a
+/// `(+K more modules)` tail — the safety net that keeps the render bounded for a
+/// *large* repository (hundreds of modules), complementing
+/// [`MAX_SAMPLED_APIS_PER_MODULE`] which only bounds a single module's symbols.
+///
+/// Selects the most API-rich modules (by public API count, then test count,
+/// then path, for determinism) — NOT simply the first `MAX_RENDERED_MODULES`
+/// entries of `package.modules`, which is path-sorted; a naive prefix would
+/// show an arbitrary alphabetical slice instead of the modules that actually
+/// carry the repository's structure. See [`select_modules`]. The selected
+/// modules still render in path order for readability.
+const MAX_RENDERED_MODULES: usize = 50;
+
 /// Build the repository map for `repository` by folding its persisted graph.
 pub async fn repository_map(
     pool: &SqlitePool,
@@ -134,26 +155,45 @@ pub async fn repository_map(
 }
 
 impl RepositoryMap {
-    /// Render the map as a compact text tree (the agent-context representation).
+    /// Render the map as a compact, BOUNDED summary — the agent-context
+    /// representation (the Chapter 07 transcript-declutter fix). Each module
+    /// renders its API/test counts plus a capped sample of API names
+    /// ([`MAX_SAMPLED_APIS_PER_MODULE`]), never the full per-symbol dump; a
+    /// package with more modules than [`MAX_RENDERED_MODULES`] shows only the
+    /// most significant ones ([`select_modules`]), folding the remainder into a
+    /// `(+K more modules)` tail.
+    ///
+    /// This trims the model's actual context, not just a display: the full
+    /// symbol list serves a small local model poorly and burns tokens the agent
+    /// doesn't need up front — it has search/read tools for anything this
+    /// summary doesn't cover.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "repository {}", self.repository);
         for package in &self.packages {
             let _ = writeln!(out, "package {}", package.name);
-            for module in &package.modules {
+            let total_modules = package.modules.len();
+            let shown = select_modules(&package.modules, MAX_RENDERED_MODULES);
+            for module in &shown {
                 let label = if module.name.is_empty() {
                     "(crate root)"
                 } else {
                     &module.name
                 };
-                let _ = writeln!(out, "  module {label}");
-                for api in &module.public_apis {
-                    let _ = writeln!(out, "    {} {}", kind_label(api.kind), api.name);
+                let _ = writeln!(
+                    out,
+                    "  module {label} — {} APIs, {} tests",
+                    module.public_apis.len(),
+                    module.tests.len()
+                );
+                if !module.public_apis.is_empty() {
+                    let _ = writeln!(out, "    {}", sample_apis(&module.public_apis));
                 }
-                for test in &module.tests {
-                    let _ = writeln!(out, "    test {test}");
-                }
+            }
+            let hidden_modules = total_modules - shown.len();
+            if hidden_modules > 0 {
+                let _ = writeln!(out, "  … (+{hidden_modules} more modules)");
             }
         }
         let surface = if self.change_surface.is_empty() {
@@ -329,5 +369,280 @@ fn kind_label(kind: CodeNodeKind) -> &'static str {
         CodeNodeKind::Method => "method",
         CodeNodeKind::Constant => "const",
         _ => "symbol",
+    }
+}
+
+/// Render a module's API sample for [`RepositoryMap::render`]: up to
+/// [`MAX_SAMPLED_APIS_PER_MODULE`] entries as `kind name`, comma-joined, with a
+/// trailing `(+K more)` once the module holds more than the cap.
+fn sample_apis(apis: &[ApiSymbol]) -> String {
+    let shown = apis.len().min(MAX_SAMPLED_APIS_PER_MODULE);
+    let mut sample: Vec<String> = apis[..shown]
+        .iter()
+        .map(|api| format!("{} {}", kind_label(api.kind), api.name))
+        .collect();
+    let hidden = apis.len() - shown;
+    if hidden > 0 {
+        sample.push(format!("… (+{hidden} more)"));
+    }
+    sample.join(", ")
+}
+
+/// Select up to `cap` of `modules` to render for [`RepositoryMap::render`].
+///
+/// When `modules.len() <= cap`, every module is kept, in its original (path)
+/// order — no ranking needed. Otherwise the SELECTION is by significance —
+/// most public APIs first, ties broken by most tests, then by path for
+/// determinism — so a large repository's `(+K more modules)` cap hides the
+/// least-informative modules rather than an arbitrary alphabetical tail
+/// (`modules` is path-sorted, so a naive `[..cap]` prefix would show only
+/// whichever modules happen to sort early). The selected set is then
+/// re-ordered by path before returning, so the RENDER stays readable
+/// top-to-bottom by module path even though selection was by significance.
+fn select_modules(modules: &[ModuleEntry], cap: usize) -> Vec<&ModuleEntry> {
+    if modules.len() <= cap {
+        return modules.iter().collect();
+    }
+    let mut ranked: Vec<&ModuleEntry> = modules.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.public_apis
+            .len()
+            .cmp(&a.public_apis.len())
+            .then_with(|| b.tests.len().cmp(&a.tests.len()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    ranked.truncate(cap);
+    ranked.sort_by(|a, b| a.name.cmp(&b.name));
+    ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under both caps, `render` shows every API by name and the exact counts —
+    /// the same information the old per-symbol dump carried for a module this
+    /// small, just with the counts made explicit.
+    #[test]
+    fn render_shows_full_sample_and_counts_under_the_caps() {
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules: vec![ModuleEntry {
+                    name: String::new(),
+                    public_apis: vec![
+                        ApiSymbol {
+                            name: "Engine".to_owned(),
+                            kind: CodeNodeKind::Type,
+                        },
+                        ApiSymbol {
+                            name: "compute".to_owned(),
+                            kind: CodeNodeKind::Function,
+                        },
+                    ],
+                    tests: vec!["engine_ticks".to_owned()],
+                }],
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains("module (crate root) — 2 APIs, 1 tests"),
+            "counts line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("type Engine, fn compute"),
+            "full sample under the cap:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("more)"),
+            "nothing hidden under either cap:\n{rendered}"
+        );
+        assert!(rendered.contains("change surface: (none)"));
+    }
+
+    /// A module with more APIs than [`MAX_SAMPLED_APIS_PER_MODULE`] caps its
+    /// sample and folds the remainder into an exact `(+K more)` tail — the count
+    /// line still reports the true total, never the capped sample size.
+    #[test]
+    fn render_caps_the_api_sample_with_a_more_tail() {
+        let total = MAX_SAMPLED_APIS_PER_MODULE + 3;
+        let public_apis: Vec<ApiSymbol> = (0..total)
+            .map(|i| ApiSymbol {
+                name: format!("sym{i:02}"),
+                kind: CodeNodeKind::Function,
+            })
+            .collect();
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules: vec![ModuleEntry {
+                    name: "big".to_owned(),
+                    public_apis,
+                    tests: Vec::new(),
+                }],
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains(&format!("module big — {total} APIs, 0 tests")),
+            "count line reports the true total, not the capped sample:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("fn sym00"),
+            "first sampled name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("fn sym{:02}", MAX_SAMPLED_APIS_PER_MODULE - 1)),
+            "the cap-th symbol is still sampled:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("… (+3 more)"),
+            "exact hidden count in the tail:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("fn sym{:02}", MAX_SAMPLED_APIS_PER_MODULE)),
+            "the (cap+1)-th symbol must not be individually named:\n{rendered}"
+        );
+    }
+
+    /// A package with more modules than [`MAX_RENDERED_MODULES`] caps the
+    /// modules shown and folds the remainder into an exact `(+K more modules)`
+    /// tail — the safety net that bounds the render for a large repository
+    /// (many modules), distinct from the per-module API cap. Every module here
+    /// is equally (in)significant (0 APIs, 0 tests), so [`select_modules`]'s
+    /// significance ranking is a pure tie, resolved by its path tie-break —
+    /// this pins that fallback down to a path-ordered prefix, exactly as
+    /// before selection existed.
+    #[test]
+    fn render_caps_modules_per_package_with_a_more_modules_tail() {
+        let total = MAX_RENDERED_MODULES + 4;
+        let modules: Vec<ModuleEntry> = (0..total)
+            .map(|i| ModuleEntry {
+                name: format!("m{i:03}"),
+                public_apis: Vec::new(),
+                tests: Vec::new(),
+            })
+            .collect();
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules,
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains("module m000 —"),
+            "first shown:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("module m{:03} —", MAX_RENDERED_MODULES - 1)),
+            "the cap-th module is still shown:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("module m{:03} —", MAX_RENDERED_MODULES)),
+            "the (cap+1)-th module must not be individually shown:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(+4 more modules)"),
+            "exact hidden module count in the tail:\n{rendered}"
+        );
+    }
+
+    /// When modules differ in significance, the cap must select the most
+    /// API-rich ones — NOT an arbitrary alphabetical prefix of the (path-
+    /// sorted) module list. Constructed so the API-rich modules sort dead
+    /// LAST alphabetically: under the old "first `MAX_RENDERED_MODULES` in
+    /// path order" behavior every one of them would be hidden, so this test
+    /// would fail under that code. The selected set still RENDERS in path
+    /// order for readability — significance only decides WHICH modules are
+    /// kept, not the order they're printed in.
+    #[test]
+    fn render_selects_the_most_api_rich_modules_not_an_alphabetical_prefix() {
+        // Path-first, API-poor (1 API each) — sorts ahead of every rich module.
+        let low_count = MAX_RENDERED_MODULES + 2;
+        let mut modules: Vec<ModuleEntry> = (0..low_count)
+            .map(|i| ModuleEntry {
+                name: format!("a_plain_{i:03}"),
+                public_apis: vec![ApiSymbol {
+                    name: "f".to_owned(),
+                    kind: CodeNodeKind::Function,
+                }],
+                tests: Vec::new(),
+            })
+            .collect();
+        // Path-last, API-rich (10 APIs each) — the modules that actually carry
+        // the repository's structure, but alphabetically after every plain one.
+        for i in 0..5 {
+            modules.push(ModuleEntry {
+                name: format!("z_rich_{i:02}"),
+                public_apis: (0..10)
+                    .map(|j| ApiSymbol {
+                        name: format!("api{j:02}"),
+                        kind: CodeNodeKind::Function,
+                    })
+                    .collect(),
+                tests: Vec::new(),
+            });
+        }
+        let total_modules = modules.len();
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules,
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+
+        // Every API-rich module is shown despite sorting dead last — proving
+        // selection is by significance, not a path-ordered prefix.
+        for i in 0..5 {
+            assert!(
+                rendered.contains(&format!("module z_rich_{i:02} —")),
+                "an API-rich module must be shown regardless of its path:\n{rendered}"
+            );
+        }
+        // A low-significance module yields its slot to make room.
+        assert!(
+            !rendered.contains(&format!("module a_plain_{:03} —", low_count - 1)),
+            "a low-significance module must be squeezed out:\n{rendered}"
+        );
+        // The hidden count is exact: total modules minus the cap.
+        let hidden = total_modules - MAX_RENDERED_MODULES;
+        assert!(
+            rendered.contains(&format!("(+{hidden} more modules)")),
+            "exact hidden module count:\n{rendered}"
+        );
+        // The selected set still renders in path order: every shown
+        // "a_plain_*" line precedes every "z_rich_*" line.
+        let first_rich = rendered
+            .find("module z_rich_00 —")
+            .expect("the first rich module is shown");
+        let last_plain = rendered
+            .rfind("module a_plain_")
+            .expect("plain modules are shown");
+        assert!(
+            last_plain < first_rich,
+            "the selected modules render in path order, not significance order:\n{rendered}"
+        );
+    }
+
+    /// Fix 2 leaves the change-surface slot untouched: still a joined list, or
+    /// the `(none)` stub when empty.
+    #[test]
+    fn render_preserves_change_surface() {
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: Vec::new(),
+            change_surface: vec!["a::b".to_owned(), "c::d".to_owned()],
+        };
+        assert!(map.render().contains("change surface: a::b, c::d"));
     }
 }
