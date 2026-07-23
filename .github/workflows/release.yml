@@ -34,7 +34,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
-            os: macos-13 # Intel runner
+            # macOS Intel runners (macos-13) are retired; cross-compile the
+            # x86_64 binary on the Apple Silicon runner. The release job only
+            # builds (never runs) the binary, so cross-compilation is safe.
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest # Apple Silicon runner
     steps:
