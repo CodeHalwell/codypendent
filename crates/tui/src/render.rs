@@ -396,6 +396,9 @@ fn entry_lines<'a>(
     };
 
     match entry {
+        TranscriptEntry::User { text } => {
+            out.push(head(format!("› {text}"), theme.focus.active));
+        }
         TranscriptEntry::Model { text } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
         }
@@ -3021,6 +3024,22 @@ mod tests {
         assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
         // The status footer is still present.
         assert!(text.contains("mode"), "status footer:\n{text}");
+    }
+
+    #[test]
+    fn a_user_turn_renders_with_a_caret_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "add a test".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let out = render_to_string(&s, 80, 12);
+        assert!(out.contains("› add a test") || out.contains("> add a test"));
     }
 
     #[test]

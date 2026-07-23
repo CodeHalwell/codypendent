@@ -254,8 +254,12 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             objective,
             mode,
         } => {
-            let run = state.ensure_run(run_id, objective, mode);
+            let run = state.ensure_run(run_id, objective.clone(), mode);
             run.state = RunState::Preparing;
+            // The objective is the run's opening turn — shown once here as the
+            // first transcript entry, in addition to the pane title `ensure_run`
+            // already set on `RunView.objective` (unchanged).
+            AppState::push_entry(run, TranscriptEntry::User { text: objective });
         }
         EventBody::RunStateChanged { run_id, state: rs } => {
             if let Some(run) = state.run_mut(run_id) {
@@ -1205,6 +1209,24 @@ mod tests {
         assert_eq!(s.runs[0].state, RunState::Running);
     }
 
+    #[test]
+    fn run_started_pushes_a_user_turn_with_the_objective() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "add a test".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        assert!(matches!(
+            &s.runs[0].transcript[0],
+            TranscriptEntry::User { text } if text == "add a test"
+        ));
+    }
+
     /// C13: every transcript-pushing reducer arm routes through `push_entry`,
     /// so a run's transcript is bounded by `MAX_TRANSCRIPT_ENTRIES` regardless
     /// of how many events arrive. The arms the fix converted from a direct
@@ -1381,22 +1403,24 @@ mod tests {
                 run_id: Some(run_id),
             }),
         );
-        let TranscriptEntry::Note { text, expanded } = &s.runs[0].transcript[0] else {
+        // transcript[0] is the User turn RunStarted pushes for the objective;
+        // the note folds in right after it.
+        let TranscriptEntry::Note { text, expanded } = &s.runs[0].transcript[1] else {
             unreachable!("NoteAppended must fold into a Note entry")
         };
         assert_eq!(text, &long_text);
         assert!(!expanded, "a note starts folded, same as a fresh tool card");
 
         s.focus = Pane::Transcript;
-        s.runs[0].transcript_selected = 0;
+        s.runs[0].transcript_selected = 1;
         reduce(&mut s, Action::Expand);
-        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
             unreachable!()
         };
         assert!(*expanded, "Expand toggles a selected note's expanded state");
 
         reduce(&mut s, Action::Expand);
-        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
             unreachable!()
         };
         assert!(!*expanded, "Expand toggles it back off");
@@ -1425,15 +1449,17 @@ mod tests {
                 run_id: Some(run_id),
             }),
         );
-        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+        // transcript[0] is the User turn RunStarted pushes for the objective;
+        // the note folds in right after it.
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
             unreachable!("NoteAppended must fold into a Note entry")
         };
         assert!(!expanded, "every note starts unexpanded, short or long");
 
         s.focus = Pane::Transcript;
-        s.runs[0].transcript_selected = 0;
+        s.runs[0].transcript_selected = 1;
         reduce(&mut s, Action::Expand);
-        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[0] else {
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
             unreachable!()
         };
         assert!(*expanded, "Expand flips it regardless of length");
@@ -1491,9 +1517,10 @@ mod tests {
                 },
             ),
         );
-        // Two deltas coalesce into one transcript entry.
-        assert_eq!(s.runs[0].transcript.len(), 1);
-        match &s.runs[0].transcript[0] {
+        // Two deltas coalesce into one transcript entry, right after the User
+        // turn RunStarted pushes for the objective.
+        assert_eq!(s.runs[0].transcript.len(), 2);
+        match &s.runs[0].transcript[1] {
             TranscriptEntry::Model { text } => assert_eq!(text, "Hello, world"),
             other => panic!("expected coalesced Model entry, got {other:?}"),
         }
@@ -3135,9 +3162,11 @@ mod tests {
             s.runs[0].transcript.last(),
             Some(TranscriptEntry::Patch(_))
         ));
-        s.runs[0].transcript_selected = 0;
+        // transcript[0] is the User turn RunStarted pushes for the objective;
+        // the patch is the next entry.
+        s.runs[0].transcript_selected = 1;
         reduce(&mut s, Action::Expand);
-        let TranscriptEntry::Patch(p) = &s.runs[0].transcript[0] else {
+        let TranscriptEntry::Patch(p) = &s.runs[0].transcript[1] else {
             unreachable!()
         };
         assert!(p.expanded);

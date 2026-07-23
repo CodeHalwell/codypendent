@@ -200,6 +200,8 @@ pub struct PatchSummary {
 /// entry so it can be selected and expanded independently.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
+    /// The user's own message — the run objective, or a steering follow-up.
+    User { text: String },
     /// Coalesced streamed model prose.
     Model { text: String },
     /// A tool card (boxed: it is by far the largest variant).
