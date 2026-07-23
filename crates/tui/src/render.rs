@@ -341,9 +341,16 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 
 fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
+    let last_idx = run.transcript.len().checked_sub(1);
     for (idx, entry) in run.transcript.iter().enumerate() {
         let selected = focused && idx == run.transcript_selected;
-        entry_lines(entry, theme, selected, &mut lines);
+        // Task 4: the streaming caret belongs on the newest entry only, and
+        // only while the run is actively streaming into it — never
+        // mid-transcript, and never once the run has moved on to
+        // Idle/Thinking/RunningTool (a tool call, a thinking pause, or
+        // completion all drop it).
+        let streaming_tail = last_idx == Some(idx) && run.activity == RunActivity::Streaming;
+        entry_lines(entry, theme, selected, streaming_tail, &mut lines);
     }
     if lines.is_empty() {
         lines.push(Line::styled(
@@ -376,6 +383,7 @@ fn entry_lines<'a>(
     entry: &'a TranscriptEntry,
     theme: &Theme,
     selected: bool,
+    streaming_tail: bool,
     out: &mut Vec<Line<'a>>,
 ) {
     let head = |text: String, color: Color| -> Line<'a> {
@@ -389,11 +397,7 @@ fn entry_lines<'a>(
 
     match entry {
         TranscriptEntry::Model { text } => {
-            for (i, l) in text.lines().enumerate() {
-                let color = theme.agent.model_text;
-                let prefix = if i == 0 { "▌ " } else { "  " };
-                out.push(head(format!("{prefix}{l}"), color));
-            }
+            model_entry_lines(text, theme, selected, streaming_tail, out);
         }
         TranscriptEntry::Tool(card) => tool_card_lines(card, theme, selected, out),
         TranscriptEntry::Patch(patch) => patch_lines(patch, theme, selected, out),
@@ -424,6 +428,53 @@ fn entry_lines<'a>(
         }
         TranscriptEntry::Unsupported { label } => {
             out.push(head(format!("? {label}"), theme.text.muted));
+        }
+    }
+}
+
+/// Renders one coalesced model-text entry. While `streaming_tail` is set —
+/// this is the run's newest transcript entry and the run's derived activity
+/// is [`RunActivity::Streaming`] — a muted `▋` caret is appended directly
+/// after the accumulated text on its last line (Task 4), so a mid-stream cell
+/// visibly reads as still-writing instead of silently paused. The caret is
+/// drawn fresh from `run.activity` every frame — it is never stored on the
+/// entry — so it disappears the instant the run leaves `Streaming` (a tool
+/// call starting, a thinking pause, or the run completing).
+///
+/// Folding the caret into the same `Line` that both the transcript
+/// `Paragraph` and [`max_scroll_offset`]'s measurement read (see
+/// `render_conversation`) means the measured bottom already accounts for it —
+/// "follow latest" pins to the caret's row with no separate adjustment.
+fn model_entry_lines<'a>(
+    text: &'a str,
+    theme: &Theme,
+    selected: bool,
+    streaming_tail: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    let color = theme.agent.model_text;
+    let text_style = if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(color)
+    };
+    let mut rows: Vec<&str> = text.lines().collect();
+    if rows.is_empty() {
+        // A `Model` entry is only ever created alongside its first delta's
+        // text (`AppState::append_model_text`), so empty text here is
+        // defensive rather than expected — but a caret still needs a row.
+        rows.push("");
+    }
+    let last = rows.len() - 1;
+    for (i, l) in rows.into_iter().enumerate() {
+        let prefix = if i == 0 { "▌ " } else { "  " };
+        if streaming_tail && i == last {
+            out.push(Line::from(vec![
+                Span::styled(format!("{prefix}{l}"), text_style),
+                Span::styled("▋", Style::default().fg(theme.text.muted)),
+            ]));
+        } else {
+            out.push(Line::styled(format!("{prefix}{l}"), text_style));
         }
     }
 }
@@ -2675,6 +2726,64 @@ mod tests {
         let out = render_to_string(&s, 80, 20);
         assert!(!out.contains("working…"), "unexpected status row:\n{out}");
         assert!(!out.contains("running "), "unexpected status row:\n{out}");
+    }
+
+    /// Task 4: while a run's activity is `Streaming`, the model cell shows a
+    /// muted `▋` caret right after the accumulated text, so the mid-stream
+    /// cell reads as still-writing rather than silently paused; the caret is
+    /// derived render state, never stored, so it drops the instant the run
+    /// completes.
+    #[test]
+    fn a_streaming_cell_shows_a_caret_then_drops_it_on_completion() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "partial".to_owned(),
+            }),
+        );
+        let mid = render_to_string(&s, 80, 20);
+        assert!(mid.contains("partial"), "streamed text missing:\n{mid}");
+        assert!(mid.contains('▋'), "streaming cell shows a caret:\n{mid}");
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("partial".to_owned()),
+                },
+                chronicle: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "application/json".to_owned(),
+                    byte_length: 10,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+            }),
+        );
+        let done = render_to_string(&s, 80, 20);
+        assert!(
+            !done.contains('▋'),
+            "caret is gone once the run completes:\n{done}"
+        );
     }
 
     #[test]
