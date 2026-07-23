@@ -269,30 +269,34 @@ impl DeltaSink for NullDeltaSink {
     fn on_text(&mut self, _chunk: &str) {}
 }
 
-/// A [`DeltaSink`] that buffers chunks in arrival order, for the loop to
-/// drain-emit as `ModelStreamDelta` events once `next_step` returns.
+/// A [`DeltaSink`] that forwards each chunk to the agent loop over an unbounded
+/// channel, so the loop can emit a `ModelStreamDelta` LIVE as the chunk arrives
+/// — not buffered until `next_step` returns.
 ///
-/// `DeltaSink::on_text` is synchronous — a driver may call it from a plain,
-/// non-async callback as it walks a completed response — while the loop's
-/// [`FrameworkAgentRuntime::emit`] is `async` (it awaits a journal write
-/// before publishing). Rather than making `on_text` async, which would leak
-/// async machinery (and object-safety complications) into every driver, this
-/// sink just buffers each chunk as it arrives; the loop awaits `next_step` to
-/// completion — so every chunk for this request has already been pushed —
-/// then drains the buffer in order, emitting one `ModelStreamDelta` per
-/// chunk. Order is preserved because nothing observes the sink between the
-/// `on_text` calls and the drain.
-#[derive(Default)]
-struct BufferingSink {
-    chunks: Vec<String>,
+/// `DeltaSink::on_text` is synchronous — a driver calls it from its plain stream
+/// loop as each token arrives — while the loop's [`FrameworkAgentRuntime::emit`]
+/// is `async` (it awaits a journal write before publishing). Rather than make
+/// `on_text` async (which would leak async machinery and object-safety
+/// complications into every driver), `on_text` does a non-blocking
+/// [`UnboundedSender::send`](mpsc::UnboundedSender::send) (itself sync). The loop
+/// drains the matching receiver CONCURRENTLY with the driver's `next_step`
+/// future (a `tokio::select!`), awaiting `emit` once per chunk, so each delta
+/// reaches clients as the model produces it. A single mpsc queue preserves
+/// order, and chunks enqueued before a mid-stream error stay queued (drained
+/// after the future resolves) rather than being lost.
+struct ChannelSink {
+    tx: mpsc::UnboundedSender<String>,
 }
 
-impl DeltaSink for BufferingSink {
+impl DeltaSink for ChannelSink {
     fn on_text(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
-        self.chunks.push(chunk.to_string());
+        // A send can only fail if the loop already dropped the receiver (the
+        // request was torn down); there is nothing left to emit into, so
+        // dropping the chunk is correct.
+        let _ = self.tx.send(chunk.to_string());
     }
 }
 
@@ -890,14 +894,66 @@ impl FrameworkAgentRuntime {
             }
 
             let started = Instant::now();
-            // A fresh sink per request: the driver pushes this request's text
-            // chunks into it (synchronously — see `BufferingSink`), and the
-            // loop drains it below, once `next_step` has returned.
-            let mut sink = BufferingSink::default();
+            // Live per-chunk streaming. The driver pushes each text chunk through
+            // the `ChannelSink` AS the model produces it; concurrently we drain
+            // the channel and emit one `ModelStreamDelta` per chunk, so deltas
+            // reach clients live rather than buffered until `next_step` returns.
+            // One journaled event per delta — the current "deltas are journaled"
+            // contract (ephemeral, non-journaled deltas are a deferred future
+            // option, deliberately not taken here).
+            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            let mut sink = ChannelSink { tx };
+            let step_result = {
+                // `step_fut` borrows `&transcript` and `&mut sink`; scoping it
+                // here releases both borrows before the `match step` arms below
+                // mutate `transcript`. The `#[async_trait]` future is boxed and
+                // `Unpin`, so `&mut step_fut` polls without `tokio::pin!`.
+                let mut step_fut = driver.next_step(&transcript, &mut sink);
+                loop {
+                    tokio::select! {
+                        // Poll the step future first: its completion is what ends
+                        // the request. While it is pending (a real provider stream
+                        // yields between updates) the recv branch runs, emitting
+                        // each queued chunk LIVE and in order; a driver that bursts
+                        // several chunks within a single poll is caught by the
+                        // drain below.
+                        biased;
+                        res = &mut step_fut => break res,
+                        Some(chunk) = rx.recv() => {
+                            self.emit(
+                                run.session_id,
+                                run_actor.clone(),
+                                EventBody::ModelStreamDelta {
+                                    run_id: run.run_id,
+                                    text: chunk,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            };
+            // Drain chunks queued but not emitted live above — a synchronous
+            // burst the `select!` did not interleave, or the chunks a driver
+            // pushed just before returning `Err`. `sink` (holding the sender) is
+            // still alive, so `try_recv` reports `Empty`, not `Disconnected`, once
+            // drained. This runs on BOTH the `Ok` and `Err` paths, so chunks
+            // emitted before a mid-stream error are never lost.
+            while let Ok(chunk) = rx.try_recv() {
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ModelStreamDelta {
+                        run_id: run.run_id,
+                        text: chunk,
+                    },
+                )
+                .await?;
+            }
             let StepOutcome {
                 step,
                 usage: step_usage,
-            } = match driver.next_step(&transcript, &mut sink).await {
+            } = match step_result {
                 Ok(outcome) => outcome,
                 Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
             };
@@ -927,24 +983,6 @@ impl FrameworkAgentRuntime {
                 usage = ?trace.usage,
                 "model request"
             );
-
-            // Drain-emit the chunks the driver pushed through the sink during
-            // this request, each becoming its own `ModelStreamDelta`, in
-            // arrival order. This happens here — after the `next_step` above
-            // has resolved — rather than inside `on_text` itself, because
-            // `on_text` is synchronous but `emit` is `async` (see
-            // `BufferingSink`).
-            for chunk in sink.chunks {
-                self.emit(
-                    run.session_id,
-                    run_actor.clone(),
-                    EventBody::ModelStreamDelta {
-                        run_id: run.run_id,
-                        text: chunk,
-                    },
-                )
-                .await?;
-            }
 
             match step {
                 ModelStep::Say(text) => {
@@ -2127,10 +2165,12 @@ fn build_chronicle(
 ///
 /// It translates the loop's [`TurnItem`] transcript into framework
 /// [`Message`](agent_framework_core::types::Message)s, advertises the Phase 1
-/// tools as declaration-only function tools, calls
-/// [`ChatClient::get_response`](agent_framework_core::client::ChatClient::get_response),
-/// and maps the returned turn back to a [`ModelStep`]: a function call becomes
-/// [`ModelStep::CallTool`], any other completed turn becomes
+/// tools as declaration-only function tools, and calls
+/// [`ChatClient::get_streaming_response`](agent_framework_core::client::ChatClient::get_streaming_response),
+/// pushing each update's text delta through the [`DeltaSink`] as it arrives (the
+/// loop emits a live `ModelStreamDelta` per chunk). It then assembles the
+/// updates into a response and maps it back to a [`ModelStep`]: a function call
+/// becomes [`ModelStep::CallTool`], any other completed turn becomes
 /// [`ModelStep::Finish`] carrying its text.
 ///
 /// This is a focused implementation compiled behind `provider-openai`; a live
@@ -2354,63 +2394,129 @@ impl ModelDriver for FrameworkModelDriver {
     async fn next_step(
         &self,
         transcript: &[TurnItem],
-        // Not yet used: this driver still returns its text in one shot (the
-        // existing `get_response` body below); Task 2 rewrites this body to
-        // stream via `get_streaming_response` and push chunks through `sink`.
-        _sink: &mut dyn DeltaSink,
+        sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
-        use agent_framework_core::types::ChatOptions;
+        use agent_framework_core::types::{ChatOptions, ChatResponseUpdate};
+        use futures::StreamExt;
 
         let mut options = ChatOptions::new();
         options.tools = Self::tool_definitions();
 
-        let response = self
+        let mut stream = self
             .client
-            .get_response(Self::to_messages(transcript), options)
+            .get_streaming_response(Self::to_messages(transcript), options)
             .await
-            .map_err(|e| anyhow::anyhow!("model request failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
 
-        // Provider usage (Phase 7). The framework `ChatResponse` surfaces real
-        // TOKEN counts on `response.usage_details` (the OpenAI-compatible chat
-        // path parses `prompt_tokens`/`completion_tokens`). We report those
-        // MEASURED tokens with an UNMEASURED cost (`cost_micros: None`): the
-        // driver has no per-token price, so the routed model's price is applied
-        // downstream in the daemon's node-execution path. When the provider
-        // reports no usage at all, this is honestly `None` — never a fabricated
-        // zero. Computed once and attached to whichever step the turn yields.
-        let usage = measured_usage(response.usage_details.as_ref());
-
-        // A function call in the returned turn becomes a tool call.
-        if let Some(message) = response.messages.last() {
-            if let Some(call) = message.function_calls().into_iter().next() {
-                let args = call
-                    .parse_arguments()
-                    .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
-                    .unwrap_or(Value::Null);
-                return Ok(StepOutcome::new(
-                    ModelStep::CallTool {
-                        tool: call.name.clone(),
-                        args,
-                    },
-                    usage,
-                ));
+        // Consume the provider stream, pushing each update's text delta through
+        // `sink` AS IT ARRIVES (the agent loop turns each into a live
+        // `ModelStreamDelta`) and collecting the updates for assembly. A
+        // mid-stream error propagates via `?` — the loop's existing "driver
+        // error fails the run" path; chunks already pushed to `sink` stay emitted
+        // (they went out as they arrived) and no usage is fabricated (the
+        // assembly below is never reached).
+        let mut updates: Vec<ChatResponseUpdate> = Vec::new();
+        while let Some(update) = stream.next().await {
+            let update = update.map_err(|e| anyhow::anyhow!("model stream error: {e}"))?;
+            if let Some(text) = update_text_delta(&update) {
+                sink.on_text(&text);
             }
+            updates.push(update);
         }
 
-        // Otherwise the completed turn is the final answer.
-        let text = response.text();
-        Ok(StepOutcome::new(
-            ModelStep::Finish {
-                summary: if text.is_empty() {
-                    "run complete".to_string()
-                } else {
-                    text
-                },
-            },
-            usage,
-        ))
+        // Text was already streamed to `sink` live above, so the assembler runs
+        // with a no-op `on_text`. `updates_to_step` (unit-tested) is the single
+        // place that folds the updates into `(ModelStep, usage)` — coalescing
+        // text, merging tool-call fragments, and assembling provider usage —
+        // exactly as the former non-streaming `get_response` mapping did.
+        let (step, usage) = updates_to_step(updates, |_| {});
+        Ok(StepOutcome::new(step, usage))
     }
+}
+
+/// The text delta a single streaming [`ChatResponseUpdate`](agent_framework_core::types::ChatResponseUpdate)
+/// contributes, or `None` when it carries none (a usage-only or tool-call
+/// fragment, or an empty keep-alive). The one rule the live driver loop and the
+/// pure [`updates_to_step`] assembler share, so they never diverge on what
+/// counts as an emittable chunk.
+#[cfg(feature = "provider-openai")]
+fn update_text_delta(update: &agent_framework_core::types::ChatResponseUpdate) -> Option<String> {
+    let text = update.text_content();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Map a fully-assembled framework
+/// [`ChatResponse`](agent_framework_core::types::ChatResponse) to the loop's
+/// `(ModelStep, usage)`: a function call becomes [`ModelStep::CallTool`], any
+/// other completed turn becomes [`ModelStep::Finish`] carrying its text. Usage is
+/// MEASURED tokens with an UNMEASURED cost (priced downstream), or `None` when
+/// the provider reported none — never a fabricated zero. This is the identical
+/// mapping the non-streaming `get_response` path used, now applied to the
+/// stream-assembled response.
+#[cfg(feature = "provider-openai")]
+fn chat_response_to_step(
+    response: &agent_framework_core::types::ChatResponse,
+) -> (ModelStep, Option<ModelUsage>) {
+    let usage = measured_usage(response.usage_details.as_ref());
+
+    // A function call in the assembled turn becomes a tool call.
+    if let Some(message) = response.messages.last() {
+        if let Some(call) = message.function_calls().into_iter().next() {
+            let args = call
+                .parse_arguments()
+                .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
+                .unwrap_or(Value::Null);
+            return (
+                ModelStep::CallTool {
+                    tool: call.name.clone(),
+                    args,
+                },
+                usage,
+            );
+        }
+    }
+
+    // Otherwise the completed turn is the final answer.
+    let text = response.text();
+    (
+        ModelStep::Finish {
+            summary: if text.is_empty() {
+                "run complete".to_string()
+            } else {
+                text
+            },
+        },
+        usage,
+    )
+}
+
+/// Fold a batch of streaming updates into `(ModelStep, usage)`, invoking
+/// `on_text` with each text delta in arrival order. Pure and synchronous — the
+/// testable mirror of [`FrameworkModelDriver::next_step`]'s live loop: it
+/// extracts each delta with [`update_text_delta`], absorbs every update into a
+/// [`ChatResponse`](agent_framework_core::types::ChatResponse) via the
+/// framework's own coalescer (text coalesces, tool-call fragments merge, usage
+/// accumulates), then maps the assembled response with [`chat_response_to_step`].
+/// The driver emits live to its sink as updates arrive and calls this with a
+/// no-op `on_text` purely to assemble; the unit test calls it with a collecting
+/// closure to pin the ordered-chunk / coalesced-text / assembled-usage contract.
+#[cfg(feature = "provider-openai")]
+fn updates_to_step(
+    updates: Vec<agent_framework_core::types::ChatResponseUpdate>,
+    mut on_text: impl FnMut(&str),
+) -> (ModelStep, Option<ModelUsage>) {
+    use agent_framework_core::types::ChatResponse;
+
+    let mut assembled = ChatResponse::default();
+    for update in updates {
+        if let Some(text) = update_text_delta(&update) {
+            on_text(&text);
+        }
+        assembled.absorb_update(update);
+    }
+    assembled.finalize();
+    chat_response_to_step(&assembled)
 }
 
 /// Map the framework chat response's [`UsageDetails`](agent_framework_core::types::UsageDetails)
@@ -2825,5 +2931,209 @@ mod tests {
 
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas, vec!["Hello, world.".to_string()]);
+    }
+
+    // -- Task 2: live streaming (multi-delta + partial-on-error) ------------
+
+    /// A driver that, on each `next_step`, pushes several text chunks through
+    /// the sink — like a real streaming provider emitting token-by-token,
+    /// yielding between chunks so the loop's `select!` observes the step future
+    /// as pending and drains each chunk LIVE — then finishes. The run ends on
+    /// the returned `Finish`, so exactly one `next_step` runs per run.
+    struct MultiChunkStreamingDriver {
+        chunks: Vec<String>,
+    }
+
+    impl MultiChunkStreamingDriver {
+        fn new(chunks: &[&str]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.to_string()).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelDriver for MultiChunkStreamingDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("multi-chunk".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            for chunk in &self.chunks {
+                sink.on_text(chunk);
+                // Yield so the loop sees the step future pending and emits this
+                // chunk live (via the `recv` branch) before the next arrives.
+                tokio::task::yield_now().await;
+            }
+            Ok(StepOutcome::new(
+                ModelStep::Finish {
+                    summary: self.chunks.concat(),
+                },
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multi_chunk_stream_emits_one_ordered_delta_per_chunk() {
+        // A streaming request that produces several chunks yields one
+        // `ModelStreamDelta` PER chunk, live and in order — not a single
+        // buffered dump — and their concatenation is the full reply.
+        let driver = MultiChunkStreamingDriver::new(&["Strea", "ming ", "reply."]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "stream a reply",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("streaming run completes");
+
+        let deltas = drain_deltas(&mut events);
+        assert_eq!(
+            deltas,
+            vec![
+                "Strea".to_string(),
+                "ming ".to_string(),
+                "reply.".to_string()
+            ]
+        );
+        // More than one delta proves per-chunk streaming (not one buffered emit).
+        assert!(deltas.len() > 1, "expected multiple deltas, got {deltas:?}");
+        assert_eq!(deltas.concat(), "Streaming reply.");
+    }
+
+    /// A driver that pushes two chunks through the sink and THEN fails
+    /// mid-stream, with no yields — so the chunks are still queued on the
+    /// channel when it returns `Err`, forcing the loop to drain them on the
+    /// error path (not just the success path).
+    struct FailAfterChunksDriver {
+        chunks: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ModelDriver for FailAfterChunksDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("fail-after-chunks".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            for chunk in &self.chunks {
+                sink.on_text(chunk);
+            }
+            Err(anyhow::anyhow!("stream failed mid-response"))
+        }
+    }
+
+    #[tokio::test]
+    async fn chunks_streamed_before_a_mid_stream_error_are_still_emitted() {
+        // The run fails (the driver errored), but the chunks pushed before the
+        // error must survive as deltas — they went out as they arrived / are
+        // drained on the error path, never lost.
+        let driver = FailAfterChunksDriver {
+            chunks: vec!["par".to_string(), "tial".to_string()],
+        };
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "fail mid-stream",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let outcome = runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("execute_run returns Ok even when the run itself fails");
+
+        assert!(
+            matches!(outcome.disposition, RunDisposition::Failed { .. }),
+            "expected a failed run, got {:?}",
+            outcome.disposition
+        );
+        let deltas = drain_deltas(&mut events);
+        assert_eq!(deltas, vec!["par".to_string(), "tial".to_string()]);
+    }
+
+    /// A text-only assistant streaming update.
+    #[cfg(feature = "provider-openai")]
+    fn text_update(text: &str) -> agent_framework_core::types::ChatResponseUpdate {
+        agent_framework_core::types::ChatResponseUpdate::text(text)
+    }
+
+    /// A usage-bearing final update, as the OpenAI streaming path emits when
+    /// `stream_options.include_usage` is set: a `Content::Usage` carrying
+    /// measured token counts, and no text.
+    #[cfg(feature = "provider-openai")]
+    fn usage_update(
+        prompt: u64,
+        completion: u64,
+    ) -> agent_framework_core::types::ChatResponseUpdate {
+        use agent_framework_core::types::{Content, UsageContent, UsageDetails};
+        agent_framework_core::types::ChatResponseUpdate {
+            contents: vec![Content::Usage(UsageContent {
+                details: UsageDetails {
+                    input_token_count: Some(prompt),
+                    output_token_count: Some(completion),
+                    ..Default::default()
+                },
+            })],
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn updates_fold_into_streamed_chunks_and_a_final_step_with_usage() {
+        // Two text updates then a usage-bearing final update fold into: chunks
+        // pushed in order, text coalesced into the final step, and assembled
+        // provider usage (measured tokens, unmeasured cost).
+        let updates = vec![text_update("Hel"), text_update("lo"), usage_update(3, 2)];
+        let mut chunks = Vec::new();
+        let (step, usage) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+
+        assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
+        match step {
+            ModelStep::Finish { summary } => assert_eq!(summary, "Hello"),
+            other => panic!("expected Finish carrying the coalesced text, got {other:?}"),
+        }
+        assert_eq!(
+            usage,
+            Some(ModelUsage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                cost_micros: None,
+            })
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn updates_with_no_usage_assemble_to_none_never_a_fabricated_zero() {
+        // No usage update ⇒ honestly `None` (the honesty invariant): the run is
+        // unmeasured, never charged a fabricated zero.
+        let updates = vec![text_update("hi")];
+        let mut chunks = Vec::new();
+        let (step, usage) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+
+        assert_eq!(chunks, vec!["hi".to_string()]);
+        assert!(matches!(step, ModelStep::Finish { .. }));
+        assert_eq!(usage, None);
     }
 }

@@ -19,6 +19,9 @@ codypendent-routing = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
+# Drives the framework `ChatStream` (`get_streaming_response`) in the live
+# `FrameworkModelDriver`; only needed when a streaming provider is compiled in.
+futures = { workspace = true, optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,7 +40,7 @@ sqlx = { workspace = true }
 
 [features]
 default = ["provider-openai"]
-provider-openai = ["dep:agent-framework-openai"]
+provider-openai = ["dep:agent-framework-openai", "dep:futures"]
 provider-anthropic = ["dep:agent-framework-anthropic"]
 
 [lints]

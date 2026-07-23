@@ -664,6 +664,7 @@ dependencies = [
  "codypendent-integrations",
  "codypendent-protocol",
  "codypendent-routing",
+ "futures",
  "hex",
  "serde",
  "serde_json",
