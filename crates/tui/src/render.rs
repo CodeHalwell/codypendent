@@ -573,14 +573,16 @@ fn model_entry_lines<'a>(
 }
 
 fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &mut Vec<Line<'a>>) {
-    let (status_text, status_color) = match card.status {
-        ToolStatus::Proposed => ("proposed", theme.status.warning),
+    // Task 5 (codex chat shell): the collapsed head is one compact line — a
+    // run glyph, the tool's verb/name, and a terse outcome mark — instead of
+    // a `[status]` bracket; `card.status`/`card.outcome` drive the mark
+    // exactly as they drove the old bracket text.
+    let (outcome_mark, outcome_color) = match card.status {
+        ToolStatus::Proposed => ("⟳ review", theme.status.warning),
         ToolStatus::Running => ("running", theme.status.running),
         ToolStatus::Completed => match &card.outcome {
-            Some(codypendent_protocol::ToolOutcome::Failed { .. }) => {
-                ("failed", theme.status.error)
-            }
-            _ => ("done", theme.status.success),
+            Some(codypendent_protocol::ToolOutcome::Failed { .. }) => ("✗", theme.status.error),
+            _ => ("✓", theme.status.success),
         },
     };
     let name = if card.tool.is_empty() {
@@ -595,11 +597,8 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
         Style::default().fg(theme.agent.tool)
     };
     out.push(Line::from(vec![
-        Span::styled(format!("{marker} ⚙ {name} "), head_style),
-        Span::styled(
-            format!("[{status_text}]"),
-            Style::default().fg(status_color),
-        ),
+        Span::styled(format!("{marker} ⏺ {name} "), head_style),
+        Span::styled(outcome_mark, Style::default().fg(outcome_color)),
     ]));
 
     if card.expanded {
@@ -641,19 +640,28 @@ fn patch_lines<'a>(
     selected: bool,
     out: &mut Vec<Line<'a>>,
 ) {
+    // Task 5 (codex chat shell): the collapsed head is one compact line — a
+    // patch glyph, the change set's short id standing in for a target name
+    // (`PatchSummary` carries no file path or add/delete line counts yet —
+    // that needs a protocol change, out of scope here), and a `⟳ review`
+    // marker. The protocol has no `PatchApplied`/`PatchRejected` event, so a
+    // `PatchProposed` change set never resolves on the wire: every patch
+    // card sits in the transcript for manual review for its entire
+    // lifetime, so the marker is unconditional rather than derived from a
+    // per-instance status field.
     let marker = if patch.expanded { "▾" } else { "▸" };
     let head_style = if selected {
         theme.selection_style()
     } else {
         Style::default().fg(theme.diff.header)
     };
-    out.push(Line::styled(
-        format!(
-            "{marker} ❖ patch proposed ({})",
-            short_id(&patch.changeset_id)
+    out.push(Line::from(vec![
+        Span::styled(
+            format!("{marker} ❖ patch {} ", short_id(&patch.changeset_id)),
+            head_style,
         ),
-        head_style,
-    ));
+        Span::styled("⟳ review", Style::default().fg(theme.status.warning)),
+    ]));
     if patch.expanded {
         out.push(Line::styled(
             format!(
@@ -2642,8 +2650,8 @@ mod tests {
     use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
-        Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
-        ProposedAction, Risk, RiskLevel, RunId, SessionEvent, ToolOutcome,
+        Actor, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, EventBody,
+        ModelId, ProposedAction, Risk, RiskLevel, RunId, SessionEvent, ToolOutcome,
     };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2770,6 +2778,136 @@ mod tests {
         assert!(
             text.contains("approvals"),
             "approval count missing:\n{text}"
+        );
+    }
+
+    /// Task 5 (codex chat shell): the collapsed tool card head restyles into
+    /// one compact Codex-style line — a run glyph (`⏺`) and the tool's
+    /// verb/name, with a terse outcome mark instead of the old `[status]`
+    /// bracket.
+    #[test]
+    fn a_completed_tool_card_renders_compact_with_a_run_glyph_and_check() {
+        let state = running_build_state();
+        let text = render_to_string(&state, 110, 30);
+        assert!(
+            text.contains("⏺ shell.run"),
+            "run glyph + name missing:\n{text}"
+        );
+        assert!(text.contains('✓'), "success outcome mark missing:\n{text}");
+        assert!(
+            !text.contains("[done]"),
+            "old bracket style must be gone:\n{text}"
+        );
+    }
+
+    /// A tool still awaiting a decision (`ToolStatus::Proposed`) shows the
+    /// same `⟳ review` marker a patch does, instead of the old `[proposed]`.
+    #[test]
+    fn a_proposed_tool_card_shows_a_review_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolProposed {
+                run_id,
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("⟳ review"), "review marker missing:\n{out}");
+        assert!(
+            !out.contains("[proposed]"),
+            "old bracket style must be gone:\n{out}"
+        );
+    }
+
+    /// A failed tool card shows a terse `✗` in the collapsed head; the
+    /// failure message itself stays in the expanded detail (unchanged).
+    #[test]
+    fn a_failed_tool_card_shows_a_cross_mark() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "d".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "exit 1".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains('✗'), "failure outcome mark missing:\n{out}");
+        assert!(
+            !out.contains("[failed]"),
+            "old bracket style must be gone:\n{out}"
+        );
+    }
+
+    /// Task 5: a patch card's collapsed head is `❖ patch {short id}` plus a
+    /// `⟳ review` marker. The protocol has no `PatchApplied`/`PatchRejected`
+    /// event — a `PatchProposed` change set never resolves on the wire, so
+    /// every patch card sits in the transcript for manual review for its
+    /// entire lifetime; the marker is unconditional rather than derived from
+    /// a per-instance status field (`PatchSummary` carries none).
+    #[test]
+    fn a_patch_card_renders_compact_with_a_patch_glyph_and_review_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("❖ patch"), "patch glyph missing:\n{out}");
+        assert!(out.contains("⟳ review"), "review marker missing:\n{out}");
+        assert!(
+            !out.contains("patch proposed ("),
+            "old verbose label must be gone:\n{out}"
         );
     }
 
