@@ -23,7 +23,7 @@ use codypendent_protocol::{
 use crate::reduce::capability_label;
 use crate::state::{
     filter_models, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel,
-    Overlay, PatchSummary, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    Overlay, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -351,7 +351,25 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
             Style::default().fg(theme.text.muted),
         ));
     }
+    // The live "working" status row (Task 3): appended last so it always
+    // reads as the newest line, right under the latest transcript content.
+    if let Some(status) = activity_status_line(&run.activity, theme) {
+        lines.push(status);
+    }
     lines
+}
+
+/// The dim status row a run's derived [`RunActivity`] renders as, so a run
+/// between visible transcript updates never looks silently paused.
+/// `Streaming` needs no row of its own (the growing model text is itself the
+/// live signal) and `Idle` renders nothing.
+fn activity_status_line(activity: &RunActivity, theme: &Theme) -> Option<Line<'static>> {
+    let text = match activity {
+        RunActivity::Thinking => "working…".to_owned(),
+        RunActivity::RunningTool(tool) => format!("running {tool}…"),
+        RunActivity::Streaming | RunActivity::Idle => return None,
+    };
+    Some(Line::styled(text, Style::default().fg(theme.text.muted)))
 }
 
 fn entry_lines<'a>(
@@ -2576,6 +2594,87 @@ mod tests {
             text.contains("approvals"),
             "approval count missing:\n{text}"
         );
+    }
+
+    /// Task 3: a run that is `Preparing`/`Running` with no model text
+    /// streaming yet shows a dim "working…" row, so it never looks silently
+    /// paused between transcript updates.
+    #[test]
+    fn a_thinking_run_shows_a_working_status_row() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("working…"), "status row missing:\n{out}");
+    }
+
+    /// Task 3: while a tool is executing, the status row names it instead of
+    /// the generic "working…" — e.g. "running shell.run…".
+    #[test]
+    fn a_running_tool_status_row_names_the_tool() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("running shell.run…"),
+            "tool status row missing:\n{out}"
+        );
+    }
+
+    /// Task 3: a fresh run (no `RunStateChanged` yet) is `Idle`, and `Idle`
+    /// renders no status row at all — the row must not appear by default.
+    #[test]
+    fn an_idle_run_shows_no_status_row() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(!out.contains("working…"), "unexpected status row:\n{out}");
+        assert!(!out.contains("running "), "unexpected status row:\n{out}");
     }
 
     #[test]

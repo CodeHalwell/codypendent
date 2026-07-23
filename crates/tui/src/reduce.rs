@@ -15,7 +15,8 @@ use codypendent_protocol::{
 use crate::action::{Action, Intent};
 use crate::state::{
     filter_models, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    Overlay, Pane, PatchSummary, PendingApproval, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard, ToolStatus,
+    TranscriptEntry,
 };
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -259,11 +260,25 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         EventBody::RunStateChanged { run_id, state: rs } => {
             if let Some(run) = state.run_mut(run_id) {
                 run.state = rs;
+                // Only the states this task's transition table names move
+                // `activity`; anything else (paused, awaiting approval/input,
+                // recovering, unknown) leaves whatever activity was last
+                // observed in place.
+                match rs {
+                    RunState::Preparing | RunState::Running => {
+                        run.activity = RunActivity::Thinking;
+                    }
+                    RunState::Completed | RunState::Failed | RunState::Cancelled => {
+                        run.activity = RunActivity::Idle;
+                    }
+                    _ => {}
+                }
             }
         }
         EventBody::ModelStreamDelta { run_id, text } => {
             if let Some(run) = state.run_mut(run_id) {
                 AppState::append_model_text(run, &text);
+                run.activity = RunActivity::Streaming;
             }
         }
         EventBody::ToolProposed {
@@ -301,6 +316,10 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             args_digest,
         } => {
             if let Some(run) = state.run_mut(run_id) {
+                // Cloned before `tool` moves into the card below: the tool
+                // card entering `Running` is what `RunActivity::RunningTool`
+                // names.
+                let tool_name = tool.clone();
                 match last_card(run, |c| c.status == ToolStatus::Proposed) {
                     Some(card) => {
                         card.tool = tool;
@@ -321,6 +340,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         })),
                     ),
                 }
+                run.activity = RunActivity::RunningTool(tool_name);
             }
         }
         EventBody::ToolCompleted {
@@ -353,6 +373,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         })),
                     ),
                 }
+                // The tool finished; the agent is back to composing its next
+                // step.
+                run.activity = RunActivity::Thinking;
             }
         }
         EventBody::PatchProposed {
@@ -446,6 +469,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     },
                 );
                 run.disposition = Some(disposition);
+                run.activity = RunActivity::Idle;
             }
         }
 
@@ -1726,6 +1750,82 @@ mod tests {
             s.runs[0].disposition,
             Some(RunDisposition::Failed { .. })
         ));
+    }
+
+    /// Task 3: `RunActivity` is derived purely from folding run-state,
+    /// streaming, and tool-lifecycle events — never fetched. Walks a run
+    /// through every transition the reducer owns: `Running` ⇒ `Thinking`, a
+    /// model delta ⇒ `Streaming`, a tool starting ⇒ `RunningTool(name)`, that
+    /// tool completing ⇒ back to `Thinking`, and the terminal `RunCompleted`
+    /// ⇒ `Idle`.
+    #[test]
+    fn run_activity_tracks_thinking_streaming_tool_and_idle() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
+
+        reduce(
+            &mut s,
+            ev(
+                agent_actor(run_id),
+                EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "hi".to_owned(),
+                },
+            ),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Streaming);
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+            }),
+        );
+        assert_eq!(
+            s.runs[0].activity,
+            RunActivity::RunningTool("shell.run".to_owned())
+        );
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_owned()),
+                },
+                chronicle: artifact(),
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Idle);
     }
 
     #[test]
