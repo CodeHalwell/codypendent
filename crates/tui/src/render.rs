@@ -342,6 +342,16 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
     let last_idx = run.transcript.len().checked_sub(1);
+    // Assistant-turn header (codex chat shell Task 3): a `⏺ codypendent`
+    // line announces the first agent cell (Model/Tool/Patch) of each turn,
+    // so the transcript reads as "you asked → codypendent answered" rather
+    // than an undifferentiated stream. `awaiting_header` tracks whether the
+    // next agent cell is still the first one since the most recent `User`
+    // entry; every other cell kind (Steering, Budget, Note, Backstage,
+    // Completed, Unsupported) leaves it untouched, so a run that ends before
+    // producing any agent cell never emits a lone header with nothing under
+    // it.
+    let mut awaiting_header = false;
     for (idx, entry) in run.transcript.iter().enumerate() {
         let selected = focused && idx == run.transcript_selected;
         // Task 4: the streaming caret belongs on the newest entry only, and
@@ -350,6 +360,19 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
         // Idle/Thinking/RunningTool (a tool call, a thinking pause, or
         // completion all drop it).
         let streaming_tail = last_idx == Some(idx) && run.activity == RunActivity::Streaming;
+        let is_agent_cell = matches!(
+            entry,
+            TranscriptEntry::Model { .. } | TranscriptEntry::Tool(_) | TranscriptEntry::Patch(_)
+        );
+        if matches!(entry, TranscriptEntry::User { .. }) {
+            awaiting_header = true;
+        } else if is_agent_cell && awaiting_header {
+            lines.push(Line::styled(
+                "⏺ codypendent",
+                Style::default().fg(theme.focus.active),
+            ));
+            awaiting_header = false;
+        }
         entry_lines(entry, theme, selected, streaming_tail, &mut lines);
     }
     if lines.is_empty() {
@@ -422,10 +445,27 @@ fn entry_lines<'a>(
                 theme.status.warning,
             ));
         }
-        TranscriptEntry::Completed { disposition } => {
-            let (label, color) = disposition_display(disposition, theme);
-            out.push(head(format!("● {label}"), color));
-        }
+        TranscriptEntry::Completed { disposition } => match disposition {
+            // Success: the streamed model prose already ended the turn —
+            // render nothing here, so the reply is never echoed a second
+            // (or, with the old status line plus this one, third) time.
+            RunDisposition::Completed { .. } => {}
+            RunDisposition::Failed { reason } => {
+                out.push(head(format!("✗ {reason}"), theme.status.error));
+            }
+            RunDisposition::Cancelled { reason } => {
+                let text = reason
+                    .as_ref()
+                    .map_or_else(|| "✗ cancelled".to_owned(), |r| format!("✗ cancelled: {r}"));
+                out.push(head(text, theme.text.muted));
+            }
+            // Protocol RULE 1 (render, do not crash): `RunDisposition` is
+            // `#[non_exhaustive]` — this also catches the `Unknown` variant a
+            // disposition kind this build predates deserializes to.
+            _ => {
+                out.push(head("✗ run ended".to_owned(), theme.text.muted));
+            }
+        },
         TranscriptEntry::Note { text, expanded } => {
             note_lines(text, *expanded, theme, selected, out)
         }
@@ -2531,27 +2571,6 @@ fn budget_label(dimension: BudgetDimension) -> &'static str {
     }
 }
 
-fn disposition_display(disposition: &RunDisposition, theme: &Theme) -> (String, Color) {
-    match disposition {
-        RunDisposition::Completed { summary } => (
-            format!(
-                "run completed{}",
-                summary.as_ref().map_or(String::new(), |s| format!(": {s}"))
-            ),
-            theme.status.success,
-        ),
-        RunDisposition::Failed { reason } => (format!("run failed: {reason}"), theme.status.error),
-        RunDisposition::Cancelled { reason } => (
-            format!(
-                "run cancelled{}",
-                reason.as_ref().map_or(String::new(), |s| format!(": {s}"))
-            ),
-            theme.text.muted,
-        ),
-        _ => ("run ended".to_owned(), theme.text.muted),
-    }
-}
-
 fn format_cost(cost_minor: Option<u64>) -> String {
     match cost_minor {
         Some(c) => format!("${}.{:02}", c / 100, c % 100),
@@ -2854,6 +2873,187 @@ mod tests {
         assert!(
             !done.contains('▋'),
             "caret is gone once the run completes:\n{done}"
+        );
+    }
+
+    /// A completed helper: `RunCompleted` needs a `chronicle` artifact
+    /// reference alongside the disposition; every disposition test below
+    /// uses this filler ref, only the disposition itself is under test.
+    fn filler_chronicle() -> ArtifactRef {
+        ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_owned(),
+            byte_length: 10,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        }
+    }
+
+    /// Task 3 (codex chat shell): a successful run's reply already ended the
+    /// turn as streamed model prose, so the `Completed` cell must render
+    /// nothing — no second/third echo of the same reply — and the turn's
+    /// first agent cell gets a `⏺ codypendent` header.
+    #[test]
+    fn a_completed_success_shows_the_reply_once_no_echo() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "hello there".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("hello there".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert_eq!(
+            out.matches("hello there").count(),
+            1,
+            "reply appears exactly once, not echoed by Completed:\n{out}"
+        );
+        assert!(!out.contains("run completed"), "no completed echo:\n{out}");
+        assert!(
+            out.contains("⏺ codypendent"),
+            "assistant header shown before the reply:\n{out}"
+        );
+    }
+
+    /// A run that fails before producing any prose has no `Model`/`Tool`/
+    /// `Patch` cell — so it must not render a lone `⏺ codypendent` header
+    /// with nothing under it. It shows its failure reason, tersely (no
+    /// leftover "run failed:" verbiage from the old always-visible echo).
+    #[test]
+    fn a_failed_run_shows_its_reason() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "no model configured".to_owned(),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("no model configured"),
+            "failure reason shown:\n{out}"
+        );
+        assert!(
+            !out.contains("run failed:"),
+            "terse reason, not the old verbose echo:\n{out}"
+        );
+        assert!(
+            !out.contains("⏺ codypendent"),
+            "no agent cell ever ran, so no lone header:\n{out}"
+        );
+    }
+
+    /// `RunDisposition::Cancelled` carries an optional reason (unlike the
+    /// unit-variant the design sketch assumed) — it renders tersely too, and
+    /// still surfaces the reason when one is given.
+    #[test]
+    fn a_cancelled_run_shows_its_reason_tersely() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Cancelled {
+                    reason: Some("budget exceeded".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("cancelled"), "cancellation shown:\n{out}");
+        assert!(out.contains("budget exceeded"), "reason shown:\n{out}");
+        assert!(
+            !out.contains("run cancelled:"),
+            "terse form, not the old verbose echo:\n{out}"
+        );
+    }
+
+    /// The assistant header announces only the first agent cell of a turn —
+    /// a tool call followed by more model text in the same turn must not
+    /// repeat it, and a `Tool` cell (not just `Model`) triggers it.
+    #[test]
+    fn the_assistant_header_appears_once_per_turn_even_with_multiple_agent_cells() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc123".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "done".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert_eq!(
+            out.matches("⏺ codypendent").count(),
+            1,
+            "header appears exactly once for the whole turn:\n{out}"
         );
     }
 
