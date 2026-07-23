@@ -244,6 +244,58 @@ pub struct RunOutcome {
     pub usage: Option<ModelUsage>,
 }
 
+// ---------------------------------------------------------------------------
+// DeltaSink: the streaming seam (Task 1 groundwork)
+// ---------------------------------------------------------------------------
+
+/// Receives natural-language text chunks as the model generates them, so the
+/// agent loop can emit a `ModelStreamDelta` per chunk. Text flows through the
+/// sink DURING generation; the driver still returns the assembled
+/// [`StepOutcome`] once it is done. Every driver today still produces its text
+/// in one shot (a [`ScriptedDriver`]'s `Say` step, or [`FrameworkModelDriver`]'s
+/// completed response), so `on_text` is called once per request — but this is
+/// the seam a real token-by-token stream (a later task) plugs into without
+/// another signature change.
+pub trait DeltaSink: Send {
+    /// Handle one chunk of streamed text.
+    fn on_text(&mut self, chunk: &str);
+}
+
+/// A sink that discards every chunk — for a driver or caller that does not
+/// stream (or does not care to observe the chunks).
+pub struct NullDeltaSink;
+
+impl DeltaSink for NullDeltaSink {
+    fn on_text(&mut self, _chunk: &str) {}
+}
+
+/// A [`DeltaSink`] that buffers chunks in arrival order, for the loop to
+/// drain-emit as `ModelStreamDelta` events once `next_step` returns.
+///
+/// `DeltaSink::on_text` is synchronous — a driver may call it from a plain,
+/// non-async callback as it walks a completed response — while the loop's
+/// [`FrameworkAgentRuntime::emit`] is `async` (it awaits a journal write
+/// before publishing). Rather than making `on_text` async, which would leak
+/// async machinery (and object-safety complications) into every driver, this
+/// sink just buffers each chunk as it arrives; the loop awaits `next_step` to
+/// completion — so every chunk for this request has already been pushed —
+/// then drains the buffer in order, emitting one `ModelStreamDelta` per
+/// chunk. Order is preserved because nothing observes the sink between the
+/// `on_text` calls and the drain.
+#[derive(Default)]
+struct BufferingSink {
+    chunks: Vec<String>,
+}
+
+impl DeltaSink for BufferingSink {
+    fn on_text(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.chunks.push(chunk.to_string());
+    }
+}
+
 /// Produces the next [`ModelStep`] from the conversation so far. The loop is
 /// written entirely against this trait, so it runs identically with a scripted
 /// driver (tests) or a live framework client.
@@ -256,7 +308,14 @@ pub trait ModelDriver: Send + Sync {
     /// Given the conversation so far, produce the next step and the MEASURED
     /// usage for the request that produced it (see [`StepOutcome`]). A driver
     /// that cannot measure usage returns `usage: None` — never a fabricated zero.
-    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<StepOutcome>;
+    /// As it produces natural-language text, it pushes each chunk through
+    /// `sink` (see [`DeltaSink`]); today's drivers push once per request, but
+    /// this is the seam a later token-by-token stream plugs into.
+    async fn next_step(
+        &self,
+        transcript: &[TurnItem],
+        sink: &mut dyn DeltaSink,
+    ) -> anyhow::Result<StepOutcome>;
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -305,13 +364,20 @@ impl ModelDriver for ScriptedDriver {
         self.model_id.clone()
     }
 
-    async fn next_step(&self, _transcript: &[TurnItem]) -> anyhow::Result<StepOutcome> {
+    async fn next_step(
+        &self,
+        _transcript: &[TurnItem],
+        sink: &mut dyn DeltaSink,
+    ) -> anyhow::Result<StepOutcome> {
         let step = {
             let mut queue = self.steps.lock().expect("scripted driver mutex poisoned");
             queue.pop_front().unwrap_or(ModelStep::Finish {
                 summary: "scripted run complete".to_string(),
             })
         };
+        if let ModelStep::Say(text) = &step {
+            sink.on_text(text);
+        }
         Ok(StepOutcome::new(step, self.usage))
     }
 }
@@ -824,10 +890,14 @@ impl FrameworkAgentRuntime {
             }
 
             let started = Instant::now();
+            // A fresh sink per request: the driver pushes this request's text
+            // chunks into it (synchronously — see `BufferingSink`), and the
+            // loop drains it below, once `next_step` has returned.
+            let mut sink = BufferingSink::default();
             let StepOutcome {
                 step,
                 usage: step_usage,
-            } = match driver.next_step(&transcript).await {
+            } = match driver.next_step(&transcript, &mut sink).await {
                 Ok(outcome) => outcome,
                 Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
             };
@@ -858,17 +928,30 @@ impl FrameworkAgentRuntime {
                 "model request"
             );
 
+            // Drain-emit the chunks the driver pushed through the sink during
+            // this request, each becoming its own `ModelStreamDelta`, in
+            // arrival order. This happens here — after the `next_step` above
+            // has resolved — rather than inside `on_text` itself, because
+            // `on_text` is synchronous but `emit` is `async` (see
+            // `BufferingSink`).
+            for chunk in sink.chunks {
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ModelStreamDelta {
+                        run_id: run.run_id,
+                        text: chunk,
+                    },
+                )
+                .await?;
+            }
+
             match step {
                 ModelStep::Say(text) => {
-                    self.emit(
-                        run.session_id,
-                        run_actor.clone(),
-                        EventBody::ModelStreamDelta {
-                            run_id: run.run_id,
-                            text: text.clone(),
-                        },
-                    )
-                    .await?;
+                    // The sink (drained above) already emitted this text as a
+                    // `ModelStreamDelta`; only the transcript/findings
+                    // bookkeeping happens here, so net behavior is unchanged
+                    // (still exactly one delta per `Say`).
                     findings.push(text.clone());
                     transcript.push(TurnItem::Assistant(text));
                 }
@@ -2268,7 +2351,14 @@ impl ModelDriver for FrameworkModelDriver {
         self.model_id.clone()
     }
 
-    async fn next_step(&self, transcript: &[TurnItem]) -> anyhow::Result<StepOutcome> {
+    async fn next_step(
+        &self,
+        transcript: &[TurnItem],
+        // Not yet used: this driver still returns its text in one shot (the
+        // existing `get_response` body below); Task 2 rewrites this body to
+        // stream via `get_streaming_response` and push chunks through `sink`.
+        _sink: &mut dyn DeltaSink,
+    ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
         use agent_framework_core::types::ChatOptions;
 
@@ -2353,6 +2443,7 @@ fn measured_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ClosureSink;
 
     #[test]
     fn github_evidence_labels_untrusted_content_without_dropping_it() {
@@ -2393,17 +2484,25 @@ mod tests {
                 summary: "done".to_string(),
             },
         ]);
-        let first = driver.next_step(&[]).await.unwrap();
+        let first = driver.next_step(&[], &mut NullDeltaSink).await.unwrap();
         assert_eq!(first.step, ModelStep::Say("hi".to_string()));
         // A plain scripted driver reports NO usage (unmeasured, as today).
         assert_eq!(first.usage, None);
         assert!(matches!(
-            driver.next_step(&[]).await.unwrap().step,
+            driver
+                .next_step(&[], &mut NullDeltaSink)
+                .await
+                .unwrap()
+                .step,
             ModelStep::Finish { .. }
         ));
         // Draining past the end keeps yielding Finish, never hangs.
         assert!(matches!(
-            driver.next_step(&[]).await.unwrap().step,
+            driver
+                .next_step(&[], &mut NullDeltaSink)
+                .await
+                .unwrap()
+                .step,
             ModelStep::Finish { .. }
         ));
     }
@@ -2415,7 +2514,14 @@ mod tests {
         let plain = ScriptedDriver::new(vec![ModelStep::Finish {
             summary: "done".to_string(),
         }]);
-        assert_eq!(plain.next_step(&[]).await.unwrap().usage, None);
+        assert_eq!(
+            plain
+                .next_step(&[], &mut NullDeltaSink)
+                .await
+                .unwrap()
+                .usage,
+            None
+        );
 
         // With `with_usage`, every request reports the scripted MEASURED usage —
         // the seam that feeds the `ModelRequestTrace` and the run's cost total.
@@ -2431,8 +2537,22 @@ mod tests {
             },
         ])
         .with_usage(usage);
-        assert_eq!(measured.next_step(&[]).await.unwrap().usage, Some(usage));
-        assert_eq!(measured.next_step(&[]).await.unwrap().usage, Some(usage));
+        assert_eq!(
+            measured
+                .next_step(&[], &mut NullDeltaSink)
+                .await
+                .unwrap()
+                .usage,
+            Some(usage)
+        );
+        assert_eq!(
+            measured
+                .next_step(&[], &mut NullDeltaSink)
+                .await
+                .unwrap()
+                .usage,
+            Some(usage)
+        );
     }
 
     #[test]
@@ -2586,5 +2706,124 @@ mod tests {
             tokens_only["costs"]["cost_micros"].is_null(),
             "measured tokens with an unmeasured cost render cost as null, not zero"
         );
+    }
+
+    // -- Task 1: the `DeltaSink` seam ---------------------------------------
+
+    /// A [`RunJournal`] that persists nothing to a real store: it just hands
+    /// back a `SessionEvent` carrying a locally-incrementing sequence number,
+    /// so [`FrameworkAgentRuntime::execute_run`] can run its real `emit`/
+    /// `transition` calls with no sqlite pool in play. No test in this module
+    /// scripts a tool call, so the approval-request closure is never expected
+    /// to run — it errors loudly if it ever is, rather than silently minting a
+    /// bogus approval.
+    fn in_memory_journal() -> RunJournal {
+        let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        RunJournal::new(
+            move |_session_id, actor, body| {
+                let next_sequence = next_sequence.clone();
+                async move {
+                    Ok(SessionEvent {
+                        sequence: next_sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        occurred_at: chrono::Utc::now(),
+                        causation_id: None,
+                        correlation_id: None,
+                        actor,
+                        body,
+                    })
+                }
+            },
+            |_request| async {
+                Err::<ApprovalId, anyhow::Error>(anyhow::anyhow!(
+                    "no tool call is scripted in this test; approval unexpected"
+                ))
+            },
+        )
+    }
+
+    /// A runtime wired for a single scripted, tool-free run: an empty model
+    /// registry (unused — the driver is passed to `execute_run` directly, not
+    /// resolved from the registry), the default policy, a fresh approval
+    /// broker (never touched — no tool call is scripted), [`in_memory_journal`],
+    /// and an artifact sink that always succeeds (the loop unconditionally
+    /// stores a run chronicle at the end of every run, so a failing sink would
+    /// fail every run). Returns the runtime, a receiver subscribed BEFORE any
+    /// event can be published, and the session id to build the run's
+    /// [`RunContext`] against.
+    fn test_runtime() -> (
+        FrameworkAgentRuntime,
+        tokio::sync::broadcast::Receiver<SessionEvent>,
+        SessionId,
+    ) {
+        let hub = SubscriptionHub::new();
+        let session_id = SessionId::new();
+        let events = hub.subscribe(session_id);
+        let sink: Box<dyn ArtifactSink> = Box::new(ClosureSink(
+            |media_type: String, _provenance: Provenance, bytes: Vec<u8>| async move {
+                let artifact = ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type,
+                    byte_length: bytes.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    sensitivity: codypendent_protocol::DataClassification::Internal,
+                };
+                Ok::<ArtifactRef, anyhow::Error>(artifact)
+            },
+        ));
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            ApprovalBroker::new(),
+            hub,
+            in_memory_journal(),
+            sink,
+        );
+        (runtime, events, session_id)
+    }
+
+    /// Collect the `text` of every `ModelStreamDelta` currently buffered on
+    /// `events`, in publish order. Only meaningful once the run that published
+    /// them has finished: `SubscriptionHub::publish` is synchronous, so by the
+    /// time `execute_run` returns, every event it published is already queued
+    /// on this receiver.
+    fn drain_deltas(events: &mut tokio::sync::broadcast::Receiver<SessionEvent>) -> Vec<String> {
+        let mut deltas = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ModelStreamDelta { text, .. } = event.body {
+                deltas.push(text);
+            }
+        }
+        deltas
+    }
+
+    #[tokio::test]
+    async fn a_say_step_streams_its_text_as_a_delta_through_the_sink() {
+        // A scripted `Say` run emits exactly one `ModelStreamDelta` carrying
+        // the text, routed through the `DeltaSink` seam (Task 1) rather than
+        // straight from the `Say` arm as before — net behavior is unchanged:
+        // still exactly one delta per `Say`.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let deltas = drain_deltas(&mut events);
+        assert_eq!(deltas, vec!["Hello, world.".to_string()]);
     }
 }

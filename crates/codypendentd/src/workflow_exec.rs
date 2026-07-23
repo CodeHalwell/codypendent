@@ -2377,7 +2377,9 @@ mod tests {
     use crate::workflows::WorkflowConductorHost;
     use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
     use codypendent_protocol::ClientId;
-    use codypendent_runtime::agent::{ModelStep, ModelUsage, ScriptedDriver, StepOutcome};
+    use codypendent_runtime::agent::{
+        DeltaSink, ModelStep, ModelUsage, ScriptedDriver, StepOutcome,
+    };
     use codypendent_workflow::{
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
     };
@@ -2469,6 +2471,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
+            sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // The node is in flight and registered — fire the run's token, then
@@ -2480,6 +2483,9 @@ mod tests {
                     summary: "unreached".to_string(),
                 }
             };
+            if let ModelStep::Say(text) = &step {
+                sink.on_text(text);
+            }
             Ok(StepOutcome::unmeasured(step))
         }
     }

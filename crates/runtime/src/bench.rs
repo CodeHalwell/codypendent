@@ -30,7 +30,7 @@ use codypendent_routing::{
     ModelProfile,
 };
 
-use crate::agent::{ModelDriver, ModelStep, TurnItem};
+use crate::agent::{ModelDriver, ModelStep, NullDeltaSink, TurnItem};
 
 /// One timed generation: how many tokens were produced, how long until the first
 /// token appeared, and the total wall time.
@@ -295,8 +295,13 @@ impl<'a> DriverBenchTarget<'a> {
     /// estimates tokens from the response text (the driver seam surfaces no usage
     /// for the bench's purposes), so the request's measured usage is discarded.
     async fn step(&self, prompt: &str) -> Result<ModelStep, String> {
+        // The bench measures total generation time and the final `ModelStep`,
+        // not streamed text, so any chunks the driver pushes are discarded.
         self.driver
-            .next_step(&[TurnItem::Objective(prompt.to_string())])
+            .next_step(
+                &[TurnItem::Objective(prompt.to_string())],
+                &mut NullDeltaSink,
+            )
             .await
             .map(|outcome| outcome.step)
             .map_err(|e| format!("model driver error: {e}"))
