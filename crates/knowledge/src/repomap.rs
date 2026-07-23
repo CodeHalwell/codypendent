@@ -63,6 +63,20 @@ pub struct ApiSymbol {
 /// The single synthetic package name used in v1.
 const CRATE_PACKAGE: &str = "crate";
 
+/// Cap on the API names sampled per module before folding the remainder into a
+/// `(+K more)` tail. [`RepositoryMap::render`] is a bounded SUMMARY, not a dump:
+/// a module with hundreds of symbols still contributes only a handful of lines —
+/// the agent has `workspace.read_file`/search tools for the rest (the Chapter 07
+/// transcript-declutter fix; a flat per-symbol render once flooded a run's
+/// opening context with ~25 KB for a repository of a few thousand symbols).
+const MAX_SAMPLED_APIS_PER_MODULE: usize = 8;
+
+/// Cap on the modules rendered per package before folding the remainder into a
+/// `(+K more modules)` tail — the safety net that keeps the render bounded for a
+/// *large* repository (hundreds of modules), complementing
+/// [`MAX_SAMPLED_APIS_PER_MODULE`] which only bounds a single module's symbols.
+const MAX_RENDERED_MODULES: usize = 50;
+
 /// Build the repository map for `repository` by folding its persisted graph.
 pub async fn repository_map(
     pool: &SqlitePool,
@@ -134,26 +148,43 @@ pub async fn repository_map(
 }
 
 impl RepositoryMap {
-    /// Render the map as a compact text tree (the agent-context representation).
+    /// Render the map as a compact, BOUNDED summary — the agent-context
+    /// representation (the Chapter 07 transcript-declutter fix). Each module
+    /// renders its API/test counts plus a capped sample of API names
+    /// ([`MAX_SAMPLED_APIS_PER_MODULE`]), never the full per-symbol dump; a
+    /// package with more modules than [`MAX_RENDERED_MODULES`] folds the
+    /// remainder into a `(+K more modules)` tail.
+    ///
+    /// This trims the model's actual context, not just a display: the full
+    /// symbol list serves a small local model poorly and burns tokens the agent
+    /// doesn't need up front — it has search/read tools for anything this
+    /// summary doesn't cover.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "repository {}", self.repository);
         for package in &self.packages {
             let _ = writeln!(out, "package {}", package.name);
-            for module in &package.modules {
+            let shown = package.modules.len().min(MAX_RENDERED_MODULES);
+            for module in &package.modules[..shown] {
                 let label = if module.name.is_empty() {
                     "(crate root)"
                 } else {
                     &module.name
                 };
-                let _ = writeln!(out, "  module {label}");
-                for api in &module.public_apis {
-                    let _ = writeln!(out, "    {} {}", kind_label(api.kind), api.name);
+                let _ = writeln!(
+                    out,
+                    "  module {label} — {} APIs, {} tests",
+                    module.public_apis.len(),
+                    module.tests.len()
+                );
+                if !module.public_apis.is_empty() {
+                    let _ = writeln!(out, "    {}", sample_apis(&module.public_apis));
                 }
-                for test in &module.tests {
-                    let _ = writeln!(out, "    test {test}");
-                }
+            }
+            let hidden_modules = package.modules.len() - shown;
+            if hidden_modules > 0 {
+                let _ = writeln!(out, "  … (+{hidden_modules} more modules)");
             }
         }
         let surface = if self.change_surface.is_empty() {
@@ -329,5 +360,168 @@ fn kind_label(kind: CodeNodeKind) -> &'static str {
         CodeNodeKind::Method => "method",
         CodeNodeKind::Constant => "const",
         _ => "symbol",
+    }
+}
+
+/// Render a module's API sample for [`RepositoryMap::render`]: up to
+/// [`MAX_SAMPLED_APIS_PER_MODULE`] entries as `kind name`, comma-joined, with a
+/// trailing `(+K more)` once the module holds more than the cap.
+fn sample_apis(apis: &[ApiSymbol]) -> String {
+    let shown = apis.len().min(MAX_SAMPLED_APIS_PER_MODULE);
+    let mut sample: Vec<String> = apis[..shown]
+        .iter()
+        .map(|api| format!("{} {}", kind_label(api.kind), api.name))
+        .collect();
+    let hidden = apis.len() - shown;
+    if hidden > 0 {
+        sample.push(format!("… (+{hidden} more)"));
+    }
+    sample.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under both caps, `render` shows every API by name and the exact counts —
+    /// the same information the old per-symbol dump carried for a module this
+    /// small, just with the counts made explicit.
+    #[test]
+    fn render_shows_full_sample_and_counts_under_the_caps() {
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules: vec![ModuleEntry {
+                    name: String::new(),
+                    public_apis: vec![
+                        ApiSymbol {
+                            name: "Engine".to_owned(),
+                            kind: CodeNodeKind::Type,
+                        },
+                        ApiSymbol {
+                            name: "compute".to_owned(),
+                            kind: CodeNodeKind::Function,
+                        },
+                    ],
+                    tests: vec!["engine_ticks".to_owned()],
+                }],
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains("module (crate root) — 2 APIs, 1 tests"),
+            "counts line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("type Engine, fn compute"),
+            "full sample under the cap:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("more)"),
+            "nothing hidden under either cap:\n{rendered}"
+        );
+        assert!(rendered.contains("change surface: (none)"));
+    }
+
+    /// A module with more APIs than [`MAX_SAMPLED_APIS_PER_MODULE`] caps its
+    /// sample and folds the remainder into an exact `(+K more)` tail — the count
+    /// line still reports the true total, never the capped sample size.
+    #[test]
+    fn render_caps_the_api_sample_with_a_more_tail() {
+        let total = MAX_SAMPLED_APIS_PER_MODULE + 3;
+        let public_apis: Vec<ApiSymbol> = (0..total)
+            .map(|i| ApiSymbol {
+                name: format!("sym{i:02}"),
+                kind: CodeNodeKind::Function,
+            })
+            .collect();
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules: vec![ModuleEntry {
+                    name: "big".to_owned(),
+                    public_apis,
+                    tests: Vec::new(),
+                }],
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains(&format!("module big — {total} APIs, 0 tests")),
+            "count line reports the true total, not the capped sample:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("fn sym00"),
+            "first sampled name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("fn sym{:02}", MAX_SAMPLED_APIS_PER_MODULE - 1)),
+            "the cap-th symbol is still sampled:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("… (+3 more)"),
+            "exact hidden count in the tail:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("fn sym{:02}", MAX_SAMPLED_APIS_PER_MODULE)),
+            "the (cap+1)-th symbol must not be individually named:\n{rendered}"
+        );
+    }
+
+    /// A package with more modules than [`MAX_RENDERED_MODULES`] caps the
+    /// modules shown and folds the remainder into an exact `(+K more modules)`
+    /// tail — the safety net that bounds the render for a large repository
+    /// (many modules), distinct from the per-module API cap.
+    #[test]
+    fn render_caps_modules_per_package_with_a_more_modules_tail() {
+        let total = MAX_RENDERED_MODULES + 4;
+        let modules: Vec<ModuleEntry> = (0..total)
+            .map(|i| ModuleEntry {
+                name: format!("m{i:03}"),
+                public_apis: Vec::new(),
+                tests: Vec::new(),
+            })
+            .collect();
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: vec![PackageEntry {
+                name: CRATE_PACKAGE.to_owned(),
+                modules,
+            }],
+            change_surface: Vec::new(),
+        };
+        let rendered = map.render();
+        assert!(
+            rendered.contains("module m000 —"),
+            "first shown:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("module m{:03} —", MAX_RENDERED_MODULES - 1)),
+            "the cap-th module is still shown:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("module m{:03} —", MAX_RENDERED_MODULES)),
+            "the (cap+1)-th module must not be individually shown:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("(+4 more modules)"),
+            "exact hidden module count in the tail:\n{rendered}"
+        );
+    }
+
+    /// Fix 2 leaves the change-surface slot untouched: still a joined list, or
+    /// the `(none)` stub when empty.
+    #[test]
+    fn render_preserves_change_surface() {
+        let map = RepositoryMap {
+            repository: RepositoryId::new(),
+            packages: Vec::new(),
+            change_surface: vec!["a::b".to_owned(), "c::d".to_owned()],
+        };
+        assert!(map.render().contains("change surface: a::b, c::d"));
     }
 }
