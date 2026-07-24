@@ -22,9 +22,9 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_models, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel,
-    Overlay, PatchSummary, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
-    TranscriptEntry,
+    filter_models, filter_providers, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard,
+    ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity, RunView,
+    StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -938,6 +938,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
+        Overlay::ProviderPicker { query, selected } => {
+            render_provider_picker(frame, area, state, theme, query, *selected);
+        }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
         Overlay::DocEdit { buffer, .. } => {
@@ -1313,6 +1316,213 @@ fn context_label(context_tokens: Option<u64>) -> String {
     match context_tokens {
         Some(tokens) => format!("{}k", tokens / 1000),
         None => "—".to_owned(),
+    }
+}
+
+/// The provider-catalog picker (Task 8): the same filter-line + list/detail
+/// shape as [`render_model_picker`], over [`AppState::providers`] instead of
+/// `models`. Selecting a row stages it on [`AppState::pending_provider`] —
+/// browse/stage only this task; wiring a staged provider into a live run is a
+/// follow-up. There is no "serving run" to compare against (unlike the model
+/// picker's current-run marker), so the current/staged marker instead reflects
+/// [`AppState::pending_provider`] — the provider already staged from a
+/// previous pick. Colors are Theme tokens only (RULE 7).
+fn render_provider_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Provider catalog ({}) ", state.providers.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input (the
+    // command palette's shape).
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[1]);
+
+    // The provider already staged for the next run, if any — marks the
+    // staged row/detail.
+    let staged = state.pending_provider.as_deref();
+
+    // Left: the filtered provider list (id, staged marker, name + badges).
+    let matches = filter_providers(&state.providers, query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if state.providers.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no providers configured",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching provider",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate() {
+        let card = &state.providers[idx];
+        let is_selected = row == selected;
+        let is_staged = staged == Some(card.id.as_str());
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                if is_staged { "● " } else { "  " },
+                Style::default().fg(theme.status.success),
+            ),
+            Span::styled(
+                truncate(&card.id, 26),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        // The name, the protocol/location badges, and the auth summary each
+        // get their own line (rather than one long joined line), mirroring
+        // the model picker's list rows, so they survive the fixed-width
+        // column without truncating trailing detail off a narrow terminal.
+        let name_line = Line::styled(
+            format!("      {}", card.name),
+            Style::default().fg(theme.text.muted),
+        );
+        let badges_line = Line::styled(
+            format!("      {}", provider_badges(card)),
+            Style::default().fg(theme.text.muted),
+        );
+        let auth_line = Line::styled(
+            format!("      {}", card.auth),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, name_line, badges_line, auth_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+
+    // Right: the detail panel for the focused provider.
+    let detail_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive))
+        .style(Style::default().bg(theme.surface.overlay));
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(card) = state.focused_provider() {
+        let is_staged = staged == Some(card.id.as_str());
+        lines.push(Line::from(vec![
+            Span::styled(
+                card.id.clone(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            if is_staged {
+                Span::styled(
+                    "  ● staged".to_owned(),
+                    Style::default().fg(theme.status.success),
+                )
+            } else {
+                Span::raw("")
+            },
+        ]));
+        let field = |k: &str, v: String, color: Color| -> Line {
+            Line::from(vec![
+                Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
+                Span::styled(v, Style::default().fg(color)),
+            ])
+        };
+        lines.push(field("name", card.name.clone(), theme.text.secondary));
+        lines.push(field(
+            "protocol",
+            card.protocol.clone(),
+            theme.text.secondary,
+        ));
+        lines.push(field("auth", card.auth.clone(), theme.status.warning));
+        lines.push(field(
+            "location",
+            provider_location_label(card.local).to_owned(),
+            theme.status.info,
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "  Enter stages this provider for your next run",
+            Style::default().fg(theme.text.muted),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  no provider selected",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑/↓ select · Enter stage · Esc close",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+}
+
+/// A provider card's badges, space-joined: its protocol and local/hosted
+/// location — mirrors [`model_badges`], adapted to [`ProviderCard`] fields
+/// (a provider has no measured cost/context, so those columns are omitted).
+fn provider_badges(card: &ProviderCard) -> String {
+    format!(
+        "{} · {}",
+        card.protocol,
+        provider_location_label(card.local)
+    )
+}
+
+fn provider_location_label(local: bool) -> &'static str {
+    if local {
+        "local ✓"
+    } else {
+        "hosted"
     }
 }
 
@@ -3959,6 +4169,78 @@ mod tests {
         assert!(
             text.contains("32k"),
             "the profiled model's context missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn provider_picker_snapshot_shows_rows_staged_marker_and_badges() {
+        // `ProviderCard` is already in scope via the module's own `use
+        // crate::state::{..., ProviderCard, ...}` (unlike `GraphEdgeCard`
+        // below, which needs its own local import).
+        let mut state = running_build_state();
+        state.providers = vec![
+            ProviderCard {
+                id: "groq".to_owned(),
+                name: "Groq".to_owned(),
+                protocol: "openai-chat".to_owned(),
+                auth: "api-key: GROQ_API_KEY".to_owned(),
+                local: false,
+            },
+            ProviderCard {
+                id: "ollama".to_owned(),
+                name: "Ollama (local)".to_owned(),
+                protocol: "openai-chat".to_owned(),
+                auth: "none".to_owned(),
+                local: true,
+            },
+        ];
+        // A previous pick already staged "groq" — that row must render
+        // marked staged.
+        state.pending_provider = Some("groq".to_owned());
+        reduce(&mut state, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        // Focus the SECOND row (ollama) — deliberately NOT the staged one
+        // (groq) — so the staged-marker assertions below can only be
+        // satisfied by the list rows themselves, never by the
+        // (ollama-focused) detail panel.
+        reduce(&mut state, Action::SelectNext);
+        assert!(matches!(state.overlay, Overlay::ProviderPicker { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("Provider catalog"), "title missing:\n{text}");
+        assert!(text.contains("groq"), "first row missing:\n{text}");
+        assert!(text.contains("ollama"), "second row missing:\n{text}");
+        assert!(text.contains("Groq"), "first row's name missing:\n{text}");
+        assert!(
+            text.contains("Ollama (local)"),
+            "second row's name missing:\n{text}"
+        );
+
+        // Row-scoped, mirroring the model picker's own current-marker check:
+        // only the staged provider's list row shows the leading marker.
+        assert!(
+            text.contains("● groq"),
+            "the list's staged marker is missing from groq's row:\n{text}"
+        );
+        assert!(
+            !text.contains("● ollama"),
+            "the list must not mark the non-staged provider's row staged:\n{text}"
+        );
+
+        // Protocol + auth + local/hosted badges.
+        assert!(text.contains("openai-chat"), "protocol missing:\n{text}");
+        assert!(
+            text.contains("api-key: GROQ_API_KEY"),
+            "auth badge missing:\n{text}"
+        );
+        assert!(text.contains("none"), "auth badge missing:\n{text}");
+        assert!(text.contains("hosted"), "hosted badge missing:\n{text}");
+        assert!(
+            text.contains("local \u{2713}"),
+            "local badge missing:\n{text}"
         );
     }
 

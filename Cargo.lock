@@ -646,6 +646,7 @@ dependencies = [
  "codypendent-integrations",
  "codypendent-knowledge",
  "codypendent-protocol",
+ "codypendent-providers",
  "codypendent-routing",
  "codypendent-runtime",
  "codypendent-sandbox",

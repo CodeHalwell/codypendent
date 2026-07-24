@@ -152,6 +152,15 @@ pub enum Overlay {
     /// focused row on [`AppState::pending_model`] (advisory only this task —
     /// MP2 wires it to actually pin the next run's model).
     ModelPicker { query: String, selected: usize },
+    /// The provider-catalog picker (Task 8): a fuzzy-filterable list of the
+    /// providers selectable for a run (see [`AppState::providers`]), opened
+    /// from the command palette's `/provider` entry. `query` filters by
+    /// id/name/protocol substring; `selected` indexes the filtered results
+    /// (reset to 0 whenever the query changes) — the same shape as
+    /// [`Overlay::ModelPicker`]. `Enter` stages the focused row on
+    /// [`AppState::pending_provider`] (advisory/browse-only this task; wiring
+    /// a staged provider into a live run is a follow-up).
+    ProviderPicker { query: String, selected: usize },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -685,6 +694,45 @@ pub(crate) fn filter_models(models: &[ModelCard], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// One provider-catalog row for the `/provider` picker projection (Task 8).
+/// The TUI performs no I/O; the CLI harness seeds this from
+/// `codypendent_providers::Catalog` (the built-in ~40-provider catalog,
+/// layered with any user `providers.toml`), exactly as it maps a
+/// `ModelConfig` into a [`ModelCard`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCard {
+    /// The provider's id, as configured in the catalog (e.g. `"groq"`).
+    pub id: String,
+    /// The provider's display name (e.g. `"Groq"`).
+    pub name: String,
+    /// Wire protocol label, e.g. `"openai-chat"` | `"anthropic"` | `"acp"`.
+    pub protocol: String,
+    /// Auth label, e.g. `"api-key: GROQ_API_KEY"` | `"none"` | `"acp: npx"`.
+    pub auth: String,
+    /// On-device (Ollama/LM Studio/vLLM) vs. hosted.
+    pub local: bool,
+}
+
+/// The indices into `providers` whose id/name/protocol case-insensitively
+/// contains `query` — the provider picker's substring filter, in list order.
+/// Mirrors [`filter_models`] exactly, adapted to [`ProviderCard`] fields. An
+/// empty query matches every provider.
+#[must_use]
+pub(crate) fn filter_providers(providers: &[ProviderCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    providers
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| {
+            needle.is_empty()
+                || card.id.to_lowercase().contains(&needle)
+                || card.name.to_lowercase().contains(&needle)
+                || card.protocol.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -785,6 +833,21 @@ pub struct AppState {
     /// this task (MP1) — nothing yet reads it to change routing behavior; a
     /// later task (MP2) wires it to pin the next run's model.
     pub pending_model: Option<ModelId>,
+    /// The provider-catalog projection for the `/provider` picker (Task 8):
+    /// the built-in ~40-provider catalog, layered with any user
+    /// `providers.toml`, mapped to a self-contained [`ProviderCard`] by the
+    /// CLI harness. Populated once at attach; the [`Overlay::ProviderPicker`]
+    /// browser reads it.
+    pub providers: Vec<ProviderCard>,
+    /// Index into `providers` of the focused card — kept resolved to the
+    /// picker's live filtered selection by the reducer, mirroring
+    /// `selected_model`.
+    pub selected_provider: usize,
+    /// The provider staged from the picker (`Enter` on a row). Advisory/
+    /// browse-only this task — nothing yet reads it to change which provider
+    /// serves a run; wiring a staged provider into a live run (including the
+    /// auth state machine) is a follow-up.
+    pub pending_provider: Option<String>,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -854,6 +917,9 @@ impl AppState {
             models: Vec::new(),
             selected_model: 0,
             pending_model: None,
+            providers: Vec::new(),
+            selected_provider: 0,
+            pending_provider: None,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
@@ -875,10 +941,12 @@ impl AppState {
                 InputMode::Editing
             }
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The palette and the model picker both filter on printable keys
-            // while staying arrow-navigable, so they share this input mode
-            // (see [`crate::input::map_palette_key`]).
-            Overlay::Palette { .. } | Overlay::ModelPicker { .. } => InputMode::Palette,
+            // The palette, the model picker, and the provider picker all
+            // filter on printable keys while staying arrow-navigable, so they
+            // share this input mode (see [`crate::input::map_palette_key`]).
+            Overlay::Palette { .. }
+            | Overlay::ModelPicker { .. }
+            | Overlay::ProviderPicker { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`
             // mode.
@@ -988,6 +1056,12 @@ impl AppState {
     #[must_use]
     pub fn focused_model(&self) -> Option<&ModelCard> {
         self.models.get(self.selected_model)
+    }
+
+    /// The focused provider-picker card, if any.
+    #[must_use]
+    pub fn focused_provider(&self) -> Option<&ProviderCard> {
+        self.providers.get(self.selected_provider)
     }
 
     /// Project the status-line fields from the selected run + pending approvals.

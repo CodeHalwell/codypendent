@@ -40,6 +40,10 @@ codypendent-runtime = { workspace = true }
 # The measured `ModelProfile` the bench produces and persists (its types are
 # named in `models_bench`); a leaf crate, no cycle.
 codypendent-routing = { workspace = true }
+# The provider/auth data model + built-in catalog (Task 8), read here to seed
+# the TUI's `/provider` picker projection — a daemon-free, network-free leaf
+# crate, exactly like `codypendent-routing` above.
+codypendent-providers = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
