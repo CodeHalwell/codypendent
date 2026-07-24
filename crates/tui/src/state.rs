@@ -809,6 +809,18 @@ pub struct AppState {
     /// Set when the user detaches (`q`). The CLI observes this to leave the TUI
     /// loop; the run is never affected.
     pub should_detach: bool,
+    /// Set alongside `should_detach` by `PaletteCommand::NewConversation`
+    /// (continuous-session plan, Task 5). Continuity (Tasks 1-4) keys off "this
+    /// session already has prior runs," so the only way to guarantee an
+    /// unseeded, genuinely fresh conversation is a brand-new session — and a
+    /// pure, I/O-free reducer cannot mint one. Documented precisely so this
+    /// isn't mistaken for a live in-place reset: the CLI harness, on seeing
+    /// this flag set at detach time, forgets this repository's remembered
+    /// session (so the daemon can't resume it) instead of resetting anything
+    /// live. The current run, if any, is completely unaffected — exactly like
+    /// a plain detach — and the fresh conversation itself begins on the next
+    /// `codypendent` launch for this repository, not this instant.
+    pub start_new_conversation: bool,
     /// A monotonic tick counter for spinner animation.
     pub tick: u64,
     /// A transient status-line notice and the tick at which it expires.
@@ -861,6 +873,7 @@ impl AppState {
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
+            start_new_conversation: false,
             tick: 0,
             notice: None,
             outbox: Vec::new(),
