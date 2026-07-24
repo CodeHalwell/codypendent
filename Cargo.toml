@@ -76,6 +76,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hmac = "0.12"
 wiremock = "0.6"
 
+# ACP (Agent Client Protocol) — Zed's reference Rust impl (agentclientprotocol/rust-sdk).
+# Used by crates/integrations' ACP *client* (acp_client.rs) to delegate a run to
+# an external agent subprocess over JSON-RPC 2.0 stdio. The only new external dep.
+agent-client-protocol = "2"
+
 # Async traits and config parsing
 async-trait = "0.1"
 toml = "0.8"
