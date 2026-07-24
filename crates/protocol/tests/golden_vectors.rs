@@ -17,8 +17,10 @@
 //! a committed directory: `<repo-root>/protocol-vectors/*.json`. One file per
 //! source module (`command.rs` -> `command.json`, `envelope.rs` ->
 //! `envelope.json`, ...), each a JSON object mapping a descriptive vector name
-//! to the serialized value, alphabetically sorted (via `serde_json::Value`'s
-//! default `BTreeMap`-backed `Map`) and pretty-printed.
+//! to the serialized value, alphabetically sorted (by `sort_keys`, so the
+//! bytes are identical whether `serde_json::Value`'s `Map` is `BTreeMap`- or
+//! `IndexMap`-backed — a workspace dependency enables the `preserve_order`
+//! feature under `--all-features`) and pretty-printed.
 //!
 //! A TypeScript vitest in `extensions/vscode/test/protocol-vectors.test.ts`
 //! reads the SAME files (a relative path, no copy — see
@@ -193,9 +195,35 @@ fn manifest_value(vectors: &[Vector]) -> Value {
     Value::Object(map)
 }
 
+/// Recursively sort every JSON object's keys so a rendered vector is identical
+/// regardless of whether `serde_json`'s `Map` is `BTreeMap`-backed (its default)
+/// or `IndexMap`-backed. The latter is in force under `--workspace
+/// --all-features`, where the `agent-client-protocol` dependency (via its schema
+/// crate) turns on `serde_json`'s `preserve_order` feature for the whole build;
+/// without this the same value would serialize in insertion order there and in
+/// alphabetical order under `cargo test -p codypendent-protocol`, so the
+/// committed vectors could only ever match one of the two invocations. Array
+/// order is preserved (it is semantically significant).
+fn sort_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            // A `BTreeMap` yields the keys in alphabetical order regardless of
+            // `serde_json`'s `Map` backing; rebuild the object from it.
+            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            let object: serde_json::Map<String, Value> = sorted
+                .into_iter()
+                .map(|(k, v)| (k.clone(), sort_keys(v)))
+                .collect();
+            Value::Object(object)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_keys).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Pretty-print with a trailing newline (a normal committed text file).
 fn render(value: &Value) -> String {
-    let mut text = serde_json::to_string_pretty(value).expect("pretty-print vectors");
+    let mut text = serde_json::to_string_pretty(&sort_keys(value)).expect("pretty-print vectors");
     text.push('\n');
     text
 }

@@ -18,6 +18,7 @@
 //! webhook listener into daemon startup.
 
 pub mod acp;
+pub mod acp_client;
 pub mod github;
 pub mod ide;
 pub mod webhook;

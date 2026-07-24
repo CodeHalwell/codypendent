@@ -1,0 +1,21 @@
+[package]
+name = "codypendent-providers"
+description = "codypendent-providers: the provider/auth data model, credential-provider trait, and curated built-in catalog. A daemon-free, network-free leaf crate (like codypendent-routing); no agent-framework dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

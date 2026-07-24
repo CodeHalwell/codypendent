@@ -1,0 +1,15 @@
+# Workspace clippy configuration.
+#
+# `large-error-threshold` (clippy::result_large_err): the daemon and runtime
+# return `codypendent_protocol::CodypendentError` by value across ~two dozen
+# command/lifecycle handlers. That struct carries a structured `details:
+# serde_json::Value` bag (plus a correlation id and optional user action) as its
+# deliberate error contract. Adding the `agent-client-protocol` dependency pulls
+# in a schema crate that enables serde_json's `preserve_order` feature; under
+# Cargo's workspace feature-unification that switches `serde_json::Value`'s map
+# from `BTreeMap` to `IndexMap`, growing the value (and therefore
+# `CodypendentError`) to ~144 bytes and tripping the lint's 128-byte default.
+# The error is intentionally rich and returned by value; raise the threshold
+# rather than box a public protocol field or scatter `#[allow]` across every
+# handler in several crates.
+large-error-threshold = 192

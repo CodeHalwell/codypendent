@@ -12,6 +12,7 @@ members = [
     "crates/workflow",
     "crates/sandbox",
     "crates/routing",
+    "crates/providers",
     "crates/eval",
     "crates/test-support",
 ]
@@ -24,7 +25,10 @@ exclude = ["benches/crdt-bench"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
+# edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
+# is newer, so builds are unaffected; this keeps the declared MSRV honest.
+rust-version = "1.88"
 repository = "https://github.com/CodeHalwell/codypendent"
 license = "MIT"
 
@@ -39,6 +43,7 @@ codypendent-integrations = { path = "crates/integrations" }
 codypendent-workflow = { path = "crates/workflow" }
 codypendent-sandbox = { path = "crates/sandbox" }
 codypendent-routing = { path = "crates/routing" }
+codypendent-providers = { path = "crates/providers" }
 codypendent-eval = { path = "crates/eval" }
 codypendent-test-support = { path = "crates/test-support" }
 
@@ -73,6 +78,11 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hmac = "0.12"
 wiremock = "0.6"
+
+# ACP (Agent Client Protocol) — Zed's reference Rust impl (agentclientprotocol/rust-sdk).
+# Used by crates/integrations' ACP *client* (acp_client.rs) to delegate a run to
+# an external agent subprocess over JSON-RPC 2.0 stdio. The only new external dep.
+agent-client-protocol = "2"
 
 # Async traits and config parsing
 async-trait = "0.1"

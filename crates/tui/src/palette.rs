@@ -35,6 +35,8 @@ pub enum PaletteCommand {
     Blackboard,
     /// Open the model picker (MP1).
     Model,
+    /// Open the provider catalog picker (Task 8).
+    Provider,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -125,6 +127,14 @@ pub const COMMANDS: &[PaletteEntry] = &[
         description: "browse selectable models and stage one for the next run",
         // Palette-only this task: no single-key equivalent (see the field's
         // doc comment).
+        key: "—",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Provider,
+        title: "Provider catalog",
+        description: "browse the built-in provider catalog and stage one",
+        // Palette-only (Task 8): no single-key equivalent, mirroring the
+        // model picker's own row.
         key: "—",
     },
     PaletteEntry {
@@ -222,6 +232,14 @@ mod tests {
         let model = filtered("model");
         assert_eq!(model.len(), 1);
         assert_eq!(model[0].command, PaletteCommand::Model);
+    }
+
+    #[test]
+    fn filters_to_the_provider_picker_command() {
+        // Task 8: "/provider" opens the catalog picker via the palette front door.
+        let provider = filtered("provider");
+        assert_eq!(provider.len(), 1);
+        assert_eq!(provider[0].command, PaletteCommand::Provider);
     }
 
     #[test]

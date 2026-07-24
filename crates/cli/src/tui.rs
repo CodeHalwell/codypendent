@@ -47,8 +47,8 @@ use codypendent_protocol::{
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, ModelCard, ModelLocationLabel, SkillCard,
-    TerminalGuard, Theme, WorkflowNodeCard,
+    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, ModelCard, ModelLocationLabel,
+    ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,9 @@ pub async fn run(
     // MP1: seed the model-picker projection (models.toml + any measured
     // profile from `model_profiles`), exactly like the projections above.
     state.models = load_model_cards(paths).await;
+    // Task 8: seed the provider-catalog picker projection (the built-in
+    // catalog + any user `providers.toml`), exactly like `load_model_cards`.
+    state.providers = load_provider_cards(paths);
     // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
     // repository's declared workflow manifests, then overlay each workflow's
     // LATEST durable run — its per-node live state, measured cost, and
@@ -1322,6 +1325,68 @@ fn model_card(
         }),
         cost_per_1k_usd: profile.map(|profile| profile.performance.cost_per_1k_tokens_usd),
         context_tokens: profile.and_then(|profile| profile.capabilities.context_tokens),
+    }
+}
+
+/// Seed the provider-catalog projection for the `/provider` picker (Task 8):
+/// the built-in ~40-provider catalog layered with the user's
+/// `<data_dir>/providers.toml`, exactly as [`load_model_cards`] maps
+/// `models.toml` into [`ModelCard`]s. This is the CLI's job precisely because
+/// the TUI crate performs no I/O and never depends on `codypendent-providers`.
+///
+/// Never fails the TUI: a missing user `providers.toml` is fine (the loader
+/// treats it as absent and returns the built-ins); a *malformed* one degrades
+/// to the built-ins alone, with a stderr note.
+fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
+    use codypendent_providers::{AuthMethod, Catalog};
+
+    let providers_path = paths.data_dir.join("providers.toml");
+    let catalog = match Catalog::load_with_user_overrides(&providers_path) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("codypendent: provider catalog fell back to built-ins ({error})");
+            Catalog::builtin()
+        }
+    };
+    catalog
+        .providers()
+        .map(|p| ProviderCard {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            protocol: protocol_label(p.protocol).to_owned(),
+            auth: match p.auth.first() {
+                None | Some(AuthMethod::None) => "none".to_string(),
+                Some(AuthMethod::ApiKey { env, .. }) => {
+                    format!("api-key: {}", env.first().map(String::as_str).unwrap_or(""))
+                }
+                Some(AuthMethod::Acp { command, .. }) => format!("acp: {command}"),
+                Some(AuthMethod::CloudIam { variant, .. }) => format!("cloud-iam: {variant}"),
+                Some(AuthMethod::OAuth { .. }) => "oauth".to_string(),
+                // `AuthMethod` is `#[non_exhaustive]`: a future variant this
+                // build does not understand still renders (protocol RULE 1),
+                // rather than failing to compile or panicking.
+                Some(_) => "unknown".to_string(),
+            },
+            local: p.local,
+        })
+        .collect()
+}
+
+/// The provider picker's wire-protocol label — the same kebab-case spelling
+/// `codypendent_providers::model::Protocol`'s `Serialize` impl emits (e.g.
+/// `"openai-chat"`), spelled out explicitly here rather than derived from
+/// `{:?}` because `Debug` prints the Rust identifier (`"OpenAiChat"`), not the
+/// wire spelling. `Protocol` is `#[non_exhaustive]`, so a future variant this
+/// build does not understand still renders as `"unknown"` rather than
+/// failing to compile.
+fn protocol_label(protocol: codypendent_providers::Protocol) -> &'static str {
+    use codypendent_providers::Protocol;
+    match protocol {
+        Protocol::OpenAiChat => "openai-chat",
+        Protocol::Anthropic => "anthropic",
+        Protocol::GeminiNative => "gemini-native",
+        Protocol::Acp => "acp",
+        _ => "unknown",
     }
 }
 

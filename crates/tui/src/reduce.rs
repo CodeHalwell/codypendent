@@ -14,9 +14,9 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent};
 use crate::state::{
-    filter_models, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard, ToolStatus,
-    TranscriptEntry,
+    filter_models, filter_providers, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState,
+    DocSuggestionView, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
+    ToolCard, ToolStatus, TranscriptEntry,
 };
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -664,6 +664,17 @@ fn nav(state: &mut AppState, delta: i32) {
             state.selected_model = indices.get(*selected).copied().unwrap_or(0);
             return;
         }
+        // Same shape as the model picker (Task 8): keep `selected_provider`
+        // resolved to the same card the filtered cursor points at.
+        Overlay::ProviderPicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_providers(&state.providers, query);
+            step(selected, indices.len(), delta);
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
+            return;
+        }
         _ => {}
     }
     // Base view: a pending approval owns the arrows (move between stacked
@@ -956,6 +967,13 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // Same shape as the model picker (Task 8): editing the provider
+        // picker's query changes the filtered set, so the selection returns
+        // to the top.
+        Overlay::ProviderPicker { query, selected } => {
+            edit(query);
+            *selected = 0;
+        }
         // The base view: text lands in the persistent composer draft.
         Overlay::None => edit(&mut state.composer),
         _ => {}
@@ -964,6 +982,14 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
     // the reset above, against the full list — see `AppState::selected_model`).
     if let Overlay::ModelPicker { query, .. } = &state.overlay {
         state.selected_model = filter_models(&state.models, query)
+            .first()
+            .copied()
+            .unwrap_or(0);
+    }
+    // Same re-resolution for the provider picker (Task 8) — see
+    // `AppState::selected_provider`.
+    if let Overlay::ProviderPicker { query, .. } = &state.overlay {
+        state.selected_provider = filter_providers(&state.providers, query)
             .first()
             .copied()
             .unwrap_or(0);
@@ -1077,6 +1103,25 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
         }
+        // Enter stages the focused provider on `pending_provider` and emits a
+        // status notice (Task 8) — browse/stage only this task; wiring a
+        // staged provider into a live run is a follow-up. Re-derives the
+        // filtered list from the overlay's own `query`/`selected` rather than
+        // trusting `selected_provider`, for the same zero-match reason as the
+        // model-picker arm above. `mem::take` already closed the picker (left
+        // the overlay `None`).
+        Overlay::ProviderPicker { query, selected } => {
+            if let Some(&idx) = filter_providers(&state.providers, &query).get(selected) {
+                if let Some(card) = state.providers.get(idx) {
+                    let id = card.id.clone();
+                    state.pending_provider = Some(id.clone());
+                    state.notice = Some((
+                        format!("provider staged: {id} — applies to your next run"),
+                        state.tick + 25,
+                    ));
+                }
+            }
+        }
         // Base view (`mem::take` left `None`): send the composer. A live run is
         // steered; a terminal run is followed up (continuing the same
         // conversation); with no run at all yet, the message starts the
@@ -1141,6 +1186,13 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Model => {
             state.selected_model = 0;
             state.overlay = Overlay::ModelPicker {
+                query: String::new(),
+                selected: 0,
+            };
+        }
+        PaletteCommand::Provider => {
+            state.selected_provider = 0;
+            state.overlay = Overlay::ProviderPicker {
                 query: String::new(),
                 selected: 0,
             };
@@ -3382,6 +3434,215 @@ mod tests {
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
         assert!(s.pending_model.is_none(), "Esc must not stage anything");
+    }
+
+    // --- Task 8: the `/provider` picker (mirrors the model-picker tests above) ---
+
+    fn provider_card(
+        id: &str,
+        name: &str,
+        protocol: &str,
+        auth: &str,
+        local: bool,
+    ) -> crate::state::ProviderCard {
+        crate::state::ProviderCard {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            protocol: protocol.to_owned(),
+            auth: auth.to_owned(),
+            local,
+        }
+    }
+
+    /// Open the provider picker via the palette front door: `/` → filter
+    /// "provider" → Enter. Every other test below starts from this.
+    fn open_provider_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn palette_opens_the_provider_picker() {
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        open_provider_picker(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ProviderPicker {
+                query: String::new(),
+                selected: 0,
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn provider_picker_navigation_moves_selection_and_resolves_the_focused_card() {
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card(
+                "groq",
+                "Groq",
+                "openai-chat",
+                "api-key: GROQ_API_KEY",
+                false,
+            ),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        open_provider_picker(&mut s);
+        assert_eq!(s.selected_provider, 0);
+
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(
+            s.overlay,
+            Overlay::ProviderPicker {
+                query: String::new(),
+                selected: 1,
+            }
+        );
+        assert_eq!(
+            s.selected_provider, 1,
+            "the resolved index tracks the filtered cursor"
+        );
+        assert_eq!(s.focused_provider().map(|c| c.id.as_str()), Some("ollama"));
+
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        assert_eq!(s.selected_provider, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_provider, 0);
+        assert_eq!(s.focused_provider().map(|c| c.id.as_str()), Some("groq"));
+    }
+
+    #[test]
+    fn provider_picker_filters_by_id_substring_and_resets_selection() {
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card(
+                "groq",
+                "Groq",
+                "openai-chat",
+                "api-key: GROQ_API_KEY",
+                false,
+            ),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // move onto "ollama" first
+        assert_eq!(s.selected_provider, 1);
+
+        for c in "groq".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // Filtering narrows the list to "groq" and resets the cursor to its
+        // top, resolving `selected_provider` back to the matching full-list
+        // index rather than leaving it pointing at the no-longer-visible row.
+        match &s.overlay {
+            Overlay::ProviderPicker { query, selected } => {
+                assert_eq!(query, "groq");
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected the provider picker, got {other:?}"),
+        }
+        assert_eq!(s.selected_provider, 0);
+        assert_eq!(s.focused_provider().map(|c| c.id.as_str()), Some("groq"));
+    }
+
+    #[test]
+    fn provider_picker_enter_stages_the_focused_provider_and_emits_a_notice() {
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card(
+                "groq",
+                "Groq",
+                "openai-chat",
+                "api-key: GROQ_API_KEY",
+                false,
+            ),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // focus "ollama"
+        reduce(&mut s, Action::InputSubmit); // stage it
+
+        assert_eq!(s.overlay, Overlay::None, "the picker closes on select");
+        assert_eq!(s.pending_provider.as_deref(), Some("ollama"));
+        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
+        assert!(
+            notice.contains("ollama"),
+            "the notice names the staged provider: {notice}"
+        );
+        assert!(
+            notice.contains("next run"),
+            "the notice explains staging is advisory: {notice}"
+        );
+    }
+
+    #[test]
+    fn provider_picker_enter_with_zero_matches_stages_nothing() {
+        // Regression (mirrors the model-picker's own regression test):
+        // `selected_provider`'s `.unwrap_or(0)` fallback (see `nav` and
+        // `edit_prompt`) points at the full list's row 0 whenever the live
+        // query matches nothing — Enter must NOT silently stage that row.
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card(
+                "groq",
+                "Groq",
+                "openai-chat",
+                "api-key: GROQ_API_KEY",
+                false,
+            ),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        open_provider_picker(&mut s);
+        for c in "zzz-no-such-provider".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert!(
+            crate::state::filter_providers(&s.providers, "zzz-no-such-provider").is_empty(),
+            "precondition: the query must match nothing"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(
+            s.overlay,
+            Overlay::None,
+            "the picker still closes (mirrors the palette's no-match submit)"
+        );
+        assert!(
+            s.pending_provider.is_none(),
+            "a zero-match submit must not silently stage providers[0]"
+        );
+        assert!(
+            s.notice.is_none(),
+            "a zero-match submit must not emit a staging notice"
+        );
+    }
+
+    #[test]
+    fn provider_picker_escape_closes_without_staging() {
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.pending_provider.is_none(), "Esc must not stage anything");
     }
 
     #[test]

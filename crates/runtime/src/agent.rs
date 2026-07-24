@@ -2183,8 +2183,10 @@ fn build_chronicle(
 // FrameworkModelDriver — the live provider path (feature-gated)
 // ---------------------------------------------------------------------------
 
-/// A [`ModelDriver`] backed by a framework `ChatClient`
-/// (`agent_framework_openai::OpenAIChatCompletionClient`).
+/// A [`ModelDriver`] backed by a framework `ChatClient`: whatever
+/// `Arc<dyn ChatClient>` [`ModelRegistry::client_for`] builds — today always
+/// an `agent_framework_openai::OpenAIChatCompletionClient`, since only the
+/// OpenAI-compatible wire protocol is wired.
 ///
 /// It translates the loop's [`TurnItem`] transcript into framework
 /// [`Message`](agent_framework_core::types::Message)s, advertises the Phase 1
@@ -2208,7 +2210,7 @@ fn build_chronicle(
 /// (`to_messages_never_emits_orphan_tool_roles` pins this).
 #[cfg(feature = "provider-openai")]
 pub struct FrameworkModelDriver {
-    client: agent_framework_openai::OpenAIChatCompletionClient,
+    client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
     model_id: ModelId,
 }
 
@@ -2216,16 +2218,17 @@ pub struct FrameworkModelDriver {
 impl FrameworkModelDriver {
     /// Wrap a constructed client and record the model id it serves.
     pub fn new(
-        client: agent_framework_openai::OpenAIChatCompletionClient,
+        client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
         model_id: ModelId,
     ) -> Self {
         Self { client, model_id }
     }
 
     /// Build a driver from the registry by resolving `model_id` to a client.
-    pub fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
+    pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
         let client = models
             .client_for(&model_id)
+            .await
             .map_err(|e| anyhow::anyhow!("could not build client for {model_id}: {e}"))?;
         Ok(Self::new(client, model_id))
     }

@@ -16,6 +16,11 @@ codypendent-integrations = { workspace = true }
 # `ModelProfile`. `codypendent-routing` is a leaf crate (protocol-only), so this
 # adds no cycle.
 codypendent-routing = { workspace = true }
+# Generalizes ModelRegistry::client_for to dispatch on Protocol and resolve
+# credentials via the async CredentialProvider seam. codypendent-providers is
+# a daemon-free, network-free leaf crate (like codypendent-routing), so this
+# adds no cycle.
+codypendent-providers = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }

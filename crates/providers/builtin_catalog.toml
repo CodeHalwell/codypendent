@@ -1,0 +1,391 @@
+# Curated built-in provider catalog. Shadowable/extendable by the user's
+# <data_dir>/providers.toml (same shape). Secrets are env-var NAMES only.
+
+# --- Tier 1: frontier direct APIs (OpenAI-compatible unless noted) ---
+[[provider]]
+id = "openai"
+name = "OpenAI"
+protocol = "openai-chat"
+base_url = "https://api.openai.com/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["OPENAI_API_KEY"]
+
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY"]
+header = "x-api-key"
+prefix = ""
+
+[[provider]]
+id = "gemini"
+name = "Google Gemini API"
+protocol = "openai-chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+[[provider.auth]]
+kind = "api_key"
+env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+
+[[provider]]
+id = "xai"
+name = "xAI (Grok)"
+protocol = "openai-chat"
+base_url = "https://api.x.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["XAI_API_KEY"]
+
+[[provider]]
+id = "deepseek"
+name = "DeepSeek"
+protocol = "openai-chat"
+base_url = "https://api.deepseek.com"
+[[provider.auth]]
+kind = "api_key"
+env = ["DEEPSEEK_API_KEY"]
+
+[[provider]]
+id = "mistral"
+name = "Mistral"
+protocol = "openai-chat"
+base_url = "https://api.mistral.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["MISTRAL_API_KEY"]
+
+[[provider]]
+id = "moonshot"
+name = "Moonshot AI (Kimi)"
+protocol = "openai-chat"
+base_url = "https://api.moonshot.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["MOONSHOT_API_KEY"]
+
+[[provider]]
+id = "zhipu"
+name = "Zhipu / Z.ai (GLM)"
+protocol = "openai-chat"
+base_url = "https://api.z.ai/api/paas/v4"
+[[provider.auth]]
+kind = "api_key"
+env = ["ZAI_API_KEY", "ZHIPUAI_API_KEY"]
+
+[[provider]]
+id = "minimax"
+name = "MiniMax"
+protocol = "openai-chat"
+base_url = "https://api.minimax.io/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["MINIMAX_API_KEY"]
+
+[[provider]]
+id = "qwen"
+name = "Alibaba Qwen (DashScope)"
+protocol = "openai-chat"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["DASHSCOPE_API_KEY"]
+
+# --- Tier 1: cloud enterprise (catalog entries; cloud-IAM signing is a follow-up) ---
+[[provider]]
+id = "azure-openai"
+name = "Azure OpenAI (Foundry)"
+protocol = "openai-chat"
+# base_url is per-resource; the user sets it in their providers.toml (…/openai/v1/).
+[[provider.auth]]
+kind = "api_key"
+env = ["AZURE_OPENAI_API_KEY"]
+header = "api-key"
+prefix = ""
+
+[[provider]]
+id = "amazon-bedrock"
+name = "AWS Bedrock (mantle, bearer key)"
+protocol = "openai-chat"
+base_url = "https://bedrock-mantle.us-east-1.api.aws/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["AWS_BEARER_TOKEN_BEDROCK"]
+
+# --- Tier 2: inference aggregators / fast hosts (drop-in OpenAI-compatible) ---
+[[provider]]
+id = "openrouter"
+name = "OpenRouter"
+protocol = "openai-chat"
+base_url = "https://openrouter.ai/api/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["OPENROUTER_API_KEY"]
+
+[[provider]]
+id = "together"
+name = "Together AI"
+protocol = "openai-chat"
+base_url = "https://api.together.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["TOGETHER_API_KEY"]
+
+[[provider]]
+id = "groq"
+name = "Groq"
+protocol = "openai-chat"
+base_url = "https://api.groq.com/openai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["GROQ_API_KEY"]
+
+[[provider]]
+id = "fireworks"
+name = "Fireworks AI"
+protocol = "openai-chat"
+base_url = "https://api.fireworks.ai/inference/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["FIREWORKS_API_KEY"]
+
+[[provider]]
+id = "cerebras"
+name = "Cerebras"
+protocol = "openai-chat"
+base_url = "https://api.cerebras.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["CEREBRAS_API_KEY"]
+
+[[provider]]
+id = "sambanova"
+name = "SambaNova Cloud"
+protocol = "openai-chat"
+base_url = "https://api.sambanova.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["SAMBANOVA_API_KEY"]
+
+[[provider]]
+id = "deepinfra"
+name = "DeepInfra"
+protocol = "openai-chat"
+base_url = "https://api.deepinfra.com/v1/openai"
+[[provider.auth]]
+kind = "api_key"
+env = ["DEEPINFRA_TOKEN"]
+
+[[provider]]
+id = "novita"
+name = "Novita AI"
+protocol = "openai-chat"
+base_url = "https://api.novita.ai/openai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["NOVITA_API_KEY"]
+
+[[provider]]
+id = "nebius"
+name = "Nebius Token Factory"
+protocol = "openai-chat"
+base_url = "https://api.tokenfactory.nebius.com/v1/"
+[[provider.auth]]
+kind = "api_key"
+env = ["NEBIUS_API_KEY"]
+
+[[provider]]
+id = "hyperbolic"
+name = "Hyperbolic"
+protocol = "openai-chat"
+base_url = "https://api.hyperbolic.xyz/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["HYPERBOLIC_API_KEY"]
+
+[[provider]]
+id = "baseten"
+name = "Baseten Model APIs"
+protocol = "openai-chat"
+base_url = "https://inference.baseten.co/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["BASETEN_API_KEY"]
+
+[[provider]]
+id = "lambda"
+name = "Lambda Inference"
+protocol = "openai-chat"
+base_url = "https://api.lambda.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["LAMBDA_API_KEY"]
+
+[[provider]]
+id = "featherless"
+name = "Featherless AI"
+protocol = "openai-chat"
+base_url = "https://api.featherless.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["FEATHERLESS_API_KEY"]
+
+[[provider]]
+id = "inference-net"
+name = "Inference.net"
+protocol = "openai-chat"
+base_url = "https://api.inference.net/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["INFERENCE_API_KEY"]
+
+[[provider]]
+id = "chutes"
+name = "Chutes AI"
+protocol = "openai-chat"
+base_url = "https://llm.chutes.ai/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["CHUTES_API_KEY"]
+
+[[provider]]
+id = "parasail"
+name = "Parasail"
+protocol = "openai-chat"
+base_url = "https://api.parasail.io/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["PARASAIL_API_KEY"]
+
+[[provider]]
+id = "venice"
+name = "Venice AI"
+protocol = "openai-chat"
+base_url = "https://api.venice.ai/api/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["VENICE_API_KEY"]
+
+[[provider]]
+id = "perplexity"
+name = "Perplexity (Sonar)"
+protocol = "openai-chat"
+base_url = "https://api.perplexity.ai"
+[[provider.auth]]
+kind = "api_key"
+env = ["PERPLEXITY_API_KEY"]
+
+[[provider]]
+id = "ai21"
+name = "AI21 (Jamba)"
+protocol = "openai-chat"
+base_url = "https://api.ai21.com/studio/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["AI21_API_KEY"]
+
+[[provider]]
+id = "cohere"
+name = "Cohere (compat)"
+protocol = "openai-chat"
+base_url = "https://api.cohere.ai/compatibility/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["CO_API_KEY", "COHERE_API_KEY"]
+
+[[provider]]
+id = "github-models"
+name = "GitHub Models"
+protocol = "openai-chat"
+base_url = "https://models.github.ai/inference"
+extra_headers = { "X-GitHub-Api-Version" = "2022-11-28" }
+[[provider.auth]]
+kind = "api_key"
+env = ["GITHUB_TOKEN"]
+
+[[provider]]
+id = "opencode-zen"
+name = "OpenCode Zen"
+protocol = "openai-chat"
+base_url = "https://opencode.ai/zen/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["OPENCODE_API_KEY"]
+
+# --- Tier 2: local (no auth) ---
+[[provider]]
+id = "ollama"
+name = "Ollama (local)"
+protocol = "openai-chat"
+base_url = "http://localhost:11434/v1"
+local = true
+[[provider.auth]]
+kind = "none"
+
+[[provider]]
+id = "lmstudio"
+name = "LM Studio (local)"
+protocol = "openai-chat"
+base_url = "http://localhost:1234/v1"
+local = true
+[[provider.auth]]
+kind = "none"
+
+[[provider]]
+id = "vllm"
+name = "vLLM (local)"
+protocol = "openai-chat"
+base_url = "http://localhost:8000/v1"
+local = true
+[[provider.auth]]
+kind = "none"
+
+# --- ACP agents (delegate a turn; the agent owns its model) ---
+[[provider]]
+id = "gemini-cli"
+name = "Gemini CLI (ACP)"
+protocol = "acp"
+[[provider.auth]]
+kind = "acp"
+command = "gemini"
+args = ["--acp"]
+
+[[provider]]
+id = "claude-code"
+name = "Claude Code (ACP)"
+protocol = "acp"
+[[provider.auth]]
+kind = "acp"
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp"]
+
+[[provider]]
+id = "codex"
+name = "OpenAI Codex (ACP)"
+protocol = "acp"
+[[provider.auth]]
+kind = "acp"
+command = "npx"
+args = ["-y", "@agentclientprotocol/codex-acp"]
+
+[[provider]]
+id = "opencode"
+name = "OpenCode (ACP)"
+protocol = "acp"
+[[provider.auth]]
+kind = "acp"
+command = "opencode"
+args = ["acp"]
+
+[[provider]]
+id = "cursor"
+name = "Cursor CLI (ACP)"
+protocol = "acp"
+[[provider.auth]]
+kind = "acp"
+command = "agent"
+args = ["acp"]
