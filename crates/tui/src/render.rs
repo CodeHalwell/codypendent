@@ -23,7 +23,8 @@ use codypendent_protocol::{
 use crate::reduce::capability_label;
 use crate::state::{
     filter_models, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel,
-    Overlay, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    Overlay, PatchSummary, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
+    TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -211,17 +212,24 @@ const COMPOSER_HEIGHT: u16 = 3;
 
 /// The conversation: the selected run's transcript, full width, as the primary
 /// surface. Its title names the session + active run (and a run counter when
-/// several are live, switchable with Ctrl-↑/↓).
+/// several are live, switchable with Ctrl-↑/↓), plus the header chrome
+/// (Task 4, codex chat shell) naming what's serving the run: `model · mode[ ·
+/// cost]`.
 fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let session = state.session_title.as_deref().unwrap_or("Codypendent");
     let title = match state.selected_run() {
         Some(run) if state.runs.len() > 1 => format!(
-            "{session} — {} [{}/{}]",
+            "{session} — {} [{}/{}]{}",
             truncate(&run.objective, 36),
             state.selected_run + 1,
-            state.runs.len()
+            state.runs.len(),
+            header_chrome(run, &state.status()),
         ),
-        Some(run) => format!("{session} — {}", truncate(&run.objective, 44)),
+        Some(run) => format!(
+            "{session} — {}{}",
+            truncate(&run.objective, 44),
+            header_chrome(run, &state.status()),
+        ),
         None => session.to_owned(),
     };
     let block = pane_block(&title, true, theme);
@@ -260,6 +268,25 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         .wrap(Wrap { trim: false })
         .scroll((offset, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The conversation header's `model · mode[ · cost]` chrome (Task 4, codex
+/// chat shell), appended to the pane title after the session/objective so
+/// the operator sees what's serving the run without opening the run-detail
+/// pane. `mode` is always known once a run exists (`RunView::mode` isn't
+/// optional) and is the floor; `model` (learned from the agent actor) and
+/// `cost` (from the status projection's cost budget) are each left out
+/// entirely — never a `—`/`$0.00` placeholder — until known.
+fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = &run.model {
+        parts.push(model.to_string());
+    }
+    parts.push(mode_label(run.mode).to_owned());
+    if let Some(cost) = status.cost_minor {
+        parts.push(format_cost(Some(cost)));
+    }
+    format!(" · {}", parts.join(" · "))
 }
 
 /// The largest useful scroll offset: total wrapped rows minus the viewport
@@ -342,6 +369,21 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
     let last_idx = run.transcript.len().checked_sub(1);
+    // Assistant-turn header (codex chat shell Task 3): a `⏺ codypendent`
+    // line announces the first agent cell (Model/Tool/Patch) of each turn,
+    // so the transcript reads as "you asked → codypendent answered" rather
+    // than an undifferentiated stream. `awaiting_header` tracks whether the
+    // next agent cell is still the first one since the most recent `User`
+    // entry; every other cell kind (Steering, Budget, Note, Backstage,
+    // Completed, Unsupported) leaves it untouched, so a run that ends before
+    // producing any agent cell never emits a lone header with nothing under
+    // it.
+    let mut awaiting_header = false;
+    // Turn spacing (Task 4, codex chat shell): a blank line before every
+    // `User` turn after the first, so consecutive turns breathe instead of
+    // reading as one undifferentiated scroll. The opening turn needs no
+    // leading gap.
+    let mut seen_user_turn = false;
     for (idx, entry) in run.transcript.iter().enumerate() {
         let selected = focused && idx == run.transcript_selected;
         // Task 4: the streaming caret belongs on the newest entry only, and
@@ -350,6 +392,23 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
         // Idle/Thinking/RunningTool (a tool call, a thinking pause, or
         // completion all drop it).
         let streaming_tail = last_idx == Some(idx) && run.activity == RunActivity::Streaming;
+        let is_agent_cell = matches!(
+            entry,
+            TranscriptEntry::Model { .. } | TranscriptEntry::Tool(_) | TranscriptEntry::Patch(_)
+        );
+        if matches!(entry, TranscriptEntry::User { .. }) {
+            if seen_user_turn {
+                lines.push(Line::raw(""));
+            }
+            seen_user_turn = true;
+            awaiting_header = true;
+        } else if is_agent_cell && awaiting_header {
+            lines.push(Line::styled(
+                "⏺ codypendent",
+                Style::default().fg(theme.focus.active),
+            ));
+            awaiting_header = false;
+        }
         entry_lines(entry, theme, selected, streaming_tail, &mut lines);
     }
     if lines.is_empty() {
@@ -396,6 +455,9 @@ fn entry_lines<'a>(
     };
 
     match entry {
+        TranscriptEntry::User { text } => {
+            out.push(head(format!("› {text}"), theme.focus.active));
+        }
         TranscriptEntry::Model { text } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
         }
@@ -419,13 +481,44 @@ fn entry_lines<'a>(
                 theme.status.warning,
             ));
         }
-        TranscriptEntry::Completed { disposition } => {
-            let (label, color) = disposition_display(disposition, theme);
-            out.push(head(format!("● {label}"), color));
-        }
+        TranscriptEntry::Completed { disposition } => match disposition {
+            // Success: the streamed model prose already ended the turn —
+            // render nothing here, so the reply is never echoed a second
+            // (or, with the old status line plus this one, third) time.
+            RunDisposition::Completed { .. } => {}
+            RunDisposition::Failed { reason } => {
+                out.push(head(format!("✗ {reason}"), theme.status.error));
+            }
+            RunDisposition::Cancelled { reason } => {
+                let text = reason
+                    .as_ref()
+                    .map_or_else(|| "✗ cancelled".to_owned(), |r| format!("✗ cancelled: {r}"));
+                out.push(head(text, theme.text.muted));
+            }
+            // Protocol RULE 1 (render, do not crash): `RunDisposition` is
+            // `#[non_exhaustive]` — this also catches the `Unknown` variant a
+            // disposition kind this build predates deserializes to.
+            _ => {
+                out.push(head("✗ run ended".to_owned(), theme.text.muted));
+            }
+        },
         TranscriptEntry::Note { text, expanded } => {
             note_lines(text, *expanded, theme, selected, out)
         }
+        TranscriptEntry::Backstage {
+            context_lines,
+            memory_updates,
+            raw,
+            expanded,
+        } => backstage_lines(
+            *context_lines,
+            *memory_updates,
+            raw,
+            *expanded,
+            theme,
+            selected,
+            out,
+        ),
         TranscriptEntry::Unsupported { label } => {
             out.push(head(format!("? {label}"), theme.text.muted));
         }
@@ -480,14 +573,16 @@ fn model_entry_lines<'a>(
 }
 
 fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &mut Vec<Line<'a>>) {
-    let (status_text, status_color) = match card.status {
-        ToolStatus::Proposed => ("proposed", theme.status.warning),
+    // Task 5 (codex chat shell): the collapsed head is one compact line — a
+    // run glyph, the tool's verb/name, and a terse outcome mark — instead of
+    // a `[status]` bracket; `card.status`/`card.outcome` drive the mark
+    // exactly as they drove the old bracket text.
+    let (outcome_mark, outcome_color) = match card.status {
+        ToolStatus::Proposed => ("⟳ review", theme.status.warning),
         ToolStatus::Running => ("running", theme.status.running),
         ToolStatus::Completed => match &card.outcome {
-            Some(codypendent_protocol::ToolOutcome::Failed { .. }) => {
-                ("failed", theme.status.error)
-            }
-            _ => ("done", theme.status.success),
+            Some(codypendent_protocol::ToolOutcome::Failed { .. }) => ("✗", theme.status.error),
+            _ => ("✓", theme.status.success),
         },
     };
     let name = if card.tool.is_empty() {
@@ -502,11 +597,8 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
         Style::default().fg(theme.agent.tool)
     };
     out.push(Line::from(vec![
-        Span::styled(format!("{marker} ⚙ {name} "), head_style),
-        Span::styled(
-            format!("[{status_text}]"),
-            Style::default().fg(status_color),
-        ),
+        Span::styled(format!("{marker} ⏺ {name} "), head_style),
+        Span::styled(outcome_mark, Style::default().fg(outcome_color)),
     ]));
 
     if card.expanded {
@@ -548,19 +640,28 @@ fn patch_lines<'a>(
     selected: bool,
     out: &mut Vec<Line<'a>>,
 ) {
+    // Task 5 (codex chat shell): the collapsed head is one compact line — a
+    // patch glyph, the change set's short id standing in for a target name
+    // (`PatchSummary` carries no file path or add/delete line counts yet —
+    // that needs a protocol change, out of scope here), and a `⟳ review`
+    // marker. The protocol has no `PatchApplied`/`PatchRejected` event, so a
+    // `PatchProposed` change set never resolves on the wire: every patch
+    // card sits in the transcript for manual review for its entire
+    // lifetime, so the marker is unconditional rather than derived from a
+    // per-instance status field.
     let marker = if patch.expanded { "▾" } else { "▸" };
     let head_style = if selected {
         theme.selection_style()
     } else {
         Style::default().fg(theme.diff.header)
     };
-    out.push(Line::styled(
-        format!(
-            "{marker} ❖ patch proposed ({})",
-            short_id(&patch.changeset_id)
+    out.push(Line::from(vec![
+        Span::styled(
+            format!("{marker} ❖ patch {} ", short_id(&patch.changeset_id)),
+            head_style,
         ),
-        head_style,
-    ));
+        Span::styled("⟳ review", Style::default().fg(theme.status.warning)),
+    ]));
     if patch.expanded {
         out.push(Line::styled(
             format!(
@@ -613,6 +714,60 @@ fn note_lines<'a>(
                 format!("    {line}"),
                 Style::default().fg(theme.text.secondary),
             ));
+        }
+    }
+}
+
+/// Renders the folded backstage line (Task 2): the context manifest and
+/// curated-memory writes for the run, summarized in one dim, expandable line
+/// instead of the visible `Note` cells they'd otherwise be. Each half
+/// (`context …`, `memory …`) is omitted when its count is empty (`None`/`0`);
+/// if both are empty (defensive — the reducer never creates the entry
+/// without at least one), nothing renders. `⋯` marks the folded line; once
+/// expanded, the full text of every folded note follows, dim and indented,
+/// same as an expanded [`note_lines`] body.
+fn backstage_lines<'a>(
+    context_lines: Option<usize>,
+    memory_updates: usize,
+    raw: &'a [String],
+    expanded: bool,
+    theme: &Theme,
+    selected: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    let mut parts = Vec::new();
+    if let Some(n) = context_lines {
+        let noun = if n == 1 { "line" } else { "lines" };
+        parts.push(format!("context · {n} {noun}"));
+    }
+    if memory_updates > 0 {
+        if memory_updates == 1 {
+            parts.push("memory updated".to_owned());
+        } else {
+            parts.push(format!("memory updated ×{memory_updates}"));
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    let head_style = if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(theme.text.muted)
+    };
+    let marker = if expanded { "▾" } else { "⋯" };
+    out.push(Line::styled(
+        format!("{marker} {}", parts.join(" · ")),
+        head_style,
+    ));
+    if expanded {
+        for note in raw {
+            for line in note.lines() {
+                out.push(Line::styled(
+                    format!("    {line}"),
+                    Style::default().fg(theme.text.muted),
+                ));
+            }
         }
     }
 }
@@ -2460,27 +2615,6 @@ fn budget_label(dimension: BudgetDimension) -> &'static str {
     }
 }
 
-fn disposition_display(disposition: &RunDisposition, theme: &Theme) -> (String, Color) {
-    match disposition {
-        RunDisposition::Completed { summary } => (
-            format!(
-                "run completed{}",
-                summary.as_ref().map_or(String::new(), |s| format!(": {s}"))
-            ),
-            theme.status.success,
-        ),
-        RunDisposition::Failed { reason } => (format!("run failed: {reason}"), theme.status.error),
-        RunDisposition::Cancelled { reason } => (
-            format!(
-                "run cancelled{}",
-                reason.as_ref().map_or(String::new(), |s| format!(": {s}"))
-            ),
-            theme.text.muted,
-        ),
-        _ => ("run ended".to_owned(), theme.text.muted),
-    }
-}
-
 fn format_cost(cost_minor: Option<u64>) -> String {
     match cost_minor {
         Some(c) => format!("${}.{:02}", c / 100, c % 100),
@@ -2516,8 +2650,8 @@ mod tests {
     use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
-        Actor, ApprovalId, ArtifactId, ArtifactRef, DataClassification, EventBody, ModelId,
-        ProposedAction, Risk, RiskLevel, RunId, SessionEvent, ToolOutcome,
+        Actor, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, EventBody,
+        ModelId, ProposedAction, Risk, RiskLevel, RunId, SessionEvent, ToolOutcome,
     };
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2644,6 +2778,136 @@ mod tests {
         assert!(
             text.contains("approvals"),
             "approval count missing:\n{text}"
+        );
+    }
+
+    /// Task 5 (codex chat shell): the collapsed tool card head restyles into
+    /// one compact Codex-style line — a run glyph (`⏺`) and the tool's
+    /// verb/name, with a terse outcome mark instead of the old `[status]`
+    /// bracket.
+    #[test]
+    fn a_completed_tool_card_renders_compact_with_a_run_glyph_and_check() {
+        let state = running_build_state();
+        let text = render_to_string(&state, 110, 30);
+        assert!(
+            text.contains("⏺ shell.run"),
+            "run glyph + name missing:\n{text}"
+        );
+        assert!(text.contains('✓'), "success outcome mark missing:\n{text}");
+        assert!(
+            !text.contains("[done]"),
+            "old bracket style must be gone:\n{text}"
+        );
+    }
+
+    /// A tool still awaiting a decision (`ToolStatus::Proposed`) shows the
+    /// same `⟳ review` marker a patch does, instead of the old `[proposed]`.
+    #[test]
+    fn a_proposed_tool_card_shows_a_review_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolProposed {
+                run_id,
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("⟳ review"), "review marker missing:\n{out}");
+        assert!(
+            !out.contains("[proposed]"),
+            "old bracket style must be gone:\n{out}"
+        );
+    }
+
+    /// A failed tool card shows a terse `✗` in the collapsed head; the
+    /// failure message itself stays in the expanded detail (unchanged).
+    #[test]
+    fn a_failed_tool_card_shows_a_cross_mark() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "d".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "exit 1".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains('✗'), "failure outcome mark missing:\n{out}");
+        assert!(
+            !out.contains("[failed]"),
+            "old bracket style must be gone:\n{out}"
+        );
+    }
+
+    /// Task 5: a patch card's collapsed head is `❖ patch {short id}` plus a
+    /// `⟳ review` marker. The protocol has no `PatchApplied`/`PatchRejected`
+    /// event — a `PatchProposed` change set never resolves on the wire, so
+    /// every patch card sits in the transcript for manual review for its
+    /// entire lifetime; the marker is unconditional rather than derived from
+    /// a per-instance status field (`PatchSummary` carries none).
+    #[test]
+    fn a_patch_card_renders_compact_with_a_patch_glyph_and_review_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("❖ patch"), "patch glyph missing:\n{out}");
+        assert!(out.contains("⟳ review"), "review marker missing:\n{out}");
+        assert!(
+            !out.contains("patch proposed ("),
+            "old verbose label must be gone:\n{out}"
         );
     }
 
@@ -2783,6 +3047,278 @@ mod tests {
         assert!(
             !done.contains('▋'),
             "caret is gone once the run completes:\n{done}"
+        );
+    }
+
+    /// A completed helper: `RunCompleted` needs a `chronicle` artifact
+    /// reference alongside the disposition; every disposition test below
+    /// uses this filler ref, only the disposition itself is under test.
+    fn filler_chronicle() -> ArtifactRef {
+        ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_owned(),
+            byte_length: 10,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        }
+    }
+
+    /// Task 3 (codex chat shell): a successful run's reply already ended the
+    /// turn as streamed model prose, so the `Completed` cell must render
+    /// nothing — no second/third echo of the same reply — and the turn's
+    /// first agent cell gets a `⏺ codypendent` header.
+    #[test]
+    fn a_completed_success_shows_the_reply_once_no_echo() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "hello there".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("hello there".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert_eq!(
+            out.matches("hello there").count(),
+            1,
+            "reply appears exactly once, not echoed by Completed:\n{out}"
+        );
+        assert!(!out.contains("run completed"), "no completed echo:\n{out}");
+        assert!(
+            out.contains("⏺ codypendent"),
+            "assistant header shown before the reply:\n{out}"
+        );
+    }
+
+    /// A run that fails before producing any prose has no `Model`/`Tool`/
+    /// `Patch` cell — so it must not render a lone `⏺ codypendent` header
+    /// with nothing under it. It shows its failure reason, tersely (no
+    /// leftover "run failed:" verbiage from the old always-visible echo).
+    #[test]
+    fn a_failed_run_shows_its_reason() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "no model configured".to_owned(),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("no model configured"),
+            "failure reason shown:\n{out}"
+        );
+        assert!(
+            !out.contains("run failed:"),
+            "terse reason, not the old verbose echo:\n{out}"
+        );
+        assert!(
+            !out.contains("⏺ codypendent"),
+            "no agent cell ever ran, so no lone header:\n{out}"
+        );
+    }
+
+    /// `RunDisposition::Cancelled` carries an optional reason (unlike the
+    /// unit-variant the design sketch assumed) — it renders tersely too, and
+    /// still surfaces the reason when one is given.
+    #[test]
+    fn a_cancelled_run_shows_its_reason_tersely() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Cancelled {
+                    reason: Some("budget exceeded".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(out.contains("cancelled"), "cancellation shown:\n{out}");
+        assert!(out.contains("budget exceeded"), "reason shown:\n{out}");
+        assert!(
+            !out.contains("run cancelled:"),
+            "terse form, not the old verbose echo:\n{out}"
+        );
+    }
+
+    /// The assistant header announces only the first agent cell of a turn —
+    /// a tool call followed by more model text in the same turn must not
+    /// repeat it, and a `Tool` cell (not just `Model`) triggers it.
+    #[test]
+    fn the_assistant_header_appears_once_per_turn_even_with_multiple_agent_cells() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc123".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "done".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert_eq!(
+            out.matches("⏺ codypendent").count(),
+            1,
+            "header appears exactly once for the whole turn:\n{out}"
+        );
+    }
+
+    /// Task 4 (codex chat shell): the conversation header names the serving
+    /// model and the run's mode, joined `model · mode`, so the operator sees
+    /// both without opening the run-detail pane. `running_build_state` learns
+    /// "gpt-5.1-codex" from the agent actor but never fires a cost budget
+    /// event, so cost stays unknown — it must be left out entirely rather
+    /// than shown as a `$0.00`/`—` placeholder.
+    #[test]
+    fn the_conversation_header_shows_model_and_mode() {
+        let state = running_build_state();
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("gpt-5.1-codex · Build"),
+            "model · mode header:\n{text}"
+        );
+        assert!(
+            !text.contains('$'),
+            "unknown cost omitted, not a placeholder:\n{text}"
+        );
+    }
+
+    /// A fresh run has a mode but no model learned yet — the header shows
+    /// the mode alone (joined onto the title by one separator), with no
+    /// extra slot or separator standing in for the still-unknown model/cost.
+    #[test]
+    fn the_header_shows_mode_alone_before_a_model_is_learned() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Ask,
+            }),
+        );
+        let out = render_to_string(&s, 100, 20);
+        let header_row = out.lines().next().expect("a top row");
+        assert!(
+            header_row.contains("· Ask"),
+            "mode shown in the header:\n{header_row}"
+        );
+        assert_eq!(
+            header_row.matches('·').count(),
+            1,
+            "one separator for the one known field — no slot for model/cost:\n{header_row}"
+        );
+    }
+
+    /// Task 4 (codex chat shell): a blank line separates turns after the
+    /// first so the conversation breathes, instead of reading as one
+    /// undifferentiated scroll. The reducer doesn't yet drive a second
+    /// `User` turn onto a live run (steering acks as `Steering`, not
+    /// `User` — see `TranscriptEntry::User`'s doc comment), so this pushes
+    /// the follow-up turn directly to exercise the render-side spacing rule
+    /// in isolation from that reducer wiring.
+    #[test]
+    fn a_blank_line_separates_turns_after_the_first() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "alpha".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s.runs[0].transcript.push(TranscriptEntry::User {
+            text: "beta".to_owned(),
+        });
+        let out = render_to_string(&s, 80, 20);
+        let rows: Vec<&str> = out.lines().collect();
+        // Search for the turn marker itself (not just the bare word), so a
+        // match can't land on the pane title — which also shows the
+        // objective ("alpha") and would otherwise be mistaken for the
+        // transcript row.
+        let alpha_row = rows
+            .iter()
+            .position(|r| r.contains("› alpha"))
+            .expect("first turn rendered");
+        let beta_row = rows
+            .iter()
+            .position(|r| r.contains("› beta"))
+            .expect("second turn rendered");
+        assert_eq!(
+            beta_row,
+            alpha_row + 2,
+            "exactly one blank row separates the turns:\n{out}"
         );
     }
 
@@ -2969,19 +3505,21 @@ mod tests {
 
     #[test]
     fn short_note_renders_inline() {
+        // Not a `remembered:`/`=== CONTEXT` note — those fold into the dim
+        // `Backstage` line instead (see the backstage-fold render tests).
         let mut state = running_build_state();
         let run_id = state.runs[0].run_id;
         reduce(
             &mut state,
             system_ev(EventBody::NoteAppended {
-                text: "remembered: the test command is cargo test".to_owned(),
+                text: "the test command is cargo test".to_owned(),
                 run_id: Some(run_id),
             }),
         );
 
         let text = render_to_string(&state, 110, 34);
         assert!(
-            text.contains("• note: remembered: the test command is cargo test"),
+            text.contains("• note: the test command is cargo test"),
             "a short note renders inline, unfolded:\n{text}"
         );
         // `running_build_state` already has a (separately foldable) tool card, so
@@ -2991,6 +3529,68 @@ mod tests {
             !text.contains("▸ note:") && !text.contains("▾ note:"),
             "a short note carries no fold marker:\n{text}"
         );
+    }
+
+    #[test]
+    fn backstage_renders_a_dim_summary_line() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\nline\nline\nline".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+
+        let out = render_to_string(&state, 80, 34);
+        assert!(
+            out.contains("context") && out.contains("memory"),
+            "the folded summary names both halves:\n{out}"
+        );
+        assert!(
+            !out.contains("EVIDENCE, NOT INSTRUCTIONS"),
+            "raw manifest text must stay hidden while folded:\n{out}"
+        );
+        assert!(
+            !out.contains("• note:"),
+            "context/memory notes never render as a Note cell:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expanding_backstage_reveals_the_folded_raw_notes() {
+        let mut state = running_build_state();
+        let run_id = state.runs[0].run_id;
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "remembered: the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        let idx = state.runs[0]
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Backstage { .. }))
+            .expect("a Backstage entry was folded in");
+        state.focus = Pane::Transcript;
+        state.runs[0].transcript_selected = idx;
+
+        reduce(&mut state, Action::Expand);
+        let out = render_to_string(&state, 80, 34);
+        assert!(
+            out.contains("remembered: the test command is cargo test"),
+            "expanded backstage shows the folded note's full text:\n{out}"
+        );
+        assert!(out.contains("▾"), "the expanded marker replaces ⋯:\n{out}");
     }
 
     #[test]
@@ -3021,6 +3621,22 @@ mod tests {
         assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
         // The status footer is still present.
         assert!(text.contains("mode"), "status footer:\n{text}");
+    }
+
+    #[test]
+    fn a_user_turn_renders_with_a_caret_marker() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "add a test".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let out = render_to_string(&s, 80, 12);
+        assert!(out.contains("› add a test") || out.contains("> add a test"));
     }
 
     #[test]
