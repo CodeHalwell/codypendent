@@ -16,6 +16,7 @@ mod promotion;
 mod publish;
 mod routing;
 mod scan;
+mod session_history;
 mod workflow_exec;
 mod workflows;
 

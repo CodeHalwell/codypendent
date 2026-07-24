@@ -3,14 +3,16 @@
 //! sequence, and role enforcement. Drives `server::run` exactly like
 //! `tests/socket.rs`, exchanging framed envelopes over a `UnixStream`.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, AgentMode, Catchup, ClientCapabilities, ClientHello,
-    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, Payload,
-    SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
+    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, ModelId, Payload,
+    RunId, SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -27,6 +29,42 @@ async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask) {
         .expect("open db");
     let boot = instance::record_boot(&pool).await.expect("record boot");
     let task = tokio::spawn(server::run(pool, paths.clone(), boot));
+    (paths, task)
+}
+
+/// A [`RunExecutor`] that records every launch instead of running it, so a test
+/// can assert what the server bound onto a run (repository/model/...). Leaving
+/// `collaborators` at its default `None` keeps the server on its own fresh
+/// fan-out, exactly as the executor-less path.
+#[derive(Clone, Default)]
+struct CapturingExecutor {
+    launches: Arc<Mutex<Vec<RunLaunch>>>,
+}
+
+impl RunExecutor for CapturingExecutor {
+    fn spawn_run(&self, launch: RunLaunch) {
+        self.launches.lock().expect("launches lock").push(launch);
+    }
+}
+
+/// Like [`start_server`], but with an injected [`RunExecutor`] so a test can
+/// observe the [`RunLaunch`]es the server builds from accepted commands.
+async fn start_server_with_executor(
+    tmp: &tempfile::TempDir,
+    executor: Arc<dyn RunExecutor>,
+) -> (RuntimePaths, ServerTask) {
+    let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
+    paths.ensure_directories().expect("create directories");
+    let pool = db::open_database(&paths.data_dir.join("codypendent.db"))
+        .await
+        .expect("open db");
+    let boot = instance::record_boot(&pool).await.expect("record boot");
+    let task = tokio::spawn(server::run_with_executor(
+        pool,
+        paths.clone(),
+        boot,
+        Some(executor),
+    ));
     (paths, task)
 }
 
@@ -291,8 +329,9 @@ async fn create_attach_and_two_clients_observe_one_event() {
     )
     .await;
 
-    // Client 2 submits a command that appends an event; it observes both the
-    // acknowledgement and the resulting event (any order over one socket).
+    // Client 2 submits a follow-up; it now LAUNCHES a run (continuous-session
+    // plan, Task 3), so it observes both the acknowledgement and the resulting
+    // `RunStarted` event (any order over one socket).
     write_envelope(
         &mut s2,
         &Envelope::request(
@@ -316,7 +355,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
         match read_frame(&mut s2).await.payload {
             Payload::CommandAccepted { .. } => got_accepted = true,
             Payload::Event(event) => match event.body {
-                EventBody::NoteAppended { .. } => got_event = true,
+                EventBody::RunStarted { .. } => got_event = true,
                 // Presence is expected background noise (STEP 3.7): a client's own
                 // attach publishes a `ClientPresenceChanged` it then observes.
                 EventBody::ClientPresenceChanged { .. } => {}
@@ -340,10 +379,249 @@ async fn create_attach_and_two_clients_observe_one_event() {
             break event;
         }
     };
-    assert!(matches!(observed.body, EventBody::NoteAppended { .. }));
+    assert!(matches!(observed.body, EventBody::RunStarted { .. }));
 
     shutdown(s1, task).await;
     drop(s2);
+}
+
+/// Send a command and return its `CommandAccepted`'s `created_run`, tolerating
+/// interleaved events/pings/presence frames that a subscribed client may see
+/// ahead of the reply on the same socket.
+async fn command_created_run(
+    stream: &mut UnixStream,
+    client_id: ClientId,
+    body: CommandBody,
+    key: &str,
+) -> Option<RunId> {
+    write_envelope(
+        stream,
+        &Envelope::request(client_id, Payload::Command(command(body, key))),
+    )
+    .await
+    .expect("write command");
+    for _ in 0..12 {
+        match read_frame(stream).await.payload {
+            Payload::CommandAccepted { created_run, .. } => return created_run,
+            Payload::Event(_) | Payload::Ping => continue,
+            other => panic!("expected CommandAccepted, got {other:?}"),
+        }
+    }
+    panic!("no CommandAccepted arrived");
+}
+
+#[tokio::test]
+async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
+    // Continuous-session plan (Task 3): `SubmitUserInput` on a session that
+    // already has a (now terminal) run LAUNCHES a new, distinct run whose
+    // objective is the follow-up text — no longer a bare `NoteAppended`. The
+    // daemon's own server is executor-less, so a run's SEED is exercised by the
+    // codypendentd/runtime tests; here the observable is that a distinct new run
+    // starts and records the user's text as its objective.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let client = ClientId::new();
+    let mut s = connect(&paths).await;
+    handshake(&mut s, client).await;
+
+    // Create a session, then attach as Controller (may start, cancel, submit).
+    let created = send_recv(
+        &mut s,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "conversation".to_string(),
+                },
+                "create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut s,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "attach",
+    )
+    .await;
+
+    // A first run, cancelled to a terminal state — the prior run in the session.
+    let first_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::StartRun {
+            session_id,
+            objective: "first objective".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: None,
+        },
+        "start",
+    )
+    .await
+    .expect("StartRun creates a run");
+    let _ = command_created_run(
+        &mut s,
+        client,
+        CommandBody::CancelRun { run_id: first_run },
+        "cancel",
+    )
+    .await;
+
+    // The follow-up must launch a NEW, distinct run — not record a bare note.
+    let second_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "the follow up".to_string(),
+            mode: AgentMode::Build,
+        },
+        "input",
+    )
+    .await
+    .expect("SubmitUserInput now launches a run");
+    assert_ne!(
+        second_run, first_run,
+        "the follow-up starts a distinct new run"
+    );
+
+    // The session ledger records that run's `RunStarted` with the follow-up text.
+    let pool = client_pool(&paths).await;
+    let events = ledger::load_events(&pool, session_id)
+        .await
+        .expect("load events");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::RunStarted { run_id, objective, .. }
+                if *run_id == second_run && objective == "the follow up"
+        )),
+        "the follow-up's RunStarted must carry the user's text as its objective"
+    );
+
+    shutdown(s, task).await;
+}
+
+#[tokio::test]
+async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
+    // I-1/I-2: a follow-up (`SubmitUserInput`) carries no repository/model on the
+    // wire, yet its launched run must inherit the SESSION's provenance from its
+    // originating `StartRun` — the SAME repository (not the daemon's frozen
+    // `current_dir()`) and the SAME pinned model (not `None`). A capturing
+    // executor records each launch so we can assert exactly what the server bound.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    // The session's repository must differ from the daemon's process cwd — the
+    // whole point of I-1 is that `current_dir()` is NOT what a follow-up runs
+    // against on a shared daemon whose cwd froze at startup.
+    assert_ne!(
+        repo_path,
+        std::env::current_dir().unwrap(),
+        "the test repository must differ from the process cwd"
+    );
+    let pinned = ModelId("pinned-model-x".to_string());
+
+    let capture = Arc::new(CapturingExecutor::default());
+    let launches = capture.launches.clone();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server_with_executor(&tmp, capture).await;
+
+    let client = ClientId::new();
+    let mut s = connect(&paths).await;
+    handshake(&mut s, client).await;
+
+    let created = send_recv(
+        &mut s,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "conversation".to_string(),
+                },
+                "cont-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut s,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "cont-attach",
+    )
+    .await;
+
+    // The originating run: bound to an explicit repository and pinned to a model.
+    let first_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::StartRun {
+            session_id,
+            objective: "first objective".to_string(),
+            mode: AgentMode::Build,
+            repository: Some(repo_path.to_string_lossy().into_owned()),
+            model: Some(pinned.clone()),
+        },
+        "cont-start",
+    )
+    .await
+    .expect("StartRun creates a run");
+
+    // The follow-up: carries neither repository nor model on the wire.
+    let second_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "the follow up".to_string(),
+            mode: AgentMode::Build,
+        },
+        "cont-input",
+    )
+    .await
+    .expect("SubmitUserInput launches a run");
+    assert_ne!(second_run, first_run, "the follow-up starts a distinct run");
+
+    // `spawn_run` is called synchronously while applying the command, before its
+    // `CommandAccepted` is written, so both launches are already captured here.
+    let (repository, model) = {
+        let captured = launches.lock().expect("launches lock");
+        let continuation = captured
+            .iter()
+            .find(|launch| launch.run_id == second_run)
+            .expect("the continuation launch was captured");
+        (continuation.repository.clone(), continuation.model.clone())
+    };
+    assert_eq!(
+        repository, repo_path,
+        "the continuation runs against the session's repository, not the daemon cwd"
+    );
+    assert_ne!(
+        repository,
+        std::env::current_dir().unwrap(),
+        "the continuation must NOT fall back to the process cwd"
+    );
+    assert_eq!(
+        model,
+        Some(pinned),
+        "the continuation inherits the session's pinned model, not None"
+    );
+
+    shutdown(s, task).await;
 }
 
 #[tokio::test]

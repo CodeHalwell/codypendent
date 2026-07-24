@@ -41,6 +41,15 @@ pub enum PaletteCommand {
     Help,
     /// Detach this client (the run keeps going).
     Detach,
+    /// Start a fresh, unseeded conversation (Task 5, continuous-session plan).
+    /// Continuity keys off "this session already has prior runs," so a
+    /// genuinely fresh conversation needs a brand-new session — which this
+    /// client cannot mint in place. This detaches now (exactly like
+    /// [`PaletteCommand::Detach`] — the current run, if any, is unaffected)
+    /// and forgets this repository's remembered session, so the *next*
+    /// `codypendent` launch here finds nothing to resume and creates a fresh
+    /// one instead.
+    NewConversation,
 }
 
 /// One palette row: the command plus how it is presented and searched.
@@ -147,6 +156,14 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Detach",
         description: "leave the TUI; the run keeps going",
         key: "q",
+    },
+    PaletteEntry {
+        command: PaletteCommand::NewConversation,
+        title: "New conversation",
+        description:
+            "start a fresh, unseeded conversation — detaches now; the next launch begins it",
+        // Palette-only: a deliberate, rare action gets no single-key slot.
+        key: "—",
     },
 ];
 

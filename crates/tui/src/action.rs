@@ -203,6 +203,24 @@ pub enum Intent {
         /// lets the daemon resolve/route the model as before.
         model: Option<codypendent_protocol::ModelId>,
     },
+    /// Continue the attached session with a follow-up message once the
+    /// selected run has reached a terminal state (continuous-session plan,
+    /// Task 5): the daemon reconstructs the session's prior turns from its
+    /// event ledger and seeds a new continuation run, rather than starting a
+    /// context-free one (an active run instead steers via
+    /// [`Intent::QueueSteering`], unchanged). Mirrors [`Intent::StartRun`]'s
+    /// `mode` field; the session id is supplied by the harness the same way
+    /// `StartRun`'s is (see `intent_to_command`).
+    ///
+    /// Unlike [`Intent::StartRun`] this carries no `model` (nor repository):
+    /// the daemon is the source of truth for a continuation's provenance and
+    /// INHERITS both the session's pinned model (I-2) and repository (I-1) from
+    /// its originating `StartRun` command server-side — adding either here would
+    /// be a protocol wire change, and the client is not authoritative for them.
+    SubmitUserInput {
+        text: String,
+        mode: codypendent_protocol::AgentMode,
+    },
     /// Resolve a pending approval.
     ResolveApproval {
         approval_id: codypendent_protocol::ApprovalId,

@@ -226,6 +226,8 @@ pub async fn run(
         &repository,
         attach_watermark,
         docs_pool.clone(),
+        &mut store,
+        paths,
     )
     .await;
 
@@ -464,6 +466,10 @@ async fn event_loop(
     repository: &str,
     attach_watermark: u64,
     docs_pool: Option<sqlx::SqlitePool>,
+    // Task 5 (continuous-session plan): only touched by the "New Conversation"
+    // exit path below — everywhere else in the loop is unchanged.
+    store: &mut SessionStore,
+    paths: &RuntimePaths,
 ) -> anyhow::Result<()> {
     guard
         .terminal_mut()
@@ -634,6 +640,18 @@ async fn event_loop(
         }
 
         if state.should_detach || state.session_closed {
+            // Task 5 (continuous-session plan): "New Conversation" cannot swap
+            // this connection to a new session live (see
+            // `AppState::start_new_conversation`'s doc comment) — instead it
+            // forgets this repository's remembered session before the TUI
+            // ends, so `resolve_or_create_session` cannot resume it on the
+            // next launch and creates a genuinely fresh, unseeded one. A plain
+            // detach (`start_new_conversation` false) leaves the mapping
+            // alone, exactly as before this task.
+            if state.start_new_conversation {
+                store.sessions.remove(repository);
+                store.save(paths);
+            }
             return Ok(());
         }
 
@@ -809,6 +827,20 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             // Carry the operator's pinned model (STEP MP2) onto the wire; `None`
             // lets the daemon resolve/route as before.
             model,
+        },
+        // Task 5 (continuous-session plan): a follow-up once the selected run
+        // is terminal. No `repository`/`model` on this wire shape (unlike
+        // `StartRun`) — and it is NOT a protocol wire change to add them. The
+        // daemon instead RECOVERS the session's provenance from its originating
+        // `StartRun` command and threads the SAME repository (I-1) and pinned
+        // model (I-2) into the continuation launch (see
+        // `commands::session_run_provenance`), so a follow-up runs against the
+        // session's real checkout and stays pinned — not the daemon's frozen
+        // `current_dir()` with the model dropped.
+        Intent::SubmitUserInput { text, mode } => CommandBody::SubmitUserInput {
+            session_id,
+            text,
+            mode,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -2145,6 +2177,27 @@ mod tests {
             }
         );
 
+        // Task 5 (continuous-session plan): a follow-up after a terminal run
+        // maps to `SubmitUserInput`, not `StartRun` — the daemon seeds it from
+        // the session's prior turns instead of starting cold. Mirrors
+        // `StartRun`'s `session_id` binding above; unlike `StartRun`, it
+        // carries no `repository`/`model` (the wire shape has neither).
+        assert_eq!(
+            intent_to_command(
+                Intent::SubmitUserInput {
+                    text: "also add tests".into(),
+                    mode: AgentMode::Build,
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::SubmitUserInput {
+                session_id,
+                text: "also add tests".into(),
+                mode: AgentMode::Build,
+            }
+        );
+
         assert_eq!(
             intent_to_command(Intent::PauseRun { run_id }, session_id, repository),
             CommandBody::PauseRun { run_id }
@@ -2391,6 +2444,44 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
         assert!(SessionStore::load(&paths).sessions.is_empty());
+    }
+
+    /// Task 5 (continuous-session plan): "New Conversation" cannot swap the
+    /// live connection to a new session, so it forgets this repository's
+    /// remembered mapping instead (`event_loop`'s exit check, on
+    /// `state.start_new_conversation`) — the exact `sessions.remove` +
+    /// `save` this test exercises. With the entry gone,
+    /// `resolve_or_create_session` finds nothing to resume on the next
+    /// launch and creates a genuinely fresh, unseeded session (never fakes
+    /// continuity by reusing the forgotten one).
+    #[test]
+    fn forgetting_a_repository_removes_its_remembered_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
+        paths.ensure_directories().unwrap();
+
+        let mut store = SessionStore::default();
+        store.sessions.insert(
+            "/repo/one".into(),
+            StoredSession {
+                session_id: SessionId::new(),
+                workspace_id: WorkspaceId::new(),
+            },
+        );
+        store.save(&paths);
+        assert!(SessionStore::load(&paths)
+            .sessions
+            .contains_key("/repo/one"));
+
+        store.sessions.remove("/repo/one");
+        store.save(&paths);
+
+        assert!(
+            !SessionStore::load(&paths)
+                .sessions
+                .contains_key("/repo/one"),
+            "the forgotten repository must not resume its old session"
+        );
     }
 
     #[test]

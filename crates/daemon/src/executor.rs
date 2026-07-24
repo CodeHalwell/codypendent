@@ -19,6 +19,42 @@ use std::path::PathBuf;
 
 use codypendent_protocol::{AgentMode, ModelId, RunId, SessionId};
 
+/// One entry of a session's prior transcript, carried into a continuation
+/// run's [`RunLaunch`] (continuous-session plan, Task 2).
+///
+/// Mirrors `codypendent_runtime::agent::TurnItem` variant-for-variant, but is
+/// a distinct, crate-local type rather than a re-export or direct use of it:
+/// `codypendent-daemon` must never depend on `codypendent-runtime` (see this
+/// module's doc comment above — that dependency runs the other way, and
+/// `RunExecutor`/[`RunLaunch`] are precisely the seam that lets the assembly
+/// binary bridge the two crates without a cycle). `RunLaunch` is built
+/// directly by this crate's own code (`server.rs`, from an accepted command),
+/// so its `prior` element type must be nameable here — this enum is that
+/// dependency-safe carrier. The assembly executor (`crates/codypendentd`,
+/// which depends on both crates) converts it 1:1 into
+/// `Vec<codypendent_runtime::agent::TurnItem>` when it builds the
+/// `RunContext`.
+///
+/// Server-internal, not a wire type: never serialized, never sent over the
+/// transport, never persisted — it only crosses the in-process
+/// `RunLaunch` → `RunContext` handoff.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PriorTurn {
+    /// Mirrors `TurnItem::Objective`.
+    Objective(String),
+    /// Mirrors `TurnItem::Assistant`.
+    Assistant(String),
+    /// Mirrors `TurnItem::ToolResult`.
+    ToolResult {
+        /// The tool that produced the observation.
+        tool: String,
+        /// The compacted, model-facing output.
+        output: String,
+    },
+    /// Mirrors `TurnItem::Steering`.
+    Steering(String),
+}
+
 /// Everything the executor needs to start one run. Built by the server from the
 /// accepted `StartRun` command body (session/objective/mode) plus the run id the
 /// write path minted (`CommandOutcome::created_run`).
@@ -46,6 +82,15 @@ pub struct RunLaunch {
     /// model exactly as before. Mirrors [`repository`](RunLaunch::repository) as
     /// an optional per-run override.
     pub model: Option<ModelId>,
+    /// The prior conversation transcript to seed a continuation run with
+    /// (continuous-session plan, Task 2), as a dependency-safe [`PriorTurn`]
+    /// carrier. Empty for a plain/first run (every construction site defaults
+    /// it today); a later task populates it for a `SubmitUserInput`-launched
+    /// continuation. Converted 1:1 into `RunContext.prior`
+    /// (`codypendent_runtime::agent::RunContext`) where the assembly executor
+    /// builds the run context — this crate cannot name that type directly
+    /// (see [`PriorTurn`]'s doc comment).
+    pub prior: Vec<PriorTurn>,
 }
 
 /// The daemon's seam for actually *executing* an accepted run.
@@ -219,5 +264,36 @@ pub trait RunExecutor: Send + Sync {
     /// to create its own fresh (never-published) hub — the executor-less path.
     fn workflow_hub(&self) -> Option<crate::workflow_stream::WorkflowHub> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_launch_prior_defaults_empty_and_a_seeded_value_round_trips() {
+        // Task 2 (continuous-session plan): `RunLaunch.prior` is the
+        // dependency-safe carrier (see `PriorTurn`) threaded through to a
+        // `RunContext`'s own `prior` by the assembly executor. Every
+        // construction site defaults it empty; this proves the field itself
+        // round-trips.
+        let launch = RunLaunch {
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            objective: "objective".to_string(),
+            mode: AgentMode::Build,
+            repository: PathBuf::from("."),
+            model: None,
+            prior: Vec::new(),
+        };
+        assert!(launch.prior.is_empty());
+
+        let seeded = vec![PriorTurn::Objective("earlier turn".to_string())];
+        let launch = RunLaunch {
+            prior: seeded.clone(),
+            ..launch
+        };
+        assert_eq!(launch.prior, seeded);
     }
 }

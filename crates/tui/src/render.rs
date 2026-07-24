@@ -210,18 +210,23 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
 /// The composer's height in rows (a bordered box holding one input line).
 const COMPOSER_HEIGHT: u16 = 3;
 
-/// The conversation: the selected run's transcript, full width, as the primary
-/// surface. Its title names the session + active run (and a run counter when
-/// several are live, switchable with Ctrl-↑/↓), plus the header chrome
-/// (Task 4, codex chat shell) naming what's serving the run: `model · mode[ ·
-/// cost]`.
+/// The conversation: every run in the session, in order, as one continuous
+/// scroll (Task 5, continuous-session plan) — the primary surface, full
+/// width. Before this task, the pane showed only the *selected* run, so a
+/// follow-up's new run made the previous turn disappear the instant it
+/// started; `conversation_lines` now walks all of `state.runs`. The title
+/// names the session + the newest turn (and a turn count once the session has
+/// more than one), plus the header chrome (Task 4, codex chat shell) naming
+/// what's serving it: `model · mode[ · cost]`.
 fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let session = state.session_title.as_deref().unwrap_or("Codypendent");
     let title = match state.selected_run() {
+        // More than one run this session: name the turn count rather than a
+        // "[selected/total] run selector" — every run always renders now, so
+        // there is nothing left to select between.
         Some(run) if state.runs.len() > 1 => format!(
-            "{session} — {} [{}/{}]{}",
+            "{session} — {} · {} turns{}",
             truncate(&run.objective, 36),
-            state.selected_run + 1,
             state.runs.len(),
             header_chrome(run, &state.status()),
         ),
@@ -235,7 +240,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     let block = pane_block(&title, true, theme);
     let inner = block.inner(area);
 
-    let Some(run) = state.selected_run() else {
+    if state.runs.is_empty() {
         let hint = Paragraph::new(vec![
             Line::styled("No runs yet.", Style::default().fg(theme.text.secondary)),
             Line::styled(
@@ -246,21 +251,25 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         .block(block);
         frame.render_widget(hint, area);
         return;
-    };
+    }
 
-    // `focused = false`: the conversation shows no per-entry selection highlight
-    // (there is no in-transcript cursor in the composer-driven shell).
-    let lines = transcript_lines(run, theme, false);
+    let lines = conversation_lines(&state.runs, theme);
 
     // Auto-scroll: measure the wrapped height, cache the bottom offset (so the
     // reducer's paging can leave/enter follow mode precisely), and pin the view to
-    // the tail while following; otherwise honor the manual offset.
+    // the tail while following; otherwise honor the manual offset. The selected
+    // run's follow/scroll fields govern the WHOLE scroll — `AppState::ensure_run`
+    // keeps `selected_run` on the newest run by default, so "follow" still means
+    // "stick to the conversation's live tail."
     let max_scroll = max_scroll_offset(&lines, inner.width, inner.height);
     state.transcript_max_scroll.set(max_scroll);
-    let offset = if run.follow {
+    let (follow, scroll) = state
+        .selected_run()
+        .map_or((true, 0), |run| (run.follow, run.scroll));
+    let offset = if follow {
         max_scroll
     } else {
-        run.scroll.min(max_scroll)
+        scroll.min(max_scroll)
     };
 
     let paragraph = Paragraph::new(lines)
@@ -366,9 +375,17 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
         .style(theme.panel_style())
 }
 
-fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<Line<'a>> {
+/// The whole session's transcript, in run order, as one continuous scroll
+/// (Task 5, continuous-session plan): every run's entries walk through
+/// exactly the per-turn rendering a single run used to get alone, so a
+/// follow-up's new run is appended after the prior one instead of replacing
+/// it. `awaiting_header` and `seen_user_turn` (see their notes below) thread
+/// continuously across a run boundary — a new run's opening `User` entry is
+/// just the conversation's next turn — so the assistant header and the
+/// between-turns blank line both land exactly where they would if the whole
+/// session had always been one run's transcript.
+fn conversation_lines<'a>(runs: &'a [RunView], theme: &Theme) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
-    let last_idx = run.transcript.len().checked_sub(1);
     // Assistant-turn header (codex chat shell Task 3): a `⏺ codypendent`
     // line announces the first agent cell (Model/Tool/Patch) of each turn,
     // so the transcript reads as "you asked → codypendent answered" rather
@@ -384,43 +401,63 @@ fn transcript_lines<'a>(run: &'a RunView, theme: &Theme, focused: bool) -> Vec<L
     // reading as one undifferentiated scroll. The opening turn needs no
     // leading gap.
     let mut seen_user_turn = false;
-    for (idx, entry) in run.transcript.iter().enumerate() {
-        let selected = focused && idx == run.transcript_selected;
-        // Task 4: the streaming caret belongs on the newest entry only, and
-        // only while the run is actively streaming into it — never
-        // mid-transcript, and never once the run has moved on to
-        // Idle/Thinking/RunningTool (a tool call, a thinking pause, or
-        // completion all drop it).
-        let streaming_tail = last_idx == Some(idx) && run.activity == RunActivity::Streaming;
-        let is_agent_cell = matches!(
-            entry,
-            TranscriptEntry::Model { .. } | TranscriptEntry::Tool(_) | TranscriptEntry::Patch(_)
-        );
-        if matches!(entry, TranscriptEntry::User { .. }) {
-            if seen_user_turn {
-                lines.push(Line::raw(""));
+    // The last run's index: only the conversation's newest run can still be
+    // live, so the streaming caret (below) never lands on an earlier,
+    // necessarily-terminal run.
+    let last_run_idx = runs.len().checked_sub(1);
+    for (run_idx, run) in runs.iter().enumerate() {
+        let is_last_run = Some(run_idx) == last_run_idx;
+        let last_entry_idx = run.transcript.len().checked_sub(1);
+        let before = lines.len();
+        for (idx, entry) in run.transcript.iter().enumerate() {
+            // Task 4: the streaming caret belongs on the newest entry of the
+            // newest run only, and only while that run is actively streaming
+            // into it — never mid-transcript, never on an earlier run, and
+            // never once the run has moved on to Idle/Thinking/RunningTool (a
+            // tool call, a thinking pause, or completion all drop it).
+            let streaming_tail = is_last_run
+                && last_entry_idx == Some(idx)
+                && run.activity == RunActivity::Streaming;
+            let is_agent_cell = matches!(
+                entry,
+                TranscriptEntry::Model { .. }
+                    | TranscriptEntry::Tool(_)
+                    | TranscriptEntry::Patch(_)
+            );
+            if matches!(entry, TranscriptEntry::User { .. }) {
+                if seen_user_turn {
+                    lines.push(Line::raw(""));
+                }
+                seen_user_turn = true;
+                awaiting_header = true;
+            } else if is_agent_cell && awaiting_header {
+                lines.push(Line::styled(
+                    "⏺ codypendent",
+                    Style::default().fg(theme.focus.active),
+                ));
+                awaiting_header = false;
             }
-            seen_user_turn = true;
-            awaiting_header = true;
-        } else if is_agent_cell && awaiting_header {
-            lines.push(Line::styled(
-                "⏺ codypendent",
-                Style::default().fg(theme.focus.active),
-            ));
-            awaiting_header = false;
+            // `selected = false`: the conversation shows no per-entry
+            // selection highlight (there is no in-transcript cursor in the
+            // composer-driven shell — `render_conversation` never focuses it).
+            entry_lines(entry, theme, false, streaming_tail, &mut lines);
         }
-        entry_lines(entry, theme, selected, streaming_tail, &mut lines);
-    }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "(waiting for the agent…)",
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    // The live "working" status row (Task 3): appended last so it always
-    // reads as the newest line, right under the latest transcript content.
-    if let Some(status) = activity_status_line(&run.activity, theme) {
-        lines.push(status);
+        // A run with no transcript entries yet (shouldn't happen in practice —
+        // `RunStarted`'s fold pushes the objective as the very first entry —
+        // but kept for the same defend-in-depth reason the single-run
+        // renderer always had it) still occupies its place in the scroll.
+        if lines.len() == before {
+            lines.push(Line::styled(
+                "(waiting for the agent…)",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        // The live "working" status row (Task 3): appended right after this
+        // run's own entries — from this run's own activity — so it reads as
+        // that run's newest line. Idle (every terminal run) renders nothing.
+        if let Some(status) = activity_status_line(&run.activity, theme) {
+            lines.push(status);
+        }
     }
     lines
 }
@@ -3319,6 +3356,81 @@ mod tests {
             beta_row,
             alpha_row + 2,
             "exactly one blank row separates the turns:\n{out}"
+        );
+    }
+
+    /// Task 5 (continuous-session plan): the bug this task fixes — each
+    /// message spawned a new run, and the conversation showed only the
+    /// selected run, so the previous turn disappeared the moment a new one
+    /// started. `render_conversation` must now walk every run in the session,
+    /// in order, as one continuous scroll.
+    #[test]
+    fn the_conversation_renders_every_run_in_one_continuous_scroll() {
+        let mut s = AppState::new();
+        let run1 = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: run1,
+                objective: "alpha".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id: run1,
+                text: "alpha reply".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id: run1,
+                disposition: RunDisposition::Completed {
+                    summary: Some("alpha reply".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+
+        // A follow-up: a second run in the SAME session — the bug made the
+        // first turn vanish the instant this one started.
+        let run2 = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: run2,
+                objective: "beta".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id: run2,
+                text: "beta reply".to_owned(),
+            }),
+        );
+
+        let out = render_to_string(&s, 100, 30);
+        assert!(
+            out.contains("› alpha") && out.contains("alpha reply"),
+            "the first (completed) run's turn must still be visible:\n{out}"
+        );
+        assert!(
+            out.contains("› beta") && out.contains("beta reply"),
+            "the second (live) run's turn must also be visible:\n{out}"
+        );
+        assert_eq!(
+            out.matches("⏺ codypendent").count(),
+            2,
+            "each turn gets its own assistant header:\n{out}"
+        );
+        assert!(
+            out.contains("2 turns"),
+            "the header names the turn count (the old [n/n] run-selector \
+             counter no longer applies once every run always renders):\n{out}"
         );
     }
 

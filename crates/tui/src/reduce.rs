@@ -1078,8 +1078,9 @@ fn submit_prompt(state: &mut AppState) {
             }
         }
         // Base view (`mem::take` left `None`): send the composer. A live run is
-        // steered; otherwise the message starts a fresh run. The draft clears
-        // either way.
+        // steered; a terminal run is followed up (continuing the same
+        // conversation); with no run at all yet, the message starts the
+        // session's first one. The draft clears either way.
         Overlay::None => {
             let text = state.composer.trim().to_owned();
             if !text.is_empty() {
@@ -1087,7 +1088,19 @@ fn submit_prompt(state: &mut AppState) {
                     if let Some(run_id) = state.selected_run().map(|r| r.run_id) {
                         state.outbox.push(Intent::QueueSteering { run_id, text });
                     }
+                } else if state.selected_run().is_some() {
+                    // Task 5 (continuous-session plan): a run already exists and
+                    // has reached a terminal state — this message continues the
+                    // SAME session rather than starting a context-free run, so
+                    // the daemon seeds the continuation from the prior turns
+                    // (Tasks 1-4). The prior turn stays visible in the render
+                    // (all of the session's runs, not just this one).
+                    state.outbox.push(Intent::SubmitUserInput {
+                        text,
+                        mode: state.default_mode,
+                    });
                 } else {
+                    // No run yet this session: nothing to continue — start one.
                     state.outbox.push(Intent::StartRun {
                         objective: text,
                         mode: state.default_mode,
@@ -1135,6 +1148,16 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
         PaletteCommand::Help => state.overlay = Overlay::Help,
         PaletteCommand::Detach => state.should_detach = true,
+        // Task 5: a genuinely fresh conversation needs a brand-new session (see
+        // `AppState::start_new_conversation`'s doc comment), which this pure
+        // reducer cannot mint — so this detaches exactly like
+        // `PaletteCommand::Detach` (the current run, if any, is unaffected) and
+        // additionally flags the harness to forget this repository's
+        // remembered session before it tears down the connection.
+        PaletteCommand::NewConversation => {
+            state.should_detach = true;
+            state.start_new_conversation = true;
+        }
     }
 }
 
@@ -2927,6 +2950,25 @@ mod tests {
     }
 
     #[test]
+    fn palette_new_conversation_detaches_and_asks_to_forget_the_session() {
+        // Task 5: "New conversation" cannot mint a session itself (pure,
+        // I/O-free reducer) — it detaches, exactly like plain `Detach`, and
+        // additionally flags `start_new_conversation` so the CLI harness
+        // forgets this repository's remembered session before it tears down.
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenPalette);
+        for c in "conversation".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.should_detach, "detaches like a plain Detach");
+        assert!(
+            s.start_new_conversation,
+            "flags the harness to forget the remembered session"
+        );
+    }
+
+    #[test]
     fn palette_escape_closes_without_running_anything() {
         let mut s = AppState::new();
         reduce(&mut s, Action::OpenPalette);
@@ -3018,6 +3060,54 @@ mod tests {
                 [Intent::QueueSteering { text, run_id: r }] if text == "also add tests" && *r == run_id
             ),
             "expected a QueueSteering intent, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_after_a_run_completes_continues_the_conversation() {
+        // Task 5 (continuous-session plan): once the selected run reaches a
+        // terminal state, the composer's next message must continue the SAME
+        // session — pushing `SubmitUserInput`, not a context-free `StartRun` —
+        // so the daemon (Tasks 1-4) seeds it with the prior turns instead of
+        // starting cold. The prior turn must stay visible; it is the render
+        // side (not this reducer path) that keeps it in view.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "fix the bug".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_owned()),
+                },
+                chronicle: artifact(),
+            }),
+        );
+        assert!(!s.selected_run_is_active(), "the run is terminal");
+
+        for c in "follow up".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        let intents = s.drain_outbox();
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [Intent::SubmitUserInput {
+                    text,
+                    mode: AgentMode::Build
+                }] if text == "follow up"
+            ),
+            "expected a SubmitUserInput intent, got {intents:?}"
         );
     }
 
