@@ -11,7 +11,7 @@ use crate::model::AuthMethod;
 /// an HTTP `HeaderMap` — this leaf crate has no `http`/`reqwest` dep, and the
 /// wired OpenAI-compatible path only needs the key string; a raw-HTTP adapter
 /// (follow-up) can derive a header from `header`+`prefix`+`value`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedCredential {
     /// No credential (local endpoints).
     None,
@@ -21,6 +21,23 @@ pub enum ResolvedCredential {
         prefix: String,
         value: String,
     },
+}
+
+// `Debug` is hand-written to REDACT the key `value` — a derived `Debug` would
+// print the secret, so a stray `debug!("{cred:?}")` anywhere downstream would
+// leak it into logs. The header/prefix (non-secret) stay visible for diagnosis.
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("ResolvedCredential::None"),
+            Self::ApiKey { header, prefix, .. } => f
+                .debug_struct("ResolvedCredential::ApiKey")
+                .field("header", header)
+                .field("prefix", prefix)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// A failure resolving a credential.
@@ -124,6 +141,22 @@ pub fn credential_for(method: &AuthMethod) -> Box<dyn CredentialProvider> {
 mod tests {
     use super::*;
     use crate::model::AuthMethod;
+
+    #[test]
+    fn debug_redacts_the_api_key_value() {
+        let cred = ResolvedCredential::ApiKey {
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+            value: "sk-secret-12345".to_string(),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("sk-secret-12345"),
+            "the key value must never appear in Debug: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+        assert!(dbg.contains("Authorization")); // non-secret header stays visible
+    }
 
     #[tokio::test]
     async fn api_key_resolves_the_first_set_env_var() {
