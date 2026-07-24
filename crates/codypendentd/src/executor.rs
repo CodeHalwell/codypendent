@@ -29,7 +29,7 @@ use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
-use codypendent_daemon::executor::{RunExecutor, RunLaunch};
+use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
@@ -43,7 +43,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
-    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal,
+    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, TurnItem,
 };
 use codypendent_runtime::models::{load_models, resolve_model, ModelPolicy, ModelRegistry};
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
@@ -322,6 +322,11 @@ impl RuntimeExecutor {
                 mode: projections::agent_mode_from_db(&mode),
                 repository,
                 model,
+                // A crash-relaunched run recovers its repository and pinned
+                // model (above) but not prior history: recovery re-runs the
+                // SAME queued run, not a continuation (Task 2, continuous-
+                // session plan — no construction site populates `prior` yet).
+                prior: Vec::new(),
             });
             relaunched += 1;
         }
@@ -488,6 +493,12 @@ impl RuntimeExecutor {
             operating_tree.clone(),
             operating_tree,
         );
+        // Seed the run's transcript from the launch's prior-turn carrier
+        // (Task 2, continuous-session plan). `RunLaunch.prior` is always
+        // empty today — every construction site defaults it — so this is
+        // behavior-neutral until a later task populates it for a
+        // `SubmitUserInput`-launched continuation.
+        ctx = ctx.with_prior(convert_launch_prior(&launch.prior));
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
         // so the `github.*` tools know their target. Uses the repository IDENTITY
         // (`R`), not the worktree read root. Only meaningful when a client is
@@ -952,6 +963,30 @@ pub(crate) fn run_writes_to_worktree(mode: AgentMode) -> bool {
     mode_overlay(mode).write_allowed
 }
 
+/// Convert a launch's dependency-safe prior-transcript carrier
+/// (`codypendent_daemon::executor::PriorTurn`) into the runtime's own
+/// [`TurnItem`], 1:1 per variant (Task 2, continuous-session plan). This
+/// assembly crate is the only place that can name both types —
+/// `codypendent-daemon` must never depend on `codypendent-runtime` (see
+/// `PriorTurn`'s doc comment) — so the mapping lives here as a plain
+/// function rather than a `From` impl on either side (the orphan rule blocks
+/// implementing a foreign trait between two foreign types from a third
+/// crate).
+fn convert_launch_prior(prior: &[PriorTurn]) -> Vec<TurnItem> {
+    prior
+        .iter()
+        .map(|item| match item {
+            PriorTurn::Objective(text) => TurnItem::Objective(text.clone()),
+            PriorTurn::Assistant(text) => TurnItem::Assistant(text.clone()),
+            PriorTurn::ToolResult { tool, output } => TurnItem::ToolResult {
+                tool: tool.clone(),
+                output: output.clone(),
+            },
+            PriorTurn::Steering(text) => TurnItem::Steering(text.clone()),
+        })
+        .collect()
+}
+
 /// Bind a worktree for a run. When `isolate` is set, allocate a dedicated,
 /// isolated worktree through the [`WorktreeManager`] (recording the lease on the
 /// run's projection for provenance) and return its path; otherwise the run keeps
@@ -1160,6 +1195,45 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convert_launch_prior_maps_every_variant_and_preserves_order() {
+        // Task 2 (continuous-session plan): `RunLaunch.prior` carries
+        // `PriorTurn`s (a `codypendent-daemon`-local mirror of
+        // `codypendent_runtime::agent::TurnItem` — the daemon crate cannot
+        // depend on the runtime crate, see `RunExecutor`'s module doc), which
+        // this assembly crate converts 1:1 into `TurnItem` when it builds the
+        // `RunContext`.
+        let prior = vec![
+            PriorTurn::Objective("obj".to_string()),
+            PriorTurn::Assistant("reply".to_string()),
+            PriorTurn::ToolResult {
+                tool: "shell.run".to_string(),
+                output: "ok".to_string(),
+            },
+            PriorTurn::Steering(String::new()),
+        ];
+
+        let turns = convert_launch_prior(&prior);
+
+        assert_eq!(
+            turns,
+            vec![
+                TurnItem::Objective("obj".to_string()),
+                TurnItem::Assistant("reply".to_string()),
+                TurnItem::ToolResult {
+                    tool: "shell.run".to_string(),
+                    output: "ok".to_string(),
+                },
+                TurnItem::Steering(String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn convert_launch_prior_of_empty_is_empty() {
+        assert!(convert_launch_prior(&[]).is_empty());
+    }
 
     #[test]
     fn parses_https_and_ssh_remotes() {

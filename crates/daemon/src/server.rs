@@ -1494,6 +1494,12 @@ async fn handle_request(
                                         // classification hard filter still governs
                                         // a pin at execution time.
                                         model: model.clone(),
+                                        // No continuation history yet: `StartRun`
+                                        // always begins a fresh session (Task 2,
+                                        // continuous-session plan — a later task
+                                        // populates this for a `SubmitUserInput`-
+                                        // launched continuation).
+                                        prior: Vec::new(),
                                     });
                                 }
                             }

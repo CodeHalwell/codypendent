@@ -508,6 +508,13 @@ pub struct RunContext {
     pub workflow: Option<WorkflowContext>,
     /// Optional channel of queued steering text, drained at safe points.
     pub steering: Option<mpsc::UnboundedReceiver<String>>,
+    /// The prior conversation transcript this run is seeded with
+    /// (continuous-session plan, Task 2). Empty for a plain/first run —
+    /// populated from `RunLaunch.prior` by the executor that builds this
+    /// context, so a continuation run can hand the model earlier turns
+    /// instead of starting cold. A carrier only: nothing in this task yet
+    /// prepends it to the live transcript (a later task does).
+    pub prior: Vec<TurnItem>,
 }
 
 impl RunContext {
@@ -531,6 +538,7 @@ impl RunContext {
             ide_dirty_buffers: Vec::new(),
             workflow: None,
             steering: None,
+            prior: Vec::new(),
         }
     }
 
@@ -561,6 +569,15 @@ impl RunContext {
     /// buffer as `unsaved-ide-buffer`.
     pub fn with_ide_context(mut self, dirty_buffers: Vec<DirtyBufferDigest>) -> Self {
         self.ide_dirty_buffers = dirty_buffers;
+        self
+    }
+
+    /// Seed the run with a prior conversation transcript (continuous-session
+    /// plan, Task 2), so a continuation run can hand the model earlier turns
+    /// instead of starting cold. A plain/first run never calls this and keeps
+    /// the empty default from [`new`](Self::new).
+    pub fn with_prior(mut self, prior: Vec<TurnItem>) -> Self {
+        self.prior = prior;
         self
     }
 }
@@ -2550,6 +2567,28 @@ fn measured_usage(
 mod tests {
     use super::*;
     use crate::tools::ClosureSink;
+
+    #[test]
+    fn run_context_prior_defaults_empty_and_with_prior_exposes_it() {
+        // Task 2 (continuous-session plan): `prior` is the seed-transcript
+        // carrier a later task populates for a continuation run. A plain
+        // `RunContext::new` must default it empty (today's behavior,
+        // unchanged); `with_prior` must expose whatever it is given.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            SessionId::new(),
+            RunId::new(),
+            "objective",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        assert!(ctx.prior.is_empty());
+
+        let seeded = vec![TurnItem::Objective("earlier turn".to_string())];
+        let ctx = ctx.with_prior(seeded.clone());
+        assert_eq!(ctx.prior, seeded);
+    }
 
     #[test]
     fn github_evidence_labels_untrusted_content_without_dropping_it() {
