@@ -860,8 +860,14 @@ impl FrameworkAgentRuntime {
         self.transition(run.session_id, run.run_id, RunState::Running)
             .await?;
 
-        // Accumulators folded into the chronicle at the terminal state.
-        let mut transcript = vec![TurnItem::Objective(run.objective.clone())];
+        // Accumulators folded into the chronicle at the terminal state. A
+        // continuation run is SEEDED with the prior conversation
+        // (continuous-session plan): the reconstructed earlier turns come first,
+        // then this run's objective — so the model receives the follow-up in
+        // context. A plain/first run carries an empty `prior`, so the transcript
+        // is exactly `[Objective]`, identical to before.
+        let mut transcript = run.prior.clone();
+        transcript.push(TurnItem::Objective(run.objective.clone()));
         let mut findings: Vec<String> = Vec::new();
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
@@ -2970,6 +2976,80 @@ mod tests {
 
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas, vec!["Hello, world.".to_string()]);
+    }
+
+    /// A driver that records the transcript it is FIRST handed, then finishes —
+    /// so a test can assert exactly what the loop seeded the conversation with.
+    struct CapturingDriver {
+        seen: std::sync::Arc<std::sync::Mutex<Option<Vec<TurnItem>>>>,
+    }
+
+    #[async_trait]
+    impl ModelDriver for CapturingDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("capturing".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            transcript: &[TurnItem],
+            _sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            let mut slot = self.seen.lock().expect("capturing driver mutex");
+            if slot.is_none() {
+                *slot = Some(transcript.to_vec());
+            }
+            Ok(StepOutcome::new(
+                ModelStep::Finish {
+                    summary: "done".to_string(),
+                },
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeded_prior_precedes_the_objective_in_the_transcript() {
+        // Continuous-session plan (Task 4): a continuation run seeds its
+        // transcript with the reconstructed prior turns FOLLOWED by the new
+        // objective, so the model receives the follow-up in the conversation's
+        // context (an empty prior — a first run — yields just `[Objective]`,
+        // exactly as before).
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let driver = CapturingDriver { seen: seen.clone() };
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "q",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_prior(vec![
+            TurnItem::Objective("p".to_string()),
+            TurnItem::Assistant("pa".to_string()),
+        ]);
+
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("seeded run completes");
+
+        let seen = seen
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("the driver observed a transcript");
+        assert_eq!(
+            seen,
+            vec![
+                TurnItem::Objective("p".to_string()),
+                TurnItem::Assistant("pa".to_string()),
+                TurnItem::Objective("q".to_string()),
+            ]
+        );
     }
 
     // -- Task 2: live streaming (multi-delta + partial-on-error) ------------

@@ -1462,45 +1462,75 @@ async fn handle_request(
                                 outcome.created_run,
                                 state.executor.as_ref(),
                             ) {
-                                if let CommandBody::StartRun {
-                                    session_id,
-                                    objective,
-                                    mode,
-                                    repository,
-                                    model,
-                                } = &command.body
-                                {
-                                    executor.spawn_run(RunLaunch {
-                                        session_id: *session_id,
-                                        run_id,
-                                        objective: objective.clone(),
-                                        mode: *mode,
-                                        // The run carries its own repository root
-                                        // so a shared daemon attributes it to the
-                                        // right checkout (issue #6 item 1); an
-                                        // older client that sends none falls back
-                                        // to the daemon's working directory.
-                                        repository: repository
-                                            .as_ref()
-                                            .map(std::path::PathBuf::from)
-                                            .unwrap_or_else(|| {
-                                                std::env::current_dir().unwrap_or_else(|_| {
-                                                    std::path::PathBuf::from(".")
-                                                })
-                                            }),
-                                        // Carry the operator's pinned model (STEP
-                                        // MP2) into the run; `None` lets the
-                                        // executor resolve/route as before. The
-                                        // classification hard filter still governs
-                                        // a pin at execution time.
-                                        model: model.clone(),
-                                        // No continuation history yet: `StartRun`
-                                        // always begins a fresh session (Task 2,
-                                        // continuous-session plan — a later task
-                                        // populates this for a `SubmitUserInput`-
-                                        // launched continuation).
-                                        prior: Vec::new(),
-                                    });
+                                match &command.body {
+                                    CommandBody::StartRun {
+                                        session_id,
+                                        objective,
+                                        mode,
+                                        repository,
+                                        model,
+                                    } => {
+                                        executor.spawn_run(RunLaunch {
+                                            session_id: *session_id,
+                                            run_id,
+                                            objective: objective.clone(),
+                                            mode: *mode,
+                                            // The run carries its own repository
+                                            // root so a shared daemon attributes it
+                                            // to the right checkout (issue #6 item
+                                            // 1); an older client that sends none
+                                            // falls back to the daemon's working
+                                            // directory.
+                                            repository: repository
+                                                .as_ref()
+                                                .map(std::path::PathBuf::from)
+                                                .unwrap_or_else(|| {
+                                                    std::env::current_dir().unwrap_or_else(|_| {
+                                                        std::path::PathBuf::from(".")
+                                                    })
+                                                }),
+                                            // Carry the operator's pinned model
+                                            // (STEP MP2) into the run; `None` lets
+                                            // the executor resolve/route as before.
+                                            // The classification hard filter still
+                                            // governs a pin at execution time.
+                                            model: model.clone(),
+                                            // The reconstructed prior is built by
+                                            // the assembly executor from the
+                                            // session ledger at run start
+                                            // (continuous-session plan, Task 3),
+                                            // not carried here — the daemon cannot
+                                            // build the runtime's `TurnItem`s.
+                                            prior: Vec::new(),
+                                        });
+                                    }
+                                    // A follow-up CONTINUES the conversation: it
+                                    // launched its own run (Task 3), so drive that
+                                    // run exactly like a `StartRun`. Its objective
+                                    // is the user's text; the assembly executor
+                                    // seeds its prior transcript from the session
+                                    // ledger. `SubmitUserInput` carries no per-run
+                                    // repository (a session-level command), so the
+                                    // run falls back to the daemon's working
+                                    // directory, as an older `StartRun` client
+                                    // would.
+                                    CommandBody::SubmitUserInput {
+                                        session_id,
+                                        text,
+                                        mode,
+                                    } => {
+                                        executor.spawn_run(RunLaunch {
+                                            session_id: *session_id,
+                                            run_id,
+                                            objective: text.clone(),
+                                            mode: *mode,
+                                            repository: std::env::current_dir()
+                                                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                                            model: None,
+                                            prior: Vec::new(),
+                                        });
+                                    }
+                                    _ => {}
                                 }
                             }
                             // A `CancelRun` must also reach the LIVE runtime loop:

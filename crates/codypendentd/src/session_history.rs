@@ -46,20 +46,38 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::TurnItem;
 
+/// Reconstruct a continuation run's prior transcript from a session's ledger:
+/// drop the events of `current_run` (its own `RunStarted` is already on the
+/// ledger before it executes, and the runtime seeds that objective itself — see
+/// `execute_run`), then project the remaining prior runs via
+/// [`session_transcript`]. The FIRST run of a session leaves no prior events,
+/// so this returns empty and the run behaves exactly as before (self-correcting:
+/// no explicit continuation flag is needed — an empty prior IS a first run).
+///
+/// The entry point the assembly executor (`crates/codypendentd/src/executor.rs`)
+/// calls at run start (continuous-session plan, Task 3). Takes the loaded events
+/// by value so filtering needs no clone.
+#[must_use]
+pub(crate) fn continuation_prior(
+    events: Vec<SessionEvent>,
+    current_run: RunId,
+    verbatim_runs: usize,
+) -> Vec<TurnItem> {
+    let prior: Vec<SessionEvent> = events
+        .into_iter()
+        .filter(|event| event_run_id(&event.body) != Some(current_run))
+        .collect();
+    session_transcript(&prior, verbatim_runs)
+}
+
 /// Project a session's persisted events into a seed transcript for a
 /// continuation run: the last `verbatim_runs` runs (by start order)
 /// reconstruct turn-by-turn; every earlier run collapses into one compacted
 /// [`TurnItem::Assistant`]. A `verbatim_runs` at or above the session's run
 /// count means nothing is compacted.
 ///
-/// Exercised by this module's tests; not yet called outside them — a later
-/// task in the continuous-session plan
-/// (`docs/superpowers/plans/2026-07-24-continuous-session.md`) wires a real
-/// caller once `RunContext`/`RunLaunch` carry a seed transcript.
-/// `cfg_attr(not(test), ...)` (this file and its helpers throughout) mirrors
-/// the same not-yet-driven-code idiom already used for
-/// `RoutingSelection::node` in `routing.rs`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The pure core beneath [`continuation_prior`], which is the live caller
+/// (continuous-session plan, Task 3).
 #[must_use]
 pub(crate) fn session_transcript(events: &[SessionEvent], verbatim_runs: usize) -> Vec<TurnItem> {
     let order = run_order(events);
@@ -80,7 +98,6 @@ pub(crate) fn session_transcript(events: &[SessionEvent], verbatim_runs: usize) 
 /// (`codypendent_daemon::ledger::load_events`) selects `ORDER BY sequence
 /// ASC`, so the slice is already in ledger order and first appearance doubles
 /// as run start order.
-#[cfg_attr(not(test), allow(dead_code))]
 fn run_order(events: &[SessionEvent]) -> Vec<RunId> {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
@@ -98,7 +115,6 @@ fn run_order(events: &[SessionEvent]) -> Vec<RunId> {
 /// this projection does not consume (session lifecycle, approvals, patches,
 /// budget warnings, presence, `RunStateChanged`, `SteeringQueued`, `Unknown`,
 /// ...). Scoped to exactly the five variants the plan names.
-#[cfg_attr(not(test), allow(dead_code))]
 fn event_run_id(body: &EventBody) -> Option<RunId> {
     match body {
         EventBody::RunStarted { run_id, .. }
@@ -119,7 +135,6 @@ fn event_run_id(body: &EventBody) -> Option<RunId> {
 /// `ToolCompleted`; one empty-string `Steering` marker per `SteeringApplied`.
 /// `RunCompleted` contributes nothing here (see the module doc) — its
 /// disposition is only used when *compacting* an older run.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verbatim_turns(events: &[SessionEvent], run_id: RunId) -> Vec<TurnItem> {
     let mut turns: Vec<TurnItem> = Vec::new();
     for event in events {
@@ -162,7 +177,6 @@ fn verbatim_turns(events: &[SessionEvent], run_id: RunId) -> Vec<TurnItem> {
 /// bulk-output artifact's size/type when one was recorded — never the
 /// artifact's actual bytes, which would need I/O this pure function cannot
 /// do.
-#[cfg_attr(not(test), allow(dead_code))]
 fn tool_result_summary(outcome: &ToolOutcome, artifact: Option<&ArtifactRef>) -> String {
     match outcome {
         ToolOutcome::Succeeded => match artifact {
@@ -181,7 +195,6 @@ fn tool_result_summary(outcome: &ToolOutcome, artifact: Option<&ArtifactRef>) ->
 /// the run's coalesced assistant reply (all `ModelStreamDelta` text, in
 /// order), and — when present — the `RunDisposition`'s own inline text.
 /// Never reads `RunCompleted.chronicle`'s bytes (see the module doc).
-#[cfg_attr(not(test), allow(dead_code))]
 fn compacted_turn(events: &[SessionEvent], run_id: RunId) -> TurnItem {
     let mut objective = String::new();
     let mut assistant = String::new();
@@ -234,7 +247,6 @@ fn compacted_turn(events: &[SessionEvent], run_id: RunId) -> TurnItem {
 /// `Failed`'s (always-present) reason or a `Cancelled`'s optional one. `None`
 /// when the disposition carries no text of its own (a bare `Completed` or
 /// `Cancelled`, or a forward-compat `Unknown`).
-#[cfg_attr(not(test), allow(dead_code))]
 fn disposition_summary(disposition: &RunDisposition) -> Option<String> {
     match disposition {
         RunDisposition::Completed { summary } => summary.clone(),
@@ -405,6 +417,60 @@ mod tests {
     #[test]
     fn empty_events_project_an_empty_transcript() {
         assert_eq!(session_transcript(&[], 2), Vec::new());
+    }
+
+    #[test]
+    fn continuation_prior_reconstructs_prior_runs_and_excludes_the_current_run() {
+        // A session with one completed prior run, then THIS run's own
+        // `RunStarted` already on the ledger (appended by the write path before
+        // the run executes). The continuation prior must reconstruct the prior
+        // run but never the current run — the runtime seeds the current
+        // objective itself, so replaying it here would duplicate it.
+        let prior_run = RunId::new();
+        let current_run = RunId::new();
+        let events = vec![
+            event(1, run_started(prior_run, "earlier objective")),
+            event(
+                2,
+                EventBody::ModelStreamDelta {
+                    run_id: prior_run,
+                    text: "earlier reply".to_string(),
+                },
+            ),
+            event(3, run_completed(prior_run, None)),
+            event(4, run_started(current_run, "the follow up")),
+        ];
+
+        let prior = continuation_prior(events, current_run, 3);
+
+        assert!(
+            prior
+                .iter()
+                .any(|t| matches!(t, TurnItem::Objective(o) if o == "earlier objective")),
+            "the prior run's objective must be reconstructed"
+        );
+        assert!(
+            prior
+                .iter()
+                .any(|t| matches!(t, TurnItem::Assistant(s) if s == "earlier reply")),
+            "the prior run's reply must be reconstructed"
+        );
+        assert!(
+            !prior
+                .iter()
+                .any(|t| matches!(t, TurnItem::Objective(o) if o == "the follow up")),
+            "the current run's own objective must NOT appear in the prior"
+        );
+    }
+
+    #[test]
+    fn continuation_prior_of_a_first_run_is_empty() {
+        // The first run of a session: the only run-scoped events are its OWN, so
+        // after excluding them nothing remains — an empty prior, and the run
+        // behaves exactly as before (no continuation).
+        let current_run = RunId::new();
+        let events = vec![event(1, run_started(current_run, "the only objective"))];
+        assert!(continuation_prior(events, current_run, 3).is_empty());
     }
 
     #[test]

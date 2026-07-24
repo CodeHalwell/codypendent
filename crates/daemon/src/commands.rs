@@ -156,9 +156,11 @@ impl CommandProcessor {
                     .await
             }
             CommandBody::SubmitUserInput {
-                session_id, text, ..
+                session_id,
+                text,
+                mode,
             } => {
-                self.apply_submit_input(pool, &ctx, &command, session_id, text)
+                self.apply_submit_input(pool, &ctx, &command, session_id, text, mode)
                     .await
             }
             CommandBody::QueueSteering { run_id, .. } => {
@@ -482,6 +484,14 @@ impl CommandProcessor {
         .await
     }
 
+    /// A follow-up message CONTINUES the conversation: it launches a new bounded
+    /// run whose objective is the user's `text` (continuous-session plan, Task 3).
+    /// Mirrors [`apply_start_run`](Self::apply_start_run) exactly — mint a
+    /// `RunId`, append `RunStarted`, insert the run projection, under the same
+    /// role gate and `expected_revision`/idempotency handling — so a
+    /// `SubmitUserInput` becomes an ordinary run. The daemon does NOT reconstruct
+    /// the prior transcript here (it cannot build the runtime's `TurnItem`); the
+    /// assembly executor seeds that from the session ledger at run start.
     async fn apply_submit_input(
         &self,
         pool: &SqlitePool,
@@ -489,15 +499,18 @@ impl CommandProcessor {
         command: &Command,
         session_id: SessionId,
         text: String,
+        mode: AgentMode,
     ) -> Result<CommandOutcome, CodypendentError> {
-        // Phase 1 minimal: record the input as a note; the agent loop consumes
-        // input/steering more richly later (STEP 1.10).
+        let run_id = RunId::new();
         let events = vec![(
             Actor::Client {
                 client_id: ctx.client_id,
             },
-            // Session-level user input — not tied to one run's transcript.
-            EventBody::NoteAppended { text, run_id: None },
+            EventBody::RunStarted {
+                run_id,
+                objective: text.clone(),
+                mode,
+            },
         )];
         self.run_transaction(
             pool,
@@ -507,8 +520,13 @@ impl CommandProcessor {
             session_id,
             PreInsert::None,
             events,
-            ProjectionOp::None,
-            (None, None),
+            ProjectionOp::InsertRun {
+                run_id,
+                session_id,
+                objective: text,
+                mode,
+            },
+            (None, Some(run_id)),
             RevisionOp::Bump {
                 expected: command.expected_revision,
             },
@@ -1655,11 +1673,13 @@ mod tests {
         assert!(projection.active_runs.contains(&run));
         assert_eq!(projection.title, "diagnose the failing test");
 
-        // Published events arrive in order: RunStarted then NoteAppended.
+        // Published events arrive in order: the StartRun's RunStarted, then the
+        // SubmitUserInput's RunStarted (a follow-up now launches its OWN run —
+        // continuous-session plan, Task 3 — rather than recording a bare note).
         let first = rx.recv().await.unwrap();
         let second = rx.recv().await.unwrap();
         assert!(matches!(first.body, EventBody::RunStarted { .. }));
-        assert!(matches!(second.body, EventBody::NoteAppended { .. }));
+        assert!(matches!(second.body, EventBody::RunStarted { .. }));
         assert!(first.sequence < second.sequence);
     }
 

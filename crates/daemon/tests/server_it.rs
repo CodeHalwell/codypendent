@@ -9,7 +9,7 @@ use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, AgentMode, Catchup, ClientCapabilities, ClientHello,
-    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, Payload,
+    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, Payload, RunId,
     SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
@@ -291,8 +291,9 @@ async fn create_attach_and_two_clients_observe_one_event() {
     )
     .await;
 
-    // Client 2 submits a command that appends an event; it observes both the
-    // acknowledgement and the resulting event (any order over one socket).
+    // Client 2 submits a follow-up; it now LAUNCHES a run (continuous-session
+    // plan, Task 3), so it observes both the acknowledgement and the resulting
+    // `RunStarted` event (any order over one socket).
     write_envelope(
         &mut s2,
         &Envelope::request(
@@ -316,7 +317,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
         match read_frame(&mut s2).await.payload {
             Payload::CommandAccepted { .. } => got_accepted = true,
             Payload::Event(event) => match event.body {
-                EventBody::NoteAppended { .. } => got_event = true,
+                EventBody::RunStarted { .. } => got_event = true,
                 // Presence is expected background noise (STEP 3.7): a client's own
                 // attach publishes a `ClientPresenceChanged` it then observes.
                 EventBody::ClientPresenceChanged { .. } => {}
@@ -340,10 +341,135 @@ async fn create_attach_and_two_clients_observe_one_event() {
             break event;
         }
     };
-    assert!(matches!(observed.body, EventBody::NoteAppended { .. }));
+    assert!(matches!(observed.body, EventBody::RunStarted { .. }));
 
     shutdown(s1, task).await;
     drop(s2);
+}
+
+/// Send a command and return its `CommandAccepted`'s `created_run`, tolerating
+/// interleaved events/pings/presence frames that a subscribed client may see
+/// ahead of the reply on the same socket.
+async fn command_created_run(
+    stream: &mut UnixStream,
+    client_id: ClientId,
+    body: CommandBody,
+    key: &str,
+) -> Option<RunId> {
+    write_envelope(
+        stream,
+        &Envelope::request(client_id, Payload::Command(command(body, key))),
+    )
+    .await
+    .expect("write command");
+    for _ in 0..12 {
+        match read_frame(stream).await.payload {
+            Payload::CommandAccepted { created_run, .. } => return created_run,
+            Payload::Event(_) | Payload::Ping => continue,
+            other => panic!("expected CommandAccepted, got {other:?}"),
+        }
+    }
+    panic!("no CommandAccepted arrived");
+}
+
+#[tokio::test]
+async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
+    // Continuous-session plan (Task 3): `SubmitUserInput` on a session that
+    // already has a (now terminal) run LAUNCHES a new, distinct run whose
+    // objective is the follow-up text — no longer a bare `NoteAppended`. The
+    // daemon's own server is executor-less, so a run's SEED is exercised by the
+    // codypendentd/runtime tests; here the observable is that a distinct new run
+    // starts and records the user's text as its objective.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    let client = ClientId::new();
+    let mut s = connect(&paths).await;
+    handshake(&mut s, client).await;
+
+    // Create a session, then attach as Controller (may start, cancel, submit).
+    let created = send_recv(
+        &mut s,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "conversation".to_string(),
+                },
+                "create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut s,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "attach",
+    )
+    .await;
+
+    // A first run, cancelled to a terminal state — the prior run in the session.
+    let first_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::StartRun {
+            session_id,
+            objective: "first objective".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: None,
+        },
+        "start",
+    )
+    .await
+    .expect("StartRun creates a run");
+    let _ = command_created_run(
+        &mut s,
+        client,
+        CommandBody::CancelRun { run_id: first_run },
+        "cancel",
+    )
+    .await;
+
+    // The follow-up must launch a NEW, distinct run — not record a bare note.
+    let second_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "the follow up".to_string(),
+            mode: AgentMode::Build,
+        },
+        "input",
+    )
+    .await
+    .expect("SubmitUserInput now launches a run");
+    assert_ne!(
+        second_run, first_run,
+        "the follow-up starts a distinct new run"
+    );
+
+    // The session ledger records that run's `RunStarted` with the follow-up text.
+    let pool = client_pool(&paths).await;
+    let events = ledger::load_events(&pool, session_id)
+        .await
+        .expect("load events");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::RunStarted { run_id, objective, .. }
+                if *run_id == second_run && objective == "the follow up"
+        )),
+        "the follow-up's RunStarted must carry the user's text as its objective"
+    );
+
+    shutdown(s, task).await;
 }
 
 #[tokio::test]

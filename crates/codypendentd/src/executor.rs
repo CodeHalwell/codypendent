@@ -54,8 +54,22 @@ use crate::blackboard::WorkflowBlackboardReader;
 use crate::promotion::PromotionStoreGateway;
 use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
+use crate::session_history::continuation_prior;
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
 use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
+
+/// How many of a session's most recent runs a continuation replays VERBATIM
+/// (turn-by-turn); every earlier run is compacted to a single summary turn
+/// (continuous-session plan). Bounds the token cost each follow-up re-pays —
+/// see [`crate::session_history::session_transcript`].
+const VERBATIM_RUNS: usize = 3;
+
+/// The one-line marker a continuation's trace opens with, in place of the full
+/// `=== CONTEXT` repo-map manifest a first run emits: on a follow-up the shared
+/// context already rides in the seeded transcript, so re-mapping the repository
+/// every message would only re-pay tokens for nothing (continuous-session plan,
+/// Task 4).
+const CONTINUATION_CONTEXT_NOTE: &str = "context carried from the conversation";
 
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
@@ -357,7 +371,12 @@ impl RuntimeExecutor {
     /// disposition. `Ok(())` means the loop reached a terminal state itself;
     /// `Err(reason)` means the run could not run (e.g. no model configured) and
     /// the caller must fail it cleanly.
-    async fn execute(&self, launch: &RunLaunch, token: CancellationToken) -> Result<(), String> {
+    async fn execute(
+        &self,
+        launch: &RunLaunch,
+        reconstructed_prior: Vec<TurnItem>,
+        token: CancellationToken,
+    ) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
         let model_id = match &launch.model {
             // A model PINNED by the operator via the `/model` picker (STEP MP2):
@@ -493,12 +512,16 @@ impl RuntimeExecutor {
             operating_tree.clone(),
             operating_tree,
         );
-        // Seed the run's transcript from the launch's prior-turn carrier
-        // (Task 2, continuous-session plan). `RunLaunch.prior` is always
-        // empty today — every construction site defaults it — so this is
-        // behavior-neutral until a later task populates it for a
-        // `SubmitUserInput`-launched continuation.
-        ctx = ctx.with_prior(convert_launch_prior(&launch.prior));
+        // Seed the run's transcript with the prior conversation
+        // (continuous-session plan). The live source is the ledger-reconstructed
+        // `reconstructed_prior` (Task 3) — this crate sees `TurnItem` directly.
+        // The launch's own `PriorTurn` carrier (Task 2) is honored ahead of it
+        // for completeness, but every construction site leaves it empty today, so
+        // the seed is exactly the reconstructed prior (empty for a first run,
+        // making this behavior-neutral there).
+        let mut prior = convert_launch_prior(&launch.prior);
+        prior.extend(reconstructed_prior);
+        ctx = ctx.with_prior(prior);
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
         // so the `github.*` tools know their target. Uses the repository IDENTITY
         // (`R`), not the worktree read root. Only meaningful when a client is
@@ -590,6 +613,49 @@ impl RuntimeExecutor {
         }
     }
 
+    /// Reconstruct a continuation run's prior transcript from the session ledger
+    /// (continuous-session plan, Task 3): load the session's events and project
+    /// the runs OTHER than this one into a seed `Vec<TurnItem>` (verbatim for the
+    /// last [`VERBATIM_RUNS`], compacted older). The FIRST run of a session has no
+    /// prior runs, so this is empty and the run starts cold exactly as before. A
+    /// load failure degrades to an empty prior (start cold) rather than failing
+    /// the run — the prior is an aid, never a gate on running.
+    async fn reconstruct_prior(&self, session_id: SessionId, run_id: RunId) -> Vec<TurnItem> {
+        match ledger::load_events(&self.pool, session_id).await {
+            Ok(events) => continuation_prior(events, run_id, VERBATIM_RUNS),
+            Err(error) => {
+                warn!(%session_id, %run_id, %error, "could not load events to reconstruct the continuation prior; starting cold");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Open a run's trace. The FIRST run of a session (empty reconstructed
+    /// `prior`) gets the full knowledge-fabric context manifest via
+    /// [`emit_context`](Self::emit_context); a CONTINUATION (non-empty prior)
+    /// gets a one-line [`CONTINUATION_CONTEXT_NOTE`] marker instead — its shared
+    /// context already rides in the seeded transcript, so re-emitting the full
+    /// `=== CONTEXT` repo-map every follow-up would only re-pay tokens for
+    /// nothing (continuous-session plan, Task 4).
+    async fn emit_run_opening(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+        objective: &str,
+        prior: &[TurnItem],
+    ) {
+        if prior.is_empty() {
+            self.emit_context(session_id, run_id, repository, objective)
+                .await;
+        } else if let Err(error) = self
+            .emit_note(session_id, run_id, CONTINUATION_CONTEXT_NOTE.to_string())
+            .await
+        {
+            warn!(%session_id, %run_id, %error, "could not emit the continuation context marker");
+        }
+    }
+
     /// After a run reaches a terminal state, harvest curated memories from its own
     /// event trace and note each durable one, so "a run produces a curated memory
     /// whose provenance opens to its source" holds for every run.
@@ -677,19 +743,28 @@ impl RunExecutor for RuntimeExecutor {
                 .ensure_scanned(repository, &launch.repository)
                 .await;
 
-            // Open the run's trace with the knowledge-fabric context (repository
-            // map + retrieved tool/skill cards + cited memories). Emitted here,
-            // BEFORE the agent loop, so the note never races the loop's own
-            // sequence allocations.
+            // Reconstruct the continuation's prior transcript from the session
+            // ledger ONCE (continuous-session plan, Task 3): it both DECIDES how
+            // the trace opens and SEEDS the run. Loaded before the agent loop, so
+            // neither the opening note nor the seed races the loop's sequences.
+            let prior = executor.reconstruct_prior(session_id, run_id).await;
+
+            // Open the run's trace: a first run (empty prior) gets the full
+            // knowledge-fabric context manifest; a continuation (non-empty prior)
+            // gets a one-line carried-context marker, skipping the repo re-map
+            // (Task 4). Emitted here, BEFORE the agent loop, so the note never
+            // races the loop's own sequence allocations.
             executor
-                .emit_context(session_id, run_id, repository, &objective)
+                .emit_run_opening(session_id, run_id, repository, &objective, &prior)
                 .await;
 
             // Run the work in a CHILD task so even a panic in the agent loop
             // becomes a clean terminal failure (a `JoinError`) rather than a
-            // wedged, forever-`Queued`/`Running` run.
+            // wedged, forever-`Queued`/`Running` run. The reconstructed `prior`
+            // seeds the run's transcript (moved into the worker).
             let worker = executor.clone();
-            let joined = tokio::spawn(async move { worker.execute(&launch, token).await }).await;
+            let joined =
+                tokio::spawn(async move { worker.execute(&launch, prior, token).await }).await;
 
             let failure = match joined {
                 Ok(Ok(())) => None,              // the loop reached a terminal state itself
@@ -1195,6 +1270,70 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the session's ledger carries the full `=== CONTEXT` manifest
+    /// (the first-run repo-map note), used to tell a first run's opening from a
+    /// continuation's carried-context marker.
+    async fn context_manifest_present(pool: &SqlitePool, session: SessionId) -> bool {
+        ledger::load_events(pool, session)
+            .await
+            .expect("load events")
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.body,
+                    EventBody::NoteAppended { text, .. } if text.starts_with("=== CONTEXT")
+                )
+            })
+    }
+
+    #[tokio::test]
+    async fn first_run_emits_the_full_context_a_continuation_does_not() {
+        // Continuous-session plan (Task 4): the FIRST run of a session (empty
+        // reconstructed prior) opens its trace with the full `=== CONTEXT`
+        // repo-map manifest; a CONTINUATION (non-empty prior) opens with the
+        // one-line carried-context marker instead, never re-mapping the
+        // repository on a follow-up.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        // First run: empty prior → the full context manifest lands on the ledger.
+        let first_session = SessionId::new();
+        ledger::create_session(&pool, first_session, "first")
+            .await
+            .expect("create session");
+        executor
+            .emit_run_opening(first_session, RunId::new(), repository, "objective", &[])
+            .await;
+        assert!(
+            context_manifest_present(&pool, first_session).await,
+            "a first run must emit the full === CONTEXT manifest"
+        );
+
+        // Continuation: non-empty prior → NO manifest, the marker instead.
+        let cont_session = SessionId::new();
+        ledger::create_session(&pool, cont_session, "cont")
+            .await
+            .expect("create session");
+        let prior = vec![
+            TurnItem::Objective("earlier".to_string()),
+            TurnItem::Assistant("reply".to_string()),
+        ];
+        executor
+            .emit_run_opening(cont_session, RunId::new(), repository, "follow up", &prior)
+            .await;
+        assert!(
+            !context_manifest_present(&pool, cont_session).await,
+            "a continuation must NOT emit the === CONTEXT manifest"
+        );
+    }
 
     #[test]
     fn convert_launch_prior_maps_every_variant_and_preserves_order() {
