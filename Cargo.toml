@@ -12,6 +12,7 @@ members = [
     "crates/workflow",
     "crates/sandbox",
     "crates/routing",
+    "crates/providers",
     "crates/eval",
     "crates/test-support",
 ]
@@ -39,6 +40,7 @@ codypendent-integrations = { path = "crates/integrations" }
 codypendent-workflow = { path = "crates/workflow" }
 codypendent-sandbox = { path = "crates/sandbox" }
 codypendent-routing = { path = "crates/routing" }
+codypendent-providers = { path = "crates/providers" }
 codypendent-eval = { path = "crates/eval" }
 codypendent-test-support = { path = "crates/test-support" }
 
