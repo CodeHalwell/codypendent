@@ -535,6 +535,20 @@ async fn heartbeat_loop(
     }
 }
 
+/// Resolve a run's repository root from an optional per-run repository path,
+/// shared by the `StartRun` and continuation (`SubmitUserInput`) launch arms so
+/// both resolve identically. `Some(path)` binds the run to exactly that
+/// checkout; `None` falls back to the daemon's working directory. That fallback
+/// is a genuine last resort: a continuation first recovers the SESSION's real
+/// repository from its originating `StartRun` (I-1), so it reaches
+/// `current_dir()` only for a session that never had a repository to inherit (an
+/// older client that sent none) — never as the silent default it used to be.
+fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
+    repository.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    })
+}
+
 /// Handle one request. Returns `Ok(true)` when a Shutdown was served (the caller
 /// should stop reading this connection). Replies are framed onto `writer`.
 async fn handle_request(
@@ -1481,14 +1495,9 @@ async fn handle_request(
                                             // 1); an older client that sends none
                                             // falls back to the daemon's working
                                             // directory.
-                                            repository: repository
-                                                .as_ref()
-                                                .map(std::path::PathBuf::from)
-                                                .unwrap_or_else(|| {
-                                                    std::env::current_dir().unwrap_or_else(|_| {
-                                                        std::path::PathBuf::from(".")
-                                                    })
-                                                }),
+                                            repository: resolve_run_repository(
+                                                repository.as_deref(),
+                                            ),
                                             // Carry the operator's pinned model
                                             // (STEP MP2) into the run; `None` lets
                                             // the executor resolve/route as before.
@@ -1510,23 +1519,38 @@ async fn handle_request(
                                     // is the user's text; the assembly executor
                                     // seeds its prior transcript from the session
                                     // ledger. `SubmitUserInput` carries no per-run
-                                    // repository (a session-level command), so the
-                                    // run falls back to the daemon's working
-                                    // directory, as an older `StartRun` client
-                                    // would.
+                                    // repository or model on the wire (a
+                                    // session-level command), so the continuation
+                                    // INHERITS the session's provenance from its
+                                    // originating `StartRun`: the SAME repository
+                                    // (I-1 — a shared daemon whose `current_dir()`
+                                    // froze at startup must not silently run a
+                                    // follow-up against the wrong checkout) and the
+                                    // SAME pinned model (I-2 — a pinned session
+                                    // stays pinned). Both are recovered from the
+                                    // persisted command ledger; a load failure (or
+                                    // a session with no `StartRun`) degrades to the
+                                    // legacy `current_dir()` / unpinned fallback.
                                     CommandBody::SubmitUserInput {
                                         session_id,
                                         text,
                                         mode,
                                     } => {
+                                        let provenance = crate::commands::session_run_provenance(
+                                            &state.pool,
+                                            *session_id,
+                                        )
+                                        .await
+                                        .unwrap_or_default();
                                         executor.spawn_run(RunLaunch {
                                             session_id: *session_id,
                                             run_id,
                                             objective: text.clone(),
                                             mode: *mode,
-                                            repository: std::env::current_dir()
-                                                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                                            model: None,
+                                            repository: resolve_run_repository(
+                                                provenance.repository.as_deref(),
+                                            ),
+                                            model: provenance.model,
                                             prior: Vec::new(),
                                         });
                                     }

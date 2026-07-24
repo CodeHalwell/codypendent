@@ -211,6 +211,12 @@ pub enum Intent {
     /// [`Intent::QueueSteering`], unchanged). Mirrors [`Intent::StartRun`]'s
     /// `mode` field; the session id is supplied by the harness the same way
     /// `StartRun`'s is (see `intent_to_command`).
+    ///
+    /// Unlike [`Intent::StartRun`] this carries no `model` (nor repository):
+    /// the daemon is the source of truth for a continuation's provenance and
+    /// INHERITS both the session's pinned model (I-2) and repository (I-1) from
+    /// its originating `StartRun` command server-side — adding either here would
+    /// be a protocol wire change, and the client is not authoritative for them.
     SubmitUserInput {
         text: String,
         mode: codypendent_protocol::AgentMode,

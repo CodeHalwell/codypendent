@@ -3,14 +3,16 @@
 //! sequence, and role enforcement. Drives `server::run` exactly like
 //! `tests/socket.rs`, exchanging framed envelopes over a `UnixStream`.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, AgentMode, Catchup, ClientCapabilities, ClientHello,
-    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, Payload, RunId,
-    SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
+    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, ModelId, Payload,
+    RunId, SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -27,6 +29,42 @@ async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask) {
         .expect("open db");
     let boot = instance::record_boot(&pool).await.expect("record boot");
     let task = tokio::spawn(server::run(pool, paths.clone(), boot));
+    (paths, task)
+}
+
+/// A [`RunExecutor`] that records every launch instead of running it, so a test
+/// can assert what the server bound onto a run (repository/model/...). Leaving
+/// `collaborators` at its default `None` keeps the server on its own fresh
+/// fan-out, exactly as the executor-less path.
+#[derive(Clone, Default)]
+struct CapturingExecutor {
+    launches: Arc<Mutex<Vec<RunLaunch>>>,
+}
+
+impl RunExecutor for CapturingExecutor {
+    fn spawn_run(&self, launch: RunLaunch) {
+        self.launches.lock().expect("launches lock").push(launch);
+    }
+}
+
+/// Like [`start_server`], but with an injected [`RunExecutor`] so a test can
+/// observe the [`RunLaunch`]es the server builds from accepted commands.
+async fn start_server_with_executor(
+    tmp: &tempfile::TempDir,
+    executor: Arc<dyn RunExecutor>,
+) -> (RuntimePaths, ServerTask) {
+    let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
+    paths.ensure_directories().expect("create directories");
+    let pool = db::open_database(&paths.data_dir.join("codypendent.db"))
+        .await
+        .expect("open db");
+    let boot = instance::record_boot(&pool).await.expect("record boot");
+    let task = tokio::spawn(server::run_with_executor(
+        pool,
+        paths.clone(),
+        boot,
+        Some(executor),
+    ));
     (paths, task)
 }
 
@@ -467,6 +505,120 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
                 if *run_id == second_run && objective == "the follow up"
         )),
         "the follow-up's RunStarted must carry the user's text as its objective"
+    );
+
+    shutdown(s, task).await;
+}
+
+#[tokio::test]
+async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
+    // I-1/I-2: a follow-up (`SubmitUserInput`) carries no repository/model on the
+    // wire, yet its launched run must inherit the SESSION's provenance from its
+    // originating `StartRun` — the SAME repository (not the daemon's frozen
+    // `current_dir()`) and the SAME pinned model (not `None`). A capturing
+    // executor records each launch so we can assert exactly what the server bound.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    // The session's repository must differ from the daemon's process cwd — the
+    // whole point of I-1 is that `current_dir()` is NOT what a follow-up runs
+    // against on a shared daemon whose cwd froze at startup.
+    assert_ne!(
+        repo_path,
+        std::env::current_dir().unwrap(),
+        "the test repository must differ from the process cwd"
+    );
+    let pinned = ModelId("pinned-model-x".to_string());
+
+    let capture = Arc::new(CapturingExecutor::default());
+    let launches = capture.launches.clone();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server_with_executor(&tmp, capture).await;
+
+    let client = ClientId::new();
+    let mut s = connect(&paths).await;
+    handshake(&mut s, client).await;
+
+    let created = send_recv(
+        &mut s,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "conversation".to_string(),
+                },
+                "cont-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut s,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "cont-attach",
+    )
+    .await;
+
+    // The originating run: bound to an explicit repository and pinned to a model.
+    let first_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::StartRun {
+            session_id,
+            objective: "first objective".to_string(),
+            mode: AgentMode::Build,
+            repository: Some(repo_path.to_string_lossy().into_owned()),
+            model: Some(pinned.clone()),
+        },
+        "cont-start",
+    )
+    .await
+    .expect("StartRun creates a run");
+
+    // The follow-up: carries neither repository nor model on the wire.
+    let second_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "the follow up".to_string(),
+            mode: AgentMode::Build,
+        },
+        "cont-input",
+    )
+    .await
+    .expect("SubmitUserInput launches a run");
+    assert_ne!(second_run, first_run, "the follow-up starts a distinct run");
+
+    // `spawn_run` is called synchronously while applying the command, before its
+    // `CommandAccepted` is written, so both launches are already captured here.
+    let (repository, model) = {
+        let captured = launches.lock().expect("launches lock");
+        let continuation = captured
+            .iter()
+            .find(|launch| launch.run_id == second_run)
+            .expect("the continuation launch was captured");
+        (continuation.repository.clone(), continuation.model.clone())
+    };
+    assert_eq!(
+        repository, repo_path,
+        "the continuation runs against the session's repository, not the daemon cwd"
+    );
+    assert_ne!(
+        repository,
+        std::env::current_dir().unwrap(),
+        "the continuation must NOT fall back to the process cwd"
+    );
+    assert_eq!(
+        model,
+        Some(pinned),
+        "the continuation inherits the session's pinned model, not None"
     );
 
     shutdown(s, task).await;

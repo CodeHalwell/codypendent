@@ -41,7 +41,7 @@ use std::str::FromStr;
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, ClientId, ClientRole, CodypendentError,
-    Command, CommandBody, CommandId, EventBody, RunId, RunState, SessionEvent, SessionId,
+    Command, CommandBody, CommandId, EventBody, ModelId, RunId, RunState, SessionEvent, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -1402,6 +1402,65 @@ async fn session_exists(pool: &SqlitePool, session_id: SessionId) -> anyhow::Res
     Ok(row.is_some())
 }
 
+/// The repository and pinned model a session's runs inherit, recovered from the
+/// session's originating [`StartRun`](CommandBody::StartRun) command
+/// (continuous-session I-1/I-2).
+///
+/// Neither value is projected onto the `runs` row: the row carries no repository
+/// column at all, and only a *default* `model_policy` ([`DEFAULT_MODEL_POLICY`],
+/// supplied by the write path) — never the operator's pin. The authoritative
+/// source is the persisted `StartRun` command body itself, which the idempotent
+/// write path stores verbatim, so the operator's `repository`/`model` survive on
+/// it. A follow-up ([`SubmitUserInput`](CommandBody::SubmitUserInput)) carries
+/// neither on the wire, so a continuation reads them from here to run against the
+/// SAME checkout and pinned model as the session's first run — instead of the
+/// daemon's (possibly startup-frozen) `current_dir()` and an unpinned default.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SessionRunProvenance {
+    /// The repository root the session's originating run was launched against
+    /// (`StartRun.repository`); `None` when that run carried none (an older
+    /// client) or the session has no applied `StartRun`.
+    pub repository: Option<String>,
+    /// The model the session's originating run pinned (`StartRun.model`); `None`
+    /// when unpinned or the session has no applied `StartRun`.
+    pub model: Option<ModelId>,
+}
+
+/// Recover a session's [`SessionRunProvenance`] from its originating `StartRun`
+/// command. Only a `StartRun` carries a repository/model, so this scans the
+/// session's applied `StartRun` commands newest-first and returns the most
+/// recent one's `repository`/`model` (a session that re-pinned thus inherits its
+/// latest pin; the repository is stable across a session either way). A session
+/// with no applied `StartRun` yields the default (both `None`), so the caller
+/// falls back exactly as an older client's continuation did.
+///
+/// The `body LIKE` clause only *bounds* the rows scanned — the command body is
+/// compact JSON, internally tagged `"type":"StartRun"` — while the
+/// deserialize-and-match below is the authoritative extractor.
+pub(crate) async fn session_run_provenance(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> anyhow::Result<SessionRunProvenance> {
+    let bodies: Vec<(String,)> = sqlx::query_as(
+        "SELECT body FROM commands \
+         WHERE session_id = ? AND status = 'applied' \
+           AND body LIKE '%\"type\":\"StartRun\"%' \
+         ORDER BY received_at DESC",
+    )
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    for (body,) in bodies {
+        if let Ok(CommandBody::StartRun {
+            repository, model, ..
+        }) = serde_json::from_str::<CommandBody>(&body)
+        {
+            return Ok(SessionRunProvenance { repository, model });
+        }
+    }
+    Ok(SessionRunProvenance::default())
+}
+
 async fn approval_session(
     pool: &SqlitePool,
     approval_id: codypendent_protocol::ApprovalId,
@@ -1681,6 +1740,104 @@ mod tests {
         assert!(matches!(first.body, EventBody::RunStarted { .. }));
         assert!(matches!(second.body, EventBody::RunStarted { .. }));
         assert!(first.sequence < second.sequence);
+    }
+
+    #[tokio::test]
+    async fn session_run_provenance_recovers_repository_and_pinned_model() {
+        // I-1/I-2: a session's repository and pinned model live only on its
+        // originating `StartRun` command body (the `runs` row carries neither),
+        // and must be recoverable so a later continuation inherits them.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "prov-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: Some("/work/some-checkout".to_string()),
+                        model: Some(ModelId("pinned-model-x".to_string())),
+                    },
+                    "prov-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        // A follow-up carries neither repository nor model, and must NOT clobber
+        // the session's recoverable provenance.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "keep going".to_string(),
+                        mode: AgentMode::Build,
+                    },
+                    "prov-input",
+                ),
+            )
+            .await
+            .expect("submit input");
+
+        let provenance = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(
+            provenance.repository.as_deref(),
+            Some("/work/some-checkout"),
+            "the continuation must inherit the session's StartRun repository"
+        );
+        assert_eq!(
+            provenance.model,
+            Some(ModelId("pinned-model-x".to_string())),
+            "the continuation must inherit the session's pinned model"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_provenance_defaults_without_a_start_run() {
+        // A session with no applied `StartRun` (e.g. an unpinned older client
+        // that sent no repository) yields the default, so a continuation falls
+        // back exactly as before rather than misattributing a repository/model.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "prov-empty-create").await;
+
+        // An unpinned StartRun (no repository, no model) leaves nothing to
+        // inherit — the recovered provenance is empty on both fields.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                        model: None,
+                    },
+                    "prov-empty-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        let provenance = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(provenance.repository, None);
+        assert_eq!(provenance.model, None);
     }
 
     #[tokio::test]

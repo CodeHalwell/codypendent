@@ -830,8 +830,13 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         },
         // Task 5 (continuous-session plan): a follow-up once the selected run
         // is terminal. No `repository`/`model` on this wire shape (unlike
-        // `StartRun`) — the daemon already knows the session's repository and
-        // the continuation reuses whatever model the prior run resolved to.
+        // `StartRun`) — and it is NOT a protocol wire change to add them. The
+        // daemon instead RECOVERS the session's provenance from its originating
+        // `StartRun` command and threads the SAME repository (I-1) and pinned
+        // model (I-2) into the continuation launch (see
+        // `commands::session_run_provenance`), so a follow-up runs against the
+        // session's real checkout and stays pinned — not the daemon's frozen
+        // `current_dir()` with the model dropped.
         Intent::SubmitUserInput { text, mode } => CommandBody::SubmitUserInput {
             session_id,
             text,
