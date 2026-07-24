@@ -675,6 +675,7 @@ dependencies = [
  "codypendent-daemon",
  "codypendent-integrations",
  "codypendent-protocol",
+ "codypendent-providers",
  "codypendent-routing",
  "futures",
  "hex",

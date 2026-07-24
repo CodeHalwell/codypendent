@@ -35,6 +35,14 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "provider-openai")]
 use agent_framework_openai::OpenAIChatCompletionClient;
 
+#[cfg(feature = "provider-openai")]
+use std::sync::Arc;
+
+#[cfg(feature = "provider-openai")]
+use codypendent_providers::{
+    credential_for, AuthMethod, CredentialError, Protocol, ResolvedCredential,
+};
+
 /// This module's result alias.
 pub type Result<T> = std::result::Result<T, ModelsError>;
 
@@ -135,6 +143,11 @@ pub enum ModelsError {
     )]
     UnsupportedProvider { model: ModelId, provider: String },
 
+    /// A model's provider maps to a wire protocol this build does not yet wire
+    /// (Anthropic/Gemini native are follow-ups; only OpenAI-compatible is wired).
+    #[error("model `{model}` uses protocol `{protocol}` which is not yet wired (only OpenAI-compatible is)")]
+    ProtocolNotWired { model: ModelId, protocol: String },
+
     /// A model's `api_key_env` names an environment variable that is not
     /// set. Names the variable, per STEP 1.9's test requirement and the
     /// Chapter 11 rule that secrets are identified, never guessed at, in
@@ -202,40 +215,91 @@ impl ModelRegistry {
     }
 }
 
+/// Map a legacy [`ModelConfig`] onto the new provider abstraction: today's only
+/// supported `provider = "openai-compatible"` becomes `(OpenAiChat, ApiKey|None)`.
+/// An empty `api_key_env` means no key (local endpoints) → `AuthMethod::None`.
+/// This is the backward-compatible bridge that lets every existing
+/// `models.toml` keep resolving through the generalized [`ModelRegistry::client_for`].
+#[cfg(feature = "provider-openai")]
+fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> {
+    if cfg.provider != "openai-compatible" {
+        return Err(ModelsError::UnsupportedProvider {
+            model: cfg.id.clone(),
+            provider: cfg.provider.clone(),
+        });
+    }
+    let auth = if cfg.api_key_env.trim().is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::ApiKey {
+            env: vec![cfg.api_key_env.clone()],
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        }
+    };
+    Ok((Protocol::OpenAiChat, auth))
+}
+
 #[cfg(feature = "provider-openai")]
 impl ModelRegistry {
-    /// Build a framework chat client for `id`.
+    /// Build a framework chat client for `id`, dispatching on the model's wire
+    /// [`Protocol`] and resolving credentials through the async
+    /// `CredentialProvider` seam (`codypendent_providers::credential_for`).
     ///
-    /// Reads the API key from `api_key_env` right here, at call time — it is
+    /// Reads the API key from its env var right here, at call time — it is
     /// moved straight into the client and is never stored on the registry,
     /// logged, or otherwise retained by this function (Chapter 11,
     /// "Secrets"). A required-but-unset variable produces
     /// [`ModelsError::MissingApiKeyEnv`] naming the variable.
     ///
-    /// Uses `OpenAIChatCompletionClient::new(api_key, model)` +
-    /// `.with_base_url(base_url)` — the one code path that serves both the
-    /// hosted OpenAI endpoint and any OpenAI-compatible local/self-hosted
-    /// endpoint (e.g. Ollama), per STEP 1.9.
-    pub fn client_for(&self, id: &ModelId) -> Result<OpenAIChatCompletionClient> {
+    /// Today only [`Protocol::OpenAiChat`] is wired: a legacy `models.toml`
+    /// entry (`provider = "openai-compatible"`) maps onto it via
+    /// [`config_to_protocol_auth`] and builds the exact same
+    /// `OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url)`
+    /// as before — the one code path that serves both the hosted OpenAI
+    /// endpoint and any OpenAI-compatible local/self-hosted endpoint (e.g.
+    /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. Any
+    /// other protocol (Anthropic/Gemini native are follow-ups) returns
+    /// [`ModelsError::ProtocolNotWired`].
+    pub async fn client_for(
+        &self,
+        id: &ModelId,
+    ) -> Result<Arc<dyn agent_framework_core::client::ChatClient>> {
         let cfg = self
             .get(id)
             .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
-        if cfg.provider != "openai-compatible" {
-            return Err(ModelsError::UnsupportedProvider {
+        let (protocol, auth) = config_to_protocol_auth(cfg)?;
+        match protocol {
+            Protocol::OpenAiChat => {
+                let api_key = match credential_for(&auth).resolve().await {
+                    Ok(ResolvedCredential::ApiKey { value, .. }) => value,
+                    Ok(ResolvedCredential::None) => String::new(),
+                    Err(CredentialError::MissingEnv { var }) => {
+                        return Err(ModelsError::MissingApiKeyEnv {
+                            model: id.clone(),
+                            var,
+                        });
+                    }
+                    // `CredentialError` is `#[non_exhaustive]`: this also
+                    // catches `NotWired` (unreachable today — the legacy
+                    // bridge above only ever produces `ApiKey`/`None` auth,
+                    // both wired) plus any future variant.
+                    Err(other) => {
+                        return Err(ModelsError::ProtocolNotWired {
+                            model: id.clone(),
+                            protocol: other.to_string(),
+                        });
+                    }
+                };
+                let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
+                    .with_base_url(cfg.base_url.clone());
+                Ok(Arc::new(client))
+            }
+            other => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
-                provider: cfg.provider.clone(),
-            });
+                protocol: format!("{other:?}"),
+            }),
         }
-        let api_key = if cfg.api_key_env.trim().is_empty() {
-            String::new()
-        } else {
-            std::env::var(&cfg.api_key_env).map_err(|_| ModelsError::MissingApiKeyEnv {
-                model: id.clone(),
-                var: cfg.api_key_env.clone(),
-            })?
-        };
-        Ok(OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
-            .with_base_url(cfg.base_url.clone()))
     }
 }
 
@@ -492,8 +556,8 @@ api_key_env = ""
     // -- missing-env-var --------------------------------------------------
 
     #[cfg(feature = "provider-openai")]
-    #[test]
-    fn client_for_names_missing_env_var() {
+    #[tokio::test]
+    async fn client_for_names_missing_env_var() {
         // A deliberately unique variable name: never set anywhere in this
         // process, so no set_var/remove_var is needed and there is no race
         // with other tests touching global env state.
@@ -512,11 +576,12 @@ api_key_env = ""
             api_key_env: var_name.to_string(),
         }]);
 
-        // `OpenAIChatCompletionClient` (the `Ok` type) has no `Debug` impl, so
+        // `Arc<dyn ChatClient>` (the `Ok` type) has no `Debug` impl, so
         // `expect_err` (which would need to print it on the `Ok` branch)
         // isn't usable here; `.err().expect(..)` never needs to format `Ok`.
         let err = registry
             .client_for(&id)
+            .await
             .err()
             .expect("missing env var must error");
         match &err {
@@ -533,8 +598,8 @@ api_key_env = ""
     }
 
     #[cfg(feature = "provider-openai")]
-    #[test]
-    fn client_for_allows_empty_api_key_env_for_local_endpoints() {
+    #[tokio::test]
+    async fn client_for_allows_empty_api_key_env_for_local_endpoints() {
         let id = model_id("local-default");
         let registry = ModelRegistry::new([ModelConfig {
             id: id.clone(),
@@ -544,15 +609,18 @@ api_key_env = ""
             api_key_env: String::new(),
         }]);
 
-        let client = registry
-            .client_for(&id)
-            .expect("empty api_key_env is not an error");
-        assert_eq!(client.model(), "qwen2.5-coder:14b");
+        // Builds an OpenAI-compatible client with no key (Ok is enough — the
+        // concrete `model()` accessor is no longer reachable on the returned
+        // `Arc<dyn ChatClient>`).
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "empty api_key_env is not an error"
+        );
     }
 
     #[cfg(feature = "provider-openai")]
-    #[test]
-    fn client_for_rejects_unsupported_provider() {
+    #[tokio::test]
+    async fn client_for_rejects_unsupported_provider() {
         let id = model_id("weird");
         let registry = ModelRegistry::new([ModelConfig {
             id: id.clone(),
@@ -564,6 +632,7 @@ api_key_env = ""
 
         let err = registry
             .client_for(&id)
+            .await
             .err()
             .expect("unsupported provider must error");
         assert!(matches!(err, ModelsError::UnsupportedProvider { .. }));

@@ -1955,6 +1955,7 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
     // documented future seam); the timing + scripted-probe numbers are measured.
     let registry = ModelRegistry::new(configs);
     let driver = FrameworkModelDriver::from_registry(&registry, config.id.clone())
+        .await
         .with_context(|| format!("building a model client for `{id}`"))?;
     let target = DriverBenchTarget::new(&driver, default_bench_description());
 

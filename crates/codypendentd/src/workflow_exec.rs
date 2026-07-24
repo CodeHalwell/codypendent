@@ -353,6 +353,7 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
             ),
         };
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
+            .await
             .map_err(|e| format!("could not build model client: {e}"))?;
         Ok(NodeDriver {
             driver: Box::new(driver),

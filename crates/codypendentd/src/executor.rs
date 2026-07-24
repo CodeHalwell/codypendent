@@ -428,6 +428,7 @@ impl RuntimeExecutor {
         info!(run_id = %launch.run_id, model = %model_id, "resolved model; executing run");
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
+            .await
             .map_err(|e| format!("could not build model client: {e}"))?;
 
         // When a GitHub client is configured, admit the GitHub API endpoint on
