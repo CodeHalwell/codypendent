@@ -25,7 +25,10 @@ exclude = ["benches/crdt-bench"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
+# edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
+# is newer, so builds are unaffected; this keeps the declared MSRV honest.
+rust-version = "1.88"
 repository = "https://github.com/CodeHalwell/codypendent"
 license = "MIT"
 
