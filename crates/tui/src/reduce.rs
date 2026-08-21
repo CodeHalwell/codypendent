@@ -5041,7 +5041,7 @@ fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
                 let Some(prev) = prev_grapheme(buf, at) else {
                     break;
                 };
-                if buf[prev..at].chars().all(char::is_whitespace) {
+                if buf[prev..at].trim().is_empty() {
                     at = prev;
                 } else {
                     break;
@@ -5051,7 +5051,7 @@ fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
                 let Some(prev) = prev_grapheme(buf, at) else {
                     break;
                 };
-                if buf[prev..at].chars().all(char::is_whitespace) {
+                if buf[prev..at].trim().is_empty() {
                     break;
                 }
                 at = prev;
