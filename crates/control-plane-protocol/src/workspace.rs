@@ -24,9 +24,14 @@ impl TeamSlug {
         if s.starts_with('-') || s.ends_with('-') {
             return Err(SlugValidationError::HyphenBoundary);
         }
-        for c in s.chars() {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
-                return Err(SlugValidationError::InvalidChar(c));
+
+        // PERF: Iterate over raw bytes to skip UTF-8 decoding overhead.
+        // The validation expects pure ASCII. For invalid non-ASCII bytes,
+        // casting to `char` will report the invalid byte, which is acceptable
+        // on the cold error path.
+        for &c in s.as_bytes().iter() {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != b'-' {
+                return Err(SlugValidationError::InvalidChar(c as char));
             }
         }
         Ok(Self(s))
