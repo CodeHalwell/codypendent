@@ -209,7 +209,7 @@
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.18.0",
     "esbuild": "^0.28.2",
-    "eslint": "^8.57.1",
+    "eslint": "^10.10.0",
     "jsdom": "^30.0.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
