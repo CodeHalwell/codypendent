@@ -319,8 +319,9 @@ fn validate_slug_component(kind: &'static str, value: &str) -> Result<(), GitHub
         && value != "."
         && value != ".."
         && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            // ⚡ Bolt: Use .bytes() instead of .chars() to avoid UTF-8 decoding overhead when checking pure ASCII characters
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
     if valid {
         Ok(())
     } else {
@@ -345,8 +346,9 @@ fn validate_git_ref(value: &str) -> Result<(), GitHubError> {
                 && segment != "."
                 && segment != ".."
                 && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                    // ⚡ Bolt: Use .bytes() instead of .chars() to avoid UTF-8 decoding overhead when checking pure ASCII characters
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
         });
     if valid {
         Ok(())
