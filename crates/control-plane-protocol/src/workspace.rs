@@ -24,10 +24,15 @@ impl TeamSlug {
         if s.starts_with('-') || s.ends_with('-') {
             return Err(SlugValidationError::HyphenBoundary);
         }
-        for c in s.chars() {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
-                return Err(SlugValidationError::InvalidChar(c));
-            }
+        // ⚡ Bolt: Using `.as_bytes().iter()` instead of `.chars()` avoids UTF-8 decoding overhead.
+        if let Some((i, _)) = s
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .find(|(_, &b)| !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-')
+        {
+            // ⚡ Bolt: i is guaranteed to be a valid char boundary since all checked bytes are pure ASCII up to i.
+            return Err(SlugValidationError::InvalidChar(s[i..].chars().next().unwrap()));
         }
         Ok(Self(s))
     }
