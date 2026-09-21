@@ -1,3 +1,6 @@
 ## 2023-10-27 - Table detection parsing optimization
 **Learning:** Checking if an ASCII character (like `-`) appears in a string by using `.chars()` incurs Unicode decoding overhead.
 **Action:** Use `.as_bytes().iter().all(|&c| c == b'-')` instead of `.chars().all(|c| c == '-')` for pure ASCII checks to skip UTF-8 processing, resulting in significant performance improvements.
+## 2025-01-24 - Pure ASCII string validation optimization
+**Learning:** Using `.chars()` on strings that are purely ASCII decodes UTF-8 unconditionally, which adds overhead. We can bypass this by checking raw bytes using `.as_bytes().iter().enumerate()`. When doing this, if a byte is non-ASCII (e.g., fails an `is_ascii_*` check), it's guaranteed to be the leading byte of a UTF-8 sequence or just a single character. Therefore, we can safely use `s[i..].chars().next().unwrap()` to retrieve the actual character for error reporting since `i` is guaranteed to be on a valid character boundary.
+**Action:** Use `.as_bytes().iter().enumerate()` instead of `.chars()` for pure ASCII check loops to skip UTF-8 processing, resulting in significant performance improvements. Retrieve the character for error formatting using `s[i..].chars().next().unwrap()`.

@@ -269,9 +269,12 @@ fn validate_hex_64(s: &str) -> Result<(), IdValidationError> {
     if s.len() != 64 {
         return Err(IdValidationError::InvalidHexLength(s.len()));
     }
-    for c in s.chars() {
-        if !c.is_ascii_hexdigit() || c.is_ascii_uppercase() {
-            return Err(IdValidationError::InvalidHexChar(c));
+    // Optimization: bypass UTF-8 decoding for pure ASCII validation loops.
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if !b.is_ascii_hexdigit() || b.is_ascii_uppercase() {
+            return Err(IdValidationError::InvalidHexChar(
+                s[i..].chars().next().unwrap(),
+            ));
         }
     }
     Ok(())
