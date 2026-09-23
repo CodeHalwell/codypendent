@@ -54,6 +54,7 @@ impl FromStr for OrganizationSlug {
     }
 }
 
+// ⚡ Bolt: Optimize pure ASCII validation loop by eliminating UTF-8 decoding overhead.
 fn validate_slug(s: &str) -> Result<(), SlugValidationError> {
     if s.len() < 2 || s.len() > 64 {
         return Err(SlugValidationError::InvalidLength(s.len()));
@@ -61,8 +62,9 @@ fn validate_slug(s: &str) -> Result<(), SlugValidationError> {
     if s.starts_with('-') || s.ends_with('-') {
         return Err(SlugValidationError::HyphenBoundary);
     }
-    for c in s.chars() {
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+            let c = s[i..].chars().next().unwrap();
             return Err(SlugValidationError::InvalidChar(c));
         }
     }
