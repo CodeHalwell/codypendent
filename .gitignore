@@ -33,3 +33,6 @@ __pycache__/
 # A stray criterion run from the wrong cwd created apps/desktop/src/target/;
 # ignore a target dir at ANY depth, not just the workspace root.
 **/target/
+
+# Package installs and tool caches (vitest, vite) under any package directory.
+node_modules/
