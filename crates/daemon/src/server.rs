@@ -3705,10 +3705,11 @@ async fn handle_request(
                     // path (`/`, another user's `$HOME`) up to 50k entries. Scope
                     // the walk to a repository the connection's kernel-derived
                     // principal actually owns before touching the filesystem.
-                    // TODO(ownership): also add SearchWorkspaceFiles to
-                    // `CommandBody::named_resources()` (crates/protocol) so the
-                    // central gate is not vacuous; this handler enforces it
-                    // defensively in the meantime.
+                    // This handler is the enforcement point: the walk cannot start
+                    // until the ownership check below passes. A follow-up may also
+                    // name the repository in `CommandBody::named_resources()`
+                    // (crates/protocol) so the central gate covers it too, but that
+                    // would be belt-and-braces, not a fix for an open hole.
                     let authorized = principal_owns_repository(
                         state,
                         conn.principal,
