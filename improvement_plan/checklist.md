@@ -24,7 +24,8 @@ have landed yet. Evidence: `findings-register.md` §"Re-verification"._
 
 ## Phase 2 — Finish the working tree
 
-- [ ] Bring the four new SDK components to the sibling contract (`sdk/ui/src/first-party/*.tsx`, untracked)
+- [x] Bring the four new SDK components to the sibling contract (`sdk/ui/src/first-party/*.tsx`, untracked)
+  - Verified 2026-09-23: the first-party components are tracked, extend `SurfaceOptions`, spread `{...surface}`, derive child ids from `surface.id`, pass `Badge` a `message=`, and `diff-inspector.tsx` has no `onApplyHunk`. `test/first-party/catalogue.test.tsx` covers the catalogue.
   - Required `SurfaceOptions` + `{...surface}` spread (honor `state`/`density`/`width`/`id`).
   - Unique ids derived from caller `id` (no hardcoded `SurfaceFrame`/child ids).
   - Badge via `message=`, not children (`diff-inspector.tsx:70-71`).
@@ -74,7 +75,7 @@ have landed yet. Evidence: `findings-register.md` §"Re-verification"._
 ## Definition of done
 
 - [ ] Full workspace `cargo clippy --workspace --all-targets` green.
-- [ ] `sdk/ui` typecheck and test suite green.
+- [x] `sdk/ui` typecheck and test suite green. (Verified 2026-09-23: `npm run check` passes: typecheck, 14 files / 86 tests, build.)
 - [ ] The edit tool never corrupts or panic-errors on unicode content.
 - [ ] `/undo` restores a checkpoint or is removed; no misleading transcript notes.
 - [ ] An accepted cancel/pause always takes effect.
