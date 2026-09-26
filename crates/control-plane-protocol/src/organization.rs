@@ -61,9 +61,12 @@ fn validate_slug(s: &str) -> Result<(), SlugValidationError> {
     if s.starts_with('-') || s.ends_with('-') {
         return Err(SlugValidationError::HyphenBoundary);
     }
-    for c in s.chars() {
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
-            return Err(SlugValidationError::InvalidChar(c));
+    // Performance optimization: Using `.as_bytes().iter()` avoids UTF-8 decoding overhead
+    // for strings we expect to be pure ASCII.
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+            // If we hit an invalid byte, we can safely decode the rest to get the offending character
+            return Err(SlugValidationError::InvalidChar(s[i..].chars().next().unwrap()));
         }
     }
     Ok(())
