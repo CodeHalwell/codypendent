@@ -1065,9 +1065,10 @@ fn federation_variants(source: &str, path: &std::path::Path) -> BTreeSet<String>
         // A variant declaration at enum level: `Name {` (all federation
         // variants carry fields), never a field, attribute or doc line.
         if let Some(name) = trimmed.strip_suffix(" {") {
+            // ⚡ Bolt: skip UTF-8 decoding for ASCII checks
             if !name.is_empty()
-                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                && name.chars().all(|c| c.is_alphanumeric())
+                && name.as_bytes().first().is_some_and(|&c| c.is_ascii_uppercase())
+                && name.as_bytes().iter().all(|&c| c.is_ascii_alphanumeric())
             {
                 variants.insert(name.to_string());
             }
