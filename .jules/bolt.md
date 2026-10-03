@@ -1,3 +1,6 @@
 ## 2023-10-27 - Table detection parsing optimization
 **Learning:** Checking if an ASCII character (like `-`) appears in a string by using `.chars()` incurs Unicode decoding overhead.
 **Action:** Use `.as_bytes().iter().all(|&c| c == b'-')` instead of `.chars().all(|c| c == '-')` for pure ASCII checks to skip UTF-8 processing, resulting in significant performance improvements.
+## 2023-10-27 - Rust pure ASCII validation optimization
+**Learning:** Using `.chars()` in Rust for string validation incurs unnecessary UTF-8 decoding overhead when only validating against ASCII characters. Iterating over `.bytes()` is significantly faster. Crucially, when iterating over bytes, if a string contains any multi-byte UTF-8 character, its first byte will always be >= 128 (non-ASCII), meaning the loop will fail correctly on the first byte of that character. This means the index `i` from `.bytes().enumerate()` is guaranteed to be a valid character boundary when it hits a non-ASCII character, allowing safe extraction of the character for error reporting using `s[i..].chars().next().unwrap()`.
+**Action:** Prefer `.bytes().enumerate()` over `.chars()` for performance-sensitive pure ASCII string validation loops in Rust, while maintaining accurate error reporting.
