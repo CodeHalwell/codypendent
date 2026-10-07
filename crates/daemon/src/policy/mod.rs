@@ -314,14 +314,24 @@ impl PolicyEngine {
     /// expanded and every root canonicalized. Exposed so the tool layer can
     /// check specific paths under a granted capability.
     pub fn file_read_scope(&self, ctx: &EvalContext) -> PathScope {
-        build_path_scope(&self.merged.fs_read, &self.merged.fs_deny, ctx)
+        build_path_scope(
+            &self.merged.fs_read,
+            &self.merged.fs_deny,
+            &self.merged.untrusted_fs_roots,
+            ctx,
+        )
     }
 
     /// The write scope for `ctx` (see [`file_read_scope`]).
     ///
     /// [`file_read_scope`]: PolicyEngine::file_read_scope
     pub fn file_write_scope(&self, ctx: &EvalContext) -> PathScope {
-        build_path_scope(&self.merged.fs_write, &self.merged.fs_deny, ctx)
+        build_path_scope(
+            &self.merged.fs_write,
+            &self.merged.fs_deny,
+            &self.merged.untrusted_fs_roots,
+            ctx,
+        )
     }
 
     /// The command scope (allow-list plus the wall-clock ceiling).
@@ -1231,11 +1241,16 @@ fn git_subcommand(args: &[String]) -> Result<Option<&str>, String> {
 /// honor the configured denials. Home is resolved via `$HOME` with an OS
 /// fallback (`directories`), so the poison only triggers when the home
 /// directory is genuinely unknowable.
-fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> PathScope {
+fn build_path_scope(
+    roots: &[String],
+    deny: &[String],
+    untrusted_roots: &[String],
+    ctx: &EvalContext,
+) -> PathScope {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
-    build_path_scope_with_home(roots, deny, ctx, home.as_deref())
+    build_path_scope_with_home(roots, deny, untrusted_roots, ctx, home.as_deref())
 }
 
 /// The pure core of [`build_path_scope`], with the home directory resolved by
@@ -1245,6 +1260,7 @@ fn build_path_scope(roots: &[String], deny: &[String], ctx: &EvalContext) -> Pat
 fn build_path_scope_with_home(
     roots: &[String],
     deny: &[String],
+    untrusted_roots: &[String],
     ctx: &EvalContext,
     home: Option<&Path>,
 ) -> PathScope {
@@ -1273,9 +1289,43 @@ fn build_path_scope_with_home(
                 // A dropped root only narrows the scope; still worth a loud note.
                 tracing::warn!(entry, "policy root dropped: $HOME is unknown");
             }
-            expanded
+            expanded.map(|expanded| (entry, canonical(expanded)))
         })
-        .map(canonical)
+        .filter(|(entry, resolved)| {
+            // A root an untrusted layer introduced is a path the REPOSITORY
+            // chose, and the repository can plant a symlink there. Resolving it
+            // follows the link, so `$WORKTREE/link -> /` would otherwise turn
+            // into a root of `/`: silent read/write access to the whole machine
+            // minus the deny list, with no approval card. Hold it to its own
+            // anchor — after symlink resolution it must still be inside the
+            // worktree / repository / home directory it was written relative to.
+            // Dropping a root only narrows the scope, so this fails closed.
+            if !untrusted_roots.iter().any(|untrusted| untrusted == *entry) {
+                return true;
+            }
+            let anchor = if entry.starts_with("$WORKTREE") {
+                Some(ctx.worktree.as_path())
+            } else if entry.starts_with("$REPOSITORY") {
+                Some(ctx.repository.as_path())
+            } else if entry.starts_with("$HOME") {
+                home
+            } else {
+                None
+            };
+            let contained = anchor
+                .map(|anchor| scope::is_within(resolved, &scope::canonicalize_lenient(anchor)))
+                .unwrap_or(false);
+            if !contained {
+                tracing::error!(
+                    root = entry.as_str(),
+                    resolves_to = %resolved.display(),
+                    "dropping a repository-supplied policy root that resolves outside its own \
+                     anchor (a symlink leading out of the checkout); the scope narrows"
+                );
+            }
+            contained
+        })
+        .map(|(_, resolved)| resolved)
         .collect();
 
     PathScope::new(expanded_roots, denies)
@@ -1315,6 +1365,84 @@ mod tests {
         EvalContext::new(repo, worktree)
     }
 
+    /// A repository controls two things an attacker needs: the files in its
+    /// checkout (so it can commit a symlink) and its own `.codypendent/policy.toml`
+    /// (so it can name that symlink as a policy root). Narrowing `$WORKTREE` to
+    /// `$WORKTREE/link` passes the lexical containment check at merge time; the
+    /// evaluator then canonicalised the root THROUGH the link, so a root of `/`
+    /// (or `~/.aws`) was granted with no approval card — read access to every
+    /// credential file not on the deny list, write access to `~/.bashrc`.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_policy_root_that_is_a_symlink_out_of_the_checkout_is_dropped() {
+        use crate::policy::config::RawPolicy;
+
+        let outside = tempdir().unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+        std::fs::write(outside.join("credentials"), "aws_secret_access_key=...").unwrap();
+        let checkout = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(checkout.path()).unwrap();
+        std::os::unix::fs::symlink(&outside, worktree.join("link")).unwrap();
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join("src/lib.rs"), "fn main() {}").unwrap();
+
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.apply_untrusted_overlay(
+            &RawPolicy::parse(
+                "[filesystem]\nread = [\"$REPOSITORY/link\"]\nwrite = [\"$WORKTREE/link\"]",
+            )
+            .unwrap(),
+        );
+        let engine = PolicyEngine::from_merged(merged);
+        let ctx = ctx(&worktree, &worktree);
+
+        let secret = outside.join("credentials");
+        assert_ne!(
+            engine.file_write_scope(&ctx).classify(&secret),
+            ScopeVerdict::Allowed,
+            "a symlinked write root must not grant the directory it points at"
+        );
+        assert_ne!(
+            engine.file_read_scope(&ctx).classify(&secret),
+            ScopeVerdict::Allowed,
+            "a symlinked read root must not grant the directory it points at"
+        );
+    }
+
+    /// The other half: a root the repository narrowed to that genuinely lies
+    /// inside the checkout still works, symlink or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_policy_root_that_stays_inside_the_checkout_is_kept() {
+        use crate::policy::config::RawPolicy;
+
+        let checkout = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(checkout.path()).unwrap();
+        std::fs::create_dir_all(worktree.join("real/inner")).unwrap();
+        std::fs::write(worktree.join("real/inner/file.rs"), "").unwrap();
+        // An alias that stays inside the checkout.
+        std::os::unix::fs::symlink(worktree.join("real"), worktree.join("alias")).unwrap();
+
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.apply_untrusted_overlay(
+            &RawPolicy::parse("[filesystem]\nwrite = [\"$WORKTREE/real\", \"$WORKTREE/alias\"]")
+                .unwrap(),
+        );
+        let engine = PolicyEngine::from_merged(merged);
+        let ctx = ctx(&worktree, &worktree);
+        let scope = engine.file_write_scope(&ctx);
+
+        assert_eq!(
+            scope.classify(&worktree.join("real/inner/file.rs")),
+            ScopeVerdict::Allowed
+        );
+        // Outside the narrowed roots is still outside.
+        assert_ne!(
+            scope.classify(&worktree.join("elsewhere.txt")),
+            ScopeVerdict::Allowed
+        );
+    }
+
     /// S4: a DENY entry that cannot be expanded (here `$HOME/.ssh` with no
     /// resolvable home) must POISON the whole scope — no roots, so every path
     /// classifies out of scope and both reads and writes are refused — rather
@@ -1331,7 +1459,7 @@ mod tests {
         let roots = vec!["$REPOSITORY".to_string()];
         let deny = vec!["$HOME/.ssh".to_string()];
 
-        let scope = build_path_scope_with_home(&roots, &deny, &ctx, None);
+        let scope = build_path_scope_with_home(&roots, &deny, &[], &ctx, None);
 
         // Poisoned: no roots survived, so the deny could never be dropped.
         assert!(
@@ -1360,7 +1488,7 @@ mod tests {
         let roots = vec!["$REPOSITORY".to_string()];
         let deny = vec!["$HOME/.ssh".to_string()];
 
-        let scope = build_path_scope_with_home(&roots, &deny, &ctx, Some(&home));
+        let scope = build_path_scope_with_home(&roots, &deny, &[], &ctx, Some(&home));
 
         assert!(!scope.roots.is_empty(), "the repository root must survive");
         assert_eq!(

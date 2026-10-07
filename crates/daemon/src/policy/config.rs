@@ -74,6 +74,17 @@ pub struct MergedPolicy {
     pub fs_read: Vec<String>,
     pub fs_write: Vec<String>,
     pub fs_deny: Vec<String>,
+    /// The `fs_read` / `fs_write` roots that an UNTRUSTED layer (a repo-local
+    /// `.codypendent/policy.toml`) introduced by narrowing a broader root to a
+    /// subpath. They are the only roots whose location the repository itself
+    /// controls — it can commit a symlink at `$WORKTREE/link` and name that path
+    /// — so evaluation re-checks that each still lies inside its own anchor after
+    /// symlinks are resolved (`build_path_scope`). Roots from trusted layers are
+    /// not listed: a user may legitimately point `$HOME/code` at another disk.
+    /// Omitted from the serialized form when empty, so a policy with no such
+    /// root derives the same `PolicyVersion` it always did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub untrusted_fs_roots: Vec<String>,
     pub shell_allowed_programs: Vec<String>,
     pub shell_interpreter_requires_approval: bool,
     pub shell_maximum_seconds: u64,
@@ -108,6 +119,7 @@ impl MergedPolicy {
                 "$HOME/.ssh".to_string(),
                 "$HOME/.config".to_string(),
             ],
+            untrusted_fs_roots: Vec::new(),
             shell_allowed_programs: vec![
                 // Original Rust baseline.
                 "cargo".to_string(),
@@ -149,6 +161,18 @@ impl MergedPolicy {
         }
     }
 
+    /// Record, in [`untrusted_fs_roots`](Self::untrusted_fs_roots), each root in
+    /// `narrowed` that is not one of the `broader` roots it was derived from —
+    /// i.e. a subpath the untrusted layer chose.
+    fn note_overlay_roots(&mut self, broader: &[String], narrowed: &[String]) {
+        let broader: Vec<String> = broader.iter().filter_map(|r| normalize_raw(r)).collect();
+        for root in narrowed {
+            if !broader.contains(root) && !self.untrusted_fs_roots.contains(root) {
+                self.untrusted_fs_roots.push(root.clone());
+            }
+        }
+    }
+
     /// Apply a narrower file layer over this policy, enforcing the merge
     /// invariant. Only fields the overlay sets are touched; each is narrowed,
     /// never widened. Used for an **untrusted** source (a repo-local
@@ -161,10 +185,14 @@ impl MergedPolicy {
         }
         if let Some(fs) = &raw.filesystem {
             if let Some(read) = &fs.read {
-                self.fs_read = intersect_roots(&self.fs_read, read);
+                let narrowed = intersect_roots(&self.fs_read, read);
+                self.note_overlay_roots(&self.fs_read.clone(), &narrowed);
+                self.fs_read = narrowed;
             }
             if let Some(write) = &fs.write {
-                self.fs_write = intersect_roots(&self.fs_write, write);
+                let narrowed = intersect_roots(&self.fs_write, write);
+                self.note_overlay_roots(&self.fs_write.clone(), &narrowed);
+                self.fs_write = narrowed;
             }
             if let Some(deny) = &fs.deny {
                 // Deny accumulates: a narrower layer can add denials but never
@@ -744,6 +772,31 @@ mod tests {
             1
         );
         assert_eq!(merged.fs_deny.len(), before + 1);
+    }
+
+    #[test]
+    fn untrusted_overlay_records_only_the_roots_it_introduced() {
+        // Re-stating a broader layer's own root introduces nothing new...
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.apply_untrusted_overlay(
+            &RawPolicy::parse("[filesystem]\nwrite = [\"$WORKTREE\"]").unwrap(),
+        );
+        assert!(merged.untrusted_fs_roots.is_empty());
+
+        // ...but a subpath the repository chose is the repository's doing.
+        merged.apply_untrusted_overlay(
+            &RawPolicy::parse("[filesystem]\nwrite = [\"$WORKTREE/src\"]").unwrap(),
+        );
+        assert_eq!(merged.untrusted_fs_roots, vec!["$WORKTREE/src".to_string()]);
+        assert_eq!(merged.fs_write, vec!["$WORKTREE/src".to_string()]);
+    }
+
+    #[test]
+    fn a_policy_with_no_untrusted_roots_keeps_its_serialized_form() {
+        // `PolicyVersion` is a hash of this serialization; adding the provenance
+        // list must not change the version of any policy that has none.
+        let json = serde_json::to_string(&MergedPolicy::builtin_defaults()).unwrap();
+        assert!(!json.contains("untrusted_fs_roots"), "{json}");
     }
 
     #[test]
