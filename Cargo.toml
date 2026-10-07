@@ -98,7 +98,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # decodes the signature and publisher key carried as text in `plugin.toml`'s
 # `[security]`. Pinned to a version that builds on the workspace's rust-version (1.82).
 ed25519-dalek = "=2.2.0"
-base64 = "0.22"
+base64 = "0.23"
 
 # GitHub & IDE integrations (Phase 3). `reqwest` is the typed GitHub client's
 # HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook
