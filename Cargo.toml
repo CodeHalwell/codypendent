@@ -88,7 +88,7 @@ hex = "0.4"
 flate2 = "1"
 bzip2 = "0.5"
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
 # publisher signature over the canonical `codypendent-plugin-signature-v1` digest
