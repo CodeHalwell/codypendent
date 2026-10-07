@@ -255,7 +255,11 @@ impl ModelProfileStore {
         success: bool,
         run_id: &str,
     ) -> Result<bool, ModelProfileStoreError> {
-        let mut tx = pool.begin().await?;
+        // IMMEDIATE: this reads the profile, then writes an outcome and the folded
+        // profile. A deferred transaction would fail with SQLITE_BUSY_SNAPSHOT when
+        // another run's outcome committed in between, and the outcome (the routing
+        // signal) would be dropped.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let Some(existing_json) = sqlx::query(
             "SELECT profile_json FROM model_profiles WHERE model_id = ? AND endpoint = ?",

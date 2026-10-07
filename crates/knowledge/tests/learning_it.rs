@@ -46,6 +46,41 @@ fn user_provenance() -> LearningProvenance {
     }
 }
 
+/// Many runs finishing together capture into the same scope. Every capture reads
+/// (duplicate / conflict / count checks) and then writes; as deferred
+/// transactions the losers failed with SQLITE_BUSY_SNAPSHOT and their learnings
+/// were silently dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_captures_into_one_scope_do_not_fail_with_a_stale_snapshot() {
+    let (_temporary, pool) = temp_pool().await;
+    let scope = LearningScope::Repository(RepositoryId::new());
+
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let pool = pool.clone();
+        let scope = scope.clone();
+        tasks.push(tokio::spawn(async move {
+            LearningStore::new()
+                .capture(
+                    &pool,
+                    candidate(
+                        scope,
+                        &format!("concurrent learning {index} concerns module {index}"),
+                        vec![user_provenance()],
+                    ),
+                )
+                .await
+        }));
+    }
+    for task in tasks {
+        let outcome = task.await.unwrap();
+        assert!(
+            outcome.is_ok(),
+            "a concurrent capture must serialise, not fail: {outcome:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn migration_is_additive_and_legacy_memories_table_remains_available() {
     let (_temporary, pool) = temp_pool().await;

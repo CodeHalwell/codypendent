@@ -409,7 +409,15 @@ impl LearningStore {
             .as_deref()
             .and_then(|value| normalize_conflict_key(Some(value)))
             .or_else(|| inferred_conflict_key(&candidate.content));
-        let mut tx = pool.begin().await?;
+        // BEGIN IMMEDIATE, not the deferred default: every path below READS (the
+        // duplicate / conflict / count checks) and then WRITES. A deferred
+        // transaction takes its read snapshot at the first SELECT, and in WAL mode
+        // a writer that committed after that snapshot makes the later write fail
+        // at once with SQLITE_BUSY_SNAPSHOT — `busy_timeout` cannot help, because
+        // the snapshot is stale, not the lock held. Taking the write lock up front
+        // serialises the callers instead. (The rest of the daemon already does
+        // this for read-then-write; see `approvals.rs`.)
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         if let Some(existing_id) = find_duplicate(
             &mut *tx,
@@ -616,7 +624,7 @@ impl LearningStore {
         }
 
         let hash = normalized_hash(&current.content)?;
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing_id) = find_duplicate(
             &mut *tx,
             &current.scope,
@@ -676,7 +684,7 @@ impl LearningStore {
                     .to_owned(),
             ));
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let conflicts = find_conflicts(
             &mut *tx,
             &record.scope,
