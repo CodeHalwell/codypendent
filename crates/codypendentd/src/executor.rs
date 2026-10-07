@@ -682,6 +682,13 @@ impl RuntimeExecutor {
             return;
         }
         let guard = scan::lock_repository(repository).await;
+        // Sample the revision AGAIN now that the lock is held. The value taken
+        // before the wait is what the cheap pre-check above used, but the wait can
+        // be long (another caller's full scan), and a branch switch or pull during
+        // it would leave this scan reading one revision while recording another:
+        // the map would then claim a revision the graph does not hold, and a later
+        // run at that revision would skip a scan it needs.
+        let revision = scan::head_revision(root);
         // Re-check: another caller may have folded this exact revision while
         // this one waited for the lock. This is the check that makes the pair of
         // triggers idempotent — the cheap pre-check above only avoids the wait.
@@ -3946,7 +3953,7 @@ impl WorktreeReleaseGuard {
     /// `Drop` is a no-op). Consumes the guard.
     pub(crate) async fn release(mut self) {
         if let Some(binding) = self.binding.take() {
-            self.unified_exec.terminate_under(&binding.worktree).await;
+            terminate_processes_in_owned_worktree(&self.unified_exec, &binding).await;
             release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
         }
     }
@@ -3958,10 +3965,30 @@ impl WorktreeReleaseGuard {
     /// protective path.
     pub(crate) async fn release_captured(mut self) {
         if let Some(binding) = self.binding.take() {
-            self.unified_exec.terminate_under(&binding.worktree).await;
+            terminate_processes_in_owned_worktree(&self.unified_exec, &binding).await;
             release_captured_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding)
                 .await;
         }
+    }
+}
+
+/// Kill the interactive processes under a run's worktree — but only when the
+/// worktree is the run's own.
+///
+/// A read-only run has no lease: its "worktree" is the repository root, shared
+/// with every other run on that checkout. `terminate_under` filters on
+/// `cwd.starts_with(root)` across ALL sessions, so releasing one read-only run
+/// used to kill another run's dev server or test watcher mid-flight (and the
+/// unwind path, which already required a lease, disagreed with the normal one).
+/// A leased worktree is private to its run, so everything under it is that run's
+/// to end before the directory is removed. Processes a read-only run leaves
+/// behind are ended by `terminate_session` when its session closes.
+async fn terminate_processes_in_owned_worktree(
+    unified_exec: &codypendent_daemon::unified_exec::UnifiedExecManager,
+    binding: &WorktreeBinding,
+) {
+    if binding.lease.is_some() {
+        unified_exec.terminate_under(&binding.worktree).await;
     }
 }
 
@@ -3980,7 +4007,7 @@ impl Drop for WorktreeReleaseGuard {
                 let unified_exec = self.unified_exec.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        unified_exec.terminate_under(&binding.worktree).await;
+                        terminate_processes_in_owned_worktree(&unified_exec, &binding).await;
                         release_run_worktree(&pool, &artifacts, &manager, &binding).await;
                     });
                 } else {
@@ -6332,6 +6359,111 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    /// A live interactive process (`cat` blocks on stdin) whose cwd is `cwd`,
+    /// owned by a run other than the one being released.
+    #[cfg(unix)]
+    async fn spawn_foreign_process(
+        unified_exec: &codypendent_daemon::unified_exec::UnifiedExecManager,
+        cwd: &Path,
+    ) -> (SessionId, i32) {
+        use codypendent_daemon::unified_exec::{OpenProcessSpec, ReadBudget};
+        let session = SessionId::new();
+        let out = unified_exec
+            .exec(
+                OpenProcessSpec {
+                    session_id: session,
+                    run_id: RunId::new(),
+                    program: PathBuf::from("/bin/cat"),
+                    args: Vec::new(),
+                    cwd: cwd.to_path_buf(),
+                    environment: Vec::new(),
+                },
+                ReadBudget {
+                    yield_time_ms: 250,
+                    max_output_tokens: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        (session, out.process_id.expect("cat stays running"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_a_read_only_run_leaves_other_runs_processes_alone() {
+        // A read-only run keeps the repository root: no lease, a worktree shared
+        // with every other run on the checkout. Releasing it used to
+        // `terminate_under(repo_root)`, killing a process another run had started
+        // in that same checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let manager = WorktreeManager::new();
+        let unified_exec = Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new());
+
+        let (other_session, other_pid) = spawn_foreign_process(&unified_exec, &repo).await;
+
+        let read_only_run = seed_run(&pool).await;
+        let binding = bind_run_worktree(&pool, &artifacts, &manager, read_only_run, false, &repo)
+            .await
+            .unwrap();
+        assert!(binding.lease.is_none(), "a read-only run holds no lease");
+        WorktreeReleaseGuard::arm(
+            pool.clone(),
+            artifacts,
+            manager,
+            unified_exec.clone(),
+            binding,
+        )
+        .release()
+        .await;
+
+        let still_running = unified_exec
+            .list(other_session)
+            .await
+            .iter()
+            .any(|p| p.process_id == other_pid && p.running);
+        unified_exec.terminate_all().await;
+        assert!(
+            still_running,
+            "another run's process in the shared checkout must survive this release"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_a_runs_own_worktree_still_ends_the_processes_inside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let manager = WorktreeManager::new();
+        let unified_exec = Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new());
+
+        let run = seed_run(&pool).await;
+        let binding = bind_run_worktree(&pool, &artifacts, &manager, run, true, &repo)
+            .await
+            .unwrap();
+        assert!(binding.lease.is_some());
+        let (session, _pid) = spawn_foreign_process(&unified_exec, &binding.worktree).await;
+
+        WorktreeReleaseGuard::arm(
+            pool.clone(),
+            artifacts,
+            manager,
+            unified_exec.clone(),
+            binding,
+        )
+        .release()
+        .await;
+
+        let remaining = unified_exec.list(session).await;
+        unified_exec.terminate_all().await;
+        assert!(
+            remaining.is_empty(),
+            "a private worktree's processes end before it is removed: {remaining:?}"
+        );
     }
 
     #[tokio::test]
