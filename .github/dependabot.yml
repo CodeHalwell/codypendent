@@ -29,8 +29,11 @@ updates:
     open-pull-requests-limit: 5
     groups:
       # The RustCrypto "next" generation (digest 0.11, crypto-common 0.2,
-      # hybrid-array) is a coordinated release: `hmac`, `sha2`, `chacha20poly1305`
-      # and friends only compile against each other at matching generations.
+      # hybrid-array) is released together. `hmac` 0.13 cannot compile against
+      # `sha2` 0.10 (two versions of `digest` in one graph), and
+      # `chacha20poly1305` 0.11 moves to `hybrid-array`, which needs a small port
+      # of `crates/secrets`. Grouped so the set arrives as one PR instead of
+      # several that each fail on their own.
       rustcrypto:
         patterns:
           - "sha2"
@@ -79,9 +82,11 @@ updates:
 
   # --- npm -----------------------------------------------------------------
   # React, react-dom and their types are pinned to the SAME exact version in
-  # `sdk/ui`, `extensions/vscode` and the apps: two React copies in one bundle
-  # break hooks. They are grouped so a bump moves every copy together, and the
-  # PR has to be applied to all packages at once.
+  # `sdk/ui` and `extensions/vscode` (the extension bundles the `sdk/ui`
+  # renderer): two React copies in one bundle break hooks. Within a directory
+  # they are grouped, because `react` alone makes the renderer tests refuse to
+  # load and `react-dom` alone does not install. A group is per directory, so
+  # the two PRs have to be merged together.
   - package-ecosystem: "npm"
     directory: "/sdk/ui"
     schedule:
@@ -95,9 +100,9 @@ updates:
         update-types: ["minor", "patch"]
     ignore:
       # `peerDependencies` pins react-reconciler to 0.31.x on purpose: the custom
-      # renderer's host config is written against that API, and 0.34 fails the
-      # renderer tests (react-renderer, first-party catalogue). Lift this when
-      # the host config is ported.
+      # renderer's host config is written against that API. 0.34 needs React 19.3
+      # and then fails 12 tests (react-renderer, worker-react-e2e, first-party
+      # catalogue). Lift this when the host config is ported.
       - dependency-name: "react-reconciler"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       - dependency-name: "@types/react-reconciler"
@@ -115,9 +120,9 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
     ignore:
-      # ESLint 9+ drops `.eslintrc.cjs` in favour of flat config, and ESLint 10
-      # adds rules (e.g. `no-useless-assignment`) the extension's sources trip.
-      # A migration, not a bump.
+      # ESLint 9 and 10 move to flat config, and ESLint 10 adds rules (e.g.
+      # `no-useless-assignment`) the extension's sources trip. A migration, not
+      # a bump.
       - dependency-name: "eslint"
         update-types: ["version-update:semver-major"]
 
