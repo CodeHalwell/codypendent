@@ -3,7 +3,7 @@ name = "codypendent-desktop"
 description = "Tauri shell for the Codypendent desktop client: owns the codypendentd socket connection and bridges it to the webview."
 version = "0.14.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 repository = "https://github.com/CodeHalwell/codypendent"
 license = "MIT"
 publish = false
@@ -78,7 +78,7 @@ anyhow = "1.0"
 # Artifact chunks cross the wire base64-encoded and content-addressed, so the
 # shell decodes and re-verifies them exactly as the reference client does
 # (`sdk/protocol/src/client.ts::readArtifact`) before handing bytes to a webview.
-base64 = "0.22"
+base64 = "0.23"
 # The `models.toml` writers, ported from `crates/cli/src/models_file.rs` and
 # `crates/cli/src/tui.rs::write_remove_model`: `fs4` for the advisory lock that
 # serializes CLI/TUI/desktop edits of the shared file, `toml` for serializing

@@ -1525,7 +1525,7 @@ impl DiagnosticBuffer {
 
 fn reserve_output_bytes(counter: &AtomicU64, maximum: u64, amount: u64) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(amount).filter(|next| *next <= maximum)
         })
         .is_ok()

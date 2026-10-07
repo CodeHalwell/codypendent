@@ -1477,7 +1477,7 @@ async fn sync_engine_offline_and_mock_server_sync() {
             ),
         )
         .route(
-            "/v1/organizations/:organization_id/repositories",
+            "/v1/organizations/{organization_id}/repositories",
             get(move |headers: HeaderMap| {
                 let repository = repository_catalog.clone();
                 async move {
@@ -1792,7 +1792,7 @@ async fn permanent_rejections_leave_the_head_batch_without_consuming_transient_r
             get(|| async { Json(Vec::<StreamEvent>::new()) }),
         )
         .route(
-            "/v1/organizations/:organization_id/repositories",
+            "/v1/organizations/{organization_id}/repositories",
             get(move |headers: HeaderMap| {
                 let repository = repository_catalog.clone();
                 async move {
@@ -1967,7 +1967,7 @@ async fn local_corruption_is_dead_lettered_without_starving_a_later_valid_delta(
 
     let app = Router::new()
         .route(
-            "/v1/organizations/:organization_id/repositories",
+            "/v1/organizations/{organization_id}/repositories",
             get(move |headers: HeaderMap| {
                 let repository = catalog.clone();
                 async move {
@@ -2187,7 +2187,7 @@ async fn authenticated_repository_ceilings_are_enforced_before_the_first_push() 
 
     let app = Router::new()
         .route(
-            "/v1/organizations/:organization_id/repositories",
+            "/v1/organizations/{organization_id}/repositories",
             get(move || {
                 let mut repository = catalog.clone();
                 let is_wide = catalog_widened.load(std::sync::atomic::Ordering::SeqCst);

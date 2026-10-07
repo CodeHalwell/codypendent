@@ -54,15 +54,15 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/organizations",
             post(create_organization).get(list_organizations),
         )
-        .route("/v1/organizations/:id", get(get_organization))
-        .route("/v1/organizations/:id/members", post(add_member))
+        .route("/v1/organizations/{id}", get(get_organization))
+        .route("/v1/organizations/{id}/members", post(add_member))
         // Repository management
         .route(
-            "/v1/organizations/:org_id/repositories",
+            "/v1/organizations/{org_id}/repositories",
             post(register_repository).get(list_repositories),
         )
         .route(
-            "/v1/organizations/:org_id/repositories/:id",
+            "/v1/organizations/{org_id}/repositories/{id}",
             get(get_repository),
         )
         // Sync & Sessions
@@ -70,28 +70,28 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/sync/push", post(push_sync_envelope))
         .route("/v1/sync/pull", get(pull_sync_events))
         .route(
-            "/v1/organizations/:org_id/sessions",
+            "/v1/organizations/{org_id}/sessions",
             get(list_shared_sessions),
         )
         // Published Objects
         .route(
-            "/v1/organizations/:org_id/objects/upload",
+            "/v1/organizations/{org_id}/objects/upload",
             post(upload_object),
         )
         .route(
-            "/v1/organizations/:org_id/objects/presign",
+            "/v1/organizations/{org_id}/objects/presign",
             post(presign_object_url),
         )
         .route(
-            "/v1/organizations/:org_id/objects/:hash",
+            "/v1/organizations/{org_id}/objects/{hash}",
             get(download_object),
         )
         .route(
-            "/v1/organizations/:org_id/objects/:hash/metadata",
+            "/v1/organizations/{org_id}/objects/{hash}/metadata",
             get(get_object_metadata),
         )
         // Audit Logs
-        .route("/v1/organizations/:org_id/audit", get(list_audit_records))
+        .route("/v1/organizations/{org_id}/audit", get(list_audit_records))
         // WebSocket Realtime Events Stream
         .route("/v1/events/ticket", post(issue_ws_ticket))
         .route("/v1/events/stream", get(ws_handler))

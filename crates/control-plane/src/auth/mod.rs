@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use axum::{
     extract::{FromRef, FromRequestParts},
     http::{header, request::Parts},
@@ -253,7 +252,6 @@ pub fn create_daemon_token(
 
 pub struct AuthPrincipal(pub Principal);
 
-#[async_trait]
 impl<S> FromRequestParts<S> for AuthPrincipal
 where
     AppState: FromRef<S>,

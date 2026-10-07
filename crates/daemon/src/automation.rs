@@ -16,7 +16,7 @@ use codypendent_protocol::{
     ConcurrencyPolicy, MissedRunPolicy, PageCursor, RepositoryId, TriggerSource,
     WebhookSignatureScheme, WorkflowId,
 };
-use croner::Cron;
+use croner::parser::CronParser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
@@ -103,8 +103,14 @@ pub fn next_cron_occurrence_after(
     let tz: Tz = timezone
         .parse()
         .map_err(|_| invalid_request(format!("invalid cron timezone '{timezone}'")))?;
-    let cron = Cron::new(expression)
-        .parse()
+    // `sloppy_ranges(true)` keeps croner 2.x's lenient step forms (`0/10`,
+    // `/10`) parseable: a binding whose expression was accepted when it was
+    // created must still compute its next firing after an upgrade, and the
+    // tightened OCPS default in croner 4 would otherwise refuse it here.
+    let cron = CronParser::builder()
+        .sloppy_ranges(true)
+        .build()
+        .parse(expression)
         .map_err(|e| invalid_request(format!("invalid cron expression '{expression}': {e}")))?;
     let after_in_tz = after.with_timezone(&tz);
     let next = cron

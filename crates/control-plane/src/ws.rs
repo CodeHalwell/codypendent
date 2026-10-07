@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
     response::IntoResponse,
@@ -104,14 +104,16 @@ pub async fn issue_ws_ticket(
     Ok(Json(WsTicketResponse { ticket, expires_at }))
 }
 
-/// `ws` is taken as an `Option` deliberately: `WebSocketUpgrade`'s own rejection
+/// `ws` is taken as a `Result` deliberately: `WebSocketUpgrade`'s own rejection
 /// runs before this function body, and a malformed handshake must not be able to
 /// pre-empt (or mask) the credential and authorization checks below. The upgrade
-/// is required, just last.
+/// is required, just last. (axum 0.8 reserves `Option<T>` for extractors that
+/// implement `OptionalFromRequestParts`, which `WebSocketUpgrade` does not;
+/// `Result<T, T::Rejection>` is the spelling that keeps the rejection deferred.)
 pub async fn ws_handler(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
-    ws: Option<WebSocketUpgrade>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<impl IntoResponse, ControlPlaneError> {
     if query.token.is_some() {
         return Err(ControlPlaneError::BadRequest(
@@ -147,8 +149,9 @@ pub async fn ws_handler(
     }
 
     // Only once the subscription is authorized does the handshake itself matter.
-    let ws =
-        ws.ok_or_else(|| ControlPlaneError::BadRequest("websocket upgrade required".to_string()))?;
+    let ws = ws.map_err(|rejection| {
+        ControlPlaneError::BadRequest(format!("websocket upgrade required: {rejection}"))
+    })?;
 
     let stream_name = grant.stream;
     let last_id = grant.last_event_id;
@@ -241,7 +244,7 @@ async fn handle_socket(
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            if sender.send(Message::Text(msg_text)).await.is_err() {
+            if sender.send(Message::Text(msg_text.into())).await.is_err() {
                 return;
             }
         }
@@ -280,7 +283,7 @@ async fn handle_socket(
                 }
 
                 if let Ok(json_str) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json_str)).await.is_err() {
+                    if sender.send(Message::Text(json_str.into())).await.is_err() {
                         break;
                     }
                 }

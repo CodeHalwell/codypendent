@@ -397,7 +397,7 @@ jobs:
       # toolchain file, so this points the container at what it actually has.
       #
       # Deliberately NOT fixed by pinning `rust-toolchain.toml`: the workspace
-      # declares `rust-version = "1.88"`, so pinning the repo to the container's
+      # declares `rust-version = "1.95"`, so pinning the repo to the container's
       # 1.85.0 would fail every job that actually compiles. cargo-deny only reads
       # the manifest and lockfile — it never builds — so an older cargo is fine
       # for it and for nothing else.

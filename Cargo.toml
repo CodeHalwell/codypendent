@@ -36,10 +36,13 @@ exclude = ["benches/crdt-bench"]
 [workspace.package]
 version = "0.14.0"
 edition = "2021"
-# 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
-# edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
-# is newer, so builds are unaffected; this keeps the declared MSRV honest.
-rust-version = "1.88"
+# 1.95 is the effective MSRV: the workspace uses `Atomic*::try_update`
+# (stabilised in 1.95; the older `fetch_update` spelling is deprecated on the
+# current stable, and CI lints with `-D warnings`). Before that the floor was
+# 1.88, set by the `agent-client-protocol` dep (ACP client, edition-2024). The
+# pinned toolchain (rust-toolchain.toml) is newer, so builds are unaffected;
+# this keeps the declared MSRV honest.
+rust-version = "1.95"
 repository = "https://github.com/CodeHalwell/codypendent"
 license = "MIT"
 
@@ -88,7 +91,7 @@ hex = "0.4"
 flate2 = "1"
 bzip2 = "0.5"
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
 # publisher signature over the canonical `codypendent-plugin-signature-v1` digest
@@ -98,7 +101,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # decodes the signature and publisher key carried as text in `plugin.toml`'s
 # `[security]`. Pinned to a version that builds on the workspace's rust-version (1.82).
 ed25519-dalek = "=2.2.0"
-base64 = "0.22"
+base64 = "0.23"
 
 # GitHub & IDE integrations (Phase 3). `reqwest` is the typed GitHub client's
 # HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook
@@ -133,7 +136,7 @@ futures = "0.3"
 # Identifiers and time
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-croner = "2.1"
+croner = "4"
 chrono-tz = "0.10"
 url = "2"
 
@@ -151,14 +154,14 @@ zeroize = { version = "1.8", features = ["derive"] }
 # The vector layer stays abstracted behind a trait — Phase 2 ships a small
 # embedded cosine index; Qdrant is a Phase 4+ option behind the same trait.
 tantivy = "0.22"
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 # One grammar per language the code graph can fold. A repository whose files
 # none of these cover produces an EMPTY graph, so this list is the feature's
 # real reach — widen it here, and `codegraph::language_for` picks it up.
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.23"
+tree-sitter-javascript = "0.25"
 notify = "7"
 fs4 = "0.8"
 

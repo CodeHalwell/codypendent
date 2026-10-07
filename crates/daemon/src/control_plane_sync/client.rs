@@ -267,7 +267,7 @@ mod tests {
         };
         let response_repository = expected.clone();
         let app = Router::new().route(
-            "/v1/organizations/:organization_id/repositories",
+            "/v1/organizations/{organization_id}/repositories",
             get(
                 move |Path(requested_organization_id): Path<Uuid>, headers: HeaderMap| {
                     let repository = response_repository.clone();

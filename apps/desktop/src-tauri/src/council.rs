@@ -460,7 +460,7 @@ pub async fn run_council<S: ProgressSink>(
                 *members
             }
             CouncilEvent::MemberCompleted { .. } | CouncilEvent::MemberFailed { .. } => active
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     Some(value.saturating_sub(1))
                 })
                 .unwrap_or(0)

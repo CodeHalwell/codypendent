@@ -266,7 +266,7 @@ describe("ControlPlaneClient", () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it("keeps every SDK network route anchored in the actual Axum router", () => {
+  it("keeps every SDK network route anchored in the actual Axum router (0.8 `{param}` path syntax)", () => {
     const router = readFileSync(
       resolve(process.cwd(), "../../crates/control-plane/src/http.rs"),
       "utf8",
@@ -275,14 +275,14 @@ describe("ControlPlaneClient", () => {
       "/v1/auth/refresh",
       "/v1/auth/pairing/challenge",
       "/v1/organizations",
-      "/v1/organizations/:id/members",
-      "/v1/organizations/:org_id/repositories",
-      "/v1/organizations/:org_id/repositories/:id",
-      "/v1/organizations/:org_id/sessions",
-      "/v1/organizations/:org_id/objects/upload",
-      "/v1/organizations/:org_id/objects/presign",
-      "/v1/organizations/:org_id/objects/:hash/metadata",
-      "/v1/organizations/:org_id/audit",
+      "/v1/organizations/{id}/members",
+      "/v1/organizations/{org_id}/repositories",
+      "/v1/organizations/{org_id}/repositories/{id}",
+      "/v1/organizations/{org_id}/sessions",
+      "/v1/organizations/{org_id}/objects/upload",
+      "/v1/organizations/{org_id}/objects/presign",
+      "/v1/organizations/{org_id}/objects/{hash}/metadata",
+      "/v1/organizations/{org_id}/audit",
     ]) {
       expect(router).toContain(`"${route}"`);
     }
