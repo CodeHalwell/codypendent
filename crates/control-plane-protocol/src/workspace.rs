@@ -16,6 +16,7 @@ use crate::organization::SlugValidationError;
 pub struct TeamSlug(pub String);
 
 impl TeamSlug {
+    // ⚡ Bolt: Use .bytes().enumerate() instead of .chars() to avoid UTF-8 decoding overhead for pure ASCII validation.
     pub fn new(slug: impl Into<String>) -> Result<Self, SlugValidationError> {
         let s = slug.into();
         if s.len() < 2 || s.len() > 64 {
@@ -24,8 +25,9 @@ impl TeamSlug {
         if s.starts_with('-') || s.ends_with('-') {
             return Err(SlugValidationError::HyphenBoundary);
         }
-        for c in s.chars() {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+        for (i, b) in s.bytes().enumerate() {
+            if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+                let c = s[i..].chars().next().unwrap();
                 return Err(SlugValidationError::InvalidChar(c));
             }
         }

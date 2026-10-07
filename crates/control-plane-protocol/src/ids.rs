@@ -265,12 +265,14 @@ impl FromStr for Sha256Digest {
     }
 }
 
+// ⚡ Bolt: Use .bytes().enumerate() instead of .chars() to avoid UTF-8 decoding overhead for pure ASCII validation.
 fn validate_hex_64(s: &str) -> Result<(), IdValidationError> {
     if s.len() != 64 {
         return Err(IdValidationError::InvalidHexLength(s.len()));
     }
-    for c in s.chars() {
-        if !c.is_ascii_hexdigit() || c.is_ascii_uppercase() {
+    for (i, b) in s.bytes().enumerate() {
+        if !b.is_ascii_hexdigit() || b.is_ascii_uppercase() {
+            let c = s[i..].chars().next().unwrap();
             return Err(IdValidationError::InvalidHexChar(c));
         }
     }
