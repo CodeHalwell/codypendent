@@ -8592,8 +8592,11 @@ impl FrameworkModelDriver {
 
         let mut options = ChatOptions::new();
         // The loop already projected the exact definition set for this run
-        // (FIX 1) — advertise it verbatim, MCP definitions included.
-        options.tools = tools.to_vec();
+        // (FIX 1) — advertise exactly that set, MCP definitions included, under
+        // names every provider accepts (the canonical dotted names are restored
+        // on the way back; see `WireToolNames`).
+        let wire_names = WireToolNames::for_tools(tools);
+        options.tools = wire_names.definitions(tools);
         apply_context_window(&mut options, self.context_tokens);
 
         let mut stream = self
@@ -8641,7 +8644,179 @@ impl FrameworkModelDriver {
         // for `Say`/`Finish`, whose text already rides the step), and
         // `extra_calls` carries every function call beyond the first.
         assembled.finalize();
-        Ok(chat_response_to_step(&assembled, self.price_per_1k_usd))
+        // A reply cut off at the output-token limit must not be run as if it were
+        // complete (see `truncated_tool_call`).
+        if let Some(error) = truncated_tool_call(&assembled) {
+            return Err(error);
+        }
+        let mut outcome = chat_response_to_step(&assembled, self.price_per_1k_usd);
+        wire_names.restore_in(&mut outcome);
+        Ok(outcome)
+    }
+}
+
+/// Whether the provider stopped this reply because it hit its output-token limit
+/// rather than because the model finished.
+#[cfg(feature = "provider-openai")]
+fn hit_output_limit(response: &agent_framework_core::types::ChatResponse) -> bool {
+    use agent_framework_core::types::FinishReason;
+    response
+        .finish_reason
+        .as_ref()
+        .is_some_and(|reason| reason.as_str() == FinishReason::LENGTH)
+}
+
+/// The error for a tool call the model began but the provider cut off.
+///
+/// A reply that stops at the output limit in the middle of a tool call carries
+/// arguments that are not valid JSON. They used to be turned into `null`, which
+/// every tool then rejected as a missing required field ("requires a string
+/// `path`"): the model was told it had omitted something it had written, retried
+/// the same oversized call, and looped until the repeated-call guard stepped in —
+/// so a large `write_file` could never succeed. Naming the real cause lets the
+/// operator (or a smaller next attempt) fix it. The message deliberately matches
+/// nothing in the retry classifier: re-sending the same request would be cut off
+/// at the same place.
+#[cfg(feature = "provider-openai")]
+fn truncated_tool_call(
+    response: &agent_framework_core::types::ChatResponse,
+) -> Option<anyhow::Error> {
+    if !hit_output_limit(response) {
+        return None;
+    }
+    let message = response.messages.last()?;
+    message
+        .function_calls()
+        .into_iter()
+        .find(|call| call.parse_arguments().is_err())
+        .map(|call| {
+            anyhow::anyhow!(
+                "the model's reply was cut off at its output-token limit in the middle of a `{}` \
+                 call, so nothing was run. Ask for smaller steps (for example, write a large file \
+                 in several edits) or raise the model's output limit.",
+                call.name
+            )
+        })
+}
+
+/// Longest tool name sent on the wire. OpenAI's limit; Anthropic's is 128.
+#[cfg(feature = "provider-openai")]
+const MAX_WIRE_TOOL_NAME: usize = 64;
+
+/// Provider-safe names for the tools one request advertises.
+///
+/// The canonical tool names are dotted — `workspace.read_file`, `shell.run`,
+/// `mcp.<server>.<tool>` — and appear in policy rules, approval patterns, hooks,
+/// the ledger and every client, so they cannot change. But Anthropic requires a
+/// tool `name` to match `^[a-zA-Z0-9_-]{1,128}$` and OpenAI `^[a-zA-Z0-9_-]{1,64}$`:
+/// a `.` is rejected with a 400 before the model runs. Local OpenAI-compatible
+/// servers do not validate names, which is why nothing noticed.
+///
+/// So the mapping exists only on the wire. [`for_tools`](Self::for_tools) derives a
+/// safe name for each advertised tool that needs one (`.` becomes `__`, any other
+/// stray character `_`, clipped to [`MAX_WIRE_TOOL_NAME`], made unique);
+/// [`definitions`](Self::definitions) is what the provider sees; and
+/// [`restore_in`](Self::restore_in) puts the canonical name back on the calls that
+/// come back, so nothing downstream ever handles a wire name. A name the model
+/// returns that is not in the map — it copied a canonical dotted name from the
+/// transcript, say — passes through unchanged and is dispatched as before.
+#[cfg(feature = "provider-openai")]
+#[derive(Debug, Default)]
+struct WireToolNames {
+    /// canonical name -> wire name, only for names that had to change.
+    to_wire: std::collections::HashMap<String, String>,
+    /// wire name -> canonical name, the inverse.
+    to_canonical: std::collections::HashMap<String, String>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl WireToolNames {
+    fn is_wire_safe(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= MAX_WIRE_TOOL_NAME
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// `name` with every character outside `[A-Za-z0-9_-]` replaced.
+    fn sanitise(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        for c in name.chars() {
+            match c {
+                '.' => out.push_str("__"),
+                c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => out.push(c),
+                _ => out.push('_'),
+            }
+        }
+        if out.is_empty() {
+            out.push_str("tool");
+        }
+        out
+    }
+
+    fn for_tools(tools: &[ToolDefinition]) -> Self {
+        let mut used: std::collections::HashSet<String> = tools
+            .iter()
+            .filter(|tool| Self::is_wire_safe(&tool.name))
+            .map(|tool| tool.name.clone())
+            .collect();
+        let mut names = Self::default();
+        for tool in tools {
+            if Self::is_wire_safe(&tool.name) || names.to_wire.contains_key(&tool.name) {
+                continue;
+            }
+            let base = Self::sanitise(&tool.name);
+            let mut candidate: String = base.chars().take(MAX_WIRE_TOOL_NAME).collect();
+            let mut attempt = 2usize;
+            // A name already taken (by a safe tool, or by another rewrite that
+            // sanitised to the same text: `a.b_c` and `a_b.c`) gets a numeric
+            // suffix, so two distinct tools can never share a wire name.
+            while !used.insert(candidate.clone()) {
+                let suffix = format!("_{attempt}");
+                let keep = MAX_WIRE_TOOL_NAME - suffix.len();
+                candidate = format!("{}{suffix}", base.chars().take(keep).collect::<String>());
+                attempt += 1;
+            }
+            names.to_wire.insert(tool.name.clone(), candidate.clone());
+            names.to_canonical.insert(candidate, tool.name.clone());
+        }
+        names
+    }
+
+    /// `tools` as the provider should see them: same schemas and descriptions,
+    /// wire-safe names.
+    fn definitions(&self, tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
+        tools
+            .iter()
+            .map(|tool| {
+                let mut tool = tool.clone();
+                if let Some(wire) = self.to_wire.get(&tool.name) {
+                    tool.name = wire.clone();
+                }
+                tool
+            })
+            .collect()
+    }
+
+    fn restore(&self, name: &str) -> String {
+        self.to_canonical
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Put the canonical name back on every call in `outcome`.
+    fn restore_in(&self, outcome: &mut StepOutcome) {
+        if self.to_canonical.is_empty() {
+            return;
+        }
+        if let ModelStep::CallTool { tool, .. } = &mut outcome.step {
+            *tool = self.restore(tool);
+        }
+        for call in &mut outcome.extra_calls {
+            call.tool = self.restore(&call.tool);
+        }
     }
 }
 
@@ -8749,7 +8924,17 @@ fn chat_response_to_step(
     }
 
     // Otherwise the completed turn is the final answer.
-    let text = response.text();
+    let mut text = response.text();
+    if hit_output_limit(response) {
+        // Reported `Completed` with a silently clipped answer would be a lie;
+        // say what happened in the answer itself.
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(
+            "[The model's reply was cut off at its output-token limit; the answer above is incomplete.]",
+        );
+    }
     StepOutcome::new(
         ModelStep::Finish {
             summary: if text.is_empty() {
@@ -14288,6 +14473,313 @@ context_tokens = 1000000
             outcome.preface.as_deref(),
             Some("Reading both files, then searching.")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool names on the wire. Anthropic and OpenAI reject `.` in a tool name
+    // (`^[a-zA-Z0-9_-]{1,128}$` / `{1,64}$`); the canonical names are dotted.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "provider-openai")]
+    fn is_valid_wire_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[cfg(feature = "provider-openai")]
+    fn named_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("the {name} tool"),
+            parameters: json!({"type": "object", "properties": {}}),
+            kind: agent_framework_core::tools::ToolKind::Function,
+            approval_mode: agent_framework_core::tools::ApprovalMode::NeverRequire,
+            executor: None,
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn every_catalogue_tool_gets_a_unique_provider_safe_name_that_round_trips() {
+        // The real catalogue, plus MCP-shaped names with the awkward characters a
+        // server name can carry.
+        let mut tools = static_tool_definitions();
+        for extra in [
+            "mcp.my server.do/thing",
+            "mcp.github.create_issue",
+            "mcp.a_b.c",
+            "mcp.a.b_c",
+        ] {
+            tools.push(named_tool(extra));
+        }
+        let names = WireToolNames::for_tools(&tools);
+        let wire = names.definitions(&tools);
+
+        let mut seen = std::collections::HashSet::new();
+        for (canonical, sent) in tools.iter().zip(&wire) {
+            assert!(
+                is_valid_wire_name(&sent.name),
+                "{} would be rejected by a provider as {:?}",
+                canonical.name,
+                sent.name
+            );
+            assert!(
+                seen.insert(sent.name.clone()),
+                "duplicate wire name {:?}",
+                sent.name
+            );
+            assert_eq!(names.restore(&sent.name), canonical.name);
+            assert_eq!(sent.description, canonical.description);
+            assert_eq!(sent.parameters, canonical.parameters);
+        }
+        // The two names that sanitise identically stayed distinct.
+        let a = names.to_wire.get("mcp.a_b.c").unwrap();
+        let b = names.to_wire.get("mcp.a.b_c").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn already_safe_names_are_untouched_and_long_names_are_clipped() {
+        let long = format!("mcp.{}.{}", "s".repeat(50), "t".repeat(50));
+        let tools = vec![named_tool("already_safe-name"), named_tool(&long)];
+        let names = WireToolNames::for_tools(&tools);
+        let wire = names.definitions(&tools);
+        assert_eq!(wire[0].name, "already_safe-name");
+        assert!(is_valid_wire_name(&wire[1].name));
+        assert_eq!(wire[1].name.len(), 64);
+        assert_eq!(names.restore(&wire[1].name), long);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn an_unknown_name_from_the_model_passes_through_unchanged() {
+        let names = WireToolNames::for_tools(&[named_tool("shell.run")]);
+        // The model copied a canonical name from the transcript, or invented one.
+        assert_eq!(names.restore("shell.run"), "shell.run");
+        assert_eq!(names.restore("no.such_tool"), "no.such_tool");
+    }
+
+    /// Records the tool names a request advertised and answers with a call to the
+    /// first of them, by the name it was given.
+    #[cfg(feature = "provider-openai")]
+    struct NameEchoClient {
+        advertised: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[async_trait]
+    impl agent_framework_core::client::ChatClient for NameEchoClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            _options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse>
+        {
+            unreachable!("the driver only ever uses the streaming path")
+        }
+
+        async fn get_streaming_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+            use agent_framework_core::types::{
+                ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent, Role,
+            };
+            let names: Vec<String> = options.tools.iter().map(|t| t.name.clone()).collect();
+            let first = names.first().cloned().expect("a tool was advertised");
+            *self.advertised.lock().expect("advertised") = names;
+            let update = ChatResponseUpdate {
+                contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call-1",
+                    &first,
+                    Some(FunctionArguments::Raw(json!({"path": "a.rs"}).to_string())),
+                ))],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    /// A client whose single streamed update is a tool call with the given raw
+    /// arguments and an optional finish reason.
+    #[cfg(feature = "provider-openai")]
+    struct OneUpdateClient {
+        contents: Vec<agent_framework_core::types::Content>,
+        finish_reason: Option<&'static str>,
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[async_trait]
+    impl agent_framework_core::client::ChatClient for OneUpdateClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            _options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse>
+        {
+            unreachable!("the driver only ever uses the streaming path")
+        }
+
+        async fn get_streaming_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            _options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+            use agent_framework_core::types::{ChatResponseUpdate, FinishReason, Role};
+            let update = ChatResponseUpdate {
+                contents: self.contents.clone(),
+                role: Some(Role::assistant()),
+                finish_reason: self.finish_reason.map(FinishReason::new),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    fn call_content(name: &str, raw_args: &str) -> agent_framework_core::types::Content {
+        use agent_framework_core::types::{Content, FunctionArguments, FunctionCallContent};
+        Content::FunctionCall(FunctionCallContent::new(
+            "call-1",
+            name,
+            Some(FunctionArguments::Raw(raw_args.to_string())),
+        ))
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn step_for(
+        contents: Vec<agent_framework_core::types::Content>,
+        finish_reason: Option<&'static str>,
+    ) -> anyhow::Result<StepOutcome> {
+        let driver = FrameworkModelDriver::new(
+            std::sync::Arc::new(OneUpdateClient {
+                contents,
+                finish_reason,
+            }),
+            ModelId("one-update".to_string()),
+        );
+        let mut sink = CollectingSink::default();
+        driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn a_tool_call_cut_off_at_the_output_limit_fails_with_the_real_cause() {
+        // The provider stopped at `max_tokens` halfway through a write_file call:
+        // the arguments are not valid JSON. This used to become `null` args and a
+        // misleading "requires a string `path`" the model could not act on.
+        let error = step_for(
+            vec![call_content(
+                "workspace.write_file",
+                r#"{"path": "src/big.rs", "content": "fn main() { let x = "#,
+            )],
+            Some("length"),
+        )
+        .await
+        .expect_err("a truncated call must not be run");
+        let text = error.to_string();
+        assert!(text.contains("cut off at its output-token limit"), "{text}");
+        assert!(text.contains("workspace.write_file"), "{text}");
+        assert!(
+            codypendent_providers::retry::retryable(&text).is_none(),
+            "re-sending the same request would be cut off at the same place"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn a_complete_tool_call_is_unaffected_by_the_length_check() {
+        // Same reason, but the arguments parse: the call finished before the limit.
+        let outcome = step_for(
+            vec![call_content("shell.run", r#"{"program": "ls"}"#)],
+            Some("length"),
+        )
+        .await
+        .expect("a well-formed call runs");
+        assert!(matches!(outcome.step, ModelStep::CallTool { .. }));
+
+        let outcome = step_for(
+            vec![call_content("shell.run", r#"{"program": "ls"}"#)],
+            None,
+        )
+        .await
+        .expect("no finish reason is normal");
+        assert!(matches!(outcome.step, ModelStep::CallTool { .. }));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn a_final_answer_cut_off_at_the_output_limit_says_so() {
+        let outcome = step_for(
+            vec![agent_framework_core::types::Content::text(
+                "The migration has three",
+            )],
+            Some("length"),
+        )
+        .await
+        .expect("a truncated answer is still an answer");
+        match outcome.step {
+            ModelStep::Finish { summary } => {
+                assert!(summary.starts_with("The migration has three"));
+                assert!(
+                    summary.contains("cut off at its output-token limit"),
+                    "{summary}"
+                );
+            }
+            other => panic!("expected a final answer, got {other:?}"),
+        }
+
+        let outcome = step_for(
+            vec![agent_framework_core::types::Content::text("All done.")],
+            Some("stop"),
+        )
+        .await
+        .unwrap();
+        match outcome.step {
+            ModelStep::Finish { summary } => assert_eq!(summary, "All done."),
+            other => panic!("expected a final answer, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn the_provider_sees_safe_names_and_the_loop_gets_the_canonical_one_back() {
+        let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let driver = FrameworkModelDriver::new(
+            std::sync::Arc::new(NameEchoClient {
+                advertised: advertised.clone(),
+            }),
+            ModelId("echo".to_string()),
+        );
+        let tools = vec![named_tool("workspace.read_file"), named_tool("shell.run")];
+        let mut sink = CollectingSink::default();
+
+        let outcome = driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &tools, &mut sink)
+            .await
+            .expect("step");
+
+        let sent = advertised.lock().unwrap().clone();
+        assert_eq!(sent, vec!["workspace__read_file", "shell__run"]);
+        assert!(sent.iter().all(|n| is_valid_wire_name(n)));
+        match outcome.step {
+            ModelStep::CallTool { tool, args } => {
+                assert_eq!(
+                    tool, "workspace.read_file",
+                    "dispatch sees the canonical name"
+                );
+                assert_eq!(args["path"], json!("a.rs"));
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

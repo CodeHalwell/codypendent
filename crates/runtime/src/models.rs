@@ -54,6 +54,15 @@ pub type Result<T> = std::result::Result<T, ModelsError>;
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Output-token ceiling sent to Anthropic when the caller sets none. The API
+/// REQUIRES `max_tokens`, and this used to be 4096: a single `write_file` for a
+/// ~400-line source file does not fit, so the model's tool call was cut off
+/// mid-JSON and the run looped on a confusing "requires a string `path`" error.
+/// 16K holds a large file or a long answer and is accepted by every current
+/// Claude model (their output ceilings are 64K and up).
+#[cfg(feature = "provider-openai")]
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 16_384;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -2028,7 +2037,7 @@ impl NativeChatClient {
             NativeProtocol::Anthropic => {
                 let mut body = serde_json::json!({
                     "model": options.model.as_deref().unwrap_or(&self.model),
-                    "max_tokens": options.max_tokens.unwrap_or(4096),
+                    "max_tokens": options.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
                     "messages": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| Ok(serde_json::json!({"role": if m.role.as_str() == "assistant" {"assistant"} else {"user"}, "content": content_json(m, true)?}))).collect::<agent_framework_core::error::Result<Vec<_>>>()?
                 });
                 if let Some(system) = system {
@@ -2126,7 +2135,7 @@ impl NativeChatClient {
             .json(&body)
             .send()
             .await
-            .map_err(|_| Error::service("native provider request failed"))?;
+            .map_err(|error| native_transport_error("native provider request", &error))?;
         if !response.status().is_success() {
             let status = response.status();
             // Read the pacing hint before the body: `bounded_response` consumes
@@ -2361,10 +2370,8 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
                                 eof = true;
                             }
                         },
-                        Some(Err(_)) => {
-                            queue.push_back(Err(agent_framework_core::error::Error::service(
-                                "native stream transport failed",
-                            )));
+                        Some(Err(error)) => {
+                            queue.push_back(Err(native_transport_error("native stream", &error)));
                             eof = true;
                         }
                         None => {
@@ -2575,6 +2582,32 @@ impl SseDecoder {
     }
 }
 
+/// Describe a transport failure on the native (Anthropic / Gemini) path without
+/// echoing it.
+///
+/// `reqwest::Error`'s `Display` includes the request URL, and Gemini's API key
+/// rides in the query string, so the text must never be forwarded — which is why
+/// this path used to collapse every failure to one fixed string. That string
+/// matched nothing in the retry classifier, so a connect timeout, a reset or a
+/// DNS blip failed the run at once while the OpenAI-compatible path (which does
+/// format its error) retried. The *kind* is safe to name, so it is spelled with
+/// the phrases the classifier recognises ("timed out", "connection error");
+/// anything else stays the generic, non-retried message.
+#[cfg(feature = "provider-openai")]
+fn native_transport_error(
+    what: &str,
+    error: &reqwest::Error,
+) -> agent_framework_core::error::Error {
+    let message = if error.is_timeout() {
+        format!("{what} timed out")
+    } else if error.is_connect() {
+        format!("{what} connection error")
+    } else {
+        format!("{what} failed")
+    };
+    agent_framework_core::error::Error::service(message)
+}
+
 #[cfg(feature = "provider-openai")]
 struct StreamNormalizer {
     protocol: NativeProtocol,
@@ -2747,9 +2780,20 @@ impl StreamNormalizer {
                             return Err(Error::service("Anthropic stream ended abnormally"));
                         }
                     }
+                    // `stop_reason: max_tokens` means the reply was CUT OFF, not
+                    // finished. Surface it as the framework's `length` finish
+                    // reason so the loop can tell a truncated tool call from a
+                    // completed one instead of treating both as success.
+                    let truncated = value.pointer("/delta/stop_reason").and_then(|v| v.as_str())
+                        == Some("max_tokens");
                     // `message_delta` carries the message's final output count.
                     Ok(ChatResponseUpdate {
                         contents: self.usage_contents(&value),
+                        finish_reason: truncated.then(|| {
+                            agent_framework_core::types::FinishReason::new(
+                                agent_framework_core::types::FinishReason::LENGTH,
+                            )
+                        }),
                         ..Default::default()
                     })
                 }
@@ -2773,6 +2817,7 @@ impl StreamNormalizer {
                 if value.pointer("/promptFeedback/blockReason").is_some() {
                     return Err(Error::service("Gemini stream was blocked"));
                 }
+                let mut truncated = false;
                 if let Some(reason) = value
                     .pointer("/candidates/0/finishReason")
                     .and_then(|v| v.as_str())
@@ -2780,6 +2825,7 @@ impl StreamNormalizer {
                     if !matches!(reason, "STOP" | "MAX_TOKENS") {
                         return Err(Error::service("Gemini stream ended abnormally"));
                     }
+                    truncated = reason == "MAX_TOKENS";
                     self.terminal = true;
                 }
                 let parts = value
@@ -2821,6 +2867,11 @@ impl StreamNormalizer {
                 contents.extend(self.usage_contents(&value));
                 Ok(ChatResponseUpdate {
                     contents,
+                    finish_reason: truncated.then(|| {
+                        agent_framework_core::types::FinishReason::new(
+                            agent_framework_core::types::FinishReason::LENGTH,
+                        )
+                    }),
                     ..Default::default()
                 })
             }
@@ -5789,6 +5840,98 @@ prefix = "Key "
         assert_eq!(usage.cache_read_input_token_count, Some(7));
         assert_eq!(usage.cache_creation_input_token_count, Some(3));
         assert_eq!(response.text(), "hi");
+    }
+
+    /// `stop_reason: max_tokens` is a CUT-OFF reply, not a finished one. Both
+    /// native streams must report it as the framework's `length` finish reason,
+    /// or the loop cannot tell a truncated tool call from a complete one.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn a_max_tokens_stop_reaches_the_assembled_response_as_length() {
+        use agent_framework_core::types::{ChatResponse, FinishReason};
+
+        let mut anthropic = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let updates: Vec<_> = [
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}"#,
+        ]
+        .into_iter()
+        .map(|event| anthropic.normalize(event.into()).unwrap().unwrap())
+        .collect();
+        let response = ChatResponse::from_updates(updates);
+        assert_eq!(
+            response.finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+
+        let mut gemini = StreamNormalizer::new(NativeProtocol::Gemini);
+        let update = gemini
+            .normalize(
+                r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}"#
+                    .into(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ChatResponse::from_updates(vec![update]).finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+
+        // A normal stop is not mistaken for truncation.
+        let mut finished = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let done = finished
+            .normalize(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#
+                    .into(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(ChatResponse::from_updates(vec![done]).finish_reason, None);
+    }
+
+    /// A connect failure on the native path must be spelled so the retry
+    /// classifier recognises it — and must not echo the URL (Gemini's key is in
+    /// the query string).
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn a_native_connect_failure_is_retryable_and_never_echoes_the_url() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        // A port that was just free and is now closed: connection refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let client = NativeChatClient::new(
+            &ModelConfig {
+                id: model_id("anthropic/down"),
+                provider: "openai-compatible".into(),
+                base_url: format!("http://127.0.0.1:{port}"),
+                model: "claude-test".into(),
+                api_key_env: String::new(),
+                provider_id: Some("anthropic".into()),
+                context_tokens: None,
+            },
+            NativeProtocol::Anthropic,
+            "sk-secret-key",
+        )
+        .unwrap();
+        let error = client
+            .get_response(vec![Message::user("hi")], ChatOptions::new())
+            .await
+            .expect_err("nothing is listening");
+        let text = error.to_string();
+        assert!(text.contains("connection error"), "got {text:?}");
+        assert!(
+            !text.contains("127.0.0.1"),
+            "the URL must not be echoed: {text:?}"
+        );
+        assert!(!text.contains("sk-secret-key"));
+        assert!(
+            codypendent_providers::retry::retryable(&text).is_some(),
+            "the retry classifier must treat a connect failure as transient: {text:?}"
+        );
     }
 
     /// The Gemini half of the same defect, on both wire shapes: a
