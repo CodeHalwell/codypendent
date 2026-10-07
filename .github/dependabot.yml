@@ -1,25 +1,196 @@
+---
+# Dependency updates.
+#
+# Two things this file is deliberately shaped around (2026-10-07 review):
+#
+# * COVERAGE. Every lockfile in the repository is listed. Before this, only the
+#   root Cargo workspace, `sdk/ui` and `extensions/vscode` were — so six npm
+#   packages and the desktop app's separate Cargo workspace
+#   (`apps/desktop/src-tauri`, its own `Cargo.lock`) went unwatched, and CI's
+#   `npm audit` / `cargo deny` failed on advisories nobody had been told about.
+#
+# * GROUPING. One PR per dependency left more than twenty open at once, several of which
+#   could not pass CI alone because their crates must move together (a `hmac`
+#   bump without `sha2`/`digest` does not compile; a tree-sitter grammar built
+#   for a newer ABI than the runtime is rejected at parse time). Dependencies
+#   that move together are grouped so they arrive as ONE reviewable PR, and the
+#   remaining minor/patch updates are batched per ecosystem. Majors stay
+#   individual so a breaking change is never hidden inside a batch.
+#
+# A dependency belongs to the FIRST group whose patterns match it, so the
+# specific groups come before the catch-all one.
 version: 2
 updates:
+  # --- Rust: root workspace ------------------------------------------------
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
+    groups:
+      # The RustCrypto "next" generation (digest 0.11, crypto-common 0.2,
+      # hybrid-array) is a coordinated release: `hmac`, `sha2`, `chacha20poly1305`
+      # and friends only compile against each other at matching generations.
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
+          - "digest"
+          - "chacha20poly1305"
+          - "chacha20"
+          - "poly1305"
+          - "aead"
+          - "cipher"
+          - "crypto-common"
+          - "ed25519-dalek"
+          - "curve25519-dalek"
+      # The grammar crates declare the tree-sitter ABI they were generated for;
+      # a grammar newer than the runtime fails at parse time, not at build time.
+      tree-sitter:
+        patterns:
+          - "tree-sitter*"
+      rust-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # sqlx 0.9 requires every query string to be `&'static str` or wrapped in
+      # `AssertSqlSafe(..)` (the `SqlSafeStr` change) — a mechanical but
+      # repository-wide edit across ~140 files that wants its own PR, not a
+      # Dependabot bump. Remove this entry when that migration is scheduled.
+      - dependency-name: "sqlx"
+        versions: [">=0.9.0"]
 
+  # --- Rust: the desktop app's own workspace -------------------------------
+  - package-ecosystem: "cargo"
+    directory: "/apps/desktop/src-tauri"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      rust-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- npm -----------------------------------------------------------------
+  # React, react-dom and their types are pinned to the SAME exact version in
+  # `sdk/ui`, `extensions/vscode` and the apps: two React copies in one bundle
+  # break hooks. They are grouped so a bump moves every copy together, and the
+  # PR has to be applied to all packages at once.
   - package-ecosystem: "npm"
     directory: "/sdk/ui"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # `peerDependencies` pins react-reconciler to 0.31.x on purpose: the custom
+      # renderer's host config is written against that API, and 0.34 fails the
+      # renderer tests (react-renderer, first-party catalogue). Lift this when
+      # the host config is ported.
+      - dependency-name: "react-reconciler"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "@types/react-reconciler"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: "npm"
     directory: "/extensions/vscode"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # ESLint 9+ drops `.eslintrc.cjs` in favour of flat config, and ESLint 10
+      # adds rules (e.g. `no-useless-assignment`) the extension's sources trip.
+      # A migration, not a bump.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
 
+  # Packages that had no coverage at all.
+  - package-ecosystem: "npm"
+    directory: "/sdk/protocol"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/sdk/control-plane"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/sdk/control-plane-react"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/sdk/remote-ui"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/apps/desktop"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # --- GitHub Actions ------------------------------------------------------
+  # Every action is pinned to a full commit SHA (see
+  # `.github/scripts/check_release_workflow_security.py`); Dependabot rewrites the
+  # SHA and its version comment together. Batched so one PR carries the lot.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
