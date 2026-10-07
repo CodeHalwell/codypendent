@@ -33,7 +33,7 @@ rand = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP & WebSockets
-axum = { version = "0.7", features = ["ws", "macros", "json"] }
+axum = { version = "0.8", features = ["ws", "macros", "json"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
