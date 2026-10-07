@@ -130,7 +130,14 @@ fn open_scoped(
                     &dir,
                     leaf,
                     OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | leaf_flags,
-                    Mode::from_raw_mode(0o600),
+                    // 0o666 and let the kernel apply the umask, exactly as an
+                    // editor or `touch` would (0o644 under the usual 022). This was
+                    // 0o600, so every file the agent created came out owner-only
+                    // while its neighbours were not — invisible to a build running
+                    // as another uid (a container, a CI runner), and a surprise in
+                    // review. An existing file's mode is still preserved on
+                    // overwrite; only creation changes.
+                    Mode::from_raw_mode(0o666),
                 )
                 .map_err(errno_to_io)?,
                 true,

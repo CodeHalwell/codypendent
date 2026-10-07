@@ -170,6 +170,46 @@ mod tests {
         );
     }
 
+    /// A new file gets the mode any ordinary tool would give it (0o666 less the
+    /// umask), not a private 0o600 that makes it unreadable to a build running as
+    /// another user. Compared against a file the OS creates in the same directory
+    /// so the assertion does not depend on the host's umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_file_gets_the_modes_an_ordinary_create_would() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+
+        std::fs::File::create(root.join("reference")).unwrap();
+        let expected = std::fs::metadata(root.join("reference"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+
+        WriteFile::execute(
+            &WriteFileInput {
+                path: root.join("created-by-the-tool.rs"),
+                content: "fn main() {}\n".to_string(),
+            },
+            &scope,
+        )
+        .await
+        .unwrap();
+        let actual = std::fs::metadata(root.join("created-by-the-tool.rs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            actual, expected,
+            "new files follow the umask, not a fixed 0o600"
+        );
+    }
+
     #[tokio::test]
     async fn overwrites_an_existing_file() {
         let dir = tempdir().unwrap();

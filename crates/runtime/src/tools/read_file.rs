@@ -10,6 +10,18 @@ use super::{secure_fs, CapabilityKind, ToolError};
 
 /// Default line ceiling when no explicit range is requested.
 const DEFAULT_MAX_LINES: usize = 200;
+/// Most lines one call returns, however wide a range was asked for. A model
+/// that sends `range: [1, 9223372036854775807]` for a large file used to make
+/// the daemon retain every line (tens of millions of `String`s, over 1.5 GB) and
+/// push all of it into the transcript. The excerpt reports `end_line` and
+/// `total_lines`, so the caller sees where the cut fell and asks for the next
+/// window.
+const MAX_RANGE_LINES: usize = 2_000;
+/// Most characters of any one line returned. A minified bundle is a single
+/// multi-megabyte line; the rest is replaced by a count of what was left out.
+const MAX_LINE_CHARS: usize = 2_000;
+/// Most bytes of numbered excerpt returned in one call, whatever the line count.
+const MAX_EXCERPT_BYTES: usize = 128 * 1024;
 /// Upper bound on the bytes the reader will produce, so a single pathological
 /// line (e.g. a minified multi-hundred-MB file) can never be buffered whole.
 /// Far larger than any real source file; content beyond it is not read.
@@ -123,10 +135,13 @@ impl ReadFile {
 
         // The inclusive window we retain: the requested span, or the first
         // DEFAULT_MAX_LINES lines by default. Only these lines are held in memory.
-        let (want_start, want_end) = match input.range {
+        let (want_start, requested_end) = match input.range {
             Some((start, end)) => (start, end),
             None => (1, DEFAULT_MAX_LINES),
         };
+        // Cap the window itself, before anything is retained: `end - start` is
+        // model-controlled and was used as-is.
+        let want_end = requested_end.min(want_start.saturating_add(MAX_RANGE_LINES - 1));
 
         // Refuse non-regular files: a FIFO/device inside the scope would block
         // the read forever (a pipe never reaches EOF while a writer can appear).
@@ -162,15 +177,30 @@ impl ReadFile {
         };
 
         // Emit the retained lines whose absolute number falls in [start, end].
-        // The window's first entry is line `want_start`.
+        // The window's first entry is line `want_start`. Output stops at the
+        // byte budget, and `end` is pulled back to the last line actually shown
+        // so the excerpt never claims lines it did not include.
         let mut content = String::new();
+        let mut end = end;
         if start > 0 {
+            let mut last_shown = start - 1;
             for (offset, line) in window.iter().enumerate() {
                 let number = want_start + offset;
-                if number >= start && number <= end {
-                    content.push_str(&format!("{number:>6}\t{line}\n"));
+                if number < start {
+                    continue;
                 }
+                if number > end {
+                    break;
+                }
+                let rendered = format!("{number:>6}\t{}\n", clip_line(line));
+                // Always show at least one line, however wide.
+                if last_shown >= start && content.len() + rendered.len() > MAX_EXCERPT_BYTES {
+                    break;
+                }
+                content.push_str(&rendered);
+                last_shown = number;
             }
+            end = last_shown;
         }
 
         Ok(FileExcerpt {
@@ -181,6 +211,21 @@ impl ReadFile {
             truncated: end < total || start > 1,
             content,
         })
+    }
+}
+
+/// `line`, or its first [`MAX_LINE_CHARS`] characters followed by how many were
+/// dropped. Cuts on a character boundary.
+fn clip_line(line: &str) -> std::borrow::Cow<'_, str> {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        Some((cut, _)) => {
+            let dropped = line[cut..].chars().count();
+            std::borrow::Cow::Owned(format!(
+                "{}… [{dropped} more characters not shown]",
+                &line[..cut]
+            ))
+        }
+        None => std::borrow::Cow::Borrowed(line),
     }
 }
 
@@ -292,6 +337,92 @@ mod tests {
             }
             other => panic!("expected FileNotFound, got {other:?}"),
         }
+    }
+
+    async fn read(path: PathBuf, range: Option<(usize, usize)>, scope: &PathScope) -> FileExcerpt {
+        ReadFile::execute(&ReadFileInput { path, range }, scope)
+            .await
+            .expect("read")
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_range_is_capped_and_reports_where_the_cut_fell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let body: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("big.txt"), body).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        // The shape a model can send: an end far past anything real.
+        let excerpt = read(root.join("big.txt"), Some((1, usize::MAX)), &scope).await;
+        assert_eq!(excerpt.start_line, 1);
+        assert_eq!(excerpt.end_line, MAX_RANGE_LINES);
+        assert_eq!(excerpt.total_lines, 5_000);
+        assert!(excerpt.truncated, "the cut must be visible to the caller");
+        assert_eq!(excerpt.content.lines().count(), MAX_RANGE_LINES);
+
+        // The next window picks up where the first stopped.
+        let next = read(
+            root.join("big.txt"),
+            Some((excerpt.end_line + 1, usize::MAX)),
+            &scope,
+        )
+        .await;
+        assert_eq!(next.start_line, MAX_RANGE_LINES + 1);
+        assert_eq!(next.end_line, 2 * MAX_RANGE_LINES);
+    }
+
+    #[tokio::test]
+    async fn a_window_ending_inside_the_cap_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("small.txt"), body).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let excerpt = read(root.join("small.txt"), Some((10, 20)), &scope).await;
+        assert_eq!((excerpt.start_line, excerpt.end_line), (10, 20));
+        assert_eq!(excerpt.total_lines, 50);
+        assert!(excerpt.content.starts_with("    10\tline 10\n"));
+    }
+
+    #[tokio::test]
+    async fn one_enormous_line_is_clipped_not_returned_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("bundle.min.js"),
+            format!("{}\nsecond\n", "x".repeat(500_000)),
+        )
+        .unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let excerpt = read(root.join("bundle.min.js"), Some((1, 2)), &scope).await;
+        assert!(
+            excerpt.content.len() < 4_096,
+            "got {} bytes",
+            excerpt.content.len()
+        );
+        assert!(excerpt.content.contains("more characters not shown"));
+        assert!(excerpt.content.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn the_excerpt_stops_at_the_byte_budget_and_end_line_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // 1,500 lines of ~1,000 characters: under the line cap, over the byte cap.
+        let body: String = (1..=1_500)
+            .map(|n| format!("{n:04} {}\n", "y".repeat(1_000)))
+            .collect();
+        std::fs::write(root.join("wide.txt"), body).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let excerpt = read(root.join("wide.txt"), Some((1, 1_500)), &scope).await;
+        assert!(excerpt.content.len() <= MAX_EXCERPT_BYTES);
+        assert!(excerpt.end_line < 1_500, "ended at {}", excerpt.end_line);
+        assert_eq!(excerpt.content.lines().count(), excerpt.end_line);
+        assert!(excerpt.truncated);
     }
 
     #[tokio::test]
