@@ -133,7 +133,7 @@ futures = "0.3"
 # Identifiers and time
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-croner = "2.1"
+croner = "3.0"
 chrono-tz = "0.10"
 url = "2"
 
