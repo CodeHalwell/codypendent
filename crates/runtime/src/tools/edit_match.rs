@@ -44,6 +44,15 @@ pub(crate) enum MatchFailure {
 /// the single- and multiple-candidate paths).
 const SIMILARITY_THRESHOLD: f64 = 0.65;
 
+/// How close a runner-up block's similarity must be to the best block's for the
+/// two to count as rivals. The reference implementation takes the best-scoring
+/// block outright, so two blocks that differ from the search in different places
+/// (0.93 vs 0.93, or 0.93 vs 0.91) were resolved by file order — the edit landed
+/// on whichever came first, and the model was told "(1 via fuzzy match)". A tie,
+/// or something close enough to one, is the model not having said which block it
+/// meant, so every rival is returned and the uniqueness check refuses the edit.
+const NEAR_TIE_MARGIN: f64 = 0.05;
+
 pub(crate) fn find_unique_span(content: &str, search: &str) -> Result<MatchResult, MatchFailure> {
     type Replacer = fn(&str, &str) -> Vec<String>;
     const CASCADE: &[(MatchStage, Replacer)] = &[
@@ -62,6 +71,13 @@ pub(crate) fn find_unique_span(content: &str, search: &str) -> Result<MatchResul
     let mut found_any = false;
     let mut first_ambiguous: Option<usize> = None;
     for (stage, replacer) in CASCADE {
+        // A whitespace-only search carries no anchor for a fuzzy stage to match
+        // on: every blank line "matches" it once trimmed, and the empty candidate
+        // that results is found at byte 0, so the edit would prepend the
+        // replacement to the file. Only a byte-exact hit can be trusted.
+        if *stage != MatchStage::Exact && search.trim().is_empty() {
+            continue;
+        }
         let candidates = replacer(content, search);
         // A normalizing stage answers "where does the search match under THIS
         // equivalence?" and reports each hit as the raw text it found. Two hits
@@ -76,6 +92,11 @@ pub(crate) fn find_unique_span(content: &str, search: &str) -> Result<MatchResul
         // occurs twice verbatim already was.
         let locations = distinct_locations(content, &candidates);
         for candidate in &candidates {
+            // `"".find("")` is `Some(0)`: an empty candidate would "match" at the
+            // start of the file whatever the search was.
+            if candidate.is_empty() {
+                continue;
+            }
             let Some(start) = content.find(candidate.as_str()) else {
                 continue;
             };
@@ -195,7 +216,9 @@ fn line_trimmed(content: &str, search: &str) -> Vec<String> {
 /// occurrence only), block-size tolerance max(1, floor(search_lines * 0.25)),
 /// middle-line Levenshtein similarity with threshold 0.65:
 /// - one candidate: incremental sum with early exit at the threshold;
-/// - many: average similarity, best candidate wins if >= 0.65;
+/// - many: average similarity; the best wins if >= 0.65 AND no rival is within
+///   `NEAR_TIE_MARGIN` of it (otherwise every rival is returned, so the caller's
+///   uniqueness check reports the edit as ambiguous instead of picking by file order);
 /// - no comparable middle lines => similarity 1.0.
 fn block_anchor(content: &str, search: &str) -> Vec<String> {
     let mut search_lines: Vec<&str> = search.split('\n').collect();
@@ -254,36 +277,25 @@ fn block_anchor(content: &str, search: &str) -> Vec<String> {
         }
     }
 
-    if scored_candidates.is_empty() {
-        Vec::new()
-    } else if scored_candidates.len() == 1 {
-        if scored_candidates[0].0 >= SIMILARITY_THRESHOLD {
-            vec![scored_candidates.remove(0).1]
-        } else {
-            Vec::new()
-        }
-    } else {
-        // Multiple candidates: pick the best
-        let mut best: Option<(f64, String)> = None;
-        for (sim, cand) in scored_candidates {
-            if let Some((best_sim, _)) = &best {
-                if sim > *best_sim {
-                    best = Some((sim, cand));
-                }
-            } else {
-                best = Some((sim, cand));
-            }
-        }
-        if let Some((best_sim, best_cand)) = best {
-            if best_sim >= SIMILARITY_THRESHOLD {
-                vec![best_cand]
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
+    // Nothing reached the floor: no candidate.
+    let best = scored_candidates
+        .iter()
+        .map(|(similarity, _)| *similarity)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if scored_candidates.is_empty() || best < SIMILARITY_THRESHOLD {
+        return Vec::new();
     }
+    // The best block, plus any rival close enough that choosing between them
+    // would be a coin flip (see `NEAR_TIE_MARGIN`). With one block this is the
+    // old single-candidate path; with a clear winner it is still just the
+    // winner; only a genuine tie now reaches the caller's uniqueness check.
+    scored_candidates
+        .into_iter()
+        .filter(|(similarity, _)| {
+            *similarity >= SIMILARITY_THRESHOLD && *similarity >= best - NEAR_TIE_MARGIN
+        })
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 /// Classic Levenshtein over chars; either side empty returns the other's
@@ -625,7 +637,9 @@ fn trimmed_boundary(content: &str, search: &str) -> Vec<String> {
 
 /// Stage 8: anchors as stage 3 but the block must have EXACTLY the search's
 /// line count and >= 50% of non-empty trimmed middle pairs must be equal
-/// (zero comparable pairs accepts); first hit only.
+/// (zero comparable pairs accepts). EVERY hit is returned, not the first: two
+/// blocks that both qualify are two possible targets, and the caller's
+/// uniqueness check must see both to refuse the edit.
 fn context_aware(content: &str, search: &str) -> Vec<String> {
     let mut search_lines: Vec<&str> = search.split('\n').collect();
     if search_lines.last() == Some(&"") && search_lines.len() > 1 {
@@ -643,6 +657,7 @@ fn context_aware(content: &str, search: &str) -> Vec<String> {
         return Vec::new();
     }
 
+    let mut candidates = Vec::new();
     for i in 0..=spans.len() - k {
         let j = i + k - 1;
         if spans[i].2.trim() == first_anchor && spans[j].2.trim() == last_anchor {
@@ -661,11 +676,11 @@ fn context_aware(content: &str, search: &str) -> Vec<String> {
             if total_non_empty == 0 || (matching as f64 / total_non_empty as f64) >= 0.5 {
                 let start = spans[i].0;
                 let end = spans[j].1;
-                return vec![content[start..end].to_string()];
+                candidates.push(content[start..end].to_string());
             }
         }
     }
-    Vec::new()
+    candidates
 }
 
 /// Stage 9: one candidate per exact occurrence.
@@ -787,6 +802,60 @@ mod tests {
         let search = "start\nmid A\nend";
         let res = find_unique_span(content, search).expect("match");
         assert_eq!(res.stage, MatchStage::Exact);
+    }
+
+    #[test]
+    fn block_anchor_refuses_two_equally_plausible_blocks() {
+        // Neither block matches the search exactly; each differs from it on a
+        // different middle line, so both score the same. File order used to
+        // decide, and the edit silently landed on the first.
+        let content = "if x {\n    do_a();\n    do_c();\n}\n\nfn other() {}\n\nif x {\n    do_q();\n    do_b();\n}\n";
+        let search = "if x {\n    do_a();\n    do_b();\n}";
+        assert_eq!(block_anchor(content, search).len(), 2);
+        assert_eq!(
+            find_unique_span(content, search),
+            Err(MatchFailure::Ambiguous { count: 2 })
+        );
+    }
+
+    #[test]
+    fn block_anchor_still_picks_a_clear_winner() {
+        let content = "fn f() {\n    aaaa();\n    bbbb();\n    cccc();\n}\n\nfn f() {\n    aaaa();\n    bbzz();\n    cczz();\n}\n";
+        // Block 1 differs on one character; block 2 on four. Both clear the 0.65
+        // floor, but they are not within the tie margin, so block 1 still wins.
+        let search = "fn f() {\n    aaaa();\n    bbbb();\n    ccccX();\n}";
+        let found = find_unique_span(content, search).expect("the closer block wins");
+        assert_eq!(found.stage, MatchStage::BlockAnchor);
+        assert_eq!(found.start, 0);
+    }
+
+    #[test]
+    fn context_aware_refuses_two_qualifying_blocks() {
+        // Half of each block's middle lines equal the search's, so stage 9
+        // accepts both; "first hit only" used to edit whichever came first.
+        let content = "begin\nx = 1\nOTHER_ONE\nend\n\nbegin\nx = 1\nOTHER_TWO\nend\n";
+        let search = "begin\nx = 1\nmiddle_a\nend";
+        assert_eq!(context_aware(content, search).len(), 2);
+        assert_eq!(
+            find_unique_span(content, search),
+            Err(MatchFailure::Ambiguous { count: 2 })
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_search_never_edits_the_start_of_the_file() {
+        // Two spaces in the file, three in the search: nothing matches byte for
+        // byte. The fuzzy stages used to "match" the blank lines and return an
+        // empty span at offset 0, prepending the replacement to the file.
+        let content = "a\n\n  \nb\n";
+        assert_eq!(
+            find_unique_span(content, "   "),
+            Err(MatchFailure::NotFound)
+        );
+        // A whitespace search that IS in the file byte for byte is still exact.
+        let found = find_unique_span("a\n\t\nb\n", "\t").expect("exact whitespace match");
+        assert_eq!(found.stage, MatchStage::Exact);
+        assert_eq!((found.start, found.len), (2, 1));
     }
 
     #[test]
