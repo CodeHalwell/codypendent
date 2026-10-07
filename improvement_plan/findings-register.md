@@ -66,6 +66,37 @@ exist); the "Not covered" list below remains accurate for both scans.
 
 ---
 
+## Re-check — whole-repository review (2026-10-07)
+
+Run at `76448fc` (v0.14.0) as part of `docs/reviews/2026-10-07-review.md`. Each entry named
+below was read against the current code. Entries not named were not re-checked. New findings
+from that review are in its section 4 and are not duplicated here.
+
+| Entry | State on 2026-10-07 | Evidence |
+|---|---|---|
+| B2 directory walk before the ownership gate | Fixed for attach | `server.rs`: the attach path warms the graph only after `principal_may_use_session`; both paths refuse an implausible root through `plausible_repository_root`. A same-uid client can still name any plausible checkout at create time (see D11). |
+| B3 learned-pattern argument tail | **Open** | `policy/arity.rs` unchanged in substance. Needs a product decision; see review section 4, item 1. |
+| B4 hook engine fails open on an unparseable spec | Partly fixed | An approved hook whose stored spec will not parse is now quarantined with an operator-facing notice (`QuarantinedHook`) instead of vanishing silently. It still does not block when its policy said `failure = "block"`. |
+| B6 database permissions | Fixed | `db.rs` sets 0600 on the database, `-wal` and `-shm`. |
+| C1 lost cancel/pause | Fixed | Verified 2026-09-23 (`RunControlRegistry`). |
+| C2 panicking workflow drive | **Open** | `cancellations.finish` and `prune_run_lock` still run inline after the drive returns (`workflows.rs`), so a panic skips both. See review section 4, item 7. |
+| C5 `auth.json` lock and temp path | Fixed | `auth.rs` takes a process mutex plus an advisory `flock` on `.auth.lock`, and the temp name carries the pid. |
+| C8 remote UI worker quota and epochs | **Open, narrowed** | `stop_session` and `stop_session_target` now remove only their own epochs, and an old task no longer removes a replacement generation's entry. `stop_plugin` and `shutdown` still clear the whole epoch set, and the task's cleanup still runs inline after the await, so a panic in `run_worker` leaks a quota slot. See review section 4, item 7. |
+| C9 `ensure_scanned` pre-lock revision | **Fixed by the review** | The revision is re-sampled after the repository lock is taken. |
+| C10 unbounded `read_file` range | **Fixed by the review** | 2,000 lines, 2,000 characters a line and 128 KiB a call; four new tests. |
+| C11 `WorktreeReleaseGuard` paths disagree | **Fixed by the review** | Only a run's own leased worktree is swept, on the normal and the unwind path alike. Two new tests. The old behaviour was worse than the entry says: releasing a read-only run killed every other run's interactive processes in the same checkout. |
+| C12 deferred read-then-write transactions | **Fixed** (`checkpoints.rs` earlier, the rest by the review) | `checkpoints.rs` already used `BEGIN IMMEDIATE` at `76448fc`. The review added it to `learning.rs` (three sites) and `model_profiles.rs`, which had the same defect. Reproduced first: three of three concurrent-capture runs lost records on the old code. |
+| C13 no event retention | **Open** | Nothing deletes from `events`; see review section 4, item 4. |
+
+Not in this register, found and fixed by the review: provider-unsafe tool names on the wire,
+the Anthropic 4,096-token output cap with truncation treated as success, ambiguous fuzzy
+edit matches resolved by file order, a whitespace-only edit search, repository-controlled
+instruction-file symlinks, a repository `policy.toml` symlink widening the file scope, mode
+0600 on agent-created files, and a transport-error classification gap on the native
+Anthropic and Gemini paths. See the review, section 3.
+
+---
+
 ## A. Blockers in uncommitted code — do not commit as-is
 
 ### A1 · `edit_file` panics and can silently corrupt source files — CRITICAL
@@ -227,7 +258,7 @@ Second defect at those three sites: they use `classify` where the module explici
 `resolve` as the no-TOCTOU seam. `classify(cwd)` + `current_dir(cwd)` is a check/act gap even
 once B1 is fixed.
 
-### B2 · Unauthenticated peer can force an arbitrary directory walk — MEDIUM
+### B2 · Unauthenticated peer can force an arbitrary directory walk — MEDIUM — **FIXED for attach (verified 2026-10-07)**
 
 `crates/daemon/src/server.rs:5782` calls `maybe_scan_repository(state, repository)` **before**
 the ownership gate at `:5786-5803`, deliberately ("so a probing re-attach with a remembered id
@@ -239,7 +270,7 @@ graph. Unauthorized read side effect plus trivial CPU/IO amplification (`/`, ano
 `$HOME`). Reached from `CreateSession` too (`:3648`). **Fix:** gate first, warm after, and
 constrain the path the way `principal_owns_repository` does for `SearchWorkspaceFiles`.
 
-### B3 · Learned approval patterns leave the argument tail unconstrained — MEDIUM-HIGH
+### B3 · Learned approval patterns leave the argument tail unconstrained — MEDIUM-HIGH — **OPEN (re-checked 2026-10-07)**
 
 `crates/daemon/src/policy/arity.rs:214-256`. `command_pattern` refuses to learn when a flag
 appears in the learned **prefix**, but `pattern_matches` accepts **any tail**. For allow-listed
@@ -253,7 +284,7 @@ programs whose code-execution switch is a trailing flag, one "always allow" is a
 The `git -c` case already guarded at `:229-238` is one instance of a general problem. Not
 reachable via env (`command_pattern` refuses non-empty `environment`) — purely via arg flags.
 
-### B4 · Hook engine fails open on an unparseable spec — MEDIUM
+### B4 · Hook engine fails open on an unparseable spec — MEDIUM — **PARTLY FIXED (verified 2026-10-07)**
 
 `crates/daemon/src/hook_engine.rs:71-77`: `if let Ok(spec) = serde_json::from_str::<HookSpec>(...)`
 drops an approved hook whose stored `spec_json` no longer parses (schema drift, downgraded
@@ -272,7 +303,7 @@ ordinary `git log`/`commit`/`rebase`). Held below HIGH because env-bearing invoc
 learnable and the env is in the action digest shown on the approval card, so exploitation needs
 a fresh human approval.
 
-### B6 · SQLite database created at default permissions — MEDIUM
+### B6 · SQLite database created at default permissions — MEDIUM — **FIXED (verified 2026-10-07)**
 
 `crates/daemon/src/db.rs:12-28` — `create_if_missing(true)` with no subsequent `chmod`, so the
 DB plus `-wal`/`-shm` land at `0666 & ~umask`, typically `0644`. Contrast the deliberate `0600`
@@ -285,7 +316,7 @@ so one local user cannot read another's sessions; that control is bypassed by re
 
 ## C. Correctness and data-integrity findings
 
-### C1 · Lost `CancelRun` / `PauseRun` — check-then-act across two mutexes — HIGH
+### C1 · Lost `CancelRun` / `PauseRun` — check-then-act across two mutexes — HIGH — **FIXED (verified 2026-09-23)**
 
 `crates/codypendentd/src/executor.rs:2515-2538` (`spawn_run`) vs `:2674-2705`
 (`cancel_run`/`pause_run`). `pending_cancellations` and `cancellations` are independent
@@ -303,7 +334,7 @@ just deletes the entry. The run drives to completion after the client was told t
 accepted. **Fix:** one mutex for both maps, or re-check the pending sets *after* installing the
 handle and fire the handle if an entry appeared.
 
-### C2 · Panicking workflow drive poisons the run permanently — MEDIUM-HIGH
+### C2 · Panicking workflow drive poisons the run permanently — MEDIUM-HIGH — **OPEN (re-checked 2026-10-07)**
 
 `crates/codypendentd/src/workflows.rs:294-360`. `spawn_drive` puts
 `host.cancellations.finish(&run_id)` (`:356`) and `host.prune_run_lock(...)` (`:358`) inline
@@ -346,7 +377,7 @@ pushes a fresh one with `api_key_env = ""`, then prints `updated model <id>` —
 still resolves *if* a key sits in `auth.json` or the catalog's documented env var happens to be
 set; otherwise requests start 401ing.
 
-### C5 · `auth.json` has no lock and a fixed temp path — MEDIUM
+### C5 · `auth.json` has no lock and a fixed temp path — MEDIUM — **FIXED (verified 2026-10-07)**
 
 `crates/runtime/src/auth.rs:97-135`. Permissions are handled meticulously (temp at `0600`,
 re-`chmod` before secret bytes, `sync_all`, `rename`, post-rename `chmod`, all pinned by tests).
@@ -397,7 +428,7 @@ paused is failed on the next boot. The workflow layer does the **opposite** —
 idempotent), but lost user work and an inconsistency between the two orchestration layers.
 Decide which is correct and align them.
 
-### C8 · Remote UI worker: quota leak and broken epoch bookkeeping — MEDIUM-HIGH
+### C8 · Remote UI worker: quota leak and broken epoch bookkeeping — MEDIUM-HIGH — **OPEN, narrowed (re-checked 2026-10-07)**
 
 `crates/daemon/src/remote_ui_workers.rs:194-230`. Three defects:
 
@@ -418,7 +449,7 @@ Decide which is correct and align them.
    `(session_id, target)` but one epoch can start many launches (one per plugin); each task
    removes `ensured[epoch]` when *it* exits, wedging siblings into the state in (2).
 
-### C9 · `ensure_scanned` records a pre-lock revision — LOW-MEDIUM
+### C9 · `ensure_scanned` records a pre-lock revision — LOW-MEDIUM — **FIXED (2026-10-07, branch `claude/review-2026-10-07`)**
 
 `crates/codypendentd/src/executor.rs:559-581` samples `scan::head_revision(root)` **before**
 `scan::lock_repository(repository).await`, but `scan_repository` stamps the graph with
@@ -429,7 +460,7 @@ later run at R skips the scan and opens with a repository map that does not matc
 double-check-under-lock correctly fixes the concurrent-rebuild race; this stale stamp is a
 separate remaining hole.
 
-### C10 · Unbounded `read_file` range → daemon memory DoS — MEDIUM
+### C10 · Unbounded `read_file` range → daemon memory DoS — MEDIUM — **FIXED (2026-10-07, branch `claude/review-2026-10-07`)**
 
 `crates/runtime/src/agent.rs:7149-7157` converts arbitrary `u64` range bounds to `usize` with
 no upper bound; `crates/runtime/src/tools/read_file.rs:105-155` validates only `start != 0` and
@@ -439,7 +470,7 @@ no upper bound; `crates/runtime/src/tools/read_file.rs:105-155` validates only `
 1.5 GB RSS. **Fix:** clamp `want_end` to `want_start + HARD_CAP` and/or cap retained bytes.
 The no-`range` default path is safely capped at 200 lines.
 
-### C11 · `WorktreeReleaseGuard`: normal and unwind paths disagree — LOW-MEDIUM
+### C11 · `WorktreeReleaseGuard`: normal and unwind paths disagree — LOW-MEDIUM — **FIXED (2026-10-07, branch `claude/review-2026-10-07`)**
 
 `crates/codypendentd/src/executor.rs:3389-3437`. `release()` always calls
 `terminate_under(&binding.worktree)`; `Drop` calls it **only** `if binding.lease.is_some()`. For
@@ -449,7 +480,7 @@ it owns), and on the unwind path its `shell.run` children are **not** terminated
 outlive the run. Note the cancel path is fine for leasing runs — the token unwinds
 `runtime.execute_run` and `release()` is the next statement (`:1167`).
 
-### C12 · DEFERRED transactions on read-then-write, no busy retry — SUSPICION, MEDIUM
+### C12 · DEFERRED transactions on read-then-write, no busy retry — SUSPICION, MEDIUM — **FIXED, and reproduced (2026-10-07, branch `claude/review-2026-10-07`)**
 
 `crates/daemon/src/checkpoints.rs:60` (also `:187`, `:216`) and
 `crates/daemon/src/model_profiles.rs:258` use `pool.begin()` then `SELECT` then `INSERT` then
@@ -462,7 +493,7 @@ exists (`grep SQLITE_BUSY` in `db.rs`/`ledger.rs`/`approvals.rs` returns nothing
 `max_connections(8)` makes concurrency real. If it fires, checkpoint recording fails
 intermittently — which touches runtime invariant 4. Not reproduced.
 
-### C13 · No retention or pruning on the event store — MEDIUM
+### C13 · No retention or pruning on the event store — MEDIUM — **OPEN (re-checked 2026-10-07)**
 
 `migrations/0001_init.sql:25-35` defines `events` as an append-only ledger whose `body` holds
 every prompt, model message and tool observation. No `DELETE FROM events`, no `VACUUM`, no TTL

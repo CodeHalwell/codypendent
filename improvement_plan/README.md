@@ -4,6 +4,10 @@ Last scan: 2026-08-15 · Baseline `5c9dbbc` + uncommitted working tree
 Re-verified: 2026-08-16 by a second independent scan — every P0/P1 item spot-checked against the
 current tree still stands; `cargo check` and `cargo clippy --workspace --all-targets` remain clean.
 See "Re-verification" in `findings-register.md`.
+Re-checked: 2026-10-07 at `76448fc` (v0.14.0) during the whole-repository review in
+[`docs/reviews/2026-10-07-review.md`](../docs/reviews/2026-10-07-review.md). Most of the items
+below have since been fixed; `checklist.md` and the "Re-check" section of the register record
+which, and what is still open. The sections below are the original August scan, kept as written.
 Detailed evidence: [`findings-register.md`](findings-register.md)
 
 ## Document map

@@ -1,7 +1,7 @@
 {
   "name": "Codypendent Documentation Suite",
   "version": "0.5.1",
-  "date": "2026-09-02",
+  "date": "2026-10-07",
   "files": [
     "CONTRIBUTING.md",
     "PROJECT_REVIEW_2026-07-17.md",
@@ -158,6 +158,8 @@
     "reviews/2026-08-13-verticals/tui-shell.md",
     "reviews/2026-08-29-massive-review.md",
     "reviews/2026-09-01-ux-review.md",
+    "reviews/2026-10-07-harness-landscape.md",
+    "reviews/2026-10-07-review.md",
     "specs/agent.toml",
     "specs/changeset.yaml",
     "specs/command.toml",
