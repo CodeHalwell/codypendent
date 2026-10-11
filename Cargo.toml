@@ -151,7 +151,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 # The vector layer stays abstracted behind a trait — Phase 2 ships a small
 # embedded cosine index; Qdrant is a Phase 4+ option behind the same trait.
 tantivy = "0.22"
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 # One grammar per language the code graph can fold. A repository whose files
 # none of these cover produces an EMPTY graph, so this list is the feature's
 # real reach — widen it here, and `codegraph::language_for` picks it up.
