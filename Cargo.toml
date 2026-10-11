@@ -76,7 +76,7 @@ agent-framework-anthropic = "0.2.0"
 
 # TUI
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
