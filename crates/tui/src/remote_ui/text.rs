@@ -91,7 +91,8 @@ pub fn wrap_cells(input: &str, width: usize) -> Vec<String> {
                 result.push(line.trim_end().to_owned());
                 line.clear();
                 line_width = 0;
-                if token.chars().all(char::is_whitespace) {
+                // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+                if token.trim().is_empty() {
                     continue;
                 }
             }
