@@ -5342,7 +5342,8 @@ fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
                 let Some(prev) = prev_grapheme(buf, at) else {
                     break;
                 };
-                if buf[prev..at].chars().all(char::is_whitespace) {
+                // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+                if buf[prev..at].trim().is_empty() {
                     at = prev;
                 } else {
                     break;
@@ -5352,7 +5353,8 @@ fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
                 let Some(prev) = prev_grapheme(buf, at) else {
                     break;
                 };
-                if buf[prev..at].chars().all(char::is_whitespace) {
+                // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+                if buf[prev..at].trim().is_empty() {
                     break;
                 }
                 at = prev;
@@ -5418,14 +5420,16 @@ pub(crate) enum CursorMove {
 fn word_left(text: &str, cursor: usize) -> usize {
     let mut at = cursor;
     while let Some(prev) = prev_grapheme(text, at) {
-        if text[prev..at].chars().all(char::is_whitespace) {
+        // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+        if text[prev..at].trim().is_empty() {
             at = prev;
         } else {
             break;
         }
     }
     while let Some(prev) = prev_grapheme(text, at) {
-        if text[prev..at].chars().all(char::is_whitespace) {
+        // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+        if text[prev..at].trim().is_empty() {
             break;
         }
         at = prev;
@@ -5439,14 +5443,16 @@ fn word_left(text: &str, cursor: usize) -> usize {
 fn word_right(text: &str, cursor: usize) -> usize {
     let mut at = cursor;
     while let Some(next) = next_grapheme(text, at) {
-        if text[at..next].chars().all(char::is_whitespace) {
+        // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+        if text[at..next].trim().is_empty() {
             at = next;
         } else {
             break;
         }
     }
     while let Some(next) = next_grapheme(text, at) {
-        if text[at..next].chars().all(char::is_whitespace) {
+        // ⚡ Bolt: prefer .trim().is_empty() over .chars().all(char::is_whitespace) to skip UTF-8 decoding overhead
+        if text[at..next].trim().is_empty() {
             break;
         }
         at = next;
