@@ -361,9 +361,9 @@ const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
 /// `FrameworkModelDriver::to_messages` (this module, behind `provider-openai`)
 /// actually sends to the model for that turn: the framing text plus the
 /// payload. Counted with
-/// `.chars().count()` rather than byte length, so a unicode-heavy transcript
-/// is not over-counted relative to plain ASCII. Pure, unit-testable in
-/// isolation, and used only by [`estimate_context_tokens`].
+/// `.len()` rather than `.chars().count()` to avoid UTF-8 decoding overhead,
+/// which over-counts unicode-heavy transcripts slightly but is safer and significantly faster.
+/// Pure, unit-testable in isolation, and used only by [`estimate_context_tokens`].
 ///
 /// Mirrors `to_messages`' per-variant framing:
 /// - `Objective` / `Assistant` / `Steering`: sent verbatim as the message
@@ -379,13 +379,13 @@ const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
 pub fn turn_item_text_len(turn: &TurnItem) -> usize {
     match turn {
         TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
-            text.chars().count()
+            text.len()
         }
         TurnItem::ToolCall { tool, args } => {
-            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+            "[calling : ]".len() + tool.len() + args.to_string().len()
         }
         TurnItem::ToolResult { tool, output, .. } => {
-            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+            "[tool result: ]\n".len() + tool.len() + output.len()
         }
     }
 }
