@@ -379,13 +379,13 @@ const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
 pub fn turn_item_text_len(turn: &TurnItem) -> usize {
     match turn {
         TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
-            text.chars().count()
+            text.len()
         }
         TurnItem::ToolCall { tool, args } => {
-            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+            "[calling : ]".len() + tool.len() + args.to_string().len()
         }
         TurnItem::ToolResult { tool, output, .. } => {
-            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+            "[tool result: ]\n".len() + tool.len() + output.len()
         }
     }
 }
@@ -421,9 +421,9 @@ const SYSTEM_PROMPT: &str = "You are a coding agent. Use the provided tools to i
 /// conservative shape as [`turn_item_text_len`]: framing punctuation is
 /// covered by the per-item overhead the caller adds.
 fn tool_definition_text_len(def: &ToolDefinition) -> usize {
-    def.name.chars().count()
-        + def.description.chars().count()
-        + def.parameters.to_string().chars().count()
+    def.name.len()
+        + def.description.len()
+        + def.parameters.to_string().len()
 }
 
 /// [`estimate_context_tokens`] plus the request parts the transcript alone
@@ -434,7 +434,7 @@ fn tool_definition_text_len(def: &ToolDefinition) -> usize {
 /// `inputSchema`s that are re-sent verbatim on every request — so the loop's
 /// budget warning and mid-run compaction both estimate with THIS function.
 pub fn estimate_request_tokens(transcript: &[TurnItem], tools: &[ToolDefinition]) -> usize {
-    let system = SYSTEM_PROMPT.chars().count() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
+    let system = SYSTEM_PROMPT.len() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
     let tool_tokens: usize = tools
         .iter()
         .map(|def| tool_definition_text_len(def) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
@@ -2938,8 +2938,8 @@ impl FrameworkAgentRuntime {
                     last_token_pct = Some(pct);
                     self.emit(run.session_id, run_actor.clone(), body).await?;
                 }
-                let system_tokens = ((SYSTEM_PROMPT.chars().count()
-                    + run.instructions.as_deref().map_or(0, |i| i.chars().count()))
+                let system_tokens = ((SYSTEM_PROMPT.len()
+                    + run.instructions.as_deref().map_or(0, |i| i.len()))
                     / CHARS_PER_TOKEN
                     + PER_ITEM_TOKEN_OVERHEAD) as u64;
                 let tool_tokens = tool_definitions
