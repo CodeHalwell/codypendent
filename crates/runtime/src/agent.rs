@@ -382,10 +382,10 @@ pub fn turn_item_text_len(turn: &TurnItem) -> usize {
             text.chars().count()
         }
         TurnItem::ToolCall { tool, args } => {
-            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+            "[calling : ]".len() + tool.chars().count() + args.to_string().chars().count()
         }
         TurnItem::ToolResult { tool, output, .. } => {
-            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+            "[tool result: ]\n".len() + tool.chars().count() + output.chars().count()
         }
     }
 }
@@ -434,7 +434,7 @@ fn tool_definition_text_len(def: &ToolDefinition) -> usize {
 /// `inputSchema`s that are re-sent verbatim on every request — so the loop's
 /// budget warning and mid-run compaction both estimate with THIS function.
 pub fn estimate_request_tokens(transcript: &[TurnItem], tools: &[ToolDefinition]) -> usize {
-    let system = SYSTEM_PROMPT.chars().count() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
+    let system = SYSTEM_PROMPT.len() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
     let tool_tokens: usize = tools
         .iter()
         .map(|def| tool_definition_text_len(def) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
@@ -2938,7 +2938,7 @@ impl FrameworkAgentRuntime {
                     last_token_pct = Some(pct);
                     self.emit(run.session_id, run_actor.clone(), body).await?;
                 }
-                let system_tokens = ((SYSTEM_PROMPT.chars().count()
+                let system_tokens = ((SYSTEM_PROMPT.len()
                     + run.instructions.as_deref().map_or(0, |i| i.chars().count()))
                     / CHARS_PER_TOKEN
                     + PER_ITEM_TOKEN_OVERHEAD) as u64;
