@@ -6980,14 +6980,10 @@ fn canonical_json(value: &Value) -> String {
 fn mcp_summary(server: &str, tool: &str, canonical_args: &str) -> String {
     /// Roughly one card line of arguments.
     const MAX_SUMMARY_ARGS_CHARS: usize = 120;
-    let args = if canonical_args.chars().count() > MAX_SUMMARY_ARGS_CHARS {
-        let truncated: String = canonical_args
-            .chars()
-            .take(MAX_SUMMARY_ARGS_CHARS)
-            .collect();
-        format!("{truncated}…")
-    } else {
-        canonical_args.to_string()
+    // ⚡ Bolt: Use char_indices().nth() to avoid O(N) traversal and intermediate allocations
+    let args = match canonical_args.char_indices().nth(MAX_SUMMARY_ARGS_CHARS) {
+        Some((idx, _)) => format!("{}…", &canonical_args[..idx]),
+        None => canonical_args.to_string(),
     };
     format!("{server}.{tool}({args})")
 }
@@ -7423,12 +7419,16 @@ fn summarize_diff(diff: &str, upstream_truncated: bool) -> DiffSummary {
         }
 
         if index < DIFF_PREVIEW_MAX_LINES {
-            let shortened = line
-                .chars()
-                .take(DIFF_PREVIEW_MAX_COLUMNS)
-                .collect::<String>();
-            truncated |= shortened.chars().count() < line.chars().count();
-            preview_lines.push(shortened);
+            // ⚡ Bolt: Use char_indices().nth() to avoid O(N) traversal and intermediate allocations
+            match line.char_indices().nth(DIFF_PREVIEW_MAX_COLUMNS) {
+                Some((idx, _)) => {
+                    truncated = true;
+                    preview_lines.push(line[..idx].to_string());
+                }
+                None => {
+                    preview_lines.push(line.to_string());
+                }
+            }
         } else {
             truncated = true;
         }
@@ -8502,11 +8502,10 @@ const MAX_ARGS_PREVIEW_CHARS: usize = 200;
 #[cfg(feature = "provider-openai")]
 fn compact_args(args: &Value) -> String {
     let rendered = args.to_string();
-    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
-        let truncated: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
-        format!("{truncated}… ({} bytes total)", rendered.len())
-    } else {
-        rendered
+    // ⚡ Bolt: Use char_indices().nth() to avoid O(N) traversal and intermediate allocations
+    match rendered.char_indices().nth(MAX_ARGS_PREVIEW_CHARS) {
+        Some((idx, _)) => format!("{}… ({} bytes total)", &rendered[..idx], rendered.len()),
+        None => rendered,
     }
 }
 
