@@ -1042,12 +1042,12 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         }
     }
     let mut safe = words.join(" ");
-    if safe.chars().count() > MAX_CHARS {
-        safe = safe.chars().take(MAX_CHARS).collect();
+    if let Some((cut_idx, _)) = safe.char_indices().nth(MAX_CHARS) {
+        safe.truncate(cut_idx);
     }
-    if raw.chars().count() > MAX_CHARS {
-        if safe.chars().count() == MAX_CHARS {
-            safe.pop();
+    if raw.char_indices().nth(MAX_CHARS).is_some() {
+        if let Some((cut_idx, _)) = safe.char_indices().nth(MAX_CHARS - 1) {
+            safe.truncate(cut_idx);
         }
         safe.push('…');
     }

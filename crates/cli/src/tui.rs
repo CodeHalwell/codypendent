@@ -9317,12 +9317,20 @@ fn summarize_author(value: &serde_json::Value) -> String {
 /// Truncate to at most `max` characters, appending an ellipsis when cut (char-safe
 /// so a multi-byte boundary is never split).
 fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_owned()
-    } else {
-        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}\u{2026}")
+    if max == 0 {
+        if text.is_empty() {
+            return String::new();
+        } else {
+            return "\u{2026}".to_string();
+        }
     }
+    let mut indices = text.char_indices();
+    if let Some((cut_idx, _)) = indices.nth(max.saturating_sub(1)) {
+        if indices.next().is_some() {
+             return format!("{}\u{2026}", &text[..cut_idx]);
+        }
+    }
+    text.to_owned()
 }
 
 fn collab_mode_label(mode: CollaborationMode) -> &'static str {
