@@ -8502,9 +8502,9 @@ const MAX_ARGS_PREVIEW_CHARS: usize = 200;
 #[cfg(feature = "provider-openai")]
 fn compact_args(args: &Value) -> String {
     let rendered = args.to_string();
-    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
-        let truncated: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
-        format!("{truncated}… ({} bytes total)", rendered.len())
+    let mut indices = rendered.char_indices();
+    if let Some((cut_idx, _)) = indices.nth(MAX_ARGS_PREVIEW_CHARS) {
+        format!("{}… ({} bytes total)", &rendered[..cut_idx], rendered.len())
     } else {
         rendered
     }

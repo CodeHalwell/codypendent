@@ -133,12 +133,20 @@ fn sanitize_label(raw: &str) -> String {
 /// character), appending `…` when truncation actually occurred. The result
 /// is always `<= max` chars, ellipsis included.
 fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    if max == 0 {
+        if s.is_empty() {
+            return String::new();
+        } else {
+            return "\u{2026}".to_string();
+        }
     }
-    let mut truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-    truncated.push('…');
-    truncated
+    let mut indices = s.char_indices();
+    if let Some((cut_idx, _)) = indices.nth(max.saturating_sub(1)) {
+        if indices.next().is_some() {
+             return format!("{}\u{2026}", &s[..cut_idx]);
+        }
+    }
+    s.to_string()
 }
 
 #[cfg(test)]
