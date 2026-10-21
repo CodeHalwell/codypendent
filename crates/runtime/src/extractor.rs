@@ -70,13 +70,12 @@ const SYSTEM_PROMPT: &str = "Extract at most 10 discrete, standalone facts worth
 /// transcript is built in chronological order, so the tail is also the most
 /// recently written part.
 #[must_use]
+// ⚡ Bolt Optimization: Avoid O(N) full string traversal
 fn tail_cap(s: &str, max: usize) -> &str {
-    let total_chars = s.chars().count();
-    if total_chars <= max {
-        return s;
+    if max == 0 {
+        return "";
     }
-    let skip = total_chars - max;
-    match s.char_indices().nth(skip) {
+    match s.char_indices().rev().nth(max - 1) {
         Some((idx, _)) => &s[idx..],
         None => s,
     }
