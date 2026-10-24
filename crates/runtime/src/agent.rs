@@ -6980,12 +6980,8 @@ fn canonical_json(value: &Value) -> String {
 fn mcp_summary(server: &str, tool: &str, canonical_args: &str) -> String {
     /// Roughly one card line of arguments.
     const MAX_SUMMARY_ARGS_CHARS: usize = 120;
-    let args = if canonical_args.chars().count() > MAX_SUMMARY_ARGS_CHARS {
-        let truncated: String = canonical_args
-            .chars()
-            .take(MAX_SUMMARY_ARGS_CHARS)
-            .collect();
-        format!("{truncated}…")
+    let args = if let Some((idx, _)) = canonical_args.char_indices().nth(MAX_SUMMARY_ARGS_CHARS) {
+        format!("{}…", &canonical_args[..idx])
     } else {
         canonical_args.to_string()
     };
@@ -7423,12 +7419,12 @@ fn summarize_diff(diff: &str, upstream_truncated: bool) -> DiffSummary {
         }
 
         if index < DIFF_PREVIEW_MAX_LINES {
-            let shortened = line
-                .chars()
-                .take(DIFF_PREVIEW_MAX_COLUMNS)
-                .collect::<String>();
-            truncated |= shortened.chars().count() < line.chars().count();
-            preview_lines.push(shortened);
+            if let Some((idx, _)) = line.char_indices().nth(DIFF_PREVIEW_MAX_COLUMNS) {
+                truncated = true;
+                preview_lines.push(line[..idx].to_string());
+            } else {
+                preview_lines.push(line.to_string());
+            }
         } else {
             truncated = true;
         }
@@ -8502,9 +8498,8 @@ const MAX_ARGS_PREVIEW_CHARS: usize = 200;
 #[cfg(feature = "provider-openai")]
 fn compact_args(args: &Value) -> String {
     let rendered = args.to_string();
-    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
-        let truncated: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
-        format!("{truncated}… ({} bytes total)", rendered.len())
+    if let Some((idx, _)) = rendered.char_indices().nth(MAX_ARGS_PREVIEW_CHARS) {
+        format!("{}… ({} bytes total)", &rendered[..idx], rendered.len())
     } else {
         rendered
     }

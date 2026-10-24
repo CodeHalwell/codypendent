@@ -88,11 +88,13 @@ fn tail_cap(s: &str, max: usize) -> &str {
 /// so a fact's `statement` is bounded independent of what the model sent.
 #[must_use]
 fn cap_statement(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    let mut indices = s.char_indices();
+    if let Some((trunc_idx, _)) = indices.nth(max.saturating_sub(1)) {
+        if indices.next().is_some() {
+            return format!("{}\u{2026}", &s[..trunc_idx]);
+        }
     }
-    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{truncated}\u{2026}")
+    s.to_string()
 }
 
 /// Map a model-reported fact `kind` to a [`MemoryClass`] (D2 mapping table).
