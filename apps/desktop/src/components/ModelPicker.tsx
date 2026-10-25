@@ -29,6 +29,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import { useFocusTrap } from "../useFocusTrap.js";
+import { ModelDiscoveryPanel } from "./ModelDiscoveryPanel.js";
+import { modelLabel, modelProviderLabel, modelVersionLabel, providerLabel } from "../modelPresentation.js";
+import "./ModelPicker.css";
 
 import {
   describeError,
@@ -185,7 +188,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
       setReadiness((current) => new Map(current).set(row.id, verdict));
       setNotice({
         tone: verdict.readiness.state === "unavailable" ? "error" : "ok",
-        text: `${row.id}: ${verdict.readiness.state} — ${verdict.readiness.detail}`,
+        text: `${modelLabel(row.id)}: ${verdict.readiness.state} — ${("detail" in verdict.readiness ? verdict.readiness.detail : "The daemon returned an unknown readiness state")}`,
       });
     } catch (error) {
       setReadiness((current) => {
@@ -193,7 +196,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
         next.delete(row.id);
         return next;
       });
-      setNotice({ tone: "error", text: `could not test ${row.id}: ${describeError(error)}` });
+      setNotice({ tone: "error", text: `Could not test ${modelLabel(row.id)}: ${describeError(error)}` });
     }
   };
 
@@ -218,13 +221,16 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   useLoadOnMount(load);
 
   const matches = useMemo(() => {
-    const needle = query.trim().toLowerCase();
+    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const rows = view?.models ?? [];
-    if (needle.length === 0) {
+    if (terms.length === 0) {
       return rows;
     }
     return rows.filter(
-      (row) => row.id.toLowerCase().includes(needle) || row.model.toLowerCase().includes(needle),
+      (row) => {
+        const text = [row.id, row.model, modelLabel(row.id), modelProviderLabel(row.id, row.provider_id, row.provider)].join(" ").toLowerCase();
+        return terms.every((term) => text.includes(term));
+      },
     );
   }, [view, query]);
 
@@ -233,7 +239,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
       await api.setRunModel(modelId);
       setNotice({
         tone: "ok",
-        text: modelId === null ? "model cleared — the daemon chooses" : `now using ${modelId}`,
+        text: modelId === null ? "Automatic model selection enabled." : `Now using ${modelLabel(modelId)}.`,
       });
       onModelPinned?.(modelId);
     } catch (error) {
@@ -248,7 +254,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     }
     try {
       await api.removeModel(removing.id);
-      setNotice({ tone: "ok", text: `removed ${removing.id} from models.toml` });
+      setNotice({ tone: "ok", text: `Removed ${modelLabel(removing.id)}.` });
     } catch (error) {
       setNotice({ tone: "error", text: `could not remove model: ${describeError(error)}` });
     } finally {
@@ -262,10 +268,11 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
       <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Models</h2>
         <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
-          Configured in <code>{view?.models_path ?? "models.toml"}</code>. The model you choose is
-          used from now on; a run already in flight keeps the one it started with.
+          Choose a model for your next task. Installed agents and local models are added automatically.
         </p>
       </header>
+
+      {(shellAvailable() || client) && <ModelDiscoveryPanel client={api} onDiscovered={() => { void load(); }} />}
 
       {unavailable ? (
         <div
@@ -302,7 +309,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
             </button>
             {view.pinned && (
               <button type="button" style={BUTTON} onClick={() => void pin(null)}>
-                Clear pin
+                Use automatic selection
               </button>
             )}
           </div>
@@ -318,14 +325,16 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
               <div data-testid="model-picker-empty" style={{ padding: 24, color: "var(--cody-text-muted)" }}>
                 {view.models.length === 0
                   ? view.configured
-                    ? `${view.models_path} has no [[model]] entries yet.`
-                    : `No ${view.models_path} yet — add a model to create one.`
+                    ? "No models found yet. Scan for installed tools above, or add a provider."
+                    : "Your models will appear here after Codypendent finds an installed agent or a running local model."
                   : `No model matches “${query}”.`}
               </div>
             ) : (
               <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
                 {matches.map((row) => {
-                  const status = describeKeyStatus(row.key);
+                  const status = row.provider === "acp"
+                    ? { glyph: "", label: "Agent account", color: "var(--cody-text-muted)" }
+                    : { ...describeKeyStatus(row.key), label: row.key.state === "stored" || row.key.state === "env" ? "Key available" : describeKeyStatus(row.key).label };
                   const pinned = view.pinned === row.id;
                   const verdict = readiness.get(row.id);
                   const badge =
@@ -333,10 +342,11 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                       ? null
                       : verdict === "checking"
                         ? { glyph: "…", label: "checking", color: "var(--cody-text-muted)", detail: "" }
-                        : { ...describeReadiness(verdict.readiness), detail: verdict.readiness.detail };
+                        : { ...describeReadiness(verdict.readiness), detail: ("detail" in verdict.readiness ? verdict.readiness.detail : "The daemon returned an unknown readiness state") };
                   return (
                     <li
                       key={row.id}
+                      className="model-picker-row"
                       style={{
                         padding: "10px 12px",
                         borderRadius: 6,
@@ -349,15 +359,14 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                     >
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                          <span style={{ fontWeight: 600 }}>{row.id}</span>
+                          <span style={{ fontWeight: 600 }}>{modelLabel(row.id)}</span>
                           {pinned && (
-                            <span style={{ ...BADGE, color: "var(--cody-link)" }}>in use</span>
+                            <span style={{ ...BADGE, color: "var(--cody-link)" }}>Selected</span>
                           )}
-                          {row.provider_id && <span style={BADGE}>{row.provider_id}</span>}
-                          <span style={{ ...BADGE, color: status.color }}>
+                          {(row.provider === "acp" || row.key.state !== "missing") && <span style={{ ...BADGE, color: status.color }}>
                             {status.glyph} {status.label}
-                          </span>
-                          {badge && (
+                          </span>}
+                          {badge && badge.label !== "unverified" && (
                             <span
                               data-testid={`model-readiness-${row.id}`}
                               title={badge.detail}
@@ -371,14 +380,19 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                           <div style={{ color: "var(--cody-danger-soft)", fontSize: 12, marginTop: 2 }}>{badge.detail}</div>
                         )}
                         <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>
-                          {row.model}
-                          {row.base_url.trim().length > 0 && ` · ${endpointHost(row.base_url)}`}
-                          {" · context "}
-                          {/* Unknown stays unknown. An em dash, never a 0. */}
-                          {row.context_tokens === null
-                            ? "—"
-                            : `${row.context_tokens.toLocaleString()} tokens`}
+                          {modelProviderLabel(row.id, row.provider_id, row.provider)}
+                          {row.context_tokens !== null && ` · ${new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(row.context_tokens)} context`}
                         </div>
+                        <details className="model-connection-details">
+                          <summary>Connection details</summary>
+                          <dl>
+                            <dt>Model ID</dt><dd><code>{row.id}</code></dd>
+                            <dt>Provider model</dt><dd><code>{row.model}</code></dd>
+                            {row.base_url.trim() && <><dt>Endpoint</dt><dd>{endpointHost(row.base_url)}</dd></>}
+                            <dt>Credentials</dt><dd>{row.provider === "acp" ? "Uses the installed agent’s account" : describeKeyStatus(row.key).label}</dd>
+                            {badge && <><dt>Check</dt><dd>{badge.label === "unverified" ? "Not tested" : badge.label}</dd></>}
+                          </dl>
+                        </details>
                       </div>
                       {api.modelReadiness && (
                         <button
@@ -419,8 +433,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <p style={{ margin: 0, fontSize: 13 }}>
-            Remove <strong>{removing.id}</strong> from <code>{view?.models_path}</code>? Its stored
-            key is deleted with it. Comments and every other table in the file are preserved.
+            Remove <strong>{modelLabel(removing.id)}</strong>? Any credentials saved specifically for this model are also removed.
           </p>
           <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
             <button
@@ -635,8 +648,7 @@ const AddModelFlow: React.FC<{
             <option value="">Choose a provider…</option>
             {providers.map((row) => (
               <option key={row.id} value={row.id}>
-                {row.name} ({row.protocol}
-                {row.local ? ", local" : ""})
+                {providerLabel(row.id, row.name)}{row.local ? " · Local" : ""}
               </option>
             ))}
           </select>
@@ -668,7 +680,7 @@ const AddModelFlow: React.FC<{
           <datalist id="catalog-models">
             {(catalog?.models ?? []).map((row) => (
               <option key={row.id} value={row.id}>
-                {row.name ?? row.id}
+                {row.name ?? modelVersionLabel(row.id)}
               </option>
             ))}
           </datalist>
@@ -720,8 +732,10 @@ const AddModelFlow: React.FC<{
             </div>
           )}
 
-          <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
-            Id to select it by
+          <details className="model-connection-details">
+          <summary>Advanced connection options</summary>
+          <label style={{ display: "block", fontSize: 12, color: "var(--cody-text-muted)" }}>
+            Model ID
             <input
               value={effectiveId}
               onChange={(event) => {
@@ -741,6 +755,7 @@ const AddModelFlow: React.FC<{
               }}
             />
           </label>
+          </details>
         </>
       )}
 

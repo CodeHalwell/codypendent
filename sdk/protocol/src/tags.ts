@@ -117,6 +117,7 @@ export const EVENT_BODY_TAGS = [
   "ToolProposed",
   "ToolDenied",
   "ToolStarted",
+  "ToolUpdated",
   "ToolCompleted",
   "PatchProposed",
   "ApprovalRequested",

@@ -43,6 +43,7 @@ pub enum NotifyMethod {
 /// construction and restores it on drop.
 pub struct TerminalGuard {
     terminal: Terminal<HyperlinkBackend<Stdout>>,
+    title: TerminalTitle,
 }
 
 impl TerminalGuard {
@@ -56,14 +57,20 @@ impl TerminalGuard {
             EnterAlternateScreen,
             EnableMouseCapture,
             event::EnableBracketedPaste,
-            event::EnableFocusChange
+            event::EnableFocusChange,
+            event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
         ) {
             Self::cleanup_after_failed_enter();
             return Err(e);
         }
         let backend = HyperlinkBackend::new(stdout);
         match Terminal::new(backend) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self {
+                terminal,
+                title: TerminalTitle::default(),
+            }),
             Err(e) => {
                 Self::cleanup_after_failed_enter();
                 Err(e)
@@ -77,12 +84,12 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
+            event::PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             DisableMouseCapture,
             event::DisableBracketedPaste,
             event::DisableFocusChange
         );
-        let _ = clear_terminal_title();
         let _ = disable_raw_mode();
     }
 
@@ -96,17 +103,54 @@ impl TerminalGuard {
         self.terminal.backend_mut().set_regions(regions);
     }
 
+    /// Update the tab title only when it changes, preserving the shell's title
+    /// on terminals that support the standard xterm title stack.
+    pub fn set_title(&mut self, title: &str) -> io::Result<()> {
+        self.title.update(self.terminal.backend_mut(), title)
+    }
+
     fn restore(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(
             self.terminal.backend_mut().backend_mut(),
+            event::PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             DisableMouseCapture,
             event::DisableBracketedPaste,
             event::DisableFocusChange
         )?;
-        let _ = clear_terminal_title();
+        let _ = self.title.restore(self.terminal.backend_mut());
         self.terminal.show_cursor()
+    }
+}
+
+#[derive(Default)]
+struct TerminalTitle {
+    last: Option<String>,
+}
+
+impl TerminalTitle {
+    fn update(&mut self, writer: &mut impl Write, title: &str) -> io::Result<()> {
+        let sanitized = sanitize_terminal_title(title);
+        if sanitized.is_empty() || self.last.as_deref() == Some(sanitized.as_str()) {
+            return Ok(());
+        }
+        if self.last.is_none() {
+            // Save window and icon titles; ignored by terminals without a stack.
+            writer.write_all(b"\x1b[22;0t")?;
+        }
+        write!(writer, "\x1b]0;{sanitized}\x07")?;
+        writer.flush()?;
+        self.last = Some(sanitized);
+        Ok(())
+    }
+
+    fn restore(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        if self.last.take().is_some() {
+            writer.write_all(b"\x1b]0;\x07\x1b[23;0t")?;
+            writer.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -149,7 +193,7 @@ impl<W: Write> Backend for HyperlinkBackend<W> {
             return self.inner.draw(content);
         }
 
-        let mut current_link: Option<String> = None;
+        let mut current_link: Option<&str> = None;
         let mut batch: Vec<(u16, u16, &'a ratatui::buffer::Cell)> = Vec::new();
 
         for (x, y, cell) in content {
@@ -159,7 +203,7 @@ impl<W: Write> Backend for HyperlinkBackend<W> {
                     && y >= rect.y
                     && y < rect.y.saturating_add(rect.height)
                 {
-                    Some(url.clone())
+                    Some(url.as_str())
                 } else {
                     None
                 }
@@ -392,6 +436,62 @@ pub fn notify(message: &str, method: NotifyMethod) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_updates_are_deduplicated_and_restore_the_shell_title() {
+        let mut title = TerminalTitle::default();
+        let mut output = Vec::new();
+        title.update(&mut output, "codypendent — café").unwrap();
+        let initial = output.len();
+        for _ in 0..100 {
+            title.update(&mut output, "codypendent — café").unwrap();
+        }
+        assert_eq!(output.len(), initial);
+        title.update(&mut output, "codypendent — next").unwrap();
+        title.restore(&mut output).unwrap();
+        let restored = output.len();
+        title.restore(&mut output).unwrap();
+        assert_eq!(output.len(), restored);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("\x1b[22;0t").count(), 1);
+        assert_eq!(output.matches("\x1b]0;codypendent").count(), 2);
+        assert!(output.ends_with("\x1b]0;\x07\x1b[23;0t"));
+    }
+
+    #[test]
+    fn hyperlink_runs_keep_their_boundaries_without_per_cell_url_copies() {
+        let mut bytes = Vec::new();
+        let mut backend = HyperlinkBackend::new(&mut bytes);
+        backend.set_regions(vec![(
+            ratatui::layout::Rect::new(1, 0, 2, 1),
+            "https://example.com/source".to_owned(),
+        )]);
+        let cells: Vec<_> = "code"
+            .chars()
+            .map(|c| {
+                let mut cell = ratatui::buffer::Cell::default();
+                cell.set_symbol(&c.to_string());
+                cell
+            })
+            .collect();
+        backend
+            .draw(
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(x, cell)| (x as u16, 0, cell)),
+            )
+            .unwrap();
+        drop(backend);
+        let output = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            output
+                .matches("\x1b]8;;https://example.com/source\x1b\\")
+                .count(),
+            1
+        );
+        assert_eq!(output.matches("\x1b]8;;\x1b\\").count(), 1);
+    }
 
     #[test]
     fn sanitizes_terminal_title() {

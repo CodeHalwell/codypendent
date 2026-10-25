@@ -8,6 +8,8 @@
 //! asks this index for `search(query, top_k)`, so swapping the backend never
 //! touches the funnel.
 
+use std::collections::HashSet;
+
 use codypendent_protocol::RegistryItemId;
 
 /// A brute-force cosine index over item embeddings, rebuildable from
@@ -48,9 +50,28 @@ impl VectorIndex {
     /// result is deterministic for a fixed index.
     #[must_use]
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(RegistryItemId, f32)> {
+        self.search_filtered(query, top_k, None)
+    }
+
+    pub fn search_allowed(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        allowed: &HashSet<RegistryItemId>,
+    ) -> Vec<(RegistryItemId, f32)> {
+        self.search_filtered(query, top_k, Some(allowed))
+    }
+
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        allowed: Option<&HashSet<RegistryItemId>>,
+    ) -> Vec<(RegistryItemId, f32)> {
         let mut scored: Vec<(RegistryItemId, f32)> = self
             .entries
             .iter()
+            .filter(|(id, _)| allowed.is_none_or(|ids| ids.contains(id)))
             .map(|(id, embedding)| (*id, cosine(query, embedding)))
             .collect();
         // Descending by score; `total_cmp` keeps NaN from poisoning the order.

@@ -101,6 +101,7 @@ export function completePaletteEntries(entries: readonly PaletteEntry[]): Palett
 }
 
 export interface CommandPaletteProps {
+  restoreFocusFallback?: React.RefObject<HTMLElement | null>;
   open: boolean;
   entries: readonly PaletteEntry[];
   onRun: (id: string) => void;
@@ -108,6 +109,7 @@ export interface CommandPaletteProps {
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
+  restoreFocusFallback,
   open,
   entries,
   onRun,
@@ -119,7 +121,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const dialogRef = useRef<HTMLDivElement | null>(null);
   // Focus stays inside the dialog and goes back to whatever opened it. Tab
   // used to walk straight out into the sidebar behind an `aria-modal` dialog.
-  useFocusTrap(dialogRef, { active: open, initialFocus: inputRef, onEscape: onClose });
+  useFocusTrap(dialogRef, { active: open, initialFocus: inputRef, onEscape: onClose, restoreFocusFallback });
 
   // Never `entries` directly: the palette offers every mounted view, whether
   // or not the app remembered to list it.
@@ -146,6 +148,17 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   }
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+    if ((event.key === "Home" || event.key === "End") && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      setSelected(event.key === "Home" ? 0 : Math.max(0, matches.length - 1));
+      return;
+    }
+    if (event.key === "PageDown" || event.key === "PageUp") {
+      event.preventDefault();
+      setSelected((current) => Math.max(0, Math.min(matches.length - 1, current + (event.key === "PageDown" ? 7 : -7))));
+      return;
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       onClose();

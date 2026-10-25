@@ -10,271 +10,111 @@
  * both clients tell the same story about the same failure.
  */
 
-/** The hard cap on rendered failure text, matching the TUI's `MAX_CHARS`. */
-const MAX_CHARS = 2_048;
+import contract from "../../../testdata/failure-sanitization.json";
 
-const BIDI_CONTROLS = new Set([
-  "؜",
-  "‎",
-  "‏",
-  "‪",
-  "‫",
-  "‬",
-  "‭",
-  "‮",
-  "⁦",
-  "⁧",
-  "⁨",
-  "⁩",
-]);
-
-function isControl(character: string): boolean {
-  const code = character.codePointAt(0) ?? 0;
-  return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+const nameCharacter = (c: string | undefined) => c !== undefined && /^[a-z0-9_-]$/i.test(c);
+function quoteEnd(chars: string[], start: number): number {
+  let i = start + 1;
+  while (i < chars.length && chars[i] !== "\n") {
+    if (chars[i] === "\\") i += 1;
+    else if (chars[i] === chars[start]) return i + 1;
+    i += 1;
+  }
+  return Math.min(i, chars.length);
+}
+function spaces(chars: string[], i: number): number {
+  while (chars[i] === " " || chars[i] === "\t") i += 1;
+  return i;
+}
+function valueEnd(chars: string[], start: number, wholeLine: boolean): number {
+  if (start >= chars.length) return start;
+  if (!wholeLine && (chars[start] === '"' || chars[start] === "'")) return quoteEnd(chars, start);
+  let depth = 0;
+  let i = start;
+  while (i < chars.length && chars[i] !== "\n") {
+    const c = chars[i];
+    if (!wholeLine) {
+      if ((c === '"' || c === "'") && depth > 0) { i = quoteEnd(chars, i); continue; }
+      if (c === "{" || c === "[") depth += 1;
+      else if ((c === "}" || c === "]") && depth > 0) { depth -= 1; if (depth === 0) return i + 1; }
+      else if (depth === 0 && (/\s/.test(c) || "&,}]\"';#".includes(c))) break;
+    }
+    i += 1;
+  }
+  return i;
 }
 
-/**
- * Strip terminal-control payloads and credential-shaped values from an
- * untrusted provider/agent error before it is rendered or copied. Bounded.
- */
-/**
- * Quotes that actually terminate a JSON string value.
- *
- * A `\"` is PART of the value, not its end. Counting raw quotes stopped
- * redaction at the first escaped one, so a compact
- * `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
- * kept its realm and response on screen.
- */
-function unescapedQuotes(text: string): number {
-  let count = 0;
-  let backslashes = 0;
-  for (const character of text) {
-    if (character === "\\") {
-      backslashes += 1;
+/** Bounded tokenizer. Shared rules and exact-output vectors cover both clients.
+ * JSON values, headers and query parameters have their own delimiters; adjacent
+ * error details survive redaction. Raw diagnostics must never be copied. */
+export function sanitizeFailureText(raw: string): string {
+  const input: string[] = [];
+  for (const c of raw) { input.push(c); if (input.length > contract.maxInput) break; }
+  const truncated = input.length > contract.maxInput || input.length > contract.maxOutput;
+  const chars: string[] = [];
+  let i = 0;
+  while (i < Math.min(input.length, contract.maxInput) && chars.length < contract.maxOutput) {
+    const c = input[i];
+    if (c === "\u001b" && input[i + 1] === "[") {
+      i += 2;
+      while (i < input.length) { const end = input[i] >= "@" && input[i] <= "~"; i += 1; if (end) break; }
       continue;
     }
-    if (character === '"' && backslashes % 2 === 0) {
-      count += 1;
+    if (c === "\u001b" && input[i + 1] === "]") {
+      i += 2;
+      while (i < input.length) {
+        if (input[i] === "\u0007") { i += 1; break; }
+        if (input[i] === "\u001b" && input[i + 1] === "\\") { i += 2; break; }
+        i += 1;
+      }
+      continue;
     }
-    backslashes = 0;
+    if (c === "\n" || c === "\t" || !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(c)) chars.push(c);
+    i += 1;
   }
-  return count;
-}
-
-/**
- * Header names whose value is a credential, for the compact `Name:value` form
- * where the value shares the name's word.
- */
-const CREDENTIAL_HEADER_NAMES = [
-  "api-key",
-  "apikey",
-  "api_key",
-  "token",
-  "password",
-  "secret",
-];
-
-export function sanitizeFailureText(raw: string): string {
-  const cleaned = Array.from(raw)
-    .filter(
-      (character) =>
-        character === "\n" ||
-        character === "\t" ||
-        (!isControl(character) && !BIDI_CONTROLS.has(character)),
-    )
-    .slice(0, MAX_CHARS)
-    .join("");
-
-  const words: string[] = [];
-  for (const line of cleaned.split("\n")) {
-    // Per LINE, because a credential header's value ends at the newline:
-    // nothing is owed across one. `Authorization: Bearer <token>` owes two
-    // fields, `password: <value>` owes one, an open JSON value owes until its
-    // closing quote (or the end of the line, which a JSON string cannot cross),
-    // and an `Authorization` key owes the
-    // whole rest of the line — a multi-parameter value spent a fixed budget on
-    // the scheme and the first parameter, leaving the nonce and response up.
-    let redactFollowing = 0;
-    let redactingValue = false;
-    let redactRestOfLine = false;
-    for (const word of line.split(/\s+/).filter((part) => part.length > 0)) {
-      const lower = word.toLowerCase();
-      const label = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
-      if (redactRestOfLine) {
-        words.push("[REDACTED]");
-        continue;
-      }
-      if (redactingValue) {
-        words.push("[REDACTED]");
-        // The closing quote ends the value, and the word carrying it is the last
-        // that can hold any of the credential. Until then EVERY word is part of
-        // it: a word budget here let a long Digest value (nine parameters, more
-        // than the eight allowed) print its response. Nothing else is needed to
-        // bound this — the loop is per LINE and the input is capped at
-        // MAX_CHARS, so an unterminated value costs one line, not the message.
-        if (unescapedQuotes(word) > 0) {
-          redactingValue = false;
+  let safe = "";
+  i = 0;
+  while (i < chars.length) {
+    if (chars[i] === '"') {
+      const end = quoteEnd(chars, i);
+      const colon = spaces(chars, end);
+      if (chars[colon] === ":") {
+        let key: unknown;
+        try { key = JSON.parse(chars.slice(i, end).join("")); } catch { /* malformed key remains plain text */ }
+        if (typeof key === "string" && contract.keys.includes(key.toLowerCase())) {
+          const start = spaces(chars, colon + 1);
+          safe += chars.slice(i, start).join("");
+          const value = valueEnd(chars, start, false);
+          if (chars[start] === '"') {
+            safe += '"[REDACTED]';
+            if (value > start + 1 && chars[value - 1] === '"') safe += '"';
+          } else safe += "[REDACTED]";
+          i = value; continue;
         }
-        continue;
-      }
-      if (redactFollowing > 0) {
-        words.push("[REDACTED]");
-        redactFollowing -= 1;
-        continue;
-      }
-      // The header name is the part of the label before its FIRST colon. RFC
-      // 9110's whitespace after that colon is optional, so `Authorization:Basic`
-      // is one word and an equality test on the whole label misses it — leaving
-      // the credential in the next word in full. A JSON key keeps its quote
-      // there (`authorization":"bearer`), so it stays with the keyword rules
-      // below and costs one word rather than the rest of the line.
-      const headerName = label.includes(":")
-        ? label.slice(0, label.indexOf(":"))
-        : null;
-      if (
-        label === "authorization" ||
-        lower.endsWith("authorization:") ||
-        headerName?.endsWith("authorization")
-      ) {
-        words.push(word);
-        redactRestOfLine = true;
-        continue;
-      }
-      // A header written without RFC 9110's optional whitespace keeps its
-      // value in the SAME word: `X-API-Key:secret`. Every rule below redacts a
-      // FOLLOWING word, so nothing ever saw that value. The name is the part
-      // before the first colon — kept, because it is context — and everything
-      // after it goes. A JSON key holds its quote there (`"x-api-key":"abc`)
-      // and is left to the JSON rules, which redact the whole word.
-      const colon = label.indexOf(":");
-      if (
-        colon > 0 &&
-        colon < label.length - 1 &&
-        CREDENTIAL_HEADER_NAMES.some((keyword) =>
-          label.slice(0, colon).endsWith(keyword),
-        )
-      ) {
-        const cut = word.indexOf(":");
-        words.push(`${word.slice(0, cut)}:[REDACTED]`);
-        continue;
-      }
-      const credentialKeywords = [
-        "bearer",
-        "token",
-        "api_key",
-        "apikey",
-        "password",
-      ];
-      // `secret` labels a credential as a WHOLE label only. It must be admitted
-      // here — the rest-of-line list below can never be reached otherwise — but
-      // NOT by the tail match: `token=super-secret` ends with it, and that value
-      // belongs to the inline rule, which redacts it in place.
-      const labelledSecret = label === "secret";
-      if (
-        credentialKeywords.includes(label) ||
-        labelledSecret ||
-        lower.endsWith("api-key:") ||
-        // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
-        // the word naming the key holds only the START of it and the credential
-        // is the NEXT word. Matching the label's TAIL catches that:
-        // `{"authorization":"bearer` ends with `bearer`. Redaction errs safe, so
-        // an over-eager match costs a word of context.
-        credentialKeywords.some((keyword) => label.endsWith(keyword))
-      ) {
-        words.push(word);
-        // A passphrase is WORDS. `bearer`, `token` and the api-key spellings
-        // carry a single token by specification, so one word is the whole value
-        // and the rest of the line stays as context; `password` and `secret`
-        // label something the grammar does not bound, and redacting one word of
-        // it printed the others.
-        if (["password", "secret"].some((keyword) => label.endsWith(keyword))) {
-          redactRestOfLine = true;
-        } else {
-          redactFollowing = 1;
-        }
-        continue;
-      }
-      // Tested against the LABEL as well as the raw word: a provider quoting
-      // the credential back (`invalid API key "sk-live-abcdef"`) puts a quote
-      // in front of the prefix, and nothing introduces the value, so the raw
-      // test alone printed it in full.
-      const secretPrefix = [
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "tvly-",
-      ].some((prefix) => lower.startsWith(prefix) || label.startsWith(prefix));
-      // A compact JSON body is ONE whitespace-delimited word, so the key-then-
-      // value rules above never see the value: `{"Authorization":"Bearer secret"}`
-      // has no space to split on, does not start with a known prefix, and the
-      // whole word must therefore be redacted on the key alone. `authorization`
-      // is the one that carries a live credential most often and was missing.
-      let jsonValueStart: number | null = null;
-      for (const needle of [
-        '"authorization":',
-        '"token":',
-        '"access_token":',
-        '"refresh_token":',
-        '"api_key":',
-        '"apikey":',
-        '"x-api-key":',
-        '"secret":',
-        '"password":',
-      ]) {
-        const index = lower.indexOf(needle);
-        if (index !== -1) {
-          jsonValueStart = index + needle.length;
-          break;
-        }
-      }
-      const jsonSecret = jsonValueStart !== null;
-      let inline: { needle: string; index: number } | null = null;
-      for (const needle of [
-        "token=",
-        "api_key=",
-        "apikey=",
-        "password=",
-        "bearer=",
-      ]) {
-        const index = lower.indexOf(needle);
-        if (index !== -1) {
-          inline = { needle, index };
-          break;
-        }
-      }
-      if (secretPrefix || jsonSecret) {
-        words.push("[REDACTED]");
-        // An opening and a closing quote mean the value ended inside this word.
-        // Fewer means it runs on into the next ones.
-        if (
-          jsonValueStart !== null &&
-          unescapedQuotes(lower.slice(jsonValueStart)) < 2
-        ) {
-          redactingValue = true;
-        }
-      } else if (inline) {
-        words.push(
-          `${word.slice(0, inline.index + inline.needle.length)}[REDACTED]`,
-        );
-      } else {
-        words.push(word);
       }
     }
-  }
-
-  let safe = words.join(" ");
-  if (Array.from(safe).length > MAX_CHARS) {
-    safe = Array.from(safe).slice(0, MAX_CHARS).join("");
-  }
-  if (Array.from(raw).length > MAX_CHARS) {
-    if (Array.from(safe).length === MAX_CHARS) {
-      safe = Array.from(safe).slice(0, -1).join("");
+    if (nameCharacter(chars[i]) && (i === 0 || !nameCharacter(chars[i - 1]))) {
+      let end = i;
+      while (end < chars.length && nameCharacter(chars[end])) end += 1;
+      const key = chars.slice(i, end).join("").toLowerCase();
+      if (contract.prefixes.some((prefix) => key.startsWith(prefix))) {
+        safe += "[REDACTED]"; i = valueEnd(chars, i, false); continue;
+      }
+      const separator = spaces(chars, end);
+      const delimiter = chars[separator];
+      const explicit = delimiter === ":" || delimiter === "=";
+      const label = ["authorization", "bearer", "token", "api_key", "apikey", "password", "secret"].includes(key);
+      if (contract.keys.includes(key) && (explicit || (label && separator > end))) {
+        const start = spaces(chars, separator + Number(explicit));
+        safe += chars.slice(i, start).join("");
+        const wholeLine = delimiter !== "=" && ["authorization", "proxy-authorization", "password", "secret", "cookie", "set-cookie"].includes(key);
+        safe += "[REDACTED]"; i = valueEnd(chars, start, wholeLine); continue;
+      }
     }
-    safe += "…";
+    safe += chars[i]; i += 1;
   }
-  return safe;
+  const flat = safe.split(/\s+/).filter(Boolean).join(" ");
+  return Array.from(flat).slice(0, contract.maxOutput - Number(truncated)).join("") + (truncated ? "…" : "");
 }
 
 /**
@@ -405,6 +245,13 @@ export function diagnoseFailure(
 ): FailureDiagnosis {
   const detail = sanitizeFailureText(reason);
   const summary = summarizeError(detail);
+  if (/\b402\b|payment[ _-]required/i.test(detail)) return {
+    summary: "The provider requires billing access",
+    detail,
+    authRelated: false,
+    remedy: "none",
+    hint: "This provider requires billing or account access before it can serve this model.",
+  };
   const structured = structuredRemedy(error);
   if (structured) {
     // The daemon classified the typed cause; that outranks any reading of

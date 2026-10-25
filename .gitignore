@@ -33,3 +33,5 @@ __pycache__/
 # A stray criterion run from the wrong cwd created apps/desktop/src/target/;
 # ignore a target dir at ANY depth, not just the workspace root.
 **/target/
+/apps/desktop/src-tauri/binaries/
+/apps/desktop/src-tauri/resources/embedding-runtime/

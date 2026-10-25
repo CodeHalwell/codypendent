@@ -693,6 +693,7 @@ pub async fn append_run_usage(
         prompt_tokens,
         completion_tokens,
         cost_micros,
+        coverage,
     } = body
     else {
         return Err(anyhow::anyhow!("append_run_usage requires RunUsage"));
@@ -708,13 +709,14 @@ pub async fn append_run_usage(
     let cost_micros_db = to_i64(*cost_micros)?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let affected = sqlx::query(
-        "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ? \
+        "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ?, usage_coverage = ? \
          WHERE id = ? AND session_id = ? \
            AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state != 'closed')",
     )
     .bind(prompt_tokens_db)
     .bind(completion_tokens_db)
     .bind(cost_micros_db)
+    .bind(coverage.map(|value| serde_json::to_string(&value)).transpose()?)
     .bind(run_id.to_string())
     .bind(session_id.to_string())
     .bind(session_id.to_string())
@@ -795,6 +797,11 @@ pub async fn append_run_usage(
         .bind(prompt_tokens_db)
         .bind(completion_tokens_db)
         .bind(cost_micros_db)
+        .bind(
+            coverage
+                .map(|value| serde_json::to_string(&value))
+                .transpose()?,
+        )
         .bind(occurred_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
@@ -1003,6 +1010,15 @@ fn remap_body(body: &EventBody, map: &HashMap<RunId, RunId>) -> EventBody {
             args_digest: args_digest.clone(),
             label: label.clone(),
         },
+        ToolUpdated {
+            run_id,
+            tool,
+            label,
+        } => ToolUpdated {
+            run_id: remap(*run_id, map),
+            tool: tool.clone(),
+            label: label.clone(),
+        },
         ToolCompleted {
             run_id,
             tool,
@@ -1064,11 +1080,13 @@ fn remap_body(body: &EventBody, map: &HashMap<RunId, RunId>) -> EventBody {
             prompt_tokens,
             completion_tokens,
             cost_micros,
+            coverage,
         } => RunUsage {
             run_id: remap(*run_id, map),
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
             cost_micros: *cost_micros,
+            coverage: *coverage,
         },
         LearningsCaptured {
             run_id,
@@ -1239,6 +1257,7 @@ mod tests {
                 prompt_tokens,
                 completion_tokens,
                 cost_micros,
+                coverage: None,
             },
             Utc::now(),
         )
@@ -1464,6 +1483,7 @@ mod tests {
                 prompt_tokens: Some(4000),
                 completion_tokens: Some(212),
                 cost_micros: Some(15_000),
+                coverage: None,
             } if persisted == run_id
         ));
     }

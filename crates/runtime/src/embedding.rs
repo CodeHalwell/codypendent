@@ -1,38 +1,6 @@
-//! The real embedding model behind knowledge's [`SemanticEmbedder`] seam
-//! (rubric 9).
-//!
-//! `codypendent-knowledge` stays model-free (ADR-009): it defines the trait and
-//! the offline `HashingEmbedder` fallback, and THIS crate — the only one allowed
-//! to talk to providers — implements the trait over an OpenAI-compatible
-//! `POST {base_url}/embeddings` endpoint. The daemon constructs one from
-//! `models.toml`'s `[embedding]` entry and injects it into context assembly and
-//! the index-outbox drain, exactly as it injects [`LlmFactExtractor`] for memory
-//! extraction. With no `[embedding]` entry there is no embedder, retrieval keeps
-//! the hashing model, and nothing about today's behavior changes.
-//!
-//! The wire shape is the OpenAI embeddings API, which Ollama
-//! (`nomic-embed-text` at `http://localhost:11434/v1`), OpenAI, and Nebius
-//! (`Qwen/Qwen3-Embedding-8B`) all serve:
-//!
-//! ```json
-//! → {"model": "nomic-embed-text", "input": ["first text", "second text"]}
-//! ← {"data": [{"index": 0, "embedding": [..]}, {"index": 1, "embedding": [..]}]}
-//! ```
-//!
-//! Three properties matter for correctness and are enforced here rather than
-//! assumed of the provider: responses are re-ordered by their `index` field (the
-//! spec permits any order); a batch is split into
-//! [`MAX_BATCH_INPUTS`]-sized requests so a large registry cannot exceed a
-//! provider's per-request limit; and every returned vector is checked to have
-//! ONE width, matching the configured `dims` when set — a mismatched width means
-//! the endpoint is not the model the persisted vectors were written under.
-//!
-//! Everything is bounded and fallible-by-value: a timeout, an HTTP error, a
-//! malformed body, or a width mismatch returns [`EmbedError`], and knowledge's
-//! `semantic_indexes` degrades that to the hashing embedder. Retrieval is an
-//! aid, never a gate on running.
+//! Shared bounded embedding client for the bundled runtime and explicit provider overrides.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -42,6 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::models::EmbeddingConfig;
 
+mod bundled;
+pub use bundled::BundledEmbedder;
+
 /// Wall-clock bound on ONE `/embeddings` request (the batch is chunked, so this
 /// bounds each chunk). Mirrors the fact extractor's 30s model-call budget.
 const EMBED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,6 +21,7 @@ const EMBED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// (OpenAI at 2048 inputs; local servers far lower), so a registry of any size
 /// is chunked rather than refused.
 const MAX_BATCH_INPUTS: usize = 64;
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 /// The provider string this adapter serves. An `[embedding]` entry naming
 /// anything else is rejected at construction rather than silently attempted.
@@ -68,6 +40,9 @@ pub struct HttpEmbedder {
     /// The provider-side model name, sent verbatim and persisted alongside every
     /// vector so a model change invalidates stored rows.
     model: String,
+    space_id: String,
+    bearer_token: Option<String>,
+    batch_size: usize,
     /// The NAME of the environment variable holding the API key (empty for a
     /// local endpoint with no auth). Only the name is retained.
     api_key_env: String,
@@ -77,6 +52,7 @@ pub struct HttpEmbedder {
     /// unchanged registry description (or a repeated query) free within a
     /// process; the `registry_embeddings` table is the cross-process cache.
     cache: Mutex<HashMap<String, Vec<f32>>>,
+    requests: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for HttpEmbedder {
@@ -112,20 +88,43 @@ impl HttpEmbedder {
         if config.model.trim().is_empty() {
             return Err(EmbedError("embedding model is blank".to_string()));
         }
-        let client = reqwest::Client::builder()
-            .timeout(EMBED_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| {
-                EmbedError(format!("could not build the embedding client: {error}"))
-            })?;
+        let mut builder = reqwest::Client::builder().timeout(EMBED_REQUEST_TIMEOUT);
+        if reqwest::Url::parse(base).ok().is_some_and(|url| {
+            url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            })
+        }) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|error| {
+            EmbedError(format!("could not build the embedding client: {error}"))
+        })?;
         Ok(Self {
             client,
             endpoint: format!("{base}/embeddings"),
             model: config.model.trim().to_string(),
+            space_id: format!(
+                "{base}/{}:dims={:?}:retrieval-v1",
+                config.model.trim(),
+                config.dims
+            ),
+            bearer_token: None,
+            batch_size: MAX_BATCH_INPUTS,
             api_key_env: config.api_key_env.trim().to_string(),
             dims: config.dims,
             cache: Mutex::new(HashMap::new()),
+            requests: tokio::sync::Mutex::new(()),
         })
+    }
+
+    pub(crate) fn with_identity(mut self, space_id: String, token: String) -> Self {
+        self.space_id = space_id;
+        self.bearer_token = Some(token);
+        self.batch_size = 16;
+        self
     }
 
     /// The endpoint this embedder posts to (diagnostics + tests).
@@ -138,6 +137,9 @@ impl HttpEmbedder {
     /// An unset or blank variable means "no auth" (a local endpoint), matching
     /// [`ModelConfig::api_key_env`](crate::models::ModelConfig::api_key_env).
     fn api_key(&self) -> Option<String> {
+        if let Some(token) = &self.bearer_token {
+            return Some(token.clone());
+        }
         if self.api_key_env.is_empty() {
             return None;
         }
@@ -230,7 +232,7 @@ fn parse_embeddings(
                     .ok_or_else(|| EmbedError(format!("embeddings entry {index} is not numeric")))
             })
             .collect::<Result<Vec<f32>, EmbedError>>()?;
-        if vector.is_empty() {
+        if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
             return Err(EmbedError(format!("embeddings entry {index} is empty")));
         }
         *slot = Some(vector);
@@ -275,22 +277,64 @@ impl SemanticEmbedder for HttpEmbedder {
         &self.model
     }
 
+    fn space_id(&self) -> &str {
+        &self.space_id
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let input = if self.model.contains("embeddinggemma") {
+            format!("task: search result | query: {text}")
+        } else {
+            text.to_string()
+        };
+        let mut vectors = self.embed_cached(&[input]).await?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbedError("query embedding missing".to_string()))
+    }
+
     /// Embed `texts` in input order, serving what the content-hash cache already
     /// holds and requesting only the rest — chunked into [`MAX_BATCH_INPUTS`]
     /// requests. A repeated text within one batch is requested once.
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let texts = texts
+            .iter()
+            .map(|text| {
+                if self.model.contains("embeddinggemma") {
+                    format!("title: none | text: {text}")
+                } else {
+                    text.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        self.embed_cached(&texts).await
+    }
+}
+
+impl HttpEmbedder {
+    async fn embed_cached(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         let keys: Vec<String> = texts.iter().map(|text| cache_key(text)).collect();
+        let active = keys.iter().collect::<HashSet<_>>();
+        if active.len() > MAX_CACHE_ENTRIES {
+            return Err(EmbedError(
+                "embedding request exceeds the bounded cache capacity".to_string(),
+            ));
+        }
+        if let Some(vectors) = self.cached(&keys) {
+            return Ok(vectors);
+        }
 
         // Split into cache hits and the distinct texts still to request.
         let mut pending: Vec<String> = Vec::new();
         let mut pending_keys: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
         {
             let cache = self.cache.lock().expect("embedding cache poisoned");
             for (text, key) in texts.iter().zip(&keys) {
-                if !cache.contains_key(key) && !pending_keys.contains(key) {
+                if !cache.contains_key(key) && seen.insert(key) {
                     pending.push(text.clone());
                     pending_keys.push(key.clone());
                 }
@@ -300,25 +344,53 @@ impl SemanticEmbedder for HttpEmbedder {
         // Request the misses, chunked; fill the cache as each chunk lands so a
         // later failure still leaves the earlier work cached.
         for (chunk, chunk_keys) in pending
-            .chunks(MAX_BATCH_INPUTS)
-            .zip(pending_keys.chunks(MAX_BATCH_INPUTS))
+            .chunks(self.batch_size)
+            .zip(pending_keys.chunks(self.batch_size))
         {
-            let vectors = self.embed_chunk(chunk).await?;
+            let _request = self.requests.lock().await;
+            let missing = {
+                let cache = self.cache.lock().expect("embedding cache poisoned");
+                chunk
+                    .iter()
+                    .zip(chunk_keys)
+                    .filter(|(_, key)| !cache.contains_key(*key))
+                    .map(|(text, key)| (text.clone(), key.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let inputs = missing
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect::<Vec<_>>();
+            let vectors = if inputs.is_empty() {
+                Vec::new()
+            } else {
+                self.embed_chunk(&inputs).await?
+            };
             let mut cache = self.cache.lock().expect("embedding cache poisoned");
-            for (key, vector) in chunk_keys.iter().zip(vectors) {
+            for ((_, key), vector) in missing.iter().zip(vectors) {
+                if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(key) {
+                    cache.retain(|key, _| active.contains(key));
+                }
                 cache.insert(key.clone(), vector);
             }
         }
 
         let cache = self.cache.lock().expect("embedding cache poisoned");
-        keys.iter()
+        let result = keys
+            .iter()
             .map(|key| {
                 cache
                     .get(key)
                     .cloned()
                     .ok_or_else(|| EmbedError("embedding cache miss after request".to_string()))
             })
-            .collect()
+            .collect();
+        result
+    }
+
+    fn cached(&self, keys: &[String]) -> Option<Vec<Vec<f32>>> {
+        let cache = self.cache.lock().expect("embedding cache poisoned");
+        keys.iter().map(|key| cache.get(key).cloned()).collect()
     }
 }
 
@@ -326,6 +398,101 @@ impl SemanticEmbedder for HttpEmbedder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn cached_queries_do_not_wait_for_indexing() {
+        let embedder = HttpEmbedder::from_config(&config("http://127.0.0.1:1/v1", "m")).unwrap();
+        embedder
+            .cache
+            .lock()
+            .unwrap()
+            .insert(cache_key("hot"), vec![1.0, 2.0]);
+        let _indexing = embedder.requests.lock().await;
+        let vectors = tokio::time::timeout(
+            Duration::from_millis(100),
+            embedder.embed_batch(&["hot".to_string()]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 2.0]]);
+    }
+
+    #[tokio::test]
+    async fn new_queries_run_between_indexing_batches() {
+        use std::sync::Arc;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let data = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| json!({"index":index,"embedding":[1.0,2.0]}))
+                    .collect::<Vec<_>>();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(json!({"data":data}))
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut embedder = HttpEmbedder::from_config(&config(&server.uri(), "m")).unwrap();
+        embedder.batch_size = 2;
+        let embedder = Arc::new(embedder);
+        let indexing = embedder.clone();
+        let background = tokio::spawn(async move {
+            indexing
+                .embed_batch(&["a".into(), "b".into(), "c".into(), "d".into()])
+                .await
+                .unwrap()
+        });
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        embedder.embed_query("new query").await.unwrap();
+        background.await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let middle: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(middle["input"][0], "new query");
+    }
+
+    #[tokio::test]
+    async fn partial_failures_cannot_expand_the_cache() {
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let inputs = body["input"].as_array().unwrap();
+                if inputs[0] == "64" {
+                    return ResponseTemplate::new(503);
+                }
+                let data = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| json!({"index":index,"embedding":[1.0,2.0]}))
+                    .collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let embedder = HttpEmbedder::from_config(&config(&server.uri(), "m")).unwrap();
+        embedder
+            .cache
+            .lock()
+            .unwrap()
+            .extend((0..MAX_CACHE_ENTRIES).map(|n| (format!("old-{n}"), vec![1.0, 2.0])));
+        assert!(embedder
+            .embed_batch(&(0..65).map(|n| n.to_string()).collect::<Vec<_>>())
+            .await
+            .is_err());
+        assert!(embedder.cache.lock().unwrap().len() <= MAX_CACHE_ENTRIES);
+    }
 
     fn config(base_url: &str, model: &str) -> EmbeddingConfig {
         EmbeddingConfig {

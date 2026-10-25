@@ -53,6 +53,7 @@ pub mod model_probe;
 mod promotion;
 mod publish;
 mod retrieval;
+mod retrieval_catalog;
 mod routing;
 // Outcome 11: the writeback that fills a model profile's per-task-class
 // success table — the map the router actually reads.
@@ -142,14 +143,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "failed to register built-in tools"),
     }
 
-    // The indexer worker (rubric 9): reconcile persisted registry vectors at
-    // startup, then drain the `index_outbox` on a timer — the first production
-    // consumer that table has ever had, so it stops growing without bound and
-    // context assembly loads vectors instead of recomputing them per call.
-    // Fire-and-forget after `register_builtins` so the builtins' own outbox rows
-    // are already queued. With no `[embedding]` entry the drain still consumes
-    // rows (nothing to persist for the offline hashing model) and retrieval is
-    // byte-for-byte what it was before.
+    // Warm semantic vectors in the background while clients connect.
     let embedder = retrieval::build_embedder(&paths);
     retrieval::spawn_index_maintenance(pool.clone(), embedder.clone());
 

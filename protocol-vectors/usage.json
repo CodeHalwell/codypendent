@@ -8,6 +8,13 @@
     },
     "body": {
       "completion_tokens": 60,
+      "coverage": {
+        "completion_requests": 2,
+        "cost_requests": 0,
+        "prompt_requests": 1,
+        "requests": 2,
+        "unmeasured_retries": 1
+      },
       "prompt_tokens": 1002,
       "run_id": "30000000-0000-0000-0000-000000000001",
       "type": "RunUsage"

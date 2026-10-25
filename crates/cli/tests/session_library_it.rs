@@ -649,10 +649,11 @@ async fn bundle_export_writes_verified_bytes_and_reports_the_redaction_summary()
 }
 
 #[tokio::test]
-async fn a_bundle_whose_bytes_do_not_match_the_ref_is_never_written() {
+async fn a_corrupt_bundle_preserves_an_existing_export() {
     let (socket, listener) = MockSocket::bind();
     let dir = tempfile::tempdir().expect("tempdir");
     let out_path = dir.path().join("bundle.tar");
+    std::fs::write(&out_path, b"keep the previous export").unwrap();
     // The ref promises one digest; the daemon then serves different bytes.
     let promised = artifact_ref(b"the promised bytes", "application/vnd.codypendent.bundle");
     let promised_for_server = promised.clone();
@@ -689,7 +690,9 @@ async fn a_bundle_whose_bytes_do_not_match_the_ref_is_never_written() {
         )
         .await
         .expect("write BundleExported");
-        serve_artifact_reads(&mut stream, &promised_for_server, b"CORRUPTED").await;
+        let corrupted = b"CORRUPTED bytes!!!";
+        assert_eq!(corrupted.len() as u64, promised_for_server.byte_length);
+        serve_artifact_reads(&mut stream, &promised_for_server, corrupted).await;
     });
 
     let mut conn = Connection::connect(&socket.path).await.expect("connect");
@@ -707,10 +710,12 @@ async fn a_bundle_whose_bytes_do_not_match_the_ref_is_never_written() {
     server.await.expect("mock server task");
 
     assert!(error.to_string().contains("digest mismatch"), "{error}");
-    assert!(
-        !out_path.exists(),
-        "a file that failed verification is never written"
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        b"keep the previous export"
     );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert!(log.is_empty(), "a failed export never reports success");
 }
 
 #[tokio::test]

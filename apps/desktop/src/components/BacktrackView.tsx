@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * Backtrack / Session Fork — the TUI's `Overlay::Backtrack(BacktrackState)`.
  *
@@ -202,18 +203,17 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
   };
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Backtrack / Session Fork</div>
+          <h1 style={surfaceStyles.title}>Checkpoints</h1>
           <div style={surfaceStyles.subtitle}>
-            Checkpoints this session's ledger recorded — branch from one, or ask to rewind a
-            worktree to it.
+            Continue from an earlier point in this conversation or review a workspace restore.
           </div>
         </div>
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         {unavailable && (
           <div role="status" style={banner("warn")}>
             {unavailable}
@@ -222,8 +222,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
 
         {activeSessionId === null && (
           <div role="status" style={banner("warn")}>
-            No session is attached, so there is no ledger to read checkpoints from. Open a session
-            first.
+            Open a chat to see its saved checkpoints.
           </div>
         )}
 
@@ -344,7 +343,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
           </div>
         ))}
       </div>
-    </div>
+    </PageShell>
   );
 };
 

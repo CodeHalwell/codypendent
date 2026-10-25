@@ -129,8 +129,12 @@ class StubTransport implements DesktopTransport {
   /** Push a frame the way the shell's channel would. */
   async push(frame: DaemonFrame): Promise<void> {
     await act(async () => {
-      this.frames?.(frame);
+      this.emit(frame);
     });
+  }
+
+  emit(frame: DaemonFrame): void {
+    this.frames?.(frame);
   }
 }
 
@@ -165,7 +169,7 @@ describe("desktop client with no daemon transport", () => {
     // banner across the top of the main pane, where it cannot be overlooked.
     const banner = screen.getByTestId("connection-banner");
     expect(banner.getAttribute("role")).toBe("alert");
-    expect(banner.textContent).toContain("Not connected to codypendentd.");
+    expect(banner.textContent).toContain("Open Codypendent to connect");
     expect(banner.textContent).toContain(NO_SHELL_DETAIL);
     expect(screen.getAllByText(NO_SHELL_DETAIL).length).toBeGreaterThan(0);
     // ...and the sidebar dot still names the state for a screen reader.
@@ -181,7 +185,7 @@ describe("desktop client with no daemon transport", () => {
     const send = screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
     expect(objective.disabled).toBe(true);
     expect(send.disabled).toBe(true);
-    expect(objective.placeholder).toBe("Not connected to codypendentd — runs cannot be submitted.");
+    expect(objective.placeholder).toBe("Connect your workspace to start a coding task.");
 
     fireEvent.change(objective, { target: { value: "do the thing" } });
     fireEvent.click(send);
@@ -193,8 +197,8 @@ describe("desktop client with no daemon transport", () => {
       .queryAllByText(/do the thing/)
       .filter((element) => element.tagName !== "TEXTAREA");
     expect(echoes).toEqual([]);
-    expect(screen.getByText("No sessions (not connected)")).toBeTruthy();
-    expect(screen.getByText("Not connected to codypendentd")).toBeTruthy();
+    expect(screen.getByText("Connect to load your chats.")).toBeTruthy();
+    expect(screen.getByText("Your workspace starts here")).toBeTruthy();
   });
 
   it("reports the daemon's own failure reason when the socket is unreachable", async () => {
@@ -328,6 +332,22 @@ describe("desktop client connected to a daemon", () => {
     expect(transport.cancelled).toEqual(["run-1"]);
   });
 
+  it("shows cancellation metadata when RunStarted precedes a new session's launch reply", async () => {
+    const transport = new StubTransport();
+    await renderWith(transport);
+    await transport.push({ ...event(1, { type: "RunStarted", run_id: "old-run", objective: "old task" }), session_id: "old-session" } as DaemonFrame);
+    await transport.push({ ...event(2, { type: "RunStateChanged", run_id: "old-run", state: { type: "Completed" } }), session_id: "old-session" } as DaemonFrame);
+    transport.startObjective = async () => {
+      transport.emit(event(1, { type: "RunStarted", run_id: "run-1", objective: "run the acceptance tests" }));
+      return { session_id: "session-1", run_id: "run-1" };
+    };
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "run the acceptance tests" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Send" })));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel Run" }));
+    expect(screen.getByTestId("cancel-confirm-objective").textContent).toBe("run the acceptance tests");
+    expect(screen.getByTestId("cancel-confirm-elapsed").textContent).not.toContain("Unknown");
+  });
+
   it("resolves approval cards through the daemon transport", async () => {
     const transport = new StubTransport();
     await renderWith(transport);
@@ -387,7 +407,7 @@ describe("desktop client connected to a daemon", () => {
             {
               approval_id: "approval-snapshot",
               run_id: "run-1",
-              action: { type: "ExecuteCommand", program: "npm", args: ["test"], environment: [], cwd: null },
+              action: { type: "ExecuteCommand", program: "npm", args: ["test"], environment: [["NODE_OPTIONS", "--require=/tmp/loader.js"]], cwd: "/tmp/recovered-repository" },
               risk: { level: { type: "Medium" }, reasons: [] },
             },
           ],
@@ -397,7 +417,10 @@ describe("desktop client connected to a daemon", () => {
       },
     });
 
-    expect(screen.getByText("ExecuteCommand: npm test")).toBeTruthy();
+    expect(screen.getByText("Run a command")).toBeTruthy();
+    expect(screen.getByText("npm test")).toBeTruthy();
+    expect(screen.getByLabelText("Proposed action details").textContent).toContain("--require=/tmp/loader.js");
+    expect(screen.getByLabelText("Proposed action details").textContent).toContain("/tmp/recovered-repository");
     expect(screen.getByRole("button", { name: "Cancel Run" })).toBeTruthy();
 
     // A live event may outrun the auxiliary history read. The history frame
@@ -459,7 +482,7 @@ describe("desktop client connected to a daemon", () => {
     });
 
     expect(screen.getByRole("alert").textContent).toContain("StartRun rejected: policy denied");
-    expect(screen.getByText("Ready")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Your workspace. Your agents." })).toBeTruthy();
   });
 
   it("switches views between sessions, inbox, and analytics", async () => {
@@ -488,15 +511,16 @@ describe("desktop client connected to a daemon", () => {
     await act(async () => {
       fireEvent.click(inboxTab);
     });
-    expect(screen.getByText("Durable Inbox")).toBeDefined();
+    expect(screen.getByRole("heading", { name: "Inbox" })).toBeDefined();
     expect(screen.getByText("Durable Inbox Test Entry")).toBeDefined();
 
     // Switch to Analytics View
-    const analyticsTab = screen.getByRole("button", { name: "Analytics View" });
+    fireEvent.click(screen.getByRole("button", { name: "Run group" }));
+    const analyticsTab = screen.getByRole("button", { name: "Usage View" });
     await act(async () => {
       fireEvent.click(analyticsTab);
     });
-    expect(screen.getByText("Analytics & Quality Center")).toBeDefined();
+    expect(await screen.findByRole("heading", { name: "Usage" })).toBeDefined();
 
     // Switch back to Sessions View
     const sessionsTab = screen.getByRole("button", { name: "Sessions View" });

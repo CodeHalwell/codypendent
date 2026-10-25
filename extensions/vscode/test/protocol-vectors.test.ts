@@ -563,6 +563,13 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         args_digest: str(r, "args_digest"),
         label: optStr(r, "label"),
       };
+    case "ToolUpdated":
+      return {
+        type: "ToolUpdated",
+        run_id: str(r, "run_id"),
+        tool: str(r, "tool"),
+        label: optStr(r, "label"),
+      };
     case "ToolCompleted": {
       const artifactRaw = optRec(r, "artifact");
       return {
@@ -619,6 +626,13 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         prompt_tokens: optNum(r, "prompt_tokens"),
         completion_tokens: optNum(r, "completion_tokens"),
         cost_micros: optNum(r, "cost_micros"),
+        coverage: r.coverage == null ? undefined : {
+          requests: num(rec(r, "coverage"), "requests"),
+          prompt_requests: num(rec(r, "coverage"), "prompt_requests"),
+          completion_requests: num(rec(r, "coverage"), "completion_requests"),
+          cost_requests: num(rec(r, "coverage"), "cost_requests"),
+          unmeasured_retries: optNum(rec(r, "coverage"), "unmeasured_retries"),
+        },
       };
     case "LearningsCaptured":
       return {

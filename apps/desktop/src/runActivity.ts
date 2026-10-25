@@ -17,6 +17,7 @@ export function thousands(value: number): string {
  * one of them as `$0.00`.
  */
 export function formatCostMicros(micros: number): string {
+  if (micros > 0 && micros < 100) return `$0.${Math.trunc(micros).toString().padStart(6, "0")}`;
   const whole = Math.trunc(micros / 1_000_000);
   const fraction = Math.trunc((micros % 1_000_000) / 100);
   return `$${whole}.${fraction.toString().padStart(4, "0")}`;
@@ -43,6 +44,17 @@ export function usageLabel(usage: RunUsage | null): string | null {
   }
   if (usage.costMicros !== null) {
     parts.push(formatCostMicros(usage.costMicros));
+  }
+  if (parts.length > 0) {
+    const coverage = usage.coverage;
+    if (!coverage) {
+      parts.push("coverage unknown");
+    } else if (coverage.requests === 0 || (coverage.unmeasured_retries ?? 0) > 0 ||
+      (usage.promptTokens !== null && coverage.prompt_requests !== coverage.requests) ||
+      (usage.completionTokens !== null && coverage.completion_requests !== coverage.requests) ||
+      (usage.costMicros !== null && coverage.cost_requests !== coverage.requests)) {
+      parts.push("partial");
+    }
   }
   return parts.length > 0 ? parts.join(" · ") : null;
 }

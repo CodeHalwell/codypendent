@@ -976,6 +976,14 @@ fn events_vectors() -> Vec<Vector> {
             }),
         ),
         vec_of(
+            "EventBody_ToolUpdated",
+            event_with(EventBody::ToolUpdated {
+                run_id: run_id(),
+                tool: "acp:tool-7".to_string(),
+                label: Some("Terminal · git status --short".to_string()),
+            }),
+        ),
+        vec_of(
             "EventBody_ToolCompleted",
             event_with(EventBody::ToolCompleted {
                 run_id: run_id(),
@@ -2274,6 +2282,13 @@ fn usage_vectors() -> Vec<Vector> {
             prompt_tokens: Some(1002),
             completion_tokens: Some(60),
             cost_micros: None,
+            coverage: Some(codypendent_protocol::UsageCoverage {
+                requests: 2,
+                prompt_requests: 1,
+                completion_requests: 2,
+                cost_requests: 0,
+                unmeasured_retries: 1,
+            }),
         }),
     )]
 }
@@ -2472,6 +2487,7 @@ fn codegraph_vectors() -> Vec<Vector> {
             qualified_name: "commands::graph_build".to_string(),
             kind: "function".to_string(),
             revision: "9f1c2ab".to_string(),
+            location: None,
         }],
         edges: vec![
             CodeGraphEdgeView {
@@ -2483,6 +2499,7 @@ fn codegraph_vectors() -> Vec<Vector> {
                 confidence: 0.45,
                 evidence_kind: "syntax_inferred".to_string(),
                 revision: "9f1c2ab".to_string(),
+                call_site: None,
                 // A mechanically-derived edge asserts nothing, so the field
                 // stays off the wire entirely.
                 asserted_by: None,
@@ -2499,6 +2516,7 @@ fn codegraph_vectors() -> Vec<Vector> {
                 confidence: 0.6,
                 evidence_kind: "agent_asserted".to_string(),
                 revision: "9f1c2ab".to_string(),
+                call_site: None,
                 asserted_by: Some(CodeGraphEdgeAssertion {
                     session_id: session_id(),
                     run_id: run_id(),
@@ -2508,6 +2526,7 @@ fn codegraph_vectors() -> Vec<Vector> {
                 }),
             },
         ],
+        related_nodes: Vec::new(),
         total_nodes: 812,
         total_edges: 1904,
         limit: 50,
@@ -2537,6 +2556,19 @@ fn codegraph_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "CommandBody_ReadCodeGraph_connected_view",
+            CommandBody::ReadCodeGraph {
+                repository: "/home/user/project".to_string(),
+                query: CodeGraphQuery {
+                    connected_view: true,
+                    include_edges: true,
+                    include_nodes: true,
+                    limit: 100,
+                    ..CodeGraphQuery::default()
+                },
+            },
+        ),
+        vec_of(
             "CommandBody_ReadCodeGraph_filtered",
             CommandBody::ReadCodeGraph {
                 repository: "/home/user/project".to_string(),
@@ -2546,6 +2578,8 @@ fn codegraph_vectors() -> Vec<Vector> {
                     kind: Some("function".to_string()),
                     name: Some("graph".to_string()),
                     node_id: Some("90000000-0000-0000-0000-000000000001".to_string()),
+                    connected_view: false,
+                    include_neighbors: false,
                     include_edges: true,
                     include_nodes: true,
                     limit: 50,

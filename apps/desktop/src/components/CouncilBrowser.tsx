@@ -1,299 +1,90 @@
+import { EmptyState, PageShell } from "./PageShell.js";
 import React, { useCallback, useRef, useState } from "react";
+import { ArrowUpRight, Plus, RefreshCw, Search, UsersRound } from "lucide-react";
+import { modelLabel } from "../modelPresentation.js";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import { useFocusTrap } from "../useFocusTrap.js";
+import { CouncilParticipants, councilTitle } from "./CouncilParticipants.js";
 import type { CouncilCard } from "../localConfig.js";
+import "./Councils.css";
 
-/**
- * The configured councils, from `<config_dir>/councils.toml`.
- *
- * A council is LOCAL CONFIGURATION — there is no council command on the daemon
- * wire — so this list is the council crate's `list_definitions` and nothing
- * else. An empty list means the file has no councils in it; a failure to read
- * it renders as unavailable, because "you have configured none" and "we could
- * not find out" are different facts.
- *
- * Deleting is always confirmed: it edits a shared configuration file, and the
- * confirmation names what will and will not be removed (the definition goes,
- * the saved run reports stay).
- */
 export interface CouncilBrowserProps {
   onLoad: () => Promise<CouncilCard[]>;
   onDelete?: (name: string) => Promise<void>;
-  /** Convene this council — hands off to the results/run view. */
   onRun?: (name: string) => void;
-  /** Open the builder. */
   onCreate?: () => void;
+  onOpenResults?: () => void;
 }
+type Status = { kind: "loading" } | { kind: "loaded"; councils: CouncilCard[] } | { kind: "unavailable"; detail: string };
 
-type Status =
-  | { kind: "loading" }
-  | { kind: "loaded"; councils: CouncilCard[] }
-  | { kind: "unavailable"; detail: string };
-
-export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
-  onLoad,
-  onDelete,
-  onRun,
-  onCreate,
-}) => {
+export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({ onLoad, onDelete, onRun, onCreate, onOpenResults }) => {
   const [status, setStatus] = useState<Status>({ kind: "loading" });
+  const [query, setQuery] = useState("");
   const [confirming, setConfirming] = useState<CouncilCard | null>(null);
-  // The deletion confirmation takes focus on Cancel and owns Escape.
-  const confirmRef = useRef<HTMLDivElement | null>(null);
-  const confirmCancelRef = useRef<HTMLButtonElement | null>(null);
-  useFocusTrap(confirmRef, {
-    active: confirming !== null,
-    initialFocus: confirmCancelRef,
-    onEscape: () => setConfirming(null),
-  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
+  const busyRef = useRef(false);
+  const generation = useRef(0);
+  const confirmRef = useRef<HTMLDivElement | null>(null);
+  const confirmCancelRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(confirmRef, { active: confirming !== null, initialFocus: confirmCancelRef,
+    onEscape: () => { if (!busyRef.current) setConfirming(null); } });
   const load = useCallback(async () => {
+    const current = ++generation.current;
     setStatus({ kind: "loading" });
-    try {
-      setStatus({ kind: "loaded", councils: await onLoad() });
-    } catch (failure) {
-      setStatus({ kind: "unavailable", detail: describe(failure) });
-    }
+    try { const councils = await onLoad(); if (generation.current === current) setStatus({ kind: "loaded", councils }); }
+    catch (failure) { if (generation.current === current) setStatus({ kind: "unavailable", detail: describe(failure) }); }
   }, [onLoad]);
-
   useLoadOnMount(load);
-
   const confirmDelete = async () => {
-    if (!onDelete || !confirming) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await onDelete(confirming.name);
-      setConfirming(null);
-      await load();
-    } catch (failure) {
-      setError(describe(failure));
-    } finally {
-      setBusy(false);
-    }
+    if (!onDelete || !confirming || busyRef.current) return;
+    busyRef.current = true; setBusy(true); setError(null);
+    try { await onDelete(confirming.name); setConfirming(null); await load(); }
+    catch (failure) { setError(describe(failure)); }
+    finally { busyRef.current = false; setBusy(false); }
   };
-
-  return (
-    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-        <div>
-          <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Councils</h2>
-          <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 720 }}>
-            A council convenes several models on one objective and has a chair synthesize
-            their reports. Definitions are local configuration, held in{" "}
-            <code>councils.toml</code> — the daemon has no council command.
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          {onCreate && (
-            <button onClick={onCreate} style={primaryButtonStyle} data-testid="council-new">
-              New council
-            </button>
-          )}
-          <button onClick={() => void load()} style={buttonStyle} data-testid="council-refresh">
-            Refresh
-          </button>
-        </div>
+  const matching = status.kind === "loaded" ? status.councils.filter((council) =>
+    `${council.name} ${councilTitle(council.name)} ${council.description} ${council.members.map((member) => modelLabel(member.model)).join(" ")} ${modelLabel(council.chair)}`.toLowerCase().includes(query.trim().toLowerCase())) : [];
+  return <PageShell className="councils-page"><div className="councils-content">
+    <header className="councils-header">
+      <div><div className="councils-eyebrow"><UsersRound size={14} aria-hidden="true" /> More than one perspective</div>
+        <h1>Councils</h1><p>Bring different models to the same question. Your chair turns their perspectives into one considered answer.</p></div>
+      <div className="councils-header-actions">
+        {onOpenResults && <button type="button" className="council-button quiet" onClick={onOpenResults}>Saved results</button>}
+        {onCreate && <button type="button" className="council-button primary" onClick={onCreate} data-testid="council-new"><Plus size={15} aria-hidden="true" /> New council</button>}
       </div>
-
-      {status.kind === "loading" && (
-        <div role="status" data-testid="council-loading" style={{ ...panel, color: "var(--cody-text-muted)" }}>
-          Reading councils.toml…
-        </div>
-      )}
-
-      {status.kind === "unavailable" && (
-        /* Not "no councils" — we could not read the file at all. */
-        <div role="status" data-testid="council-unavailable" style={{ ...panel, color: "var(--cody-warning)" }}>
-          Councils unavailable — {status.detail}
-        </div>
-      )}
-
-      {status.kind === "loaded" && status.councils.length === 0 && (
-        <div data-testid="council-empty" style={{ ...panel, color: "var(--cody-text-muted)" }}>
-          <div>
-            No councils are configured. A council needs at least two members and a chair, and
-            every one of them must already be a model in <code>models.toml</code>.
-          </div>
-          {/* An empty list that only explains itself leaves the reader to find
-              the button elsewhere on the page. Offer the action here. */}
-          {onCreate && (
-            <button
-              onClick={onCreate}
-              style={{ ...primaryButtonStyle, marginTop: 12 }}
-              data-testid="council-empty-new"
-            >
-              Create the first council
-            </button>
-          )}
-        </div>
-      )}
-
-      {status.kind === "loaded" && status.councils.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {status.councils.map((council) => (
-            <div key={council.name} data-testid={`council-${council.name}`} style={panel}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 15, fontWeight: 600 }}>{council.name}</div>
-                  {council.description && (
-                    <div style={{ marginTop: 4, fontSize: 13, color: "var(--cody-text-muted)" }}>
-                      {council.description}
-                    </div>
-                  )}
-                </div>
-                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-                  {onRun && (
-                    <button
-                      onClick={() => onRun(council.name)}
-                      style={primaryButtonStyle}
-                      data-testid={`council-run-${council.name}`}
-                    >
-                      Convene
-                    </button>
-                  )}
-                  {onDelete && (
-                    <button
-                      onClick={() => setConfirming(council)}
-                      style={buttonStyle}
-                      data-testid={`council-delete-${council.name}`}
-                    >
-                      Delete
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <dl style={{ display: "flex", gap: 24, margin: "12px 0 0", fontSize: 12, flexWrap: "wrap" }}>
-                <Field label="Chair" value={council.chair} />
-                <Field label="Rounds" value={String(council.rounds)} />
-                {/* The definition's OWN quorum when it names one, and what will
-                    actually be enforced when it does not. Never one number
-                    presented as if the operator had chosen it. */}
-                <Field
-                  label="Quorum"
-                  value={
-                    council.quorum === null || council.quorum === undefined
-                      ? `${council.requiredQuorum} (majority, not set)`
-                      : String(council.quorum)
-                  }
-                />
-                <Field label="Evidence mode" value={council.evidence ? "on" : "off"} />
-              </dl>
-
-              <div style={{ marginTop: 12, display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {council.members.map((member) => (
-                  <span
-                    key={`${member.model}:${member.role}`}
-                    style={{
-                      padding: "3px 8px",
-                      borderRadius: 999,
-                      background: "var(--cody-inset)",
-                      border: "1px solid var(--cody-border-strong)",
-                      fontSize: 12,
-                    }}
-                  >
-                    {member.role} · <code style={{ color: "var(--cody-text-muted)" }}>{member.model}</code>
-                  </span>
-                ))}
-              </div>
-
-              {council.chairIsMember && (
-                /* Legal, but the chair then weighs its own report. The council
-                   crate warns about it at creation; say so here too. */
-                <div
-                  data-testid={`council-chair-warning-${council.name}`}
-                  role="status"
-                  style={{ marginTop: 10, fontSize: 12, color: "var(--cody-warning)" }}
-                >
-                  The chair is also a member, so its synthesis will weigh its own report.
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {confirming && (
-        <div ref={confirmRef} role="alertdialog" aria-label="Confirm council deletion" data-testid="council-delete-confirm" style={confirmStyle}>
-          <div style={{ fontWeight: 600 }}>Delete council “{confirming.name}”?</div>
-          <div style={{ marginTop: 6, fontSize: 13, color: "var(--cody-text-muted)" }}>
-            The definition is removed from <code>councils.toml</code>. Saved run reports are
-            kept — a deliberation that happened still happened.
-          </div>
-          {error && (
-            <div role="alert" style={{ marginTop: 8, fontSize: 13, color: "var(--cody-danger-text)" }}>
-              {error}
-            </div>
-          )}
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button onClick={() => void confirmDelete()} disabled={busy} style={dangerButtonStyle} data-testid="council-delete-yes">
-              Delete
-            </button>
-            <button ref={confirmCancelRef} onClick={() => setConfirming(null)} disabled={busy} style={buttonStyle} data-testid="council-delete-no">
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
+    </header>
+    <div className="councils-toolbar"><h2>Your councils</h2>
+      {status.kind === "loaded" && status.councils.length > 0 && <label className="councils-search"><Search size={14} aria-hidden="true" /><input type="search" aria-label="Find a council" placeholder="Find a council" value={query} onChange={(event) => setQuery(event.target.value)} /></label>}
+      <button type="button" onClick={() => void load()} disabled={status.kind === "loading"} className="council-button quiet icon-only" aria-label="Refresh councils" title="Refresh councils" data-testid="council-refresh"><RefreshCw size={14} aria-hidden="true" /></button>
     </div>
-  );
+    {status.kind === "loading" && <div data-testid="council-loading"><EmptyState state="loading" title="Loading your councils" /></div>}
+    {status.kind === "unavailable" && <div data-testid="council-unavailable"><EmptyState state="unavailable" title="Could not load councils" description={status.detail} action={<button type="button" className="council-button" onClick={() => void load()}>Try again</button>} /></div>}
+    {status.kind === "loaded" && status.councils.length === 0 && <div data-testid="council-empty"><EmptyState title="A few good perspectives. One clear answer." description="Choose two or more models to contribute, then a chair to bring their findings together. Save the team and come back to it whenever you need."
+      action={onCreate && <button type="button" className="council-button primary" onClick={onCreate} data-testid="council-empty-new"><Plus size={15} aria-hidden="true" /> Create your first council</button>} /></div>}
+    {status.kind === "loaded" && status.councils.length > 0 && matching.length === 0 && <EmptyState title="No matching councils" description="Try another name, purpose or model." />}
+    <div className="councils-list">{matching.map((council) => <article key={council.name} className="council-card" data-testid={`council-${council.name}`}>
+      <div className="council-card-header"><div className="council-card-heading"><h2>{councilTitle(council.name)}</h2>
+        <p>{council.description || "Different perspectives, brought together by a chair."}</p></div>
+        {onRun && <button type="button" className="council-button primary" onClick={() => onRun(council.name)} data-testid={`council-run-${council.name}`}>Start council <ArrowUpRight size={14} aria-hidden="true" /></button>}
+      </div>
+      <CouncilParticipants members={council.members} chair={council.chair} />
+      <div className="council-card-footer"><span>{council.members.length} perspectives · {council.rounds === 1 ? "One discussion round" : `${council.rounds} discussion rounds`}</span>
+        {council.evidence && <span>Evidence review enabled</span>}</div>
+      <details className="council-details"><summary>Council settings</summary><dl>
+        <dt>Council ID</dt><dd>{council.name}</dd><dt>Responses needed</dt><dd>{council.requiredQuorum}{council.quorum == null ? " · majority of members" : " · configured quorum"}</dd>
+        <dt>Chair model ID</dt><dd>{council.chair}</dd><dt>Member model IDs</dt><dd>{council.members.map((member) => <div key={member.model}>{member.model}</div>)}</dd>
+      </dl>
+        {council.chairIsMember && <p className="council-note warning" role="status" data-testid={`council-chair-warning-${council.name}`}>The chair also contributes a member response and will consider its own findings.</p>}
+        {onDelete && <button type="button" className="council-button danger" onClick={() => { setError(null); setConfirming(council); }} data-testid={`council-delete-${council.name}`}>Delete council</button>}
+      </details>
+    </article>)}</div>
+    {confirming && <div ref={confirmRef} role="alertdialog" aria-label="Confirm council deletion" className="council-card council-confirm" data-testid="council-delete-confirm">
+      <h2>Delete {councilTitle(confirming.name)}?</h2><p>This removes the saved team. Previous council results are kept.</p>
+      {error && <div role="alert" className="council-notice error">{error}</div>}
+      <div className="council-actions"><button type="button" disabled={busy} onClick={() => void confirmDelete()} className="council-button danger" data-testid="council-delete-yes">{busy ? "Deleting…" : "Delete"}</button>
+        <button type="button" ref={confirmCancelRef} disabled={busy} onClick={() => setConfirming(null)} className="council-button" data-testid="council-delete-no">Cancel</button></div>
+    </div>}
+  </div></PageShell>;
 };
-
-const Field: React.FC<{ label: string; value: string }> = ({ label, value }) => (
-  <div>
-    <dt style={{ color: "var(--cody-text-muted)" }}>{label}</dt>
-    <dd style={{ margin: 0 }}>{value}</dd>
-  </div>
-);
-
-const panel: React.CSSProperties = {
-  padding: 16,
-  background: "var(--cody-panel-raised)",
-  border: "1px solid var(--cody-border-strong)",
-  borderRadius: 8,
-};
-
-const confirmStyle: React.CSSProperties = {
-  ...panel,
-  marginTop: 16,
-  borderColor: "var(--cody-danger)",
-  background: "var(--cody-danger-bg)",
-  color: "var(--cody-text)",
-};
-
-const buttonStyle: React.CSSProperties = {
-  padding: "6px 12px",
-  borderRadius: 6,
-  border: "1px solid var(--cody-border-strong)",
-  background: "var(--cody-inset)",
-  color: "var(--cody-text)",
-  fontSize: 13,
-  cursor: "pointer",
-};
-
-const primaryButtonStyle: React.CSSProperties = {
-  ...buttonStyle,
-  background: "var(--cody-success-strong)",
-  borderColor: "var(--cody-success)",
-};
-
-const dangerButtonStyle: React.CSSProperties = {
-  ...buttonStyle,
-  background: "var(--cody-danger)",
-  borderColor: "var(--cody-danger-soft)",
-};
-
-function describe(error: unknown): string {
-  if (typeof error === "string") {
-    return error;
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
-}
+function describe(error: unknown) { return error instanceof Error ? error.message : String(error); }

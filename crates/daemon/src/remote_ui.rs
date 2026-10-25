@@ -431,17 +431,46 @@ impl RemoteUiBroker {
                     .expect("validated capabilities message"),
             );
             if let Some((accepted_id, accepted_digest)) = &renderer.capabilities_receipt {
-                if accepted_id == &incoming.message_id && accepted_digest == &digest {
-                    return Ok(UiBrokerDispatch::default());
+                if accepted_id == &incoming.message_id && accepted_digest != &digest {
+                    return Err(UiBrokerError::RendererDirection {
+                        role,
+                        kind: "capabilities-collision".to_owned(),
+                    });
                 }
-                return Err(UiBrokerError::RendererDirection {
-                    role,
-                    kind: if accepted_id == &incoming.message_id {
-                        "capabilities-collision".to_owned()
-                    } else {
-                        "capabilities-renegotiation".to_owned()
-                    },
-                });
+                let accepted = renderer
+                    .host
+                    .client_capabilities()
+                    .ok_or(UiBrokerError::RendererNotAttached)?;
+                let mut contract = incoming
+                    .capabilities
+                    .as_ref()
+                    .expect("validated capabilities")
+                    .clone();
+                contract.viewport = accepted.viewport;
+                if capabilities_digest(&contract) != *accepted_digest {
+                    return Err(UiBrokerError::RendererDirection {
+                        role,
+                        kind: "capabilities-renegotiation".to_owned(),
+                    });
+                }
+                let selection = renderer
+                    .host
+                    .selection()
+                    .cloned()
+                    .ok_or(UiBrokerError::RendererNotAttached)?;
+                renderer.viewport = incoming
+                    .capabilities
+                    .as_ref()
+                    .map(|capabilities| capabilities.viewport);
+                let mut dispatch = UiBrokerDispatch::default();
+                dispatch.direct.push(ui_message(
+                    "capabilitySelection",
+                    format!("selection:{}", incoming.message_id),
+                    |wire| wire.selection = Some(selection),
+                ));
+                append_renderer_baseline(session, origin, &mut dispatch.direct)?;
+                publish_aggregate_viewports(session);
+                return Ok(dispatch);
             }
             renderer.capabilities_receipt = Some((incoming.message_id.clone(), digest));
             renderer.client_kind = incoming
@@ -2973,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_capabilities_are_one_shot_with_exact_replay_dedupe() {
+    fn renderer_capabilities_replay_the_selection_without_changing_the_contract() {
         let broker = RemoteUiBroker::default();
         let session_id = SessionId::new();
         let client_id = ClientId::new();
@@ -3002,15 +3031,14 @@ mod tests {
         let changed_id = ui_message("capabilities", "renegotiate", |wire| {
             wire.capabilities = Some(offer.clone());
         });
-        assert!(matches!(
-            broker.handle_renderer(
-                session_id,
-                client_id,
-                ClientRole::Contributor,
-                changed_id,
-            ),
-            Err(UiBrokerError::RendererDirection { kind, .. }) if kind == "capabilities-renegotiation"
-        ));
+        let remounted = broker
+            .handle_renderer(session_id, client_id, ClientRole::Controller, changed_id)
+            .expect("same renderer contract survives a view remount");
+        assert!(!remounted.renderer_negotiated);
+        assert!(remounted
+            .direct
+            .iter()
+            .any(|message| message.kind == "capabilitySelection"));
 
         offer.viewport.width += 1;
         let collision = ui_message("capabilities", "one-shot", |wire| {
@@ -3025,6 +3053,49 @@ mod tests {
             ),
             Err(UiBrokerError::RendererDirection { kind, .. }) if kind == "capabilities-collision"
         ));
+    }
+
+    #[test]
+    fn renderer_remount_updates_viewport_but_cannot_expand_capabilities() {
+        let broker = RemoteUiBroker::default();
+        let session = SessionId::new();
+        let client = ClientId::new();
+        broker
+            .subscribe_renderer(session, client)
+            .expect("subscribe");
+        let offer = daemon_offer();
+        broker
+            .handle_renderer(
+                session,
+                client,
+                ClientRole::Controller,
+                ui_message("capabilities", "initial", |wire| {
+                    wire.capabilities = Some(offer.clone())
+                }),
+            )
+            .expect("initial negotiation");
+        let mut resized = offer.clone();
+        resized.viewport.width += 100;
+        let replay = broker
+            .handle_renderer(
+                session,
+                client,
+                ClientRole::Controller,
+                ui_message("capabilities", "remounted", |wire| {
+                    wire.capabilities = Some(resized)
+                }),
+            )
+            .expect("remount after resize");
+        assert!(!replay.renderer_negotiated);
+        assert!(replay
+            .direct
+            .iter()
+            .any(|message| message.kind == "capabilitySelection"));
+        let mut changed = offer;
+        changed.primitives.pop();
+        assert!(
+            matches!(broker.handle_renderer(session, client, ClientRole::Controller, ui_message("capabilities", "changed-contract", |wire| wire.capabilities = Some(changed))), Err(UiBrokerError::RendererDirection { kind, .. }) if kind == "capabilities-renegotiation")
+        );
     }
 
     #[test]

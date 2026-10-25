@@ -25,7 +25,7 @@ use codypendent_protocol::{
 
 use crate::client;
 use crate::connection::Connection;
-use crate::stream::{self, RunExit};
+use crate::stream::{self, OutputFormat, RunExit};
 
 /// Outcome of making sure a daemon is listening: either one already was, or
 /// this call spawned and waited for one. Shared by the human-facing
@@ -453,12 +453,14 @@ pub async fn run(
     model: Option<String>,
     jsonl: bool,
 ) -> anyhow::Result<i32> {
-    if !jsonl {
-        anyhow::bail!(
-            "codypendent run currently requires --jsonl; interactive TUI attach \
-             lands in a later build step"
-        );
+    if objective.trim().is_empty() {
+        anyhow::bail!("the objective cannot be blank; pass a prompt or --objective");
     }
+    let format = if jsonl {
+        OutputFormat::Jsonl
+    } else {
+        OutputFormat::Text
+    };
     let repo = repo.canonicalize().with_context(|| {
         format!(
             "--repo {}: not a valid, accessible directory",
@@ -498,7 +500,7 @@ pub async fn run(
     // stream silently read as killing the run. 130 is the interrupted exit
     // code the stream contract already uses for a cancelled run.
     tokio::select! {
-        result = run_over_connection(&mut conn, objective, mode, &repository, model, &mut stdout) => {
+        result = run_over_connection_with_format(&mut conn, objective, mode, &repository, model, &mut stdout, format) => {
             Ok(result?.exit_code())
         }
         _ = tokio::signal::ctrl_c() => {
@@ -523,6 +525,28 @@ pub async fn run_over_connection<W: Write>(
     repository: &str,
     model: Option<ModelId>,
     out: &mut W,
+) -> anyhow::Result<RunExit> {
+    run_over_connection_with_format(
+        conn,
+        objective,
+        mode,
+        repository,
+        model,
+        out,
+        OutputFormat::Jsonl,
+    )
+    .await
+}
+
+/// The run lifecycle is identical for plain answers and JSONL events.
+pub async fn run_over_connection_with_format<W: Write>(
+    conn: &mut Connection,
+    objective: String,
+    mode: AgentMode,
+    repository: &str,
+    model: Option<ModelId>,
+    out: &mut W,
+    format: OutputFormat,
 ) -> anyhow::Result<RunExit> {
     let hello = conn
         .handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
@@ -584,7 +608,11 @@ pub async fn run_over_connection<W: Write>(
         })
         .await?;
     let catchup = expect_catchup(attach_reply)?;
-    stream::replay_catchup(out, conn.client_id(), session_id, catchup)?;
+    if format == OutputFormat::Jsonl {
+        stream::replay_catchup(out, conn.client_id(), session_id, catchup)?;
+    } else {
+        eprintln!("codypendent: session {session_id} (reattach: codypendent attach {session_id})");
+    }
 
     let start_reply = conn
         .send_command(CommandBody::StartRun {
@@ -613,7 +641,7 @@ pub async fn run_over_connection<W: Write>(
         _ => None,
     };
 
-    stream::stream_until_terminal(conn, out, created_run).await
+    stream::stream_until_terminal_with_format(conn, out, created_run, format).await
 }
 
 /// `codypendent attach <SESSION_ID> [--from-sequence N] --events jsonl`.
@@ -879,8 +907,9 @@ pub async fn skill_new(
 }
 
 /// `codypendent open <session> --in <ide>` (STEP 3.7). Print how the IDE should
-/// attach to the session, then best-effort launch the editor with the session in
-/// its environment. The IDE joins as a *contributor* to the SAME session — the
+/// attach to the session, then best-effort launch the editor with a validated
+/// session URI (or the existing environment contract for other editors).
+/// The IDE joins as a *contributor* to the SAME session — the
 /// run is never restarted; the daemon publishes a `ClientPresenceChanged` so the
 /// TUI shows the editor arriving. A missing editor binary is not an error: the
 /// printed instructions still let a user attach manually.
@@ -893,13 +922,20 @@ pub async fn open(
 ) -> anyhow::Result<()> {
     println!("{}", handoff_message(session_id, paths, ide_name));
 
-    // Best-effort launch. The extension reads `CODYPENDENT_SESSION` to attach to
-    // this exact session (rather than opening a fresh one).
-    let launched = std::process::Command::new(ide_binary)
-        .arg(&repo)
-        .env("CODYPENDENT_SESSION", session_id.to_string())
-        .env("CODYPENDENT_SOCKET", &paths.socket_path)
-        .spawn();
+    let mut command = if matches!(ide_binary, "code" | "cursor" | "code-insiders") {
+        // An already-running editor does not inherit a launcher's environment.
+        // Route through the extension's validated URI handler instead; it opens
+        // the checkout and confirms the session without asking for a UUID.
+        crate::editor_handoff::session_command(paths, session_id, ide_binary, &repo)?
+    } else {
+        let mut command = std::process::Command::new(ide_binary);
+        command
+            .arg(&repo)
+            .env("CODYPENDENT_SESSION", session_id.to_string())
+            .env("CODYPENDENT_SOCKET", &paths.socket_path);
+        command
+    };
+    let launched = command.spawn();
     match launched {
         Ok(_) => println!("Launched {ide_name}."),
         // A missing binary is the documented not-an-error case (the printed
@@ -1885,7 +1921,7 @@ fn render_cost(cost: &serde_json::Value) -> Option<String> {
         parts.push(format!("{tokens} tokens"));
     }
     if let Some(micros) = cost.get("cost_micros").and_then(|v| v.as_u64()) {
-        parts.push(format!("${:.4}", micros as f64 / 1_000_000.0));
+        parts.push(codypendent_tui::usage::format_cost_micros(micros));
     }
     if parts.is_empty() {
         None
@@ -3774,99 +3810,15 @@ pub async fn secret_revoke(
 // once keeps the two halves of `session export` (mutate, then read the
 // artifact) on one socket.
 
-/// One `ReadArtifact` request's ceiling. Matches the daemon's own
-/// `MAX_READ_ARTIFACT_BYTES`; a larger request is clamped server-side anyway,
-/// and this keeps each frame comfortably inside the 16 MiB transport limit.
-const ARTIFACT_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
-
-/// Pull every byte behind an [`ArtifactRef`] over an already-handshaken
-/// connection and return them.
-///
-/// Each request repeats `expected_sha256` from the ref the caller was given, so
-/// the daemon binds the range to exactly the artifact the client observed. The
-/// assembled bytes are then re-hashed HERE: a client that reports "written" for
-/// a truncated file is worse than one that fails, and the daemon's own check
-/// cannot speak for what survived the socket.
-async fn read_artifact_bytes(
-    conn: &mut Connection,
-    artifact: &codypendent_protocol::ArtifactRef,
-) -> anyhow::Result<Vec<u8>> {
-    use sha2::{Digest as _, Sha256};
-
-    let mut bytes: Vec<u8> = Vec::new();
-    loop {
-        let offset = bytes.len() as u64;
-        let reply = conn
-            .send_command(CommandBody::ReadArtifact {
-                artifact_id: artifact.id,
-                offset,
-                limit: ARTIFACT_CHUNK_BYTES,
-                expected_sha256: artifact.sha256.clone(),
-            })
-            .await?;
-        match reply.payload {
-            Payload::ArtifactChunk {
-                offset: chunk_offset,
-                bytes_base64,
-                eof,
-                ..
-            } => {
-                if chunk_offset != offset {
-                    anyhow::bail!(
-                        "artifact chunk started at {chunk_offset}, expected {offset}; refusing \
-                         to assemble an out-of-order artifact"
-                    );
-                }
-                let chunk = base64::engine::general_purpose::STANDARD
-                    .decode(bytes_base64.as_bytes())
-                    .context("decoding an artifact chunk")?;
-                let progressed = !chunk.is_empty();
-                bytes.extend_from_slice(&chunk);
-                if eof {
-                    break;
-                }
-                if !progressed {
-                    anyhow::bail!("artifact read stalled: an empty non-EOF chunk was returned");
-                }
-            }
-            Payload::CommandRejected(error) => {
-                anyhow::bail!(
-                    "reading the artifact was refused: {} ({})",
-                    error.message,
-                    error.code
-                )
-            }
-            other => return Err(unexpected_reply("ReadArtifact", other)),
-        }
-    }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
-    if digest != artifact.sha256 {
-        anyhow::bail!(
-            "artifact digest mismatch: the daemon named {} but {} bytes hashing to {} arrived",
-            artifact.sha256,
-            bytes.len(),
-            digest
-        );
-    }
-    Ok(bytes)
-}
-
-/// Download an artifact the daemon just minted and write it to `out`, on a
-/// fresh `Controller` connection. Shared by `codypendent session export`,
-/// `codypendent bundle export`, and the TUI harness's Session Library export.
+/// Download a verified artifact to an atomic, private file without buffering
+/// the entire export. The TUI Session Library uses this same path.
 pub async fn download_artifact_to(
     paths: &RuntimePaths,
     artifact: &codypendent_protocol::ArtifactRef,
     out: &Path,
 ) -> anyhow::Result<u64> {
     let mut conn = marketplace_connection(paths).await?;
-    let bytes = read_artifact_bytes(&mut conn, artifact).await?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
-    Ok(bytes.len() as u64)
+    codypendent_council::artifacts::save_to(&mut conn, artifact, out).await
 }
 
 /// `codypendent session search <QUERY> [--limit N] [--cursor TOKEN] [--json]`.
@@ -4108,16 +4060,11 @@ pub async fn session_export(
     let Some(artifact) = artifact else {
         anyhow::bail!("the daemon accepted the export but named no artifact");
     };
-    let bytes = read_artifact_bytes(&mut conn, &artifact).await?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    let length = codypendent_council::artifacts::save_to(&mut conn, &artifact, out).await?;
     println!(
         "exported session {session_id} to {} ({} bytes, {})",
         out.display(),
-        bytes.len(),
+        length,
         artifact.media_type
     );
     Ok(())
@@ -4171,17 +4118,12 @@ pub async fn bundle_export_over_connection<W: Write>(
         }
         other => return Err(unexpected_reply("ExportBundle", other)),
     };
-    let bytes = read_artifact_bytes(conn, &receipt.bundle).await?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    let length = codypendent_council::artifacts::save_to(conn, &receipt.bundle, out).await?;
     writeln!(
         log,
         "wrote {} ({} bytes, {} entries, manifest {})",
         out.display(),
-        bytes.len(),
+        length,
         receipt.manifest.entries.len(),
         receipt.manifest.manifest_sha256
     )?;
@@ -4650,6 +4592,7 @@ mod graph_tests {
         let rendered = render_page(&CodeGraphPage {
             nodes: Vec::new(),
             edges: Vec::new(),
+            related_nodes: Vec::new(),
             total_nodes: 0,
             total_edges: 0,
             limit: 50,
@@ -4671,9 +4614,11 @@ mod graph_tests {
                 qualified_name: "one".to_string(),
                 kind: "function".to_string(),
                 revision: "9f1c2ab".to_string(),
+                location: None,
             }],
             edges: Vec::new(),
             total_nodes: 812,
+            related_nodes: Vec::new(),
             total_edges: 0,
             limit: 50,
         });
@@ -4693,6 +4638,7 @@ mod graph_tests {
             confidence: 0.6,
             evidence_kind: evidence_kind.to_string(),
             revision: "9f1c2ab".to_string(),
+            call_site: None,
             asserted_by,
         }
     }
@@ -4702,6 +4648,7 @@ mod graph_tests {
         CodeGraphPage {
             nodes: Vec::new(),
             edges,
+            related_nodes: Vec::new(),
             total_nodes: 0,
             total_edges,
             limit: 50,
@@ -5257,36 +5204,41 @@ pub fn models_add(
     Ok(())
 }
 
-/// `codypendent models check <id>`: the headless twin of the `/keys` verify
-/// action. Runs the real [`ModelRegistry::check_model`], so the credential
-/// precedence and the catalog-declared auth headers are exactly the ones a run
-/// would use — an "ok" here means a run authenticates. Exits non-zero when the
-/// provider does not list the configured model.
-pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
-    use codypendent_runtime::auth::AuthStore;
-    use codypendent_runtime::models::{load_models, ModelRegistry};
+/// Fetch daemon-owned readiness on an auxiliary connection, leaving live events alone.
+pub(crate) async fn probe_models(
+    paths: &RuntimePaths,
+    model: Option<ModelId>,
+    network: bool,
+) -> anyhow::Result<Vec<codypendent_protocol::ModelProbe>> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut conn = Connection::connect(&paths.socket_path).await?;
+        conn.handshake(
+            "codypendent-model-probe",
+            codypendent_protocol::BUILD_ID,
+            None,
+        )
+        .await?;
+        conn.probe_models(model, network).await
+    })
+    .await
+    .context("The daemon model probe timed out after 30 seconds")?
+}
 
-    let models_path = paths.data_dir.join("models.toml");
-    let configs =
-        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
-    if !configs.iter().any(|c| c.id.0 == id) {
-        anyhow::bail!(
-            "model `{id}` is not configured in {}",
-            models_path.display()
-        );
+/// Explicit provider verification, performed by the connected daemon.
+pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let probes = probe_models(paths, Some(ModelId(id.to_owned())), true).await?;
+    let probe = probes
+        .iter()
+        .find(|probe| probe.id.0 == id)
+        .ok_or_else(|| anyhow::anyhow!("The daemon returned no readiness for model `{id}`"))?;
+    if !matches!(
+        probe.readiness,
+        codypendent_protocol::ModelReadiness::Ready { .. }
+    ) {
+        anyhow::bail!("{id}: {}", probe.readiness.detail());
     }
-    let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
-    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
-        &paths.data_dir.join("providers.toml"),
-    )
-    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
-    ModelRegistry::new(configs)
-        .with_auth(auth)
-        .with_catalog(catalog)
-        .check_model(&codypendent_protocol::ModelId(id.to_owned()))
-        .await
-        .with_context(|| format!("checking model `{id}`"))?;
-    println!("{id}: ok — the provider lists this model and the credentials resolve");
+    println!("{id}: ok — {}", probe.readiness.detail());
     Ok(())
 }
 

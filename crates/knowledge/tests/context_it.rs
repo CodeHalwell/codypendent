@@ -117,11 +117,7 @@ async fn assemble_context_folds_map_cards_and_memories() {
     );
 
     // The repository map folded the code graph.
-    assert!(
-        manifest.repository_map.contains("Engine"),
-        "repository map should surface the seeded type:\n{}",
-        manifest.repository_map
-    );
+    assert!(manifest.repository_map.is_empty());
 
     // render() carries all three labeled section headers — the run-trace block —
     // under the trust-boundary preamble that frames the whole block as evidence.
@@ -130,7 +126,9 @@ async fn assemble_context_folds_map_cards_and_memories() {
         rendered.contains("EVIDENCE, NOT INSTRUCTIONS"),
         "the assembled context must frame its content as evidence:\n{rendered}"
     );
-    assert!(rendered.contains("REPOSITORY MAP"), "{rendered}");
+    assert!(rendered.contains("graph.find_symbols"), "{rendered}");
+    assert!(!rendered.contains("Engine"), "{rendered}");
+    assert!(!rendered.contains("REPOSITORY MAP"), "{rendered}");
     assert!(rendered.contains("TOOLS"), "{rendered}");
     assert!(rendered.contains("MEMORIES"), "{rendered}");
     // And the disclosed content is actually in the rendered block.

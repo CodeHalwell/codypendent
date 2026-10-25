@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * API keys — presence, never value.
  *
@@ -25,6 +26,7 @@
 import React, { useCallback, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import { useFocusTrap } from "../useFocusTrap.js";
+import { modelLabel, providerLabel } from "../modelPresentation.js";
 
 import {
   describeError,
@@ -53,6 +55,7 @@ const PANEL: React.CSSProperties = {
 };
 
 const targetKey = (row: KeyRow) => `${row.target.kind}:${row.target.id}`;
+const keyLabel = (row: KeyRow) => row.target.kind === "model" ? modelLabel(row.target.id) : providerLabel(row.target.id, row.label);
 
 export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
   const api = client ?? localConfigClient;
@@ -119,7 +122,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
     const target = entering.target;
     try {
       await api.setApiKey(target, draft);
-      setNotice({ tone: "ok", text: `key saved for ${entering.label} — applies to the next run` });
+      setNotice({ tone: "ok", text: `Key saved for ${keyLabel(entering)} — applies to the next run` });
     } catch (error) {
       setNotice({ tone: "error", text: `could not save key: ${describeError(error)}` });
     } finally {
@@ -136,7 +139,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
     }
     try {
       await api.removeApiKey(removing.target);
-      setNotice({ tone: "ok", text: `key removed for ${removing.label}` });
+      setNotice({ tone: "ok", text: `Key removed for ${keyLabel(removing)}` });
     } catch (error) {
       setNotice({ tone: "error", text: `could not remove key: ${describeError(error)}` });
     } finally {
@@ -146,12 +149,11 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
   };
 
   return (
-    <div style={PANEL} data-testid="api-keys">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
+    <PageShell style={PANEL} data-testid="api-keys">
+      <header className="cody-page-header" style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>API keys</h2>
         <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
-          Which credentials are set. Stored keys live in{" "}
-          <code>{view?.auth_path ?? "auth.json"}</code> at mode 0600 and are never displayed.
+          Manage the credentials used by your models. Saved keys are kept locally and never displayed.
         </p>
       </header>
 
@@ -202,8 +204,8 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
                         {status.glyph}
                       </span>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontWeight: 600 }}>{row.label}</div>
-                        <div style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>{row.detail}</div>
+                        <div style={{ fontWeight: 600 }}>{keyLabel(row)}</div>
+                        <details style={{ margin: "5px 0", color: "var(--cody-text-muted)", fontSize: 11 }}><summary>Connection details</summary><p>{row.detail}</p></details>
                         <div style={{ color: status.color, fontSize: 12 }}>{status.label}</div>
                       </div>
                       <button
@@ -267,7 +269,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <label htmlFor="api-key-input" style={{ display: "block", fontSize: 12, color: "var(--cody-text-muted)" }}>
-            API key for {entering.label}
+            API key for {keyLabel(entering)}
           </label>
           <input
             id="api-key-input"
@@ -338,7 +340,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <p style={{ margin: 0, fontSize: 13 }}>
-            Remove the stored key for <strong>{removing.label}</strong>? Runs will fall back to an
+            Remove the stored key for <strong>{keyLabel(removing)}</strong>? Runs will fall back to an
             environment variable if one is configured, and fail to authenticate if none is.
           </p>
           <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
@@ -382,7 +384,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           {notice.text}
         </div>
       )}
-    </div>
+    </PageShell>
   );
 };
 

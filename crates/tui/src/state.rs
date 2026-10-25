@@ -78,7 +78,7 @@ impl LayoutMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     /// A navigable overlay (Skills / Memory / Docs / Edges / Workflow /
-    /// Blackboard / Help) is live: the arrow/command key table drives it.
+    /// Blackboard) is live: the arrow/command key table drives it.
     Normal,
     /// A text prompt is capturing printable keys.
     Editing,
@@ -87,6 +87,8 @@ pub enum InputMode {
     /// The command palette is capturing a filter query while staying navigable
     /// (printable keys filter; arrows move the selection; Enter runs it).
     Palette,
+    /// Searchable shortcut reference; typing filters and arrows scroll.
+    Help,
     /// The base conversation view: the persistent composer captures typed text;
     /// `/` (on an empty composer) opens the palette; Enter sends; PgUp/PgDn
     /// scroll the transcript; Ctrl-↑/↓ switch runs.
@@ -732,6 +734,168 @@ pub struct PatchSummary {
     pub preview: String,
     pub preview_truncated: bool,
     pub expanded: bool,
+    /// Client-only section of the bounded preview being reviewed.
+    pub review: Option<PatchReview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchReview {
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
+}
+
+impl PatchSummary {
+    /// Exact source location within the currently selected preview section.
+    /// Read only diff metadata, never paths or line-like text in hunk content.
+    pub fn reviewed_source(&self) -> Result<(String, u32), &'static str> {
+        let lines: Vec<_> = self.preview.lines().collect();
+        let selected = self.review.as_ref().map_or(0, |review| review.start);
+        let start = lines
+            .iter()
+            .enumerate()
+            .take(selected.saturating_add(1))
+            .filter(|(_, line)| line.starts_with("diff --git "))
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(0);
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start.saturating_add(1))
+            .find(|(_, line)| line.starts_with("diff --git "))
+            .map_or(lines.len(), |(index, _)| index);
+        let section = lines.get(start..end).ok_or("Choose a patch file or hunk first")?;
+        let metadata: Vec<_> = section
+            .iter()
+            .copied()
+            .take_while(|line| !line.starts_with("@@ "))
+            .collect();
+        let path = metadata.iter().find_map(|line| line.strip_prefix("+++ "));
+        if path == Some("/dev/null") || metadata.iter().any(|line| line.starts_with("deleted file mode ")) {
+            return Err("This file was deleted; there is no current source file to open");
+        }
+        let raw = path
+            .or_else(|| metadata.iter().find_map(|line| line.strip_prefix("rename to ")));
+        let file = if let Some(raw) = raw {
+            // Unified diff uses TAB to separate a path from a timestamp; Git
+            // also leaves that separator after an unquoted name with spaces.
+            let raw = raw.split('\t').next().unwrap_or(raw);
+            // Git quotes unusual names. JSON handles common escapes; octal
+            // names are refused rather than opening a different source file.
+            let decoded = if raw.starts_with('"') {
+                serde_json::from_str::<String>(raw)
+                    .map_err(|_| "This quoted diff path cannot be opened; use the IDE file browser")?
+            } else {
+                raw.to_owned()
+            };
+            if path.is_some() {
+                decoded.strip_prefix("b/").unwrap_or(&decoded).to_owned()
+            } else {
+                decoded
+            }
+        } else {
+            // Binary/mode-only entries lack +++ metadata. Match the complete
+            // canonical diff header against the daemon's changed-file list.
+            let header = section.first().copied().unwrap_or("");
+            self.files
+                .iter()
+                .find(|file| header == format!("diff --git a/{file} b/{file}"))
+                .cloned()
+                .ok_or("This patch preview has no source location to open")?
+        };
+        if file.is_empty()
+            || file.contains('\\')
+            || file.chars().any(char::is_control)
+            || std::path::Path::new(&file)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("The patch path must stay inside the reviewed checkout");
+        }
+        let hunk = if lines.get(selected).is_some_and(|line| line.starts_with("@@ ")) {
+            lines.get(selected).copied()
+        } else {
+            section.iter().copied().find(|line| line.starts_with("@@ "))
+        };
+        let line = match hunk {
+            Some(hunk) => hunk
+                .split_whitespace()
+                .nth(2)
+                .and_then(|range| range.strip_prefix('+'))
+                .and_then(|range| range.split(',').next())
+                .and_then(|line| line.parse::<u32>().ok())
+                .map(|line| line.max(1))
+                .ok_or("The selected hunk has no valid source line")?,
+            None => 1,
+        };
+        Ok((file, line))
+    }
+
+    /// Scan the existing preview only on a navigation key, never the artifact.
+    pub fn navigate(&mut self, forward: bool, files: bool) {
+        let lines: Vec<_> = self.preview.lines().collect();
+        let file_starts: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| line.starts_with("diff --git ").then_some(i))
+            .collect();
+        let starts: Vec<_> = if files {
+            if file_starts.is_empty() && !lines.is_empty() {
+                vec![0]
+            } else {
+                file_starts.clone()
+            }
+        } else {
+            lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| line.starts_with("@@ ").then_some(i))
+                .collect()
+        };
+        let Some(&first) = starts.first() else {
+            return;
+        };
+        let start = match self.review.as_ref().map(|review| review.start) {
+            None => first,
+            Some(current) if forward => starts
+                .iter()
+                .copied()
+                .find(|&i| i > current)
+                .unwrap_or(*starts.last().unwrap()),
+            Some(current) => starts
+                .iter()
+                .copied()
+                .rev()
+                .find(|&i| i < current)
+                .unwrap_or(first),
+        };
+        let end = starts
+            .iter()
+            .chain(file_starts.iter())
+            .copied()
+            .filter(|&i| i > start)
+            .min()
+            .unwrap_or(lines.len());
+        let file = file_starts
+            .iter()
+            .copied()
+            .rev()
+            .find(|&i| i <= start)
+            .and_then(|i| lines[i].strip_prefix("diff --git "))
+            .unwrap_or_else(|| self.files.first().map(String::as_str).unwrap_or("patch"));
+        let index = starts.iter().position(|&i| i == start).unwrap_or(0) + 1;
+        self.review = Some(PatchReview {
+            start,
+            end,
+            label: format!(
+                "{} {index}/{} · {file}",
+                if files { "File" } else { "Hunk" },
+                starts.len()
+            ),
+        });
+        self.expanded = true;
+    }
 }
 
 /// One entry in a run's transcript. Streaming model text is coalesced into a
@@ -833,226 +997,7 @@ impl TranscriptEntry {
     }
 }
 
-/// Remove terminal-control payloads and credential-shaped values from an
-/// untrusted provider/agent error before it is rendered, announced, or copied.
-/// The original event remains in the durable daemon ledger; the client surface
-/// deliberately projects only this bounded, safe explanation.
-#[must_use]
-/// Quotes that actually terminate a JSON string value.
-///
-/// A `\"` is PART of the value, not its end. Counting raw quotes stopped
-/// redaction at the first escaped one, so a compact
-/// `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
-/// kept its realm and response on screen.
-fn unescaped_quotes(text: &str) -> usize {
-    let mut count = 0;
-    let mut backslashes = 0_usize;
-    for character in text.chars() {
-        match character {
-            '\\' => {
-                backslashes += 1;
-                continue;
-            }
-            '"' if backslashes.is_multiple_of(2) => count += 1,
-            _ => {}
-        }
-        backslashes = 0;
-    }
-    count
-}
-
-/// Whether `text` holds a quote that ends a JSON string value.
-fn has_unescaped_quote(text: &str) -> bool {
-    unescaped_quotes(text) > 0
-}
-
-pub(crate) fn sanitize_failure_text(raw: &str) -> String {
-    const MAX_CHARS: usize = 2_048;
-    let cleaned: String = raw
-        .chars()
-        .filter(|character| {
-            matches!(character, '\n' | '\t')
-                || (!character.is_control()
-                    && !matches!(
-                        character,
-                        '\u{061c}'
-                            | '\u{200e}'
-                            | '\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2066}'..='\u{2069}'
-                    ))
-        })
-        .take(MAX_CHARS)
-        .collect();
-    /// Header names whose value is a credential, for the compact `Name:value`
-    /// form where the value shares the name's word.
-    const CREDENTIAL_HEADER_NAMES: [&str; 6] = [
-        "api-key", "apikey", "api_key", "token", "password", "secret",
-    ];
-
-    let mut words = Vec::new();
-    for line in cleaned.split('\n') {
-        // Per LINE, because a credential header's value ends at the newline:
-        // nothing is owed across one. `Authorization: Bearer <token>` owes two
-        // fields, `password: <value>` owes one, an open JSON value owes until
-        // its closing quote, and an `Authorization` key owes the whole rest of
-        // the line — a multi-parameter value spent a fixed budget on the scheme
-        // and the first parameter, leaving the nonce and response on screen.
-        let mut redact_following = 0_usize;
-        let mut redacting_value = false;
-        let mut redact_rest_of_line = false;
-        for word in line.split_whitespace() {
-            let lower = word.to_ascii_lowercase();
-            let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            if redact_rest_of_line {
-                words.push("[REDACTED]".to_owned());
-                continue;
-            }
-            if redacting_value {
-                words.push("[REDACTED]".to_owned());
-                // The closing quote ends the value, and the word carrying it is
-                // the last that can hold any of the credential. Until then EVERY
-                // word is part of it: a word budget here let a long Digest value
-                // (nine parameters, more than the eight allowed) print its
-                // response. Nothing else is needed to bound this — the loop is
-                // per LINE and the input is capped at MAX_CHARS, so an
-                // unterminated value costs one line, not the message.
-                if has_unescaped_quote(word) {
-                    redacting_value = false;
-                }
-                continue;
-            }
-            if redact_following > 0 {
-                words.push("[REDACTED]".to_owned());
-                redact_following -= 1;
-                continue;
-            }
-            // The header name is the part of the label before its FIRST colon.
-            // RFC 9110's whitespace after that colon is optional, so
-            // `Authorization:Basic` is one word and comparing the whole label
-            // misses it — leaving the credential in the next word in full. A
-            // JSON key keeps its quote there (`authorization":"bearer`), so it
-            // stays with the keyword rules below and costs one word rather than
-            // the rest of the line.
-            if credential_label == "authorization"
-                || lower.ends_with("authorization:")
-                || credential_label
-                    .split_once(':')
-                    .is_some_and(|(name, _)| name.ends_with("authorization"))
-            {
-                words.push(word.to_owned());
-                redact_rest_of_line = true;
-                continue;
-            }
-            // A header written without RFC 9110's optional whitespace keeps its
-            // value in the SAME word: `X-API-Key:secret`. Every rule below
-            // redacts a FOLLOWING word, so nothing ever saw that value. The
-            // name is the part before the first colon — kept, because it is
-            // context — and everything after it goes. A JSON key holds its
-            // quote there (`"x-api-key":"abc`) and is left to the JSON rules,
-            // which redact the whole word.
-            if let Some((name, value)) = credential_label.split_once(':') {
-                if !value.is_empty()
-                    && CREDENTIAL_HEADER_NAMES
-                        .iter()
-                        .any(|keyword| name.ends_with(keyword))
-                {
-                    let cut = word.find(':').unwrap_or(word.len());
-                    words.push(format!("{}:[REDACTED]", &word[..cut]));
-                    continue;
-                }
-            }
-            if matches!(
-            credential_label,
-            "bearer" | "token" | "api_key" | "apikey" | "password" | "secret"
-        ) || lower.ends_with("api-key:")
-            // A JSON value carries spaces (`"Authorization":"Bearer abc123"`),
-            // so the word naming the key holds only the START of it and the
-            // credential is the NEXT word. Matching the label's TAIL catches
-            // that: `{"authorization":"bearer` ends with `bearer`. Redaction
-            // errs safe, so an over-eager match costs a word of context.
-            // `secret` is deliberately NOT in this tail match, only in the
-            // whole-label one above: `token=super-secret` ends with it, and
-            // that value belongs to the inline rule, which redacts it in place
-            // rather than redacting the word after it.
-            || ["bearer", "token", "api_key", "apikey", "password"]
-                .iter()
-                .any(|keyword| credential_label.ends_with(keyword))
-            {
-                words.push(word.to_owned());
-                // A passphrase is WORDS. `bearer`, `token` and the api-key
-                // spellings carry a single token by specification, so one word
-                // is the whole value and the rest of the line stays as context;
-                // `password` and `secret` label something the grammar does not
-                // bound, and redacting one word of it printed the others.
-                if ["password", "secret"]
-                    .iter()
-                    .any(|keyword| credential_label.ends_with(keyword))
-                {
-                    redact_rest_of_line = true;
-                } else {
-                    redact_following = 1;
-                }
-                continue;
-            }
-            // Tested against the LABEL as well as the raw word: a provider
-            // quoting the credential back (`invalid API key "sk-live-abcdef"`)
-            // puts a quote in front of the prefix, and nothing introduces the
-            // value, so the raw test alone printed it in full.
-            let secret_prefix = ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-"]
-                .iter()
-                .any(|prefix| lower.starts_with(prefix) || credential_label.starts_with(prefix));
-            let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
-                .iter()
-                .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
-            // A compact JSON body is ONE whitespace-delimited word, so the
-            // key-then-value rules above never see the value:
-            // `{"Authorization":"Bearer secret"}` has no space to split on, does
-            // not start with a known prefix, and the whole word must therefore be
-            // redacted on the key alone. `authorization` is the one that carries a
-            // live credential most often and was missing.
-            let json_secret = [
-                "\"authorization\":",
-                "\"token\":",
-                "\"access_token\":",
-                "\"refresh_token\":",
-                "\"api_key\":",
-                "\"apikey\":",
-                "\"x-api-key\":",
-                "\"secret\":",
-                "\"password\":",
-            ]
-            .iter()
-            .find_map(|needle| lower.find(needle).map(|index| index + needle.len()));
-            if secret_prefix || json_secret.is_some() {
-                words.push("[REDACTED]".to_owned());
-                if let Some(value_start) = json_secret {
-                    // An opening and a closing quote mean the value ended inside
-                    // this word. Fewer means it runs on into the next ones.
-                    if unescaped_quotes(&lower[value_start..]) < 2 {
-                        redacting_value = true;
-                    }
-                }
-            } else if let Some((needle, index)) = inline_secret {
-                let keep = index + needle.len();
-                words.push(format!("{}[REDACTED]", &word[..keep]));
-            } else {
-                words.push(word.to_owned());
-            }
-        }
-    }
-    let mut safe = words.join(" ");
-    if safe.chars().count() > MAX_CHARS {
-        safe = safe.chars().take(MAX_CHARS).collect();
-    }
-    if raw.chars().count() > MAX_CHARS {
-        if safe.chars().count() == MAX_CHARS {
-            safe.pop();
-        }
-        safe.push('…');
-    }
-    safe
-}
+pub use crate::failure::sanitize_failure_text;
 
 /// Provider/model/phase metadata projected from an ACP model id plus its
 /// sanitized error chain. Kept in state so graphical, cooked, and clipboard
@@ -1269,6 +1214,8 @@ pub struct ContextBreakdown {
     pub transcript_tokens: u64,
 }
 
+pub(crate) use crate::usage::coverage_label as usage_coverage_label;
+
 /// Everything known about one run, and its transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
@@ -1302,6 +1249,7 @@ pub struct RunView {
     pub completion_tokens: Option<u64>,
     /// Measured cost in USD millionths.
     pub cost_micros: Option<u64>,
+    pub usage_coverage: Option<codypendent_protocol::UsageCoverage>,
     pub disposition: Option<RunDisposition>,
     /// The launch checkpoint recorded for this run (ordinal 1, Adoption 04).
     pub launch_checkpoint: Option<CheckpointId>,
@@ -1349,6 +1297,7 @@ impl RunView {
             prompt_tokens: None,
             completion_tokens: None,
             cost_micros: None,
+            usage_coverage: None,
             disposition: None,
             launch_checkpoint: None,
             transcript: Vec::new(),
@@ -2561,6 +2510,7 @@ pub struct StatusProjection {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub cost_micros: Option<u64>,
+    pub usage_coverage: Option<codypendent_protocol::UsageCoverage>,
     pub worktree: Option<String>,
     pub pending_approvals: usize,
 }
@@ -2816,6 +2766,7 @@ pub struct AppState {
     /// normal terminal — without this the tail was simply not drawn, so the
     /// keys a user most needs to discover were the ones they could not see.
     pub help_scroll: u16,
+    pub help_query: String,
     /// Render->input geometry cache for the Help overlay (mirrors
     /// [`Self::transcript_max_scroll`]): the largest offset that still leaves
     /// the modal full, so paging cannot run off the end into blank space.
@@ -3157,6 +3108,7 @@ impl AppState {
             council_result_scroll: 0,
             council_result_max_scroll: Cell::new(0),
             help_scroll: 0,
+            help_query: String::new(),
             help_max_scroll: Cell::new(0),
             approval_scroll: 0,
             approval_max_scroll: Cell::new(0),
@@ -3332,12 +3284,12 @@ impl AppState {
             // filter), so printable keys are simply inert here.
             | Overlay::DocPublishTarget { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
-            // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
+            // The Skills / Memory / Docs / Edges / Workflow browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`
             // mode. The add-model querying box is likewise non-interactive except
             // `Esc` (dismiss), so it shares this mode too.
-            Overlay::Help
-            | Overlay::Onboard {
+            Overlay::Help => InputMode::Help,
+            Overlay::Onboard {
                 step: OnboardStep::Validating { .. },
             }
             | Overlay::Issues
@@ -3623,6 +3575,7 @@ impl AppState {
             prompt_tokens: run.and_then(|r| r.prompt_tokens),
             completion_tokens: run.and_then(|r| r.completion_tokens),
             cost_micros: run.and_then(|r| r.cost_micros),
+            usage_coverage: run.and_then(|r| r.usage_coverage),
             worktree: run.and_then(|r| r.worktree.clone()),
             pending_approvals: self.pending_approvals.len(),
         }

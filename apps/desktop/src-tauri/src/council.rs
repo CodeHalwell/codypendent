@@ -27,7 +27,8 @@ use codypendent_council::{
     chair_is_member, cost_line, list_definitions, participant_line, persist_definition,
     remove_definition, required_quorum, result_by_id, result_by_name_or_id,
     run_with_progress_linked, CouncilDefinition, CouncilEvent, CouncilMember, CouncilProgress,
-    CouncilReport, CouncilReportHandle, CouncilRunFailure, CouncilRunOutcome, StoredCouncilResult,
+    CouncilReport, CouncilReportHandle, CouncilRunFailure, CouncilRunOutcome, MemberOutcome,
+    StoredCouncilResult,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::SessionId;
@@ -121,6 +122,20 @@ pub struct CouncilMemberOutcomeCard {
     pub cost_micros: Option<u64>,
 }
 
+impl From<MemberOutcome> for CouncilMemberOutcomeCard {
+    fn from(member: MemberOutcome) -> Self {
+        Self {
+            model: member.model,
+            role: member.role,
+            session_id: member.session_id.to_string(),
+            run_id: member.run_id.to_string(),
+            response: member.response,
+            tokens: member.tokens,
+            cost_micros: member.cost_micros,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CouncilRoundCard {
@@ -153,6 +168,8 @@ pub struct CouncilResultCard {
     /// the `status` and `failure` fields say which, so an empty synthesis is
     /// never mistaken for a chair that answered with nothing.
     pub synthesis: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<CouncilMemberOutcomeCard>,
     pub participants: Vec<String>,
     pub cost_line: String,
     pub report_markdown: String,
@@ -170,6 +187,9 @@ fn result_card(stored: StoredCouncilResult) -> CouncilResultCard {
     if let Some(chair) = &report.chair {
         participants.push(participant_line(chair));
     }
+    if let Some(review) = &report.review {
+        participants.push(participant_line(review));
+    }
     let synthesis = report
         .chair
         .as_ref()
@@ -182,15 +202,7 @@ fn result_card(stored: StoredCouncilResult) -> CouncilResultCard {
             members: round
                 .members
                 .into_iter()
-                .map(|member| CouncilMemberOutcomeCard {
-                    model: member.model,
-                    role: member.role,
-                    session_id: member.session_id.to_string(),
-                    run_id: member.run_id.to_string(),
-                    response: member.response,
-                    tokens: member.tokens,
-                    cost_micros: member.cost_micros,
-                })
+                .map(CouncilMemberOutcomeCard::from)
                 .collect(),
             failures: round.failures,
         })
@@ -209,6 +221,7 @@ fn result_card(stored: StoredCouncilResult) -> CouncilResultCard {
         rounds,
         failure: report.failure,
         synthesis,
+        review: report.review.map(CouncilMemberOutcomeCard::from),
         participants,
         cost_line: cost_line(&report.costs),
         report_markdown: handle.markdown_path.display().to_string(),
@@ -220,6 +233,9 @@ fn result_card(stored: StoredCouncilResult) -> CouncilResultCard {
 fn run_outcome_card(run: CouncilRunOutcome) -> CouncilResultCard {
     let mut participants: Vec<String> = run.outcome.members.iter().map(participant_line).collect();
     participants.push(participant_line(&run.outcome.chair));
+    if let Some(review) = &run.outcome.review {
+        participants.push(participant_line(review));
+    }
     CouncilResultCard {
         result_id: run.handle.result_id.to_string(),
         council: run.outcome.council,
@@ -237,6 +253,7 @@ fn run_outcome_card(run: CouncilRunOutcome) -> CouncilResultCard {
         rounds: Vec::new(),
         failure: None,
         synthesis: run.outcome.chair.response,
+        review: run.outcome.review.map(CouncilMemberOutcomeCard::from),
         participants,
         cost_line: cost_line(&run.costs),
         report_markdown: run.report_markdown.display().to_string(),
@@ -555,6 +572,121 @@ mod tests {
     use super::*;
 
     use std::str::FromStr as _;
+
+    #[test]
+    fn reviewed_results_preserve_the_verdict_and_reviewer_attribution() {
+        use codypendent_council::{CouncilCosts, CouncilOutcome, CouncilRoundReport};
+        use codypendent_protocol::RunId;
+
+        let member = |role: &str| MemberOutcome {
+            model: "local/model".to_owned(),
+            role: role.to_owned(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            response: format!("{role} response"),
+            tokens: None,
+            cost_micros: None,
+            incomplete: None,
+        };
+        let members = vec![member("architect"), member("critic")];
+        let chair = member("chair");
+        let review = MemberOutcome {
+            tokens: Some(9246),
+            ..member("independent reviewer")
+        };
+        let report = CouncilReport {
+            schema_version: 1,
+            result_id: Default::default(),
+            council: "review".to_owned(),
+            objective: "Review the result".to_owned(),
+            status: "completed".to_owned(),
+            started_at: "2026-10-19T13:00:00Z".to_owned(),
+            finished_at: "2026-10-19T13:01:00Z".to_owned(),
+            repository: "/workspace/review".to_owned(),
+            origin_session_id: None,
+            evidence: false,
+            definition: CouncilDefinition {
+                name: "review".to_owned(),
+                description: String::new(),
+                chair: chair.model.clone(),
+                rounds: 1,
+                quorum: None,
+                evidence: false,
+                review: true,
+                reviewer: Some(review.model.clone()),
+                members: Vec::new(),
+            },
+            warnings: Vec::new(),
+            rounds: vec![CouncilRoundReport {
+                round: 1,
+                members: members.clone(),
+                failures: Vec::new(),
+                ruling: None,
+            }],
+            chair: Some(chair.clone()),
+            review: Some(review.clone()),
+            failure: None,
+            costs: CouncilCosts {
+                tokens: Some(9246),
+                cost_micros: None,
+                measured_runs: 1,
+                total_runs: 4,
+            },
+        };
+        let handle = CouncilReportHandle {
+            result_id: report.result_id,
+            council: report.council.clone(),
+            status: report.status.clone(),
+            started_at: report.started_at.clone(),
+            finished_at: report.finished_at.clone(),
+            repository: report.repository.clone(),
+            origin_session_id: None,
+            json_path: PathBuf::from("report.json"),
+            markdown_path: PathBuf::from("report.md"),
+        };
+        let card = result_card(StoredCouncilResult {
+            handle: handle.clone(),
+            report: report.clone(),
+        });
+        assert_eq!(card.participants.len(), 4);
+        assert!(card.participants.contains(&participant_line(&review)));
+        assert_eq!(card.cost_line, "cost: 9246 tokens measured across 1/4 runs");
+        let projected = card.review.expect("independent review");
+        assert_eq!(projected.response, review.response);
+        assert_eq!(projected.run_id, review.run_id.to_string());
+        assert_eq!(projected.tokens, Some(9246));
+        assert_eq!(projected.cost_micros, None);
+
+        let fallback = run_outcome_card(CouncilRunOutcome {
+            outcome: CouncilOutcome {
+                council: report.council.clone(),
+                objective: report.objective.clone(),
+                rounds: 1,
+                members,
+                chair,
+                review: Some(review),
+            },
+            costs: report.costs.clone(),
+            warnings: Vec::new(),
+            report_json: handle.json_path.clone(),
+            report_markdown: handle.markdown_path.clone(),
+            handle: handle.clone(),
+        });
+        assert_eq!(fallback.participants.len(), 4);
+        assert_eq!(fallback.review.expect("fallback review").tokens, Some(9246));
+
+        let historical = result_card(StoredCouncilResult {
+            handle,
+            report: CouncilReport {
+                review: None,
+                ..report
+            },
+        });
+        assert!(serde_json::to_value(historical)
+            .expect("historical card")
+            .get("review")
+            .is_none());
+    }
 
     struct Collector(std::sync::Mutex<Vec<CouncilProgressFrame>>);
 

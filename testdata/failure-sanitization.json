@@ -1,0 +1,18 @@
+{
+  "maxInput": 8192,
+  "maxOutput": 2048,
+  "keys": ["authorization", "proxy-authorization", "api-key", "x-api-key", "apikey", "api_key", "access_token", "refresh_token", "token", "password", "secret", "client_secret", "bearer", "cookie", "set-cookie"],
+  "prefixes": ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-", "tavily-"],
+  "cases": [
+    {"raw":"{\"token\":\"first secret\",\"password\":\"second secret\",\"details\":\"sign in again\"}","safe":"{\"token\":\"[REDACTED]\",\"password\":\"[REDACTED]\",\"details\":\"sign in again\"}"},
+    {"raw":"request https://host/v1?access_token=abc%20def&model=local&api_key=xyz rejected","safe":"request https://host/v1?access_token=[REDACTED]&model=local&api_key=[REDACTED] rejected"},
+    {"raw":"{\"api\\u005fkey\": \"hidden\", \"status\": 401}","safe":"{\"api\\u005fkey\": \"[REDACTED]\", \"status\": 401}"},
+    {"raw":"Authorization:Digest username=\"u\", nonce=\"n\", response=\"s\"\nrequest rejected","safe":"Authorization:[REDACTED] request rejected"},
+    {"raw":"{\"secret\":{\"nested\":\"hidden\"},\"details\":\"retry\"}","safe":"{\"secret\":[REDACTED],\"details\":\"retry\"}"},
+    {"raw":"password: a long passphrase\nretry later","safe":"password: [REDACTED] retry later"},
+    {"raw":"invalid key \"sk-live-abcdef\"; retry","safe":"invalid key \"[REDACTED]\"; retry"},
+    {"raw":"{\"token\":\"not closed\nnext line","safe":"{\"token\":\"[REDACTED] next line"},
+    {"raw":"failed\u001b[31m hard\u202e text","safe":"failed hard text"},
+    {"raw":"{\"Authorization\":\"Digest username=\\\"u\\\", response=\\\"secret\\\"\",\"message\":\"denied\"}","safe":"{\"Authorization\":\"[REDACTED]\",\"message\":\"denied\"}"}
+  ]
+}

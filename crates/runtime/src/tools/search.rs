@@ -1,16 +1,17 @@
 //! `workspace.search` — ripgrep over the granted read scope, parsed into typed
 //! matches.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use codypendent_daemon::policy::{PathScope, ScopeVerdict};
 use codypendent_protocol::ProposedAction;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::time::Instant;
 
-use super::{salient::clamp_search_line, CapabilityKind, ToolError, MAX_CAPTURE_BYTES};
+use super::{CapabilityKind, MAX_CAPTURE_BYTES, ToolError, salient::clamp_search_line};
 
 /// Maximum matches returned; beyond this the search stops and flags truncation.
 const MATCH_CAP: usize = 200;
@@ -40,6 +41,8 @@ const MAX_MATCH_LINE_BYTES: usize = 2048;
 /// cancellation is blind while the tool executes, so a hung search would wedge
 /// the run indefinitely.
 const SEARCH_TIMEOUT_SECS: u64 = 120;
+const SEARCH_ATTEMPTS: usize = 2;
+const MAX_ERROR_BYTES: usize = 8192;
 
 /// Typed input for [`Search::execute`].
 #[derive(Debug, Clone)]
@@ -104,6 +107,21 @@ impl Search {
         input: &SearchInput,
         scope: &PathScope,
     ) -> Result<SearchResults, ToolError> {
+        Self::execute_with(
+            input,
+            scope,
+            Path::new("rg"),
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    async fn execute_with(
+        input: &SearchInput,
+        scope: &PathScope,
+        executable: &Path,
+        budget: Duration,
+    ) -> Result<SearchResults, ToolError> {
         if scope.roots.is_empty() {
             return Ok(SearchResults {
                 matches: Vec::new(),
@@ -111,105 +129,187 @@ impl Search {
             });
         }
 
-        let mut command = tokio::process::Command::new("rg");
-        command
-            .arg("--json")
-            .arg("-n")
-            .arg("--no-config")
-            .arg("--no-messages");
-        if let Some(glob) = &input.glob {
-            command.arg("--glob").arg(glob);
-        }
-        command.arg("--regexp").arg(&input.pattern);
-        for root in &scope.roots {
-            command.arg(root);
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ToolError::ProgramNotFound("rg".to_string())
+        let started = Instant::now();
+        let deadline = started + budget;
+        for attempt in 1..=SEARCH_ATTEMPTS {
+            // Reserve time for one retry without extending the caller's deadline.
+            let attempt_deadline = if attempt == SEARCH_ATTEMPTS {
+                deadline
             } else {
-                ToolError::Io(e)
-            }
-        })?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ToolError::Other(anyhow::anyhow!("rg stdout unavailable")))?;
-        // `Take` is what makes the bound real: `next_line` buffers a whole line
-        // before any code here can look at it, so a limit applied after the
-        // read is no limit at all against a single enormous line.
-        let mut reader =
-            BufReader::new(tokio::io::AsyncReadExt::take(stdout, MAX_STREAM_BYTES)).lines();
-
-        let collect = async {
-            let mut matches = Vec::new();
-            let mut truncated = false;
-            while let Some(line) = reader.next_line().await? {
-                let Ok(event) = serde_json::from_str::<RgEvent>(&line) else {
-                    continue;
-                };
-                if event.kind != "match" {
-                    continue;
+                started + budget / SEARCH_ATTEMPTS as u32
+            };
+            match tokio::time::timeout_at(attempt_deadline, search_once(input, scope, executable))
+                .await
+            {
+                Ok(Ok((results, status, stderr))) => {
+                    if results.truncated || status.success() || status.code() == Some(1) {
+                        return Ok(results);
+                    }
+                    if !interrupted(status) || attempt == SEARCH_ATTEMPTS {
+                        return Err(attempt_error(
+                            ToolError::Other(anyhow::anyhow!(
+                                "Search failed ({status}){}{}",
+                                if stderr.is_empty() { "" } else { ": " },
+                                stderr,
+                            )),
+                            attempt,
+                        ));
+                    }
                 }
-                let Some(data) = event.data else { continue };
-                let (Some(path), Some(line_number), Some(text)) =
-                    (data.path, data.line_number, data.lines)
-                else {
-                    continue;
-                };
-                let path = PathBuf::from(path.text);
-                // Defensive scope confinement even though rg was pointed at roots.
-                if !matches!(scope.classify(&path), ScopeVerdict::Allowed) {
-                    continue;
+                Ok(Err(error)) => return Err(attempt_error(error, attempt)),
+                Err(_) if attempt == SEARCH_ATTEMPTS => {
+                    return Err(attempt_error(
+                        ToolError::TimedOut {
+                            tool: Self::NAME,
+                            seconds: budget.as_secs().max(1),
+                        },
+                        attempt,
+                    ));
                 }
-                matches.push(SearchMatch {
-                    path,
-                    line_number,
-                    line: clamp_search_line(
-                        text.text.trim_end_matches(['\n', '\r']),
-                        MAX_MATCH_LINE_BYTES,
-                    ),
-                });
-                if matches.len() >= MATCH_CAP {
-                    truncated = true;
-                    break;
-                }
+                Err(_) => {}
             }
-            // The stream bound was reached, so ripgrep had more to say and the
-            // results are a prefix of the truth — the same thing `truncated`
-            // already means for the match cap.
-            if reader.get_ref().get_ref().limit() == 0 {
-                truncated = true;
-            }
-            Ok::<_, ToolError>((matches, truncated))
-        };
-
-        let bound = Duration::from_secs(SEARCH_TIMEOUT_SECS);
-        let (matches, truncated) = match tokio::time::timeout(bound, collect).await {
-            Ok(collected) => collected?,
-            Err(_elapsed) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(ToolError::TimedOut {
-                    tool: Self::NAME,
-                    seconds: SEARCH_TIMEOUT_SECS,
-                });
-            }
-        };
-
-        // Stop ripgrep early if we hit the cap, then reap.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-
-        Ok(SearchResults { matches, truncated })
+            tracing::debug!(attempt, "Retrying an interrupted workspace search");
+        }
+        unreachable!()
     }
+}
+
+fn attempt_error(error: ToolError, attempt: usize) -> ToolError {
+    if attempt == 1 {
+        error
+    } else {
+        ToolError::Other(anyhow::anyhow!(
+            "{error}. Automatic retry attempted once (2 attempts total)."
+        ))
+    }
+}
+
+fn interrupted(status: ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(9) || status.code() == Some(137)
+    }
+    #[cfg(not(unix))]
+    {
+        status.code() == Some(137)
+    }
+}
+
+async fn search_once(
+    input: &SearchInput,
+    scope: &PathScope,
+    executable: &Path,
+) -> Result<(SearchResults, ExitStatus, String), ToolError> {
+    let mut command = tokio::process::Command::new(executable);
+    command.arg("--json").arg("-n").arg("--no-config");
+    if let Some(glob) = &input.glob {
+        command.arg("--glob").arg(glob);
+    }
+    command.arg("--regexp").arg(&input.pattern);
+    for root in &scope.roots {
+        command.arg(root);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ToolError::ProgramNotFound("rg".to_string())
+        } else {
+            ToolError::Io(e)
+        }
+    })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::Other(anyhow::anyhow!("rg stdout unavailable")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::Other(anyhow::anyhow!("rg stderr unavailable")))?;
+    // `Take` is what makes the bound real: `next_line` buffers a whole line
+    // before any code here can look at it, so a limit applied after the
+    // read is no limit at all against a single enormous line.
+    let mut reader = BufReader::new(stdout.take(MAX_STREAM_BYTES)).lines();
+
+    let collect = async {
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        while let Some(line) = reader.next_line().await? {
+            let Ok(event) = serde_json::from_str::<RgEvent>(&line) else {
+                continue;
+            };
+            if event.kind != "match" {
+                continue;
+            }
+            let Some(data) = event.data else { continue };
+            let (Some(path), Some(line_number), Some(text)) =
+                (data.path, data.line_number, data.lines)
+            else {
+                continue;
+            };
+            let path = PathBuf::from(path.text);
+            // Defensive scope confinement even though rg was pointed at roots.
+            if !matches!(scope.classify(&path), ScopeVerdict::Allowed) {
+                continue;
+            }
+            matches.push(SearchMatch {
+                path,
+                line_number,
+                line: clamp_search_line(
+                    text.text.trim_end_matches(['\n', '\r']),
+                    MAX_MATCH_LINE_BYTES,
+                ),
+            });
+            if matches.len() >= MATCH_CAP {
+                truncated = true;
+                break;
+            }
+        }
+        // The stream bound was reached, so ripgrep had more to say and the
+        // results are a prefix of the truth — the same thing `truncated`
+        // already means for the match cap.
+        if reader.get_ref().get_ref().limit() == 0 {
+            truncated = true;
+        }
+        Ok::<_, ToolError>((matches, truncated))
+    };
+
+    let capture = async {
+        let (matches, truncated) = collect.await?;
+        if truncated {
+            let _ = child.start_kill();
+        }
+        let status = child.wait().await?;
+        Ok::<_, ToolError>((SearchResults { matches, truncated }, status))
+    };
+    let ((results, status), stderr) = tokio::try_join!(capture, capture_error(stderr))?;
+    Ok((results, status, stderr))
+}
+
+async fn capture_error(mut stderr: impl AsyncRead + Unpin) -> Result<String, ToolError> {
+    let mut captured = Vec::new();
+    let mut buffer = [0; 4096];
+    let mut truncated = false;
+    loop {
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let keep = count.min(MAX_ERROR_BYTES - captured.len());
+        captured.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < count;
+    }
+    let mut message = String::from_utf8_lossy(&captured).trim().to_owned();
+    if truncated {
+        message.push('…');
+    }
+    Ok(message)
 }
 
 /// A single `rg --json` event line. Only the `match` shape is consumed.
@@ -233,10 +333,14 @@ struct RgText {
     text: String,
 }
 
+#[cfg(all(test, unix))]
+#[path = "search_process_tests.rs"]
+mod process_tests;
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Search, SearchInput, MATCH_CAP, MAX_MATCH_LINE_BYTES, MAX_STREAM_BYTES, SEARCH_TIMEOUT_SECS,
+        MATCH_CAP, MAX_MATCH_LINE_BYTES, MAX_STREAM_BYTES, SEARCH_TIMEOUT_SECS, Search, SearchInput,
     };
     use crate::tools::ABSOLUTE_MAX_TIMEOUT;
     use codypendent_daemon::policy::PathScope;

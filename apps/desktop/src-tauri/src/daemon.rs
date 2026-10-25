@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+#[cfg(test)]
 use base64::Engine as _;
 use codypendent_council::connection::Connection;
 use codypendent_protocol::discovery::RuntimePaths;
@@ -50,10 +51,18 @@ use codypendent_protocol::{
 };
 
 use serde::Serialize;
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{oneshot, Mutex};
+
+#[async_trait::async_trait]
+impl codypendent_council::artifacts::ArtifactSource for &DaemonClient {
+    async fn read_chunk(&mut self, command: CommandBody) -> anyhow::Result<Payload> {
+        Ok(self.send_command(command).await?.payload)
+    }
+}
 
 /// How long a command waits for its correlated reply before the client gives
 /// up. A daemon that has stopped answering is a disconnect, and the UI must be
@@ -87,12 +96,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The client name/version this shell announces in its `ClientHello`.
 const CLIENT_NAME: &str = "codypendent-desktop";
 
-/// Bytes asked for per `ReadArtifact` chunk. The daemon clamps the span to its
-/// own ceiling (`MAX_READ_ARTIFACT_BYTES`), so this is a request, not a
-/// guarantee, and the retrieval loop pages until the daemon reports EOF. Same
-/// value the reference client uses (`sdk/protocol/src/client.ts::readArtifact`).
-const ARTIFACT_CHUNK_BYTES: u32 = 1024 * 1024;
-
 /// Hard ceiling on the bytes one `read_artifact` call will assemble, applied
 /// REGARDLESS of the daemon-declared `byte_length`. The declared length is the
 /// daemon's word, and the loop already bails when the bytes run past it — but
@@ -124,6 +127,10 @@ pub struct ConnectionInfo {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonFrame {
+    RemoteUi {
+        session_id: Option<SessionId>,
+        message: Box<codypendent_protocol::UiWireMessage>,
+    },
     /// One durable session event, live or replayed from attach catch-up.
     Event {
         session_id: Option<SessionId>,
@@ -258,6 +265,20 @@ pub trait FrameSink: Send + Sync + 'static {
     fn emit(&self, frame: DaemonFrame);
 }
 
+struct BoardFrameSink<S: FrameSink> {
+    sink: Arc<S>,
+    scope_id: String,
+}
+
+impl<S: FrameSink> FrameSink for BoardFrameSink<S> {
+    fn emit(&self, frame: DaemonFrame) {
+        if matches!(&frame, DaemonFrame::BlackboardPosted { item } if item.workflow_run_id == self.scope_id)
+        {
+            self.sink.emit(frame);
+        }
+    }
+}
+
 /// The run a submitted objective actually created, as reported by the daemon.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunHandle {
@@ -296,8 +317,11 @@ pub fn socket_path() -> anyhow::Result<PathBuf> {
 /// the writer for heartbeat pongs and would outlive the drop, leaking the
 /// connection. [`DaemonClient::shutdown`] is the only real teardown.
 pub struct DaemonClient {
+    socket_path: PathBuf,
+    board_client: Mutex<Option<Arc<DaemonClient>>>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
     client_id: ClientId,
+    selected_protocol: codypendent_protocol::ProtocolVersion,
     inflight: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     workspace: WorkspaceId,
     repository: Option<String>,
@@ -419,8 +443,11 @@ impl DaemonClient {
         };
 
         let client = Arc::new(Self {
+            socket_path: socket.to_path_buf(),
+            board_client: Mutex::new(None),
             writer: Arc::clone(&writer),
             client_id,
+            selected_protocol: hello.selected_protocol,
             inflight: Arc::clone(&inflight),
             workspace: workspace.unwrap_or_default(),
             repository,
@@ -452,6 +479,59 @@ impl DaemonClient {
         Ok((client, info))
     }
 
+    /// Hold the attachment identity through the write: a delayed old view must
+    /// never send an interaction to the newly selected session.
+    pub async fn send_remote_ui(
+        &self,
+        session_id: SessionId,
+        message: codypendent_protocol::UiWireMessage,
+    ) -> anyhow::Result<()> {
+        let _hold = self.attach_lock.lock().await;
+        if *self.attached.lock().await != Some(session_id) {
+            bail!("The extension's session is no longer attached");
+        }
+        if !matches!(
+            message.kind.as_str(),
+            "capabilities"
+                | "event"
+                | "viewport"
+                | "resync"
+                | "subscription"
+                | "unsubscribe"
+                | "action"
+                | "cancelAction"
+        ) {
+            bail!("This Remote UI message is not a renderer request");
+        }
+        message.validate(&codypendent_protocol::UiHardLimits::default())?;
+        let mut envelope = Envelope::request(
+            self.client_id,
+            Payload::RemoteUi {
+                message: Box::new(message),
+            },
+        );
+        envelope.session_id = Some(session_id);
+        tokio::time::timeout(COMMAND_TIMEOUT, async {
+            let mut writer = self.writer.lock().await;
+            write_envelope(&mut *writer, &envelope).await
+        })
+        .await
+        .context("Timed out sending extension interaction")??;
+        Ok(())
+    }
+
+    pub async fn probe_models(
+        &self,
+        model: Option<ModelId>,
+        network: bool,
+    ) -> anyhow::Result<Vec<codypendent_protocol::ModelProbe>> {
+        codypendent_council::connection::require_model_probe(Some(self.selected_protocol))?;
+        codypendent_council::connection::model_probe_reply(
+            self.send_command(CommandBody::ProbeModel { model, network })
+                .await?,
+        )
+    }
+
     /// Close this connection for real: abort the reader task, half-close the
     /// socket so the daemon sees EOF, and fail every in-flight command.
     ///
@@ -462,6 +542,20 @@ impl DaemonClient {
     /// leaks a live connection and task, and the stale reader keeps forwarding
     /// the old session's frames into the channel it was created with.
     pub async fn shutdown(&self) {
+        if let Some(board) = self.board_client.lock().await.take() {
+            if let Some(session_id) = *board.attached.lock().await {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    board.accepted(CommandBody::CloseSession { session_id }, "CloseSession"),
+                )
+                .await;
+            }
+            board.shutdown_connection().await;
+        }
+        self.shutdown_connection().await;
+    }
+
+    async fn shutdown_connection(&self) {
         // Abort first, so nothing further is forwarded while the socket is
         // being torn down. An aborted reader emits no `Disconnected` frame: a
         // deliberate shutdown is not a failure the UI should report.
@@ -504,8 +598,9 @@ impl DaemonClient {
         }
     }
 
-    /// Create a session, attach to it as a controller, and start a run for
-    /// `objective` — the same three commands `codypendent run` sends
+    /// Continue the attached session, or create and attach a session when no
+    /// `session_id` is supplied, then start a run for `objective`.
+    /// New conversations use the same three commands `codypendent run` sends
     /// (`crates/cli/src/commands.rs::run_over_connection`). Attach catch-up is
     /// replayed into the sink so the transcript starts from daemon state.
     ///
@@ -519,33 +614,63 @@ impl DaemonClient {
         objective: String,
         mode: AgentMode,
         model: Option<ModelId>,
+        session_id: Option<SessionId>,
         sink: &Arc<S>,
     ) -> anyhow::Result<RunHandle> {
-        let create_reply = self
-            .send_command(CommandBody::CreateSession {
-                workspace: self.workspace,
-                title: objective.clone(),
-                repository: self.repository.clone(),
-                internal: false,
-                parent_session_id: None,
-                parent_run_id: None,
-            })
-            .await?;
-        let session_id = match &create_reply.payload {
-            Payload::CommandAccepted { .. } => create_reply.session_id.ok_or_else(|| {
-                anyhow!(
-                    "daemon accepted CreateSession but its reply carried no session_id; \
-                     the desktop client cannot bind to the session it just created"
-                )
-            })?,
-            Payload::CommandRejected(error) => {
-                bail!("CreateSession rejected: {} ({})", error.message, error.code)
+        self.start_objective_prepared(objective, mode, model, session_id, sink, |_| Ok(()))
+            .await
+    }
+
+    pub async fn start_objective_prepared<S: FrameSink>(
+        &self,
+        objective: String,
+        mode: AgentMode,
+        model: Option<ModelId>,
+        session_id: Option<SessionId>,
+        sink: &Arc<S>,
+        prepare: impl FnOnce(SessionId) -> anyhow::Result<()>,
+    ) -> anyhow::Result<RunHandle> {
+        // A concurrent session selection must not move the connection between
+        // validating the requested conversation and sending its continuation.
+        let _continuation = if session_id.is_some() {
+            Some(self.attach_lock.lock().await)
+        } else {
+            None
+        };
+        let session_id = if let Some(session_id) = session_id {
+            if *self.attached.lock().await != Some(session_id) {
+                bail!("cannot continue a session that is not attached; select it before sending");
             }
-            other => bail!("unexpected reply to CreateSession: {other:?}"),
+            session_id
+        } else {
+            let create_reply = self
+                .send_command(CommandBody::CreateSession {
+                    workspace: self.workspace,
+                    title: objective.clone(),
+                    repository: self.repository.clone(),
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                })
+                .await?;
+            let session_id = match &create_reply.payload {
+                Payload::CommandAccepted { .. } => create_reply.session_id.ok_or_else(|| {
+                    anyhow!(
+                        "daemon accepted CreateSession but its reply carried no session_id; \
+                     the desktop client cannot bind to the session it just created"
+                    )
+                })?,
+                Payload::CommandRejected(error) => {
+                    bail!("CreateSession rejected: {} ({})", error.message, error.code)
+                }
+                other => bail!("unexpected reply to CreateSession: {other:?}"),
+            };
+
+            self.attach(session_id, sink).await?;
+            session_id
         };
 
-        self.attach(session_id, sink).await?;
-
+        prepare(session_id)?;
         let start_reply = self
             .send_command(CommandBody::StartRun {
                 session_id,
@@ -699,19 +824,22 @@ impl DaemonClient {
         }
     }
 
-    /// Resolve one pending approval with single-proposal scope. Wider scopes
-    /// need their own explicit desktop affordance; the two current buttons must
-    /// never silently grant more authority than the action they display.
     pub async fn resolve_approval(
         &self,
         approval_id: ApprovalId,
         decision: ApprovalDecision,
+        scope: ApprovalScope,
     ) -> anyhow::Result<()> {
+        if matches!(scope, ApprovalScope::Unknown)
+            || (decision != ApprovalDecision::Approve && scope != ApprovalScope::Once)
+        {
+            bail!("unsupported approval scope");
+        }
         let reply = self
             .send_command(CommandBody::ResolveApproval {
                 approval_id,
                 decision,
-                scope: ApprovalScope::Once,
+                scope,
             })
             .await?;
         match reply.payload {
@@ -842,95 +970,16 @@ impl DaemonClient {
     /// the webview. A mismatch is an error, never a truncated read passed off as
     /// the artifact.
     pub async fn read_artifact(&self, artifact: &ArtifactRef) -> anyhow::Result<Vec<u8>> {
-        // An independent hard cap, checked BEFORE trusting the declared
-        // length: a reference is the daemon's word, and one declaring a huge
-        // `byte_length` must not have the shell buffer to match.
-        if artifact.byte_length > ARTIFACT_MAX_TOTAL_BYTES {
-            bail!(
-                "the artifact reference declares {} bytes, above the {} MiB ceiling this \
-                 client will assemble",
-                artifact.byte_length,
-                ARTIFACT_MAX_TOTAL_BYTES / (1024 * 1024)
-            );
-        }
-        let mut bytes: Vec<u8> = Vec::new();
-        loop {
-            let offset = u64::try_from(bytes.len())
-                .context("the artifact read offset exceeded the protocol's u64 range")?;
-            let reply = self
-                .send_command(CommandBody::ReadArtifact {
-                    artifact_id: artifact.id,
-                    offset,
-                    limit: ARTIFACT_CHUNK_BYTES,
-                    expected_sha256: artifact.sha256.clone(),
-                })
-                .await?;
-            let chunk = match reply.payload {
-                Payload::ArtifactChunk {
-                    artifact_id,
-                    offset: chunk_offset,
-                    bytes_base64,
-                    eof,
-                    sha256,
-                } => {
-                    if artifact_id != artifact.id
-                        || chunk_offset != offset
-                        || sha256 != artifact.sha256
-                    {
-                        bail!(
-                            "the daemon answered ReadArtifact with a chunk that does not \
-                             correlate to the artifact requested"
-                        );
-                    }
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(&bytes_base64)
-                        .context("decoding an artifact chunk")?;
-                    (decoded, eof)
-                }
-                Payload::CommandRejected(error) => {
-                    bail!("ReadArtifact rejected: {} ({})", error.message, error.code)
-                }
-                other => bail!("unexpected reply to ReadArtifact: {other:?}"),
-            };
-            let (decoded, eof) = chunk;
-            let empty = decoded.is_empty();
-            bytes.extend_from_slice(&decoded);
-            let assembled = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if assembled > artifact.byte_length {
-                bail!(
-                    "the artifact read ran past its declared length of {} bytes",
-                    artifact.byte_length
-                );
-            }
-            // The declared length is not the only ceiling: a daemon that keeps
-            // answering chunks under it (or under a misreported one) is cut
-            // off at the hard cap regardless.
-            if assembled > ARTIFACT_MAX_TOTAL_BYTES {
-                bail!(
-                    "the artifact read exceeded the {} MiB ceiling this client will assemble",
-                    ARTIFACT_MAX_TOTAL_BYTES / (1024 * 1024)
-                );
-            }
-            if eof {
-                break;
-            }
-            if empty {
-                bail!("the artifact read made no progress before end of file");
-            }
-        }
+        let mut source = self;
+        codypendent_council::artifacts::read_all(&mut source, artifact, ARTIFACT_MAX_TOTAL_BYTES)
+            .await
+    }
 
-        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if length != artifact.byte_length {
-            bail!(
-                "the artifact read returned {length} bytes but the reference declares {}",
-                artifact.byte_length
-            );
-        }
-        let digest = hex::encode(Sha256::digest(&bytes));
-        if digest != artifact.sha256 {
-            bail!("the artifact's contents did not match the digest on its reference");
-        }
-        Ok(bytes)
+    /// Save without the preview's memory ceiling; only a bounded chunk is held
+    /// in memory and an existing destination survives verification/write errors.
+    pub async fn save_artifact(&self, artifact: &ArtifactRef, path: &Path) -> anyhow::Result<u64> {
+        let mut source = self;
+        codypendent_council::artifacts::save_to(&mut source, artifact, path).await
     }
 
     // ---------------------------------------------------------------- Session
@@ -1248,14 +1297,20 @@ impl DaemonClient {
     pub async fn watch_board<S: FrameSink>(&self, sink: &Arc<S>) -> anyhow::Result<BoardView> {
         let repository = self.board()?;
         let scope_id = board_scope_id(&repository);
-        self.grow_subscriptions(
-            vec![Subscription::Blackboard {
-                workflow_run_id: scope_id.clone(),
-            }],
-            sink,
-        )
-        .await?;
-        let cards = self
+        let board_sink = Arc::new(BoardFrameSink {
+            sink: Arc::clone(sink),
+            scope_id: scope_id.clone(),
+        });
+        let client = self.repository_board_client(&board_sink).await?;
+        client
+            .grow_subscriptions(
+                vec![Subscription::Blackboard {
+                    workflow_run_id: scope_id.clone(),
+                }],
+                &board_sink,
+            )
+            .await?;
+        let cards = client
             .read_blackboard(
                 String::new(),
                 Some("task".to_owned()),
@@ -1276,21 +1331,28 @@ impl DaemonClient {
         if title.is_empty() {
             bail!("task title must not be empty");
         }
-        self.applied_item(CommandBody::PostBlackboardItem {
-            scope: BlackboardScope::RepositoryBoard {
-                repository: self.board()?,
-            },
-            item: BlackboardItemDraft {
-                kind: "task".to_owned(),
-                payload: serde_json::json!({ "title": title, "description": "" }),
-                confidence: None,
-                evidence: Vec::new(),
-                status: Some("todo".to_owned()),
-                assignee: None,
-                ordinal: None,
-            },
-        })
-        .await
+        let client = self
+            .board_client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Open the task board before changing tasks."))?;
+        client
+            .applied_item(CommandBody::PostBlackboardItem {
+                scope: BlackboardScope::RepositoryBoard {
+                    repository: self.board()?,
+                },
+                item: BlackboardItemDraft {
+                    kind: "task".to_owned(),
+                    payload: serde_json::json!({ "title": title, "description": "" }),
+                    confidence: None,
+                    evidence: Vec::new(),
+                    status: Some("todo".to_owned()),
+                    assignee: None,
+                    ordinal: None,
+                },
+            })
+            .await
     }
 
     /// Move one card to another column.
@@ -1305,17 +1367,24 @@ impl DaemonClient {
         item_id: String,
         status: String,
     ) -> anyhow::Result<BlackboardItemView> {
-        self.applied_item(CommandBody::UpdateBlackboardItem {
-            scope: BlackboardScope::RepositoryBoard {
-                repository: self.board()?,
-            },
-            item_id,
-            status: Some(status),
-            assignee: None,
-            ordinal: None,
-            payload: None,
-        })
-        .await
+        let client = self
+            .board_client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Open the task board before changing tasks."))?;
+        client
+            .applied_item(CommandBody::UpdateBlackboardItem {
+                scope: BlackboardScope::RepositoryBoard {
+                    repository: self.board()?,
+                },
+                item_id,
+                status: Some(status),
+                assignee: None,
+                ordinal: None,
+                payload: None,
+            })
+            .await
     }
 
     /// The checkout the task board is keyed by, or an explanation of why there
@@ -1323,12 +1392,76 @@ impl DaemonClient {
     /// a second, permanently empty board with no error (see
     /// [`crate::repo_anchor`]).
     fn board(&self) -> anyhow::Result<String> {
-        self.board_repository.clone().ok_or_else(|| {
-            anyhow!(
-                "the desktop shell was started without a repository, so there is no task \
-                 board to read — a board is keyed by a checkout"
-            )
-        })
+        self.board_repository
+            .clone()
+            .ok_or_else(|| anyhow!("Choose a repository to use its task board."))
+    }
+
+    async fn repository_board_client<S: FrameSink>(
+        &self,
+        sink: &Arc<S>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let mut held = self.board_client.lock().await;
+        if self
+            .reader_task
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+        {
+            bail!("Reconnect the workspace to load its task board.");
+        }
+        if let Some(client) = held.as_ref() {
+            if client
+                .reader_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+            {
+                return Ok(Arc::clone(client));
+            }
+            client.shutdown_connection().await;
+            *held = None;
+        }
+        let (client, _) = Self::connect_as(
+            &self.socket_path,
+            self.repository.clone(),
+            Some(self.workspace),
+            Arc::clone(sink),
+        )
+        .await?;
+        let setup = async {
+            let reply = client
+                .send_command(CommandBody::CreateSession {
+                    workspace: self.workspace,
+                    title: "Repository task board".to_owned(),
+                    repository: self.board_repository.clone(),
+                    internal: true,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                })
+                .await?;
+            let session_id = match reply.payload {
+                Payload::CommandAccepted { .. } => reply.session_id.ok_or_else(|| {
+                    anyhow!("The task board connection has no workspace session.")
+                })?,
+                Payload::CommandRejected(error) => bail!(
+                    "Could not open the task board: {} ({})",
+                    error.message,
+                    error.code
+                ),
+                other => bail!("Unexpected task board session reply: {other:?}"),
+            };
+            client.attach(session_id, sink).await
+        }
+        .await;
+        if let Err(error) = setup {
+            client.shutdown_connection().await;
+            return Err(error);
+        }
+        *held = Some(Arc::clone(&client));
+        Ok(client)
     }
 
     // ------------------------------------------------------------- Plumbing
@@ -1501,6 +1634,11 @@ impl DaemonClient {
     #[must_use]
     pub fn repository(&self) -> Option<&str> {
         self.repository.as_deref()
+    }
+
+    /// The confirmed attachment used when handing this session to another client.
+    pub async fn attached_session_id(&self) -> Option<SessionId> {
+        *self.attached.lock().await
     }
 
     /// The repository a scoped knowledge command must name — the daemon
@@ -1829,6 +1967,14 @@ impl DaemonClient {
 
     /// Send one command and await its correlated reply.
     async fn send_command(&self, body: CommandBody) -> anyhow::Result<Envelope> {
+        self.send_command_with_timeout(body, COMMAND_TIMEOUT).await
+    }
+
+    async fn send_command_with_timeout(
+        &self,
+        body: CommandBody,
+        timeout: Duration,
+    ) -> anyhow::Result<Envelope> {
         let command_id = codypendent_protocol::CommandId::new();
         let command = codypendent_protocol::Command {
             command_id,
@@ -1851,7 +1997,7 @@ impl DaemonClient {
             return Err(anyhow::Error::from(error).context("writing a command to the daemon"));
         }
 
-        match tokio::time::timeout(COMMAND_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => {
                 self.inflight.lock().await.remove(&message_id);
@@ -1861,7 +2007,7 @@ impl DaemonClient {
                 self.inflight.lock().await.remove(&message_id);
                 bail!(
                     "the daemon did not reply within {} seconds",
-                    COMMAND_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 )
             }
         }
@@ -2005,6 +2151,10 @@ async fn dispatch<S: FrameSink>(
     }
     let session_id = envelope.session_id;
     match envelope.payload {
+        Payload::RemoteUi { message } => sink.emit(DaemonFrame::RemoteUi {
+            session_id,
+            message,
+        }),
         Payload::Event(event) => {
             last_seen.fetch_max(event.sequence, Ordering::Relaxed);
             sink.emit(DaemonFrame::Event {
@@ -2041,9 +2191,30 @@ async fn dispatch<S: FrameSink>(
 // the daemon gives, not states this client invents.
 // ---------------------------------------------------------------------------
 
-use codypendent_protocol::{CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphStatusView};
+use codypendent_protocol::{
+    CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport, CodeGraphStatusView,
+};
 
 impl DaemonClient {
+    pub async fn build_code_graph(&self) -> anyhow::Result<CodeGraphScanReport> {
+        let repository = self.graph_repository()?;
+        let reply = self
+            .send_command_with_timeout(
+                CommandBody::BuildCodeGraph { repository },
+                Duration::from_secs(300),
+            )
+            .await?;
+        match reply.payload {
+            Payload::CodeGraphBuilt { report, .. } => Ok(*report),
+            Payload::CommandRejected(error) => bail!(
+                "BuildCodeGraph rejected: {} ({})",
+                error.message,
+                error.code
+            ),
+            other => bail!("unexpected reply to BuildCodeGraph: {other:?}"),
+        }
+    }
+
     /// The checkout every code-graph command is scoped to.
     ///
     /// The daemon resolves a *path* to its enclosing checkout itself and derives
@@ -2542,6 +2713,12 @@ mod tests {
                         }
                     }
                 }
+                Payload::RemoteUi { message } => {
+                    let reply = Envelope::reply_to(&request, Payload::RemoteUi { message });
+                    write_envelope(&mut stream, &reply)
+                        .await
+                        .expect("remote UI echo");
+                }
                 _ => {}
             }
         }
@@ -2549,6 +2726,91 @@ mod tests {
 
     fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("daemon.sock")
+    }
+
+    #[tokio::test]
+    async fn remote_ui_is_session_bound_forwarded_and_not_a_durable_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let server = tokio::spawn(serve(
+            UnixListener::bind(&socket).unwrap(),
+            Arc::new(Observed::default()),
+        ));
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&socket, None, sink.clone())
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        client.attach(session, &sink).await.unwrap();
+        let sequence = client.last_seen.load(Ordering::SeqCst);
+        let message: codypendent_protocol::UiWireMessage =
+            serde_json::from_value(serde_json::json!({
+                "type": "resync", "messageId": "recovery", "resync": { "documentId": "document" }
+            }))
+            .unwrap();
+        assert!(client
+            .send_remote_ui(SessionId::new(), message.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no longer attached"));
+        let forbidden: codypendent_protocol::UiWireMessage = serde_json::from_value(serde_json::json!({
+            "type": "dispose", "messageId": "producer", "dispose": { "documentId": "document", "revision": 1 }
+        })).unwrap();
+        assert!(client
+            .send_remote_ui(session, forbidden)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a renderer request"));
+        client.send_remote_ui(session, message).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sink.frames().iter().any(|frame| matches!(frame, DaemonFrame::RemoteUi { session_id: Some(id), message } if *id == session && message.kind == "resync")) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("forwarded Remote UI frame");
+        assert_eq!(client.last_seen.load(Ordering::SeqCst), sequence);
+        client.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_probe_is_reported_as_protocol_support_not_bad_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_envelope(&mut stream).await.unwrap().unwrap();
+            let mut hello = server_hello();
+            hello.selected_protocol.minor = 8;
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(&request, Payload::ServerHello(hello)),
+            )
+            .await
+            .unwrap();
+            assert!(
+                read_envelope(&mut stream).await.unwrap().is_none(),
+                "no unsupported probe was sent"
+            );
+        });
+        let (client, _) = DaemonClient::connect(&socket, None, Arc::new(Collector::default()))
+            .await
+            .unwrap();
+        let error = client
+            .probe_models(None, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("daemon"), "{error}");
+        assert!(
+            error.contains("update") || error.contains("Update"),
+            "{error}"
+        );
+        client.shutdown().await;
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2755,6 +3017,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_objective_publishes_the_minted_attached_session_before_starting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let observed = Arc::new(Observed::default());
+        let server = tokio::spawn(serve(
+            UnixListener::bind(&path).expect("bind"),
+            Arc::clone(&observed),
+        ));
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        let mut prepared = None;
+        let handle = client.start_objective_prepared("First chat".into(), AgentMode::Build, None, None, &sink, |session| {
+            prepared = Some(session);
+            assert_eq!(*client.attached.try_lock().expect("attachment complete"), Some(session));
+            let commands = observed.commands.lock().expect("observed");
+            assert!(matches!(commands.as_slice(), [CommandBody::CreateSession { .. }, CommandBody::AttachSession { session_id, .. }] if *session_id == session));
+            assert!(sink.frames().iter().any(|frame| matches!(frame, DaemonFrame::Event { event, .. } if matches!(event.body, EventBody::SessionCreated { .. }))));
+            Ok(())
+        }).await.expect("prepared start");
+        assert_eq!(prepared, Some(handle.session_id));
+        assert!(
+            matches!(observed.commands.lock().expect("observed").last(), Some(CommandBody::StartRun { session_id, .. }) if *session_id == handle.session_id)
+        );
+        client.shutdown().await;
+        server.await.expect("server finished");
+    }
+
+    #[tokio::test]
+    async fn prepared_objective_failure_prevents_start_run_and_wrapper_can_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let observed = Arc::new(Observed::default());
+        let server = tokio::spawn(serve(
+            UnixListener::bind(&path).expect("bind"),
+            Arc::clone(&observed),
+        ));
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        let mut prepared = None;
+        let error = client
+            .start_objective_prepared(
+                "First chat".into(),
+                AgentMode::Build,
+                None,
+                None,
+                &sink,
+                |session| {
+                    prepared = Some(session);
+                    anyhow::bail!("fixture desktop publication failed")
+                },
+            )
+            .await
+            .expect_err("publication failed");
+        assert!(error
+            .to_string()
+            .contains("fixture desktop publication failed"));
+        assert!(!observed
+            .commands
+            .lock()
+            .expect("observed")
+            .iter()
+            .any(|command| matches!(command, CommandBody::StartRun { .. })));
+        let handle = client
+            .start_objective("Try again".into(), AgentMode::Build, None, prepared, &sink)
+            .await
+            .expect("wrapper retries attached session");
+        assert_eq!(Some(handle.session_id), prepared);
+        assert_eq!(
+            observed
+                .commands
+                .lock()
+                .expect("observed")
+                .iter()
+                .filter(|command| matches!(command, CommandBody::CreateSession { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .commands
+                .lock()
+                .expect("observed")
+                .iter()
+                .filter(|command| matches!(command, CommandBody::StartRun { .. }))
+                .count(),
+            1
+        );
+        client.shutdown().await;
+        server.await.expect("server finished");
+    }
+
+    #[tokio::test]
+    async fn follow_up_objective_keeps_the_attached_conversation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let observed = Arc::new(Observed::default());
+        let server = tokio::spawn(serve(
+            UnixListener::bind(&path).expect("bind"),
+            Arc::clone(&observed),
+        ));
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        let first = client
+            .start_objective("Hello".into(), AgentMode::Build, None, None, &sink)
+            .await
+            .expect("first message");
+        let second = client
+            .start_objective(
+                "Review the project".into(),
+                AgentMode::Build,
+                None,
+                Some(first.session_id),
+                &sink,
+            )
+            .await
+            .expect("follow-up");
+        assert_eq!(first.session_id, second.session_id);
+        let commands = observed.commands.lock().expect("observed lock").clone();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|body| matches!(body, CommandBody::CreateSession { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|body| matches!(body, CommandBody::AttachSession { .. }))
+                .count(),
+            1
+        );
+        let starts: Vec<_> = commands
+            .iter()
+            .filter_map(|body| match body {
+                CommandBody::StartRun {
+                    session_id,
+                    objective,
+                    ..
+                } => Some((*session_id, objective.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (first.session_id, "Hello"),
+                (first.session_id, "Review the project")
+            ]
+        );
+        let before = commands.len();
+        assert!(client
+            .start_objective(
+                "Wrong chat".into(),
+                AgentMode::Build,
+                None,
+                Some(SessionId::new()),
+                &sink
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            observed.commands.lock().expect("observed lock").len(),
+            before
+        );
+        client.shutdown().await;
+        server.await.expect("server finished");
+    }
+
+    #[tokio::test]
     async fn submitting_an_objective_sends_real_commands_and_forwards_real_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = socket_in(&dir);
@@ -2769,7 +3207,13 @@ mod tests {
         assert_eq!(info.daemon_version, "0.9.0-test");
 
         let handle = client
-            .start_objective("ship the thing".to_string(), AgentMode::Build, None, &sink)
+            .start_objective(
+                "ship the thing".to_string(),
+                AgentMode::Build,
+                None,
+                None,
+                &sink,
+            )
             .await
             .expect("start objective");
         assert!(
@@ -2856,7 +3300,7 @@ mod tests {
 
         let approval_id = ApprovalId::new();
         client
-            .resolve_approval(approval_id, ApprovalDecision::Approve)
+            .resolve_approval(approval_id, ApprovalDecision::Approve, ApprovalScope::Once)
             .await
             .expect("approve");
         let resolved = observed
@@ -2875,6 +3319,36 @@ mod tests {
                 )
             });
         assert!(resolved, "approval sends a real ResolveApproval command");
+        for scope in [
+            ApprovalScope::Run,
+            ApprovalScope::Pattern,
+            ApprovalScope::Repository,
+        ] {
+            let id = ApprovalId::new();
+            client
+                .resolve_approval(id, ApprovalDecision::Approve, scope)
+                .await
+                .expect("scoped approval");
+            assert!(observed.commands.lock().expect("observed lock").iter().any(|command| {
+                matches!(command, CommandBody::ResolveApproval { approval_id, decision: ApprovalDecision::Approve, scope: seen } if *approval_id == id && *seen == scope)
+            }));
+        }
+        assert!(client
+            .resolve_approval(
+                approval_id,
+                ApprovalDecision::Approve,
+                ApprovalScope::Unknown
+            )
+            .await
+            .is_err());
+        assert!(client
+            .resolve_approval(
+                approval_id,
+                ApprovalDecision::Reject,
+                ApprovalScope::Repository
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -3396,6 +3870,16 @@ mod tests {
             .await
             .expect("read artifact");
         assert_eq!(bytes, contents);
+        let saved = dir.path().join("report.csv");
+        std::fs::write(&saved, "old export").unwrap();
+        assert_eq!(
+            client
+                .save_artifact(&export.artifact, &saved)
+                .await
+                .unwrap(),
+            contents.len() as u64
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), contents);
 
         let commands = observed.commands.lock().expect("observed lock").clone();
         for expected in [
@@ -3493,5 +3977,13 @@ mod tests {
             .expect_err("bytes that do not match the reference must not be handed to the webview");
         let message = error.to_string();
         assert!(message.contains("digest"), "unexpected failure: {message}");
+        let saved = dir.path().join("keep.csv");
+        std::fs::write(&saved, "preserve me").unwrap();
+        assert!(client.save_artifact(&claimed, &saved).await.is_err());
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "preserve me");
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_board_tests.rs"]
+mod board_tests;

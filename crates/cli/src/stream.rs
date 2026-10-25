@@ -1,10 +1,7 @@
-//! JSONL rendering of the session event stream — shared by
-//! `codypendent run --jsonl` and `codypendent attach --events jsonl` (STEP
-//! 1.13). Not reused by the TUI (STEP 1.12): the TUI will consume
-//! `connection::Connection` envelopes directly and render them as widgets,
-//! whereas this module's only job is "one self-describing JSON `Envelope` per
-//! stdout line" — the JSONL stream and the TUI observe the same events, never
-//! a privileged side channel.
+//! Headless session rendering: readable answers for `codypendent run`, and
+//! one self-describing JSON `Envelope` per stdout line for `run --jsonl` and
+//! `attach --events jsonl`. Both projections consume the same daemon events
+//! and share run ownership, terminal disposition, and exit-code handling.
 
 use std::io::Write;
 
@@ -15,6 +12,132 @@ use codypendent_protocol::{
 };
 
 use crate::connection::Connection;
+
+/// Human-readable answers by default; lossless envelopes for automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Text,
+    Jsonl,
+}
+
+#[derive(Default)]
+struct TextOutput {
+    wrote_answer: bool,
+    line_open: bool,
+}
+
+impl TextOutput {
+    fn write<W: Write>(&mut self, out: &mut W, text: &str) -> anyhow::Result<()> {
+        let safe = codypendent_tui::sanitize_accessible_text(text);
+        if !safe.is_empty() {
+            write!(out, "{safe}").context("writing the answer")?;
+            out.flush().context("flushing the answer")?;
+            self.wrote_answer = true;
+            self.line_open = !safe.ends_with('\n');
+        }
+        Ok(())
+    }
+
+    fn finish_line<W: Write>(&mut self, out: &mut W) -> anyhow::Result<()> {
+        if self.line_open {
+            writeln!(out).context("finishing the answer")?;
+            out.flush()?;
+            self.line_open = false;
+        }
+        Ok(())
+    }
+
+    fn event<W: Write, E: Write>(
+        &mut self,
+        out: &mut W,
+        diagnostics: &mut E,
+        body: &EventBody,
+    ) -> anyhow::Result<()> {
+        match body {
+            EventBody::ModelStreamDelta {
+                text,
+                thought: false,
+                ..
+            } => self.write(out, text)?,
+            EventBody::ToolStarted { tool, label, .. } => {
+                self.finish_line(out)?;
+                writeln!(
+                    diagnostics,
+                    "codypendent: running tool {}",
+                    codypendent_tui::sanitize_accessible_text(if tool.starts_with("acp:") {
+                        label.as_deref().unwrap_or("Tool")
+                    } else {
+                        tool
+                    })
+                )?;
+            }
+            EventBody::ToolUpdated {
+                label: Some(label), ..
+            } => {
+                writeln!(
+                    diagnostics,
+                    "codypendent: tool action {}",
+                    codypendent_tui::sanitize_accessible_text(label)
+                )?;
+            }
+            EventBody::ModelRetrying {
+                attempt,
+                max_attempts,
+                message,
+                delay_ms,
+                ..
+            } => {
+                writeln!(
+                    diagnostics,
+                    "codypendent: retry {attempt}/{max_attempts} in {}s — {}",
+                    delay_ms.div_ceil(1000),
+                    codypendent_tui::state::sanitize_failure_text(message)
+                )?;
+            }
+            EventBody::RunStateChanged {
+                state: RunState::WaitingForApproval,
+                ..
+            } => {
+                self.finish_line(out)?;
+                writeln!(diagnostics, "codypendent: waiting for approval; open this session in the TUI or desktop to review it")?;
+            }
+            EventBody::RunStateChanged {
+                state: RunState::WaitingForUserInput,
+                ..
+            } => {
+                self.finish_line(out)?;
+                writeln!(diagnostics, "codypendent: waiting for your answer; open this session in the TUI or desktop to respond")?;
+            }
+            EventBody::RunUsage {
+                prompt_tokens,
+                completion_tokens,
+                cost_micros,
+                coverage,
+                ..
+            } => {
+                if let Some(label) = codypendent_tui::usage::format_usage(
+                    *prompt_tokens,
+                    *completion_tokens,
+                    *cost_micros,
+                    *coverage,
+                ) {
+                    self.finish_line(out)?;
+                    writeln!(diagnostics, "codypendent: measured usage: {label}")?;
+                    diagnostics.flush()?;
+                }
+            }
+            EventBody::RunCompleted {
+                disposition:
+                    RunDisposition::Completed {
+                        summary: Some(summary),
+                    },
+                ..
+            } if !self.wrote_answer => self.write(out, summary)?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 /// The terminal disposition of a headless run — the STEP 1.13 exit-code
 /// contract for `codypendent run --jsonl`.
@@ -175,6 +298,29 @@ pub async fn stream_until_terminal<W: Write>(
     out: &mut W,
     expected_run: Option<RunId>,
 ) -> anyhow::Result<RunExit> {
+    stream_until_terminal_with_format(conn, out, expected_run, OutputFormat::Jsonl).await
+}
+
+pub async fn stream_until_terminal_with_format<W: Write>(
+    conn: &mut Connection,
+    out: &mut W,
+    expected_run: Option<RunId>,
+    format: OutputFormat,
+) -> anyhow::Result<RunExit> {
+    stream_until_terminal_with_writers(conn, out, &mut std::io::stderr(), expected_run, format)
+        .await
+}
+
+/// The same stream with an explicit diagnostic sink, keeping answers/JSONL on
+/// stdout and progress/usage on stderr. Also permits end-to-end capture tests.
+pub async fn stream_until_terminal_with_writers<W: Write, E: Write>(
+    conn: &mut Connection,
+    out: &mut W,
+    diagnostics: &mut E,
+    expected_run: Option<RunId>,
+    format: OutputFormat,
+) -> anyhow::Result<RunExit> {
+    let mut text_output = TextOutput::default();
     // The authoritative binding is the run id the daemon reported for OUR
     // StartRun; first-observed `RunStarted` is only the older-daemon fallback.
     let mut run_id: Option<RunId> = expected_run;
@@ -186,6 +332,7 @@ pub async fn stream_until_terminal<W: Write>(
     let mut saw_usage = false;
     loop {
         let Some(envelope) = conn.next_envelope().await? else {
+            text_output.finish_line(out)?;
             return pending_exit.ok_or_else(|| {
                 anyhow!("daemon closed the connection before the run reached a terminal state")
             });
@@ -197,9 +344,12 @@ pub async fn stream_until_terminal<W: Write>(
             run_id.get_or_insert(*rid);
         }
 
-        write_line(out, &envelope)?;
-
         let owns_event = matches!(event_run_id(&event.body), Some(rid) if Some(rid) == run_id);
+        match format {
+            OutputFormat::Jsonl => write_line(out, &envelope)?,
+            OutputFormat::Text if owns_event => text_output.event(out, diagnostics, &event.body)?,
+            OutputFormat::Text => {}
+        }
         if !owns_event {
             continue;
         }
@@ -215,10 +365,24 @@ pub async fn stream_until_terminal<W: Write>(
                     // it. Mirrors the daemon-mismatch warning's stderr-only
                     // convention just above this function's caller.
                     if let Some(reason) = disposition_reason(disposition) {
-                        eprintln!("codypendent: run {} — {reason}", exit_verb(exit));
+                        writeln!(
+                            diagnostics,
+                            "codypendent: run {} — {}",
+                            exit_verb(exit),
+                            codypendent_tui::state::sanitize_failure_text(reason)
+                        )?;
                     }
+                    text_output.finish_line(out)?;
                     if !saw_usage {
-                        drain_trailing_usage(conn, out, run_id).await?;
+                        drain_trailing_usage(
+                            conn,
+                            out,
+                            diagnostics,
+                            run_id,
+                            format,
+                            &mut text_output,
+                        )
+                        .await?;
                     }
                     return Ok(exit);
                 }
@@ -252,10 +416,13 @@ const TRAILING_USAGE_GRACE: std::time::Duration = std::time::Duration::from_mill
 /// all-`None` event would be indistinguishable from a genuinely free run), an
 /// older daemon emits none at all, and the connection may simply end. None of
 /// those may change the run's exit code, so every exit here is `Ok(())`.
-async fn drain_trailing_usage<W: Write>(
+async fn drain_trailing_usage<W: Write, E: Write>(
     conn: &mut Connection,
     out: &mut W,
+    diagnostics: &mut E,
     run_id: Option<RunId>,
+    format: OutputFormat,
+    text_output: &mut TextOutput,
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + TRAILING_USAGE_GRACE;
     loop {
@@ -274,10 +441,15 @@ async fn drain_trailing_usage<W: Write>(
         // Forward whatever arrives in the window, exactly as the main loop
         // does: the JSONL contract is "every event the daemon sent us", not
         // "the events this function happens to care about".
-        write_line(out, &envelope)?;
+        if format == OutputFormat::Jsonl {
+            write_line(out, &envelope)?;
+        }
         if matches!(event.body, EventBody::RunUsage { .. })
             && matches!(event_run_id(&event.body), Some(rid) if Some(rid) == run_id)
         {
+            if format == OutputFormat::Text {
+                text_output.event(out, diagnostics, &event.body)?;
+            }
             return Ok(());
         }
     }
@@ -322,9 +494,11 @@ pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
         EventBody::RunStarted { run_id, .. }
         | EventBody::RunStateChanged { run_id, .. }
         | EventBody::ModelStreamDelta { run_id, .. }
+        | EventBody::ModelRetrying { run_id, .. }
         | EventBody::ToolProposed { run_id, .. }
         | EventBody::ToolDenied { run_id, .. }
         | EventBody::ToolStarted { run_id, .. }
+        | EventBody::ToolUpdated { run_id, .. }
         | EventBody::ToolCompleted { run_id, .. }
         | EventBody::PatchProposed { run_id, .. }
         | EventBody::SteeringQueued { run_id }
@@ -388,6 +562,7 @@ mod tests {
                 prompt_tokens: Some(1),
                 completion_tokens: Some(2),
                 cost_micros: None,
+                coverage: None,
             },
             EventBody::ContextUsage {
                 run_id: run,
@@ -434,5 +609,174 @@ mod tests {
             None
         );
         assert_eq!(event_run_id(&EventBody::SessionClosed), None);
+    }
+
+    async fn capture_text(run: RunId, bodies: Vec<EventBody>) -> (String, String, RunExit) {
+        use codypendent_protocol::{write_envelope, Actor};
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for (index, body) in bodies.into_iter().enumerate() {
+                let event = SessionEvent {
+                    sequence: index as u64 + 1,
+                    occurred_at: chrono::Utc::now(),
+                    causation_id: None,
+                    correlation_id: None,
+                    actor: Actor::System,
+                    body,
+                };
+                write_envelope(
+                    &mut socket,
+                    &Envelope::request(ClientId::new(), Payload::Event(event)),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let mut connection = Connection::connect(&path).await.unwrap();
+        let mut answer = Vec::new();
+        let mut diagnostics = Vec::new();
+        let exit = stream_until_terminal_with_writers(
+            &mut connection,
+            &mut answer,
+            &mut diagnostics,
+            Some(run),
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        (
+            String::from_utf8(answer).unwrap(),
+            String::from_utf8(diagnostics).unwrap(),
+            exit,
+        )
+    }
+
+    fn completion(run_id: RunId, disposition: RunDisposition) -> EventBody {
+        EventBody::RunCompleted {
+            run_id,
+            disposition,
+            chronicle: ArtifactRef {
+                id: ArtifactId::new(),
+                media_type: "text/markdown".into(),
+                byte_length: 0,
+                sha256: "a".repeat(64),
+                sensitivity: DataClassification::Internal,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn readable_usage_keeps_stdout_clean_and_qualifies_measured_subtotals() {
+        let run = RunId::new();
+        let (answer, diagnostics, exit) = capture_text(
+            run,
+            vec![
+                EventBody::ModelStreamDelta {
+                    run_id: run,
+                    text: "The answer".into(),
+                    thought: false,
+                },
+                EventBody::RunUsage {
+                    run_id: run,
+                    prompt_tokens: Some(1200),
+                    completion_tokens: None,
+                    cost_micros: Some(11),
+                    coverage: Some(codypendent_protocol::UsageCoverage {
+                        requests: 2,
+                        prompt_requests: 1,
+                        completion_requests: 0,
+                        cost_requests: 1,
+                        unmeasured_retries: 0,
+                    }),
+                },
+                completion(run, RunDisposition::Completed { summary: None }),
+            ],
+        )
+        .await;
+        assert_eq!(answer, "The answer\n");
+        assert_eq!(
+            diagnostics,
+            "codypendent: measured usage: 1,200 in · $0.000011 · partial\n"
+        );
+        assert_eq!(exit, RunExit::Completed);
+    }
+
+    #[tokio::test]
+    async fn readable_legacy_usage_is_drained_without_admitting_sibling_output() {
+        let run = RunId::new();
+        let sibling = RunId::new();
+        let (answer, diagnostics, exit) = capture_text(
+            run,
+            vec![
+                completion(
+                    run,
+                    RunDisposition::Completed {
+                        summary: Some("Done".into()),
+                    },
+                ),
+                EventBody::ModelStreamDelta {
+                    run_id: sibling,
+                    text: "sibling answer".into(),
+                    thought: false,
+                },
+                EventBody::RunUsage {
+                    run_id: sibling,
+                    prompt_tokens: Some(999),
+                    completion_tokens: None,
+                    cost_micros: None,
+                    coverage: None,
+                },
+                EventBody::RunUsage {
+                    run_id: run,
+                    prompt_tokens: Some(0),
+                    completion_tokens: None,
+                    cost_micros: None,
+                    coverage: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(answer, "Done\n");
+        assert_eq!(
+            diagnostics,
+            "codypendent: measured usage: 0 in · coverage unknown\n"
+        );
+        assert_eq!(exit, RunExit::Completed);
+    }
+
+    #[tokio::test]
+    async fn unmeasured_readable_failure_has_no_fabricated_cost_and_keeps_its_verdict() {
+        let run = RunId::new();
+        let (answer, diagnostics, exit) = capture_text(
+            run,
+            vec![
+                EventBody::RunUsage {
+                    run_id: run,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    cost_micros: None,
+                    coverage: None,
+                },
+                completion(
+                    run,
+                    RunDisposition::Failed {
+                        reason: "provider unavailable".into(),
+                        error: None,
+                    },
+                ),
+            ],
+        )
+        .await;
+        assert!(answer.is_empty());
+        assert_eq!(
+            diagnostics,
+            "codypendent: run failed — provider unavailable\n"
+        );
+        assert_eq!(exit, RunExit::Failed);
     }
 }

@@ -963,6 +963,12 @@
       "format": "uuid",
       "type": "string"
     },
+    "pattern": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "risk": {
       "$ref": "#/definitions/Risk"
     },

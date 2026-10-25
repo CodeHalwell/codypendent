@@ -165,10 +165,11 @@ export function buildEditorActionContext(
   workspaceFolders: readonly vscode.WorkspaceFolder[] = vscode.workspace.workspaceFolders ?? [],
   workspaceDocuments: readonly vscode.TextDocument[] = vscode.workspace.textDocuments,
   diagnosticsRevision = 0,
+  repository?: string,
 ): EditorActionContext {
   const ide = extractIdeContext(editor, workspaceDocuments, diagnosticsRevision);
   const diagnostics = extractDiagnostics(editor, workspaceDocuments);
-  const repositoryId = workspaceFolders[0]?.uri.fsPath;
+  const repositoryId = repository ?? workspaceFolders[0]?.uri.fsPath;
 
   const context: EditorActionContext = { ide };
   if (diagnostics.length > 0) {
@@ -181,6 +182,7 @@ export function buildEditorActionContext(
 }
 
 export interface ActionExecutionOptions {
+  repository?: string;
   model?: string;
   diagnosticsRevision?: number;
   workspaceFolders?: readonly vscode.WorkspaceFolder[];
@@ -198,6 +200,7 @@ export function executeExplainSelection(
     options?.workspaceFolders,
     options?.workspaceDocuments,
     options?.diagnosticsRevision ?? 0,
+    options?.repository,
   );
   const action: EditorNativeAction = { type: "ExplainSelection" };
   client.runEditorAction(action, context, options?.model);
@@ -214,6 +217,7 @@ export function executeFixSelection(
     options?.workspaceFolders,
     options?.workspaceDocuments,
     options?.diagnosticsRevision ?? 0,
+    options?.repository,
   );
   const action: EditorNativeAction = { type: "FixSelection" };
   client.runEditorAction(action, context, options?.model);
@@ -236,6 +240,7 @@ export function executeFixDiagnostic(
     options?.workspaceFolders,
     options?.workspaceDocuments,
     options?.diagnosticsRevision ?? 0,
+    options?.repository,
   );
   const action: EditorNativeAction = { type: "FixDiagnostic", diagnostic: target };
   client.runEditorAction(action, context, options?.model);
@@ -253,6 +258,7 @@ export function executeGenerateTestsForSelection(
     options?.workspaceFolders,
     options?.workspaceDocuments,
     options?.diagnosticsRevision ?? 0,
+    options?.repository,
   );
   const action: EditorNativeAction = { type: "GenerateTestsForSelection" };
   client.runEditorAction(action, context, options?.model);
@@ -269,6 +275,7 @@ export function executeReviewCurrentFile(
     options?.workspaceFolders,
     options?.workspaceDocuments,
     options?.diagnosticsRevision ?? 0,
+    options?.repository,
   );
   const action: EditorNativeAction = { type: "ReviewCurrentFile" };
   client.runEditorAction(action, context, options?.model);
@@ -281,6 +288,7 @@ export function registerEditorActions(
   context: vscode.ExtensionContext,
   getClient: () => DaemonClient | undefined,
   getDiagnosticsRevision: () => number = () => 0,
+  getRepository: () => string | undefined = () => undefined,
 ): vscode.Disposable[] {
   function ensureClient(): DaemonClient | undefined {
     const client = getClient();
@@ -298,6 +306,7 @@ export function registerEditorActions(
       if (!client) return;
       executeExplainSelection(client, vscode.window.activeTextEditor, {
         diagnosticsRevision: getDiagnosticsRevision(),
+        repository: getRepository(),
       });
       await vscode.commands.executeCommand("codypendent.sessionView.focus");
     }),
@@ -311,6 +320,7 @@ export function registerEditorActions(
       if (!client) return;
       executeFixSelection(client, vscode.window.activeTextEditor, {
         diagnosticsRevision: getDiagnosticsRevision(),
+        repository: getRepository(),
       });
       await vscode.commands.executeCommand("codypendent.sessionView.focus");
     }),
@@ -324,6 +334,7 @@ export function registerEditorActions(
       if (!client) return;
       const ran = executeFixDiagnostic(client, vscode.window.activeTextEditor, diagArg, {
         diagnosticsRevision: getDiagnosticsRevision(),
+        repository: getRepository(),
       });
       if (ran) {
         await vscode.commands.executeCommand("codypendent.sessionView.focus");
@@ -336,6 +347,7 @@ export function registerEditorActions(
       if (!client) return;
       executeGenerateTestsForSelection(client, vscode.window.activeTextEditor, {
         diagnosticsRevision: getDiagnosticsRevision(),
+        repository: getRepository(),
       });
       await vscode.commands.executeCommand("codypendent.sessionView.focus");
     }),
@@ -349,6 +361,7 @@ export function registerEditorActions(
       if (!client) return;
       executeReviewCurrentFile(client, vscode.window.activeTextEditor, {
         diagnosticsRevision: getDiagnosticsRevision(),
+        repository: getRepository(),
       });
       await vscode.commands.executeCommand("codypendent.sessionView.focus");
     }),

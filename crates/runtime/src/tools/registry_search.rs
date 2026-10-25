@@ -38,6 +38,7 @@ use serde_json::Value;
 /// it, so the document is truncated (and SAID to be truncated) rather than
 /// refused.
 pub const SKILL_DOCUMENT_MAX_BYTES: usize = 8 * 1024;
+pub const TOOL_SCHEMA_MAX_BYTES: usize = 32 * 1024;
 
 /// How many TOOL cards a single search discloses. Deliberately tighter than the
 /// context manifest's 12 (`RetrievalConfig::disclose_tools_max`): the manifest is
@@ -69,7 +70,7 @@ impl SkillsSearch {
 pub struct SkillsSearchInput {
     /// The task to retrieve for, in the model's own words.
     pub query: String,
-    /// A skill name from an earlier result whose `SKILL.md` should be included.
+    /// A returned skill or tool name whose procedure or input schema to include.
     pub open: Option<String>,
 }
 
@@ -118,6 +119,12 @@ pub struct SkillDocument {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSchema {
+    pub name: String,
+    pub parameters: Value,
+}
+
 /// What one `skills.search` call resolved to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RegistrySearchOutcome {
@@ -126,6 +133,7 @@ pub struct RegistrySearchOutcome {
     /// The opened skill's procedure, when `open` named a skill that exists and
     /// ships one.
     pub document: Option<SkillDocument>,
+    pub tool_schema: Option<ToolSchema>,
     /// Why `open` produced no document, when it produced none (an unknown name,
     /// a skill with no instructions entrypoint, an unreadable file). Rendered so
     /// the model is told rather than left guessing at a silent omission.
@@ -223,6 +231,18 @@ pub fn render_registry_search(outcome: &RegistrySearchOutcome) -> String {
             );
         }
     }
+    if let Some(schema) = &outcome.tool_schema {
+        let sanitized = sanitize_untrusted(
+            format!("tool:{}", schema.name),
+            &schema.parameters.to_string(),
+            TOOL_SCHEMA_MAX_BYTES,
+        );
+        let _ = writeln!(out, "\n=== TOOL {} (input schema) ===", schema.name);
+        let _ = writeln!(out, "{}", sanitized.text);
+        if sanitized.truncated {
+            let _ = writeln!(out, "… (schema truncated at {TOOL_SCHEMA_MAX_BYTES} bytes)");
+        }
+    }
     if let Some(note) = &outcome.open_note {
         let _ = writeln!(out, "\n(open: {note})");
     }
@@ -301,6 +321,7 @@ mod tests {
                 content: hostile,
             }),
             open_note: None,
+            ..Default::default()
         };
         let text = render_registry_search(&outcome);
         assert!(text.contains("=== SKILL rust.fix-ci (procedure) ==="));
@@ -326,8 +347,24 @@ mod tests {
             cards: Vec::new(),
             document: None,
             open_note: Some("no active skill named `rust.fix-ci`".to_string()),
+            ..Default::default()
         };
         let text = render_registry_search(&outcome);
         assert!(text.contains("(open: no active skill named `rust.fix-ci`)"));
+    }
+
+    #[test]
+    fn render_opens_one_tool_schema_with_an_explicit_size_limit() {
+        let outcome = RegistrySearchOutcome {
+            tool_schema: Some(ToolSchema {
+                name: "mcp.calendar.meetings".to_string(),
+                parameters: json!({"type":"object", "description":"x".repeat(TOOL_SCHEMA_MAX_BYTES * 2)}),
+            }),
+            ..Default::default()
+        };
+        let text = render_registry_search(&outcome);
+        assert!(text.contains("TOOL mcp.calendar.meetings (input schema)"));
+        assert!(text.contains("schema truncated at"));
+        assert!(text.len() < TOOL_SCHEMA_MAX_BYTES + 2048);
     }
 }

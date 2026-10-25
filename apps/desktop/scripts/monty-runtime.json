@@ -1,0 +1,36 @@
+{
+  "version": "1.2.0",
+  "license": "MIT",
+  "assets": {
+    "darwin-arm64": {
+      "filename": "pydantic_monty_runtime-1.2.0-py3-none-macosx_11_0_arm64.whl",
+      "size": 14514981,
+      "sha256": "0bf4d5e162fabf010ada6b82f65629b6c6f37e2ffa5af842ffc66bb96dc76c04",
+      "url": "https://files.pythonhosted.org/packages/23/ff/f95190190552e048224b34664c0b464ac0caf30938a0e8842ea4ae498828/pydantic_monty_runtime-1.2.0-py3-none-macosx_11_0_arm64.whl"
+    },
+    "darwin-x64": {
+      "filename": "pydantic_monty_runtime-1.2.0-py3-none-macosx_10_12_x86_64.whl",
+      "size": 12213552,
+      "sha256": "d1b864f151fe10404b951dfab1ee3dc528efc20722bc90868eae8a35a79ee276",
+      "url": "https://files.pythonhosted.org/packages/9b/35/3890f28b31fe440cdc16c946b596cbebe47623bc09141aa5cb555c5075ad/pydantic_monty_runtime-1.2.0-py3-none-macosx_10_12_x86_64.whl"
+    },
+    "linux-arm64": {
+      "filename": "pydantic_monty_runtime-1.2.0-py3-none-manylinux_2_28_aarch64.whl",
+      "size": 15012465,
+      "sha256": "5e40d158e77c89f769b8d3f9ee8c820c15b8e3ca905cae21d3439136a09fda70",
+      "url": "https://files.pythonhosted.org/packages/cb/7b/aa353e66d5d96fa41b023d9d3ddc059df5f0858b3b397947bf1e19eefbd7/pydantic_monty_runtime-1.2.0-py3-none-manylinux_2_28_aarch64.whl"
+    },
+    "linux-x64": {
+      "filename": "pydantic_monty_runtime-1.2.0-py3-none-manylinux_2_28_x86_64.whl",
+      "size": 15712470,
+      "sha256": "dd92f151e63d07de0c7550a4af35450ee1cf5c7615c9d7fdef1f9d6722f6f5a1",
+      "url": "https://files.pythonhosted.org/packages/62/fb/d53fc1efd412f0c4b02f24f74d2b7f31575152223b1574f9805fb3cb84e5/pydantic_monty_runtime-1.2.0-py3-none-manylinux_2_28_x86_64.whl"
+    },
+    "win32-x64": {
+      "filename": "pydantic_monty_runtime-1.2.0-py3-none-win_amd64.whl",
+      "size": 12817550,
+      "sha256": "c5178a277e58d04cf6de2b416b109274aca23494d98c997ef083a28d043b7e67",
+      "url": "https://files.pythonhosted.org/packages/c6/12/dd1320a76a15d122a6e564fd3b92faea4f26abf973b8c0b0ecebc5fdf3d1/pydantic_monty_runtime-1.2.0-py3-none-win_amd64.whl"
+    }
+  }
+}

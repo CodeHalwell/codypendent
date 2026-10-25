@@ -1842,6 +1842,44 @@
         }
       ]
     },
+    "UsageCoverage": {
+      "description": "Completeness of the measured subtotal. Requests count calls to the model driver, including failed/cancelled calls; each measured dimension counts the calls that reported it. Retries without their own usage leave the subtotal partial even when the final attempt reports a measurement. Absent metadata on older events means coverage is unknown.",
+      "properties": {
+        "completion_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cost_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "prompt_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unmeasured_retries": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "completion_requests",
+        "cost_requests",
+        "prompt_requests",
+        "requests"
+      ],
+      "type": "object"
+    },
     "UserAction": {
       "description": "A machine-readable hint about how the user could resolve an error, so the client can render the right affordance instead of parsing `message`.",
       "oneOf": [
@@ -2229,6 +2267,36 @@
       "type": "object"
     },
     {
+      "description": "Refines the display details of an existing call without starting another tool execution. ACP agents commonly publish the command or path after their initial generic tool title. `tool` retains the call's identity. Older clients fold this additive variant to `Unknown` and retain the initial label and eventual completion.",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "ToolUpdated"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "tool",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
       "properties": {
         "artifact": {
           "anyOf": [
@@ -2554,6 +2622,16 @@
           "type": [
             "integer",
             "null"
+          ]
+        },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UsageCoverage"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "prompt_tokens": {

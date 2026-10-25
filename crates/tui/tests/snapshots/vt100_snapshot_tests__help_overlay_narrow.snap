@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/vt100_snapshot_tests.rs
-assertion_line: 117
 expression: terminal.backend().to_string()
 ---
   ✦ codypendent                                             
@@ -11,16 +10,20 @@ expression: terminal.backend().to_string()
          ┌ Help ──────────────────────────────────┐         
          │Keys — every mouse action has a keyboard│         
          │equivalent                              │         
-         │Single-letter keys apply inside their   │         
-         │overlay. / is the always-on front door. │         
+         │Type to filter shortcuts. Ctrl-U clears.│         
+         │Esc or ? closes help.                   │         
+         │  Filter: all  ·  46 shortcuts          │         
          │                                        │         
          │  type…                                 │         
-         │    compose a message in the bottom     │         
- ✦  Conne│    composer                            │         
-         │  Enter                                 │         
- No model│    send: start a run, or steer the     │verified 
- model to│    active one                          │         
- Press En│  /                                     │etup.    
+ ✦  Conne│    compose a message in the bottom     │         
+         │    composer                            │         
+ No model│  Enter                                 │verified 
+ model to│    send: start a run, or steer the     │         
+ Press En│    active one                          │etup.    
+         │  Shift-Enter                           │         
+         │    insert a line break (modern         │         
+         │    terminals); Alt-Enter also works    │         
+         │  /                                     │         
          │    command palette — every command,    │         
          │    searchable                          │         
          │  PgUp / PgDn                           │         
@@ -43,11 +46,7 @@ expression: terminal.backend().to_string()
          │    clear the draft (Ctrl-Z restores    │         
          │    it), or close an overlay            │         
          │  ? (empty) / F1                        │         
-         │    show / hide this help overlay       │         
-         │  S / M / J / D / G                     │         
-         │    open Skills · Memory · Journey ·    │         
-         │    Docs · code-graph Edges             │         
-  MESSAGE└ 111 more rows · PgUp / PgDn ───────────┘──────── 
+  MESSAGE└ 124 more rows · PgUp / PgDn ───────────┘──────── 
  ❯ Ask Codypendent to build, fix, explain, or explore…      
                                                             
                                                             

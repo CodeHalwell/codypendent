@@ -1,3 +1,5 @@
+<img src="apps/desktop/src-tauri/icons/128x128.png" alt="Codypendent code brackets" width="80" height="80" />
+
 # Codypendent
 
 Local-first, agentic developer environment with:

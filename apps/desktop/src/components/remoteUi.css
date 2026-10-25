@@ -1,0 +1,72 @@
+/* Loaded with the extension host. Host identity stays visually separate from
+ * producer content; all controls inherit the desktop theme and focus ring. */
+.desktop-extension-host {
+  box-sizing: border-box;
+  width: 360px;
+  max-width: 40vw;
+  min-width: 0;
+  flex-shrink: 0;
+  padding: 16px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  background: var(--cody-panel);
+  color: var(--cody-text);
+  border-left: 1px solid var(--cody-border);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.desktop-extension-host .ui-document {
+  margin-bottom: 16px;
+  border: 1px solid var(--cody-border-strong);
+  border-radius: 8px;
+  background: var(--cody-panel-raised);
+}
+.desktop-extension-host .ui-document > :not(.ui-extension-chrome) { margin: 12px; }
+.desktop-extension-host .ui-extension-chrome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--cody-border-strong);
+  color: var(--cody-text-muted);
+  font-size: 11px;
+}
+.desktop-extension-host .ui-extension-chrome > :first-child { flex-basis: 100%; }
+.desktop-extension-host .ui-extension-chrome strong { color: var(--cody-text); }
+.desktop-extension-host :is(button, input, textarea, select) {
+  box-sizing: border-box;
+  max-width: 100%;
+  font: inherit;
+  color: var(--cody-text);
+  background: var(--cody-inset);
+  border: 1px solid var(--cody-border-strong);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.desktop-extension-host button { cursor: pointer; }
+.desktop-extension-host button:hover:enabled { background: var(--cody-panel-hover); }
+.desktop-extension-host :disabled { opacity: .55; cursor: default; }
+.desktop-extension-host :is(.ui-field, .ui-form, .ui-host-error-actions) { display: flex; gap: 8px; }
+.desktop-extension-host :is(.ui-field, .ui-form) { flex-direction: column; }
+.desktop-extension-host :is(.ui-host-error-actions, .ui-tabs [role="tablist"]) { flex-wrap: wrap; }
+.desktop-extension-host :is(.ui-feedback, .ui-host-error, .ui-domain-card, .ui-bordered) {
+  padding: 12px;
+  border: 1px solid var(--cody-border-strong);
+  border-radius: 6px;
+}
+.desktop-extension-host :is(.tone-success, .diff-add) { color: var(--cody-success-text); }
+.desktop-extension-host :is(.tone-warning, .ui-unsupported) { color: var(--cody-warning-text); }
+.desktop-extension-host :is(.tone-danger, .tone-error, .ui-host-error, .diff-remove) { color: var(--cody-danger-text); }
+.desktop-extension-host :is(.ui-muted, .ui-extension-chrome) { color: var(--cody-text-muted); }
+.desktop-extension-host .ui-link-button { color: var(--cody-link); }
+.desktop-extension-host :is(pre, .ui-table-scroll, .ui-log) { max-width: 100%; overflow: auto; }
+.desktop-extension-host pre { font-family: var(--cody-mono); font-size: 12px; }
+.desktop-extension-host :is(figure, p) { margin: 8px 0; }
+.desktop-extension-host :is(img, audio, svg) { max-width: 100%; }
+.desktop-extension-host table { border-collapse: collapse; width: 100%; }
+.desktop-extension-host :is(th, td) { padding: 6px; text-align: left; border-bottom: 1px solid var(--cody-border); }
+.desktop-extension-host .ui-key-value { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 8px; }
+.desktop-extension-host .ui-key-value dd { margin: 0; }
+.desktop-extension-host .ui-badge { border: 1px solid currentColor; border-radius: 4px; padding: 1px 5px; }
+.desktop-extension-host .ui-chart polyline { stroke: var(--cody-accent); stroke-width: 2; }

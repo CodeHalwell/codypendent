@@ -8,44 +8,71 @@ the same daemon, so a session started in one is live in the other.
 
 ## First launch
 
-1. Install Codypendent (`install.sh`, or a release bundle) so that `codypendent`
-   is on your `PATH` or in one of the usual places (`~/.cargo/bin`,
-   `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`).
-2. Open the app. If no daemon is running, the banner across the top says so
-   and offers **Start daemon**: the shell runs `codypendent __daemon` for you,
-   detached, with its output in `<data dir>/logs/daemon.log`, and connects the
-   moment the socket answers. **Retry now** re-attempts the connection on
-   demand. If the shell cannot find the program it names the terminal command
-   instead, `codypendent daemon start`, and you can point it at a build with
-   `CODYPENDENT_BINARY=/path/to/codypendent`.
-3. **Get Started** (the first sidebar entry) checks the three things a run
-   needs: a configured model, a credential that resolves, and a repository.
-   Each step links to the surface that fixes it. The green "setup is complete"
-   banner also says when the daemon itself is unreachable, since a complete
-   configuration with no daemon still cannot run anything.
+1. Apple release bundles include the matching CLI, worker launcher, Node
+   runtime and Monty Python sandbox. Development builds can use an installed `codypendent` on `PATH`,
+   in `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin`, or `/opt/homebrew/bin`,
+   or set `CODYPENDENT_BINARY` to the build to test.
+2. Open the app. It starts its local service automatically when needed and
+   connects as soon as it is ready. Reopening the app reuses the running service;
+   a dropped connection restarts it if necessary. Startup failures show recovery
+   controls and details from `<data dir>/logs/daemon.log`. Development builds can
+   select a daemon with `CODYPENDENT_BINARY=/path/to/codypendent`.
+3. Installed coding agents, running Ollama/LM Studio models and existing
+   provider credentials are discovered in the background. Available profiles
+   are added automatically; an existing model selection stays selected. Setup
+   opens only when discovery cannot find a usable configuration. **Models →
+   Scan again** checks for tools installed or started since launch.
 
 The sidebar footer shows which daemon you are attached to (`daemon 0.14.0 ·
 protocol 1.4 · desktop 0.14.0`) and calls out a version mismatch, which is the
 usual sign of a daemon left running across an upgrade.
 
+## Native workspace integration
+
+The desktop keeps chat, search and recent sessions in the sidebar, with Councils,
+Workflow, Workspace and Configuration available in collapsible groups. Filter
+recent chats by title, or use the command palette to reach every surface. The
+centred conversation and composer share Codypendent's ivory, petrol and gold
+palette in light and dark appearances. Model and mode controls in the composer
+open the existing configuration screens; run, approval and queue controls retain
+their existing behaviour. Smaller windows use a dismissible sidebar drawer.
+
+The workspace toolbar's **Open in** menu detects installed editors and opens the
+selected checkout in VS Code, VS Code Insiders, Cursor, Zed, Windsurf, RustRover
+or Antigravity IDE. On macOS it also opens the checkout in Finder or Terminal.
+No editor is launched during discovery. Each hand-off revalidates the saved
+checkout; terminal paths are passed as literal arguments, never shell commands.
+
+The native **Workspace** menu provides Open Repository (`⌘O`), Focus Composer
+(`⌘L`), Command Palette (`⌘K`), Toggle Sidebar (`⌘B`) and Settings (`⌘,`).
+Standard macOS Edit, Services, Window and application menus remain available.
+
 ## Models, providers and keys
+
+Automatic discovery uses installed adapters and existing sign-ins. It does not
+install an agent, open a login flow or send a generation request. Slow or failed
+agent handshakes are bounded and remain retryable. Your configuration and model
+choice are shared with the CLI and preserved by the same locked writer.
 
 **Models** lists every `[[model]]` in `models.toml` with two badges: credential
 presence (stored, from an environment variable, or missing) and readiness. The
-readiness badge is computed the way the terminal client's picker computes it —
-a local endpoint (Ollama, LM Studio, vLLM) is asked for its model list, a hosted
-model has its credential resolved without touching the network, and an ACP
-agent is left to the daemon to check when a run starts. **Test** asks the
-provider over the network and turns `unverified` into `ready` or an error that
-names the cause. **Use** pins a model for the next run; the choice, and the mode
-chosen under **Mode**, persist across launches.
+readiness badge comes from the running daemon's `ProbeModel` response. Opening
+the picker resolves configuration and credentials without calling provider
+endpoints. **Test** explicitly asks the daemon to probe the model. An older
+daemon is reported as unsupported, and an unreadable configuration is reported
+as an error. **Use** pins a model for the next run; that choice and the mode
+persist across launches.
 
-**Providers** lists the built-in catalog layered with your `providers.toml`.
-Rows this build cannot execute are shown and disabled with their reason rather
-than hidden. Coding agents that speak the Agent Client Protocol (Claude Code,
-Codex, Gemini CLI, Kimi Code, Amp, Cline and the rest of the registry) are
-added from a terminal — `codypendent acp list`, then `codypendent acp connect
-claude-code` — and then appear under Models here.
+**Providers** lists the built-in catalog, your `providers.toml`, cached ACP
+registry entries, and locally discovered agents. **Refresh agent catalog**
+fetches current official registry metadata. Select an available coding agent,
+review the selected repository, then **Connect agent**. This installs its pinned
+adapter if necessary, completes a handshake, and saves the default profile and
+all advertised models. A failed handshake saves no profiles. The legacy community
+Antigravity bridge requires explicit acceptance of its account and terms risk;
+this does not apply to Google's installed official Antigravity CLI.
+Model profiles can be removed under **Models**. CLI, TUI and desktop updates
+share the same locked, comment-preserving model-file writer.
 
 **API Keys** shows presence only. A key you enter goes one way, into
 `auth.json` at mode `0600`; nothing in the app can read it back.
@@ -59,17 +86,111 @@ claude-code` — and then appear under Models here.
 - The transcript shows a pulsing working row between visible updates, policy
   denials (`Blocked by policy: …`), budget warnings, and the measured usage
   once the run ends (`1,234 in · 567 out · $0.0034`; an unmeasured dimension is
-  absent, never zero).
-- An approval card offers Approve and Reject. A question card offers the
+  absent, never zero). `partial` identifies measured subtotals, while older
+  records show `coverage unknown`. Tiny nonzero costs retain six decimals.
+- An approval card shows the complete proposed action, including command
+  arguments, working directory, environment and paths when supplied, plus the
+  risk assessment. Supported actions offer Approve and Reject; an action type
+  this client cannot interpret explains the limitation and permits rejection
+  only. A question card offers the
   agent's options (radio or check boxes), a typed answer where the prompt
   allows one, and a rejection with feedback; the answer is sent as the
   protocol's own `ResolveQuestion`.
+- Decisions show sending, refusal, and accepted states. A pending or accepted
+  decision disables both choices, including after leaving the view and returning.
+  Acceptance waits for the daemon's resolution event before retiring the card.
+  Refused answers and rejection feedback stay available for retry; keyboard focus
+  returns to the sending button. Reissued questions reset their drafts even when
+  the prompts are identical, and reconnect retires obsolete command feedback.
+- Inbox **Review** opens the session that owns an approval or question and
+  focuses the full request. Missing session information and failed attachments
+  produce an actionable error. **Acknowledge** and **Dismiss** organize the inbox;
+  they do not decide requests. Each entry allows one pending action, displays
+  refusals locally, and ignores refresh or mutation results from older connections.
 - A failed run is a red card with the cause in plain words, the sanitized
   provider response folded underneath, and the next step as a button: **Open
   API keys** for an authentication refusal, **Choose a model** when none is
   configured, **Retry** with the same objective.
-- The draft survives a refused submission: the composer clears only once the
-  daemon has accepted the run.
+- New objectives and queued follow-ups clear only after acceptance. Refusals
+  and connection errors preserve the draft, including edits made while a request
+  is pending or after navigating away and back. Enter used to confirm IME text
+  does not send the prompt.
+
+## Live extensions
+
+The desktop negotiates Remote UI capabilities after confirming a session
+attachment. The daemon supplies verified contribution placement, snapshots,
+patches and disposal messages; the renderer sends interactions and recovery
+requests back over the same session-bound connection. A missed revision keeps
+the last valid document visible and requests a fresh snapshot. Reconnect and
+session switching discard the previous host and renegotiate. Extension identity
+comes from broker evidence, never the document's own metadata.
+
+## Agent tools and interactive results
+
+The native AG-UI agent adapts the existing daemon's run, text, reasoning, tool
+and decision events. The composer still submits to the same daemon, and its
+durable journal owns the conversation. No additional model service is needed.
+
+In Build mode, native models receive the desktop tool definitions directly.
+Installed ACP agents receive the same tools through a per-run local MCP server.
+The agent can read workspace context, find chats, inspect models and knowledge,
+open a page or source file, and prepare a draft. Existing coding tools remain
+available. Mutations continue through the daemon's normal policy and approvals.
+
+`generateSandboxedUi` creates an interactive answer in the conversation.
+`desktop.defineTool` creates a reusable `desktop.custom.<name>` helper with an
+object JSON Schema and declared desktop capabilities. New computational helpers
+can use `language: "python"`: their function body receives `args`, calls
+`host_call(name, args)` for declared capabilities and returns JSON. Python runs
+in the bundled Monty subprocess with 32 MiB memory and a five second total limit.
+Existing JavaScript async function bodies remain supported when language is
+omitted or `"javascript"`. Interactive HTML results retain their browser sandbox.
+Helpers have no direct filesystem, native bridge or network access. Declared host calls
+are separately authorised by daemon policy. Tool results return to the same
+model call and are stored as verified artifacts, so reopening a chat restores
+the result. **Workspace → Agent tools** shows saved definitions, schemas,
+versions and capabilities, with confirmed version-checked removal.
+
+See [the integration and acceptance record](../../docs/reviews/2026-10-19-workspace-uplift.md)
+for the broker, ACP bridge and AG-UI event contracts.
+
+## Patches and exports
+
+Expand a patch card and choose **Load full patch** to read its verified artifact.
+The panel shows up to 1 MB of text and explains when the view is truncated.
+**Save file…** opens the native save dialog and saves the complete artifact.
+Analytics and session exports offer the same save action once their export
+artifact is ready. Cancelling the dialog is reported as cancellation; errors
+keep the action available for another attempt.
+
+The shell streams Save downloads in bounded chunks into a private file beside
+the destination. It verifies the complete length and SHA-256 and syncs the file
+before replacing the destination atomically. A failed fetch or write preserves
+an existing export. Save can exceed the preview reader's 64 MiB limit without
+buffering the whole file. The browser cannot supply a save path; saving requires
+the connected desktop shell.
+
+A changed artifact reference or connection clears old loaded content and Save
+notices. Late results cannot appear under a newer artifact, even when its ID is
+unchanged. Load and Save retain keyboard focus while pending and restore their
+button after completion or refusal.
+
+## Queued follow-ups
+
+Queue edits retain their draft after refusal and while the panel is closed or
+another desktop view is open. Save, Send next, and Remove share a pending guard
+for each prompt; another prompt can still be changed independently. Acceptance
+closes only the draft that was submitted, so typing further changes while Save
+is pending does not lose them. The displayed queue changes only when the daemon
+reports its new contents.
+
+Edit focuses the text field. `⌘Enter` / `Ctrl-Enter` saves and `Esc` cancels;
+neither shortcut interrupts an IME composition. Pending actions retain focus on
+their row, and refusal restores the triggering control unless focus was moved
+elsewhere. Session switches discard the previous session's editor and feedback;
+late replies from retired connections or attachments cannot change the new
+session's queue error.
 
 ## Keyboard
 
@@ -97,20 +218,25 @@ colour, add the token to all three blocks in `theme.css`.
 ## Development
 
 ```bash
-# The SDK packages the app links, built once:
-(cd ../../sdk/ui && npm ci && npm run build)
-(cd ../../sdk/protocol && npm ci && npm run build)
-(cd ../../sdk/remote-ui && npm ci)
-
 npm ci
-npm run check      # tsc
-npm test           # vitest
-npm run build      # vite → dist/, embedded by the Tauri binary
-npm run tauri:dev  # the shell with hot reload (needs the Tauri Linux deps in CI's desktop-tauri job)
+npm run desktop:dev
 ```
+
+The development command builds the linked SDKs and matching CLI/worker before
+opening the hot-reload shell. The shell starts its service automatically.
+Native desktop builds require Rust 1.96 or newer; shared libraries and the CLI
+retain their existing requirement. Tauri dev/build hooks use Python 3 to prepare
+the pinned Monty worker, verify its release checksum and bundle it automatically.
+Packaged users need no separate Python, Monty or Node installation.
+`npm run check`, `npm run build` and scoped `npx vitest run test/<file>` remain
+available separately. Linux needs the Tauri platform dependencies.
 
 The Rust side is its own Cargo workspace (`src-tauri/`), checked, linted and
 tested separately: `cargo test --manifest-path src-tauri/Cargo.toml`.
+For direct Cargo builds, first run
+`python3 scripts/prepare-monty-runtime.py --output ../../target/debug` from this
+directory. `npm run tauri:build` prepares the release worker and Tauri sidecar;
+Apple staging verifies and signs the bundled worker with the other app binaries.
 
 ## Knowledge surfaces
 
@@ -131,3 +257,18 @@ so they ask for one when none is selected.
 Outside the shell (a browser tab, a test) there is no transport; the four
 views then render an explicit unavailable panel naming the commands they need
 and wear a "not in this build" badge in the sidebar and palette.
+
+### Analytics and session recovery
+
+Analytics can load additional pages without changing the original time window.
+A failed page preserves the loaded measurements for retry; changing filters or
+reconnecting retires old query/export responses. Metric cards label partial
+bucket coverage, and tiny nonzero costs remain visible.
+
+Session lifecycle actions show a pending state and reject duplicate sends.
+Rename/delete dialogs retain failures for retry; rename preserves the typed
+title. Keyboard focus stays inside pending dialogs and returns to the draft or
+Cancel after a refusal. Deleting a row returns focus to search. A successful
+mutation refreshes search results and
+invalidates old cursors. Session search also offers an explicit retry after a
+failed request.

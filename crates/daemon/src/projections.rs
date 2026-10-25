@@ -307,11 +307,22 @@ pub async fn session_projection(
     .await?;
     let mut pending_approvals = Vec::with_capacity(approval_rows.len());
     for (approval_id, run_id, action_json, risk_json) in approval_rows {
+        let action = serde_json::from_str(&action_json)?;
+        let pattern = match &action {
+            codypendent_protocol::ProposedAction::ExecuteCommand {
+                program,
+                args,
+                environment,
+                ..
+            } => crate::policy::command_pattern(program, args, environment),
+            _ => None,
+        };
         pending_approvals.push(codypendent_protocol::PendingApprovalProjection {
             approval_id: codypendent_protocol::ApprovalId::from_str(&approval_id)?,
             run_id: RunId::from_str(&run_id)?,
-            action: serde_json::from_str(&action_json)?,
+            action,
             risk: serde_json::from_str(&risk_json)?,
+            pattern,
         });
     }
 

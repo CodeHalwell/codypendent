@@ -12,9 +12,15 @@
 //! - [`repository`] — which checkout the client works in, gated so a folder
 //!   that is not a repository (or is `$HOME`) can never reach the indexer.
 
+mod artifacts;
 pub mod bridge;
 pub mod council;
 pub mod daemon;
+pub mod desktop_tools;
+pub mod environment;
+pub mod python_sandbox;
+mod native_menu;
+mod sandbox;
 // Starting `codypendentd` when nothing is listening: the CLI's `ensure_daemon`
 // for a shell whose own binary is not `codypendent`.
 pub mod knowledge;

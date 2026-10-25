@@ -1,0 +1,11 @@
+.approval-consent { position: relative; }
+.approval-consent-trigger { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--cody-border-strong); border-radius: 6px; background: var(--cody-inset); color: var(--cody-text); font-size: 12px; cursor: pointer; }
+.approval-consent-trigger:disabled { opacity: .5; cursor: default; }
+.approval-consent-options { position: absolute; z-index: 20; bottom: calc(100% + 8px); left: 0; width: min(320px, 75vw); padding: 5px; border: 1px solid var(--cody-border-strong); border-radius: 10px; background: var(--cody-panel); box-shadow: 0 12px 35px #0004; }
+.approval-consent-options button { display: grid; gap: 4px; width: 100%; border: 0; border-radius: 6px; padding: 10px; text-align: left; background: transparent; color: var(--cody-text); cursor: pointer; }
+.approval-consent-options button:hover, .approval-consent-options button:focus-visible { background: var(--cody-panel-hover); }
+.approval-consent-options strong { font-size: 12px; font-weight: 550; }
+.approval-consent-options span, .approval-consent-options p { color: var(--cody-text-muted); font-size: 11px; line-height: 1.5; }
+.approval-consent-options p { margin: 6px 10px; }
+.approval-consent-pattern { display: grid; gap: 5px; margin: 5px 10px; padding-top: 9px; border-top: 1px solid var(--cody-border); font-size: 11px; color: var(--cody-text-muted); }
+.approval-consent-pattern code { overflow-wrap: anywhere; color: var(--cody-text); }

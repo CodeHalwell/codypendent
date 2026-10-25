@@ -9,6 +9,7 @@
  * *command*, and is rendered as a client error, never as agent output.
  */
 import type {
+  ArtifactRef,
   Catchup,
   InboxEntry,
   PendingPromptView,
@@ -160,6 +161,7 @@ export type DaemonAction =
   | { type: "session-attach-started"; sessionId: string }
   | { type: "session-attach-failed"; sessionId: string }
   | { type: "session-selected"; sessionId: string }
+  | { type: "new-session" }
   | { type: "session-reattached"; sessionId: string }
   | { type: "session-history-incomplete"; sessionId: string; through: number }
   | { type: "run-submitted"; handle: RunHandle; objective: string }
@@ -322,6 +324,9 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
     case "session-selected":
       return resetSessionProjection(state, action.sessionId);
 
+    case "new-session":
+      return { ...resetSessionProjection(state, null), sessionAttachmentConfirmed: false, error: null };
+
     case "session-reattached":
       return state.activeSessionId === action.sessionId
         ? {
@@ -352,6 +357,12 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       const base = state.activeSessionId === action.handle.session_id
         ? state
         : resetSessionProjection(state, action.handle.session_id);
+      // StartRun's live events can beat its command reply. Once the run was
+      // observed, its replayed lifecycle/activity outrank provisional launch
+      // defaults (including a run that already completed before the reply).
+      if (action.handle.run_id !== null && runWasObserved(base, action.handle.run_id)) {
+        return { ...base, attachingSessionId: null, sessionAttachmentConfirmed: true, error: null };
+      }
       return {
         ...base,
         attachingSessionId: null,
@@ -506,13 +517,14 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
     // `frameBus.ts` fans them out to the panels that do model them. Folding
     // them in here would attribute a run's work to whichever session happened
     // to be selected.
+    case "remote_ui":
     case "workflow_event":
     case "blackboard_posted":
       return state;
   }
 }
 
-function resetSessionProjection(state: DaemonState, sessionId: string): DaemonState {
+function resetSessionProjection(state: DaemonState, sessionId: string | null): DaemonState {
   return {
     ...state,
     attachingSessionId: null,
@@ -537,6 +549,17 @@ function resetSessionProjection(state: DaemonState, sessionId: string): DaemonSt
   };
 }
 
+function runWasObserved(state: DaemonState, runId: string): boolean {
+  if (state.objectivesByRun[runId] !== undefined) return true;
+  // Completed runs retire their objective map entry. A fast response can
+  // finish before StartRun's reply, so its durable completion still wins.
+  for (let index = state.durableEvents.length - 1; index >= 0; index--) {
+    const body = state.durableEvents[index].body;
+    if (body.type === "RunCompleted" && body.run_id === runId) return true;
+  }
+  return false;
+}
+
 function applySnapshot(
   state: DaemonState,
   sessionId: string,
@@ -553,6 +576,9 @@ function applySnapshot(
     type: "approval",
     text: describeAction(approval.action),
     approvalId: approval.approval_id,
+    approvalAction: approval.action,
+    approvalRisk: approval.risk,
+    approvalPattern: approval.pattern ?? undefined,
     timestamp: "",
   }));
   return {
@@ -680,7 +706,7 @@ function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonSt
     objectivesByRun: {},
   };
   for (const event of events) {
-    projected = applyEvent(projected, event);
+    projected = applyEvent(projected, event, true);
   }
   return {
     ...projected,
@@ -732,7 +758,22 @@ function forgetRunObjective(
   return remaining;
 }
 
-function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
+// Bulk replay owns its initially empty transcript. It can append in place until
+// the completed projection is published; live events must still copy the array
+// so React and callers retain their previous immutable state.
+function appendTranscript(items: TranscriptItem[], item: TranscriptItem, replay: boolean): TranscriptItem[] {
+  if (!replay) return [...items, item];
+  items.push(item);
+  return items;
+}
+
+function replaceTranscriptItem(items: TranscriptItem[], index: number, item: TranscriptItem, replay: boolean): TranscriptItem[] {
+  const next = replay ? items : [...items];
+  next[index] = item;
+  return next;
+}
+
+function applyEvent(state: DaemonState, event: SessionEvent, replay = false): DaemonState {
   const body = event.body;
   const at = event.occurred_at;
   const key = `${event.sequence}`;
@@ -756,10 +797,8 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         return {
           ...state,
           objectivesByRun,
-          transcript: [
-            ...state.transcript,
-            { id: `user-${key}`, type: "user", text: objective, timestamp: at },
-          ],
+          transcript: appendTranscript(state.transcript,
+            { id: `user-${key}`, type: "user", text: objective, timestamp: at }, replay),
         };
       }
       return {
@@ -777,10 +816,8 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         activeObjective: objective || state.activeObjective,
         objectivesByRun,
         usage: null,
-        transcript: [
-          ...state.transcript,
-          { id: `user-${key}`, type: "user", text: objective, timestamp: at },
-        ],
+        transcript: appendTranscript(state.transcript,
+          { id: `user-${key}`, type: "user", text: objective, timestamp: at }, replay),
       };
     }
 
@@ -790,12 +827,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         return state;
       }
       const runId = asText(body.run_id);
-      // ACP separates deliberation from reply and the daemon now carries that
-      // through as `thought` (see `EventBody::ModelStreamDelta`). Reasoning
-      // coalesces into its OWN entry, which `TranscriptRow` already renders as
-      // a folded `<details>` — a renderer that existed for exactly this and had
-      // nothing producing it until now. Absent or false, the chunk is speech,
-      // which is what every daemon before v0.12.2 sent.
+      // Keep provider progress separate from the answer.
       const kind = body.thought === true ? "thought" : "assistant";
       const prefix = `${kind}-${runId}-`;
       const activity: RunActivity = isForeignRun(state, runId)
@@ -804,39 +836,59 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.type === kind && last.id.startsWith(prefix)) {
         const merged: TranscriptItem = { ...last, text: last.text + text };
-        return { ...state, activity, transcript: [...state.transcript.slice(0, -1), merged] };
+        return { ...state, activity, transcript: replaceTranscriptItem(state.transcript, state.transcript.length - 1, merged, replay) };
       }
       return {
         ...state,
         activity,
-        transcript: [
-          ...state.transcript,
-          { id: `${prefix}${key}`, type: kind, text, timestamp: at },
-        ],
+        transcript: appendTranscript(state.transcript,
+          { id: `${prefix}${key}`, type: kind, text, runId, timestamp: at }, replay),
       };
     }
 
     case "ToolStarted": {
       const tool = asText(body.tool);
+      const runId = asText(body.run_id);
+      const label = asText(body.label);
+      const acp = tool.startsWith("acp:");
+      const separator = acp ? label.indexOf(" · ") : -1;
+      const toolKind = separator >= 0 ? label.slice(0, separator) : (acp ? label || "Tool" : tool);
+      const toolLabel = separator >= 0 ? label.slice(separator + 3) : label || toolKind;
+      const invocation: TranscriptItem = {
+        id: `tool-${key}`,
+        type: "tool_call",
+        text: toolLabel,
+        toolName: tool,
+        toolRunId: runId,
+        toolKind,
+        toolLabel,
+        status: "running",
+        timestamp: at,
+      };
+      // ACP sends snapshots as its arguments/title stream. The stable call
+      // identity means a refinement changes one card, including after replay.
+      let transcript = state.transcript;
+      const existing = acp ? transcript.findIndex((item) => item.type === "tool_call"
+        && item.toolName === tool && item.toolRunId === runId) : -1;
+      if (existing >= 0) {
+        const previous = transcript[existing];
+        transcript = replaceTranscriptItem(transcript, existing, {
+          ...previous, text: toolLabel, toolLabel, toolKind,
+        }, replay);
+      } else {
+        transcript = appendTranscript(transcript, invocation, replay);
+      }
       return {
         ...state,
-        activity: isForeignRun(state, asText(body.run_id)) ? state.activity : { kind: "tool", tool },
-        transcript: [
-          ...state.transcript,
-          {
-            id: `tool-${key}`,
-            type: "tool_call",
-            text: asText(body.label) || tool,
-            toolName: tool,
-            status: "running",
-            timestamp: at,
-          },
-        ],
+        activity: isForeignRun(state, runId) || (existing >= 0 && transcript[existing].status !== "running")
+          ? state.activity : { kind: "tool", tool: acp ? toolLabel : tool },
+        transcript,
       };
     }
 
     case "ToolCompleted": {
       const tool = asText(body.tool);
+      const runId = asText(body.run_id);
       const outcome = body.outcome as { type?: string; message?: string } | undefined;
       const status: TranscriptItem["status"] = outcome?.type === "Succeeded" ? "success" : "error";
       // The wire deliberately carries no tool output (bulk output is an
@@ -849,33 +901,52 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
         ? String(body.artifact.id)
         : undefined;
-      // The payload carries no tool-call id (nor does `ToolStarted` —
-      // `crates/protocol/src/events.rs`), so the match is by tool NAME: the
-      // most recent still-running call of that tool. Two concurrent calls of
-      // the same tool resolve out of order; that is the protocol's
-      // limitation, not something to guess around here.
-      let patched = false;
-      const transcript = [...state.transcript]
-        .reverse()
-        .map((item) => {
-          if (!patched && item.type === "tool_call" && item.toolName === tool && item.status === "running") {
-            patched = true;
-            return {
-              ...item,
-              status,
-              ...(artifactId ? { artifactId } : {}),
-              ...(failureReason ? { toolResult: failureReason } : {}),
-            };
-          }
-          return item;
-        })
-        .reverse();
+      // Native tools match the latest running call by name within their run.
+      // ACP machine names include the invocation id, so concurrent calls with
+      // the same human title resolve correctly even when they finish out of order.
+      let transcript = state.transcript;
+      for (let index = transcript.length - 1; index >= 0; index--) {
+        const item = transcript[index];
+        if (item.type === "tool_call" && item.toolName === tool && item.toolRunId === runId && item.status === "running") {
+          transcript = replaceTranscriptItem(transcript, index, {
+            ...item,
+            status,
+            ...(artifactId ? { artifactId, artifact: body.artifact as ArtifactRef } : {}),
+            ...(failureReason ? { toolResult: failureReason } : {}),
+          }, replay);
+          break;
+        }
+      }
       return {
         ...state,
         // The tool returned; until the next token or tool the model is
         // deliberating, which is what the working row says.
-        activity: isForeignRun(state, asText(body.run_id)) ? state.activity : afterToolActivity(state),
+        activity: isForeignRun(state, runId) ? state.activity : afterToolActivity({ ...state, transcript }),
         transcript,
+      };
+    }
+
+    case "ToolUpdated": {
+      const tool = asText(body.tool);
+      const runId = asText(body.run_id);
+      const label = asText(body.label);
+      if (!label) return state;
+      const index = state.transcript.findIndex((item) => item.type === "tool_call"
+        && item.toolName === tool && item.toolRunId === runId);
+      if (index < 0) return state;
+      const separator = tool.startsWith("acp:") ? label.indexOf(" · ") : -1;
+      const toolKind = separator >= 0 ? label.slice(0, separator) : (tool.startsWith("acp:") ? label : tool);
+      const toolLabel = separator >= 0 ? label.slice(separator + 3) : label;
+      const item = state.transcript[index];
+      const transcript = replaceTranscriptItem(state.transcript, index, {
+        ...item, text: toolLabel, toolKind, toolLabel,
+      }, replay);
+      return {
+        ...state, transcript,
+        activity: !isForeignRun(state, runId) && item.status === "running"
+          && state.activity.kind === "tool"
+          && (state.activity.tool === item.toolLabel || state.activity.tool === item.toolName)
+          ? { kind: "tool", tool: toolLabel } : state.activity,
       };
     }
 
@@ -901,16 +972,14 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         activity: foreign
           ? state.activity
           : { kind: "retrying", attempt, maxAttempts, message, delayMs },
-        transcript: [
-          ...state.transcript,
+        transcript: appendTranscript(state.transcript,
           {
             id: `retry-${key}`,
             type: "system",
             tone: "info",
             text: `Retrying (${attempt}/${maxAttempts}): ${message} — next attempt in ${seconds}s`,
             timestamp: at,
-          },
-        ],
+          }, replay),
       };
     }
 
@@ -924,18 +993,17 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           : [];
       return {
         ...state,
-        transcript: [
-          ...state.transcript,
+        transcript: appendTranscript(state.transcript,
           {
             id: `denied-${key}`,
             type: "system",
+            runId: asText(body.run_id),
             tone: "warning",
             text: `Blocked by policy: ${describeAction(body.action)}${
               reasons.length > 0 ? ` — ${reasons.join("; ")}` : ""
             }`,
             timestamp: at,
-          },
-        ],
+          }, replay),
       };
     }
 
@@ -943,18 +1011,17 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const dimension = (body.dimension as { type?: string } | undefined)?.type ?? "budget";
       const used = typeof body.used === "number" ? body.used : 0;
       const limit = typeof body.limit === "number" ? body.limit : 0;
+      if (dimension === "Tokens" && limit > 0 && used / limit < 0.8) return state;
+      const id = `budget-${asText(body.run_id)}-${dimension}`;
+      const item: TranscriptItem = {
+        id, type: "system", tone: "warning", timestamp: at,
+        text: `Budget warning: ${budgetLabel(dimension)} ${used}/${limit}`,
+      };
+      const index = state.transcript.findIndex((candidate) => candidate.id === id);
       return {
         ...state,
-        transcript: [
-          ...state.transcript,
-          {
-            id: `budget-${key}`,
-            type: "system",
-            tone: "warning",
-            text: `Budget warning: ${budgetLabel(dimension)} ${used}/${limit}`,
-            timestamp: at,
-          },
-        ],
+        transcript: index < 0 ? appendTranscript(state.transcript, item, replay)
+          : replaceTranscriptItem(state.transcript, index, item, replay),
       };
     }
 
@@ -971,6 +1038,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           completionTokens:
             typeof body.completion_tokens === "number" ? body.completion_tokens : null,
           costMicros: typeof body.cost_micros === "number" ? body.cost_micros : null,
+          coverage: body.coverage ?? null,
         },
       };
     }
@@ -979,16 +1047,18 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       return {
         ...state,
         activity: state.isRunning ? { kind: "waiting", on: "approval" } : state.activity,
-        transcript: [
-          ...state.transcript,
+        transcript: appendTranscript(state.transcript,
           {
             id: `approval-${key}`,
             type: "approval",
             text: describeAction(body.action),
             approvalId: asText(body.approval_id),
+            approvalAction: body.action,
+            approvalRisk: body.risk,
+            approvalPattern: body.pattern ?? undefined,
+            decisionRevision: event.sequence,
             timestamp: at,
-          },
-        ],
+          }, replay),
         // The inbox badge moves the moment attention is needed — the entry
         // list itself still refreshes from the daemon (connect / Refresh),
         // which replaces this running estimate with the true count.
@@ -1023,6 +1093,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         text,
         timestamp: at,
         questionId: asText(body.question_id),
+        decisionRevision: event.sequence,
         questionRunId: asText(body.run_id),
         questionPrompts: prompts,
       };
@@ -1036,14 +1107,13 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           ? { kind: "waiting", on: "question" }
           : state.activity;
       if (existingCard !== -1) {
-        const transcript = [...state.transcript];
-        transcript[existingCard] = card;
+        const transcript = replaceTranscriptItem(state.transcript, existingCard, card, replay);
         return { ...state, activity: waiting, transcript };
       }
       return {
         ...state,
         activity: waiting,
-        transcript: [...state.transcript, card],
+        transcript: appendTranscript(state.transcript, card, replay),
         // A NEW question needs attention (a re-issue replaced its card above
         // without reaching here, so it never double-counts).
         unreadInboxCount: state.unreadInboxCount + 1,
@@ -1116,20 +1186,20 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           : `Patch proposed: artifact ${artifactId}`;
       return {
         ...state,
-        transcript: [
-          ...state.transcript,
+        transcript: appendTranscript(state.transcript,
           {
             id: `patch-${key}`,
             type: "system",
             text: summary,
             artifactId,
+            artifact: body.artifact,
             diffPreview,
             patchFiles: files,
+            patchRunId: asText(body.run_id) || undefined,
             patchAdditions: additions,
             patchDeletions: deletions,
             timestamp: at,
-          },
-        ],
+          }, replay),
       };
     }
 
@@ -1160,8 +1230,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         if (at_index === -1) {
           return {
             ...state,
-            transcript: [
-              ...state.transcript,
+            transcript: appendTranscript(state.transcript,
               {
                 id: backstageId,
                 type: "backstage",
@@ -1170,8 +1239,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
                 contextLines: isContext ? text.split("\n").length : undefined,
                 memoryUpdates: isMemory ? 1 : 0,
                 raw: [text],
-              },
-            ],
+              }, replay),
           };
         }
         // Find-or-update: at most ONE backstage row per run, however many
@@ -1183,16 +1251,13 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           memoryUpdates: (existing.memoryUpdates ?? 0) + (isMemory ? 1 : 0),
           raw: [...(existing.raw ?? []), text],
         };
-        const transcript = [...state.transcript];
-        transcript[at_index] = merged;
+        const transcript = replaceTranscriptItem(state.transcript, at_index, merged, replay);
         return { ...state, transcript };
       }
       return {
         ...state,
-        transcript: [
-          ...state.transcript,
-          { id: `note-${key}`, type: "system", text, timestamp: at },
-        ],
+        transcript: appendTranscript(state.transcript,
+          { id: `note-${key}`, type: "system", text, timestamp: at }, replay),
       };
     }
 
@@ -1208,6 +1273,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // the three.
       const completedRunId = asText(body.run_id);
       const completedForeign = isForeignRun(state, completedRunId);
+      const settled = settleRunTools(state.transcript, completedRunId, replay);
       // A SUCCESSFUL run adds no row. The streamed model prose already ended
       // the turn, so "Run completed: <summary>" printed the same answer a
       // second time — visible in the transcript as the reply, then the same
@@ -1225,6 +1291,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         appended = {
           id: `run-${key}`,
           type: "failure",
+          runId: completedRunId,
           text: diagnosis.summary,
           failureDetail: diagnosis.detail,
           // THIS run's objective, not whichever one the surface is showing.
@@ -1253,7 +1320,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         activeRunId: completedForeign ? state.activeRunId : null,
         runState: completedForeign ? state.runState : null,
         activity: completedForeign ? state.activity : IDLE,
-        transcript: appended ? [...state.transcript, appended] : state.transcript,
+        transcript: appended ? appendTranscript(settled, appended, replay) : settled,
         // The run is over; its objective has been read into the card above and
         // the map must not grow for the life of the session.
         objectivesByRun: forgetRunObjective(state.objectivesByRun, completedRunId),
@@ -1266,11 +1333,13 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // several runs, so a transition for a run this client is not showing must
       // not move the state of the one it is.
       const eventRunId = asText(body.run_id);
+      const terminal = ["Completed", "Failed", "Cancelled"].includes(runState);
+      const settled = terminal ? settleRunTools(state.transcript, eventRunId, replay) : state.transcript;
       if (isForeignRun(state, eventRunId)) {
-        return state;
+        return settled === state.transcript ? state : { ...state, transcript: settled };
       }
-      if (["Completed", "Failed", "Cancelled"].includes(runState)) {
-        return { ...state, isRunning: false, activeRunId: null, runState: null, activity: IDLE };
+      if (terminal) {
+        return { ...state, transcript: settled, isRunning: false, activeRunId: null, runState: null, activity: IDLE };
       }
       // Adopt the run this transition names when nothing is on screen.
       // Recording `isRunning: true` against a null `activeRunId` would leave
@@ -1349,7 +1418,28 @@ function normaliseQuestionPrompt(raw: unknown): QuestionPromptView {
 
 /** After a tool returns: still waiting on a human if we were, else deliberating. */
 function afterToolActivity(state: DaemonState): RunActivity {
-  return state.activity.kind === "waiting" ? state.activity : { kind: "thinking" };
+  if (state.activity.kind === "waiting") return state.activity;
+  for (let index = state.transcript.length - 1; index >= 0; index--) {
+    const item = state.transcript[index];
+    if (item.type === "tool_call" && item.status === "running" && item.toolRunId === state.activeRunId) {
+      return { kind: "tool", tool: item.toolLabel || item.toolName || "Tool" };
+    }
+  }
+  return { kind: "thinking" };
+}
+
+/** A final run has no running tools. Lost older ACP identities cannot tell us
+ * which outcome belongs to which card, so finish neutrally rather than guess. */
+function settleRunTools(items: TranscriptItem[], runId: string, replay: boolean): TranscriptItem[] {
+  let next = items;
+  for (let index = 0; index < next.length; index++) {
+    const item = next[index];
+    if (item.type === "tool_call" && item.toolRunId === runId && item.status === "running") {
+      if (next === items && !replay) next = [...items];
+      next[index] = { ...item, status: "finished" };
+    }
+  }
+  return next;
 }
 
 /** The `BudgetDimension` tag as the TUI labels it (`render.rs::budget_label`). */

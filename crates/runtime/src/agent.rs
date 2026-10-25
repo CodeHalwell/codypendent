@@ -87,8 +87,7 @@ use codypendent_integrations::mcp::{McpBridge, McpError, McpToolInfo};
 use codypendent_council::CouncilService;
 use codypendent_integrations::search::SearchApi;
 use codypendent_knowledge::{
-    retrieve, HashingEmbedder, RegistryItem, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
-    RiskClass, Scope,
+    retrieve, RegistryItem, RetrievalConfig, RetrievalQuery, RiskClass, Scope, SemanticEmbedder,
 };
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
 // Outcome 11: the loop classifies a finished run's objective with the SAME rules
@@ -110,41 +109,46 @@ use crate::blackboard::{
     BlackboardChannel, BlackboardChannelError, BlackboardPost, TaskBoardChannel, TaskCardChange,
     TaskCardDraft, WorkflowQueryChannel,
 };
+use crate::desktop_tools::{
+    DesktopTool, DesktopTools, DEFINE as DESKTOP_DEFINE, MANAGE as DESKTOP_MANAGE,
+    RENDER as DESKTOP_RENDER,
+};
 use crate::docs::{
     DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
 };
 use crate::models::ModelRegistry;
 use crate::tools::{
     assertable_relation_names, council_create_action, council_result_action, council_run_action,
-    docs_proposed_action, graph_assert_action, graph_proposed_action, new_pull_request,
-    parse_artifact_read, parse_ask_user, parse_assert_edge, parse_blackboard_post,
-    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
-    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
-    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
-    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
-    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
-    render_answers, render_check_runs, render_edge_assertions, render_pull_request,
-    render_registry_search, render_rejection, render_search_outcome, summarize_assertions,
-    summarize_graph_question, task_read_action, task_write_action, tool_label,
-    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
-    ArtifactReadInput, ArtifactReader, ArtifactSink, AskUser, AssertedEdge, BlackboardPostInput,
-    BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool, CodeGraphAssertions,
-    CommandRequest, CouncilCreateInput, CouncilCreateTool, CouncilResultInput, CouncilResultTool,
-    CouncilRunInput, CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
-    DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
-    EdgeAssertionOutcome, EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding,
-    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius,
-    GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
-    MemoryRememberInput, PlanEnter, PlanExit, ReadFile, ReadFileInput, RegistrySearch,
-    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, ShellExec, ShellWriteStdin,
-    SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
-    TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool,
-    WebSearch, WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput,
-    WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
-    ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
+    docs_proposed_action, graph_assert_action, graph_proposed_action, graph_traversal_schema,
+    new_pull_request, parse_artifact_read, parse_ask_user, parse_assert_edge,
+    parse_blackboard_post, parse_blackboard_query, parse_council_create, parse_council_result,
+    parse_council_run, parse_create_check_run, parse_create_draft_pull_request, parse_docs_create,
+    parse_docs_edit, parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_graph_traversal, parse_list_check_runs, parse_memory_remember,
+    parse_skills_search, parse_symbol_question, parse_task_create, parse_task_list,
+    parse_task_move, parse_task_update, parse_tests_covering, parse_update_pull_request,
+    parse_web_search, parse_workflow_create, parse_workflow_query, parse_workflow_run,
+    parse_write_file as parse_write_file_args, render_answers, render_check_runs,
+    render_edge_assertions, render_graph_answer, render_pull_request, render_registry_search,
+    render_rejection, render_search_outcome, summarize_assertions, summarize_graph_question,
+    task_read_action, task_write_action, tool_label, traversal_kind, workflow_create_action,
+    workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead, ArtifactReadInput,
+    ArtifactReader, ArtifactSink, AskUser, AssertedEdge, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CodeGraphAssertions, CommandRequest,
+    CouncilCreateInput, CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput,
+    CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
+    DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EdgeAssertionOutcome,
+    EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding, GetPullRequest,
+    GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius, GraphCallersOf,
+    GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput,
+    PlanEnter, PlanExit, ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest,
+    RepositoryTest, Search, SearchInput, Shell, ShellExec, ShellWriteStdin, SkillsSearch,
+    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
+    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
+    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput, ASSERTABLE_RELATIONS,
+    GRAPH_TRAVERSAL_TOOLS, MAX_ASSERTED_EDGES,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -160,6 +164,7 @@ const MAX_STEPS: usize = 256;
 /// bounds the total. A `BudgetWarning { WallClock }` is emitted at 80%.
 const MAX_WALL_CLOCK_SECS: u64 = 30 * 60;
 /// Maximum serialized provider stream retained in one model turn.
+#[cfg(feature = "provider-openai")]
 const MAX_MODEL_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default wall-clock timeout for a model-proposed `shell.run` when the model
@@ -365,17 +370,14 @@ const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
 /// is not over-counted relative to plain ASCII. Pure, unit-testable in
 /// isolation, and used only by [`estimate_context_tokens`].
 ///
-/// Mirrors `to_messages`' per-variant framing:
+/// Approximates `to_messages`' per-variant payload and framing:
 /// - `Objective` / `Assistant` / `Steering`: sent verbatim as the message
 ///   text, so their length IS the payload length.
-/// - `ToolCall { tool, args }`: sent as `"[calling {tool}: {args}]"`, so the
-///   estimate includes the tool name and the rendered JSON args (uncapped —
-///   `to_messages` truncates a huge args blob for the *replayed* marker via
-///   `compact_args`, but estimating the untruncated length is the safer,
-///   conservative direction: it can only overcount, never hide an
-///   approaching overflow).
-/// - `ToolResult { tool, output }`: sent as `"[tool result: {tool}]\n
-///   {output}"`, so the estimate includes the tool name and the full output.
+/// - `ToolCall { tool, args }`: paired calls send the full JSON arguments in
+///   a function message; orphan previews are bounded. Count full arguments
+///   in either case so retained context is never hidden by the preview cap.
+/// - `ToolResult { tool, output }`: count the full output, tool name and a
+///   small framing allowance for both structured and orphan results.
 pub fn turn_item_text_len(turn: &TurnItem) -> usize {
     match turn {
         TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
@@ -412,8 +414,7 @@ pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
 /// it without a driver in hand — it is sent on EVERY request, so an estimate
 /// that ignored it (as the transcript-only estimate did) understated usage by
 /// a fixed amount every step.
-const SYSTEM_PROMPT: &str = "You are a coding agent. Use the provided tools to inspect and modify \
-     the repository, then finish with a short summary.";
+const SYSTEM_PROMPT: &str = crate::agent_guidance::SYSTEM_PROMPT;
 
 /// The rendered character length one advertised [`ToolDefinition`]
 /// contributes to a request: its name, description, and JSON schema — the
@@ -434,7 +435,14 @@ fn tool_definition_text_len(def: &ToolDefinition) -> usize {
 /// `inputSchema`s that are re-sent verbatim on every request — so the loop's
 /// budget warning and mid-run compaction both estimate with THIS function.
 pub fn estimate_request_tokens(transcript: &[TurnItem], tools: &[ToolDefinition]) -> usize {
-    let system = SYSTEM_PROMPT.chars().count() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
+    let guidance = crate::agent_guidance::for_tools(
+        &tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>(),
+    );
+    let system = (SYSTEM_PROMPT.chars().count() + guidance.chars().count()) / CHARS_PER_TOKEN
+        + PER_ITEM_TOKEN_OVERHEAD;
     let tool_tokens: usize = tools
         .iter()
         .map(|def| tool_definition_text_len(def) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
@@ -563,7 +571,12 @@ fn fold_oldest_tool_results(
         if output.starts_with(FOLDED_RESULT_PREFIX) {
             continue;
         }
-        let stub = folded_result_stub(tool, output, artifact.as_ref());
+        let stub = folded_result_stub(
+            tool,
+            output,
+            artifact.as_ref(),
+            tools.iter().any(|tool| tool.name == ArtifactRead::NAME),
+        );
         if stub.chars().count() >= output.chars().count() {
             continue;
         }
@@ -577,14 +590,20 @@ fn fold_oldest_tool_results(
 /// stub cites the id + digest prefix a salient view uses and points at
 /// `artifact.read` for rehydration; without one it keeps a bounded first line
 /// so the model can still tell WHAT the folded observation was about.
-fn folded_result_stub(tool: &str, output: &str, artifact: Option<&ArtifactRef>) -> String {
+fn folded_result_stub(
+    tool: &str,
+    output: &str,
+    artifact: Option<&ArtifactRef>,
+    artifact_read: bool,
+) -> String {
     match artifact {
         Some(reference) => format!(
             "{FOLDED_RESULT_PREFIX} to reclaim context — the full {tool} output is artifact {} \
-             sha256:{} ({} bytes); reopen it with artifact.read]",
+             sha256:{} ({} bytes); {}]",
             reference.id,
             &reference.sha256[..reference.sha256.len().min(12)],
             reference.byte_length,
+            compaction_recovery_hint(artifact_read),
         ),
         None => {
             let first_line: String = output
@@ -598,6 +617,14 @@ fn folded_result_stub(tool: &str, output: &str, artifact: Option<&ArtifactRef>) 
                 "{FOLDED_RESULT_PREFIX} to reclaim context — {tool} output began: {first_line}]"
             )
         }
+    }
+}
+
+fn compaction_recovery_hint(artifact_read: bool) -> &'static str {
+    if artifact_read {
+        "reopen stored output with artifact.read using its cited ID"
+    } else {
+        "re-read relevant source through scoped read/search tools if needed; do not replay side-effecting calls"
     }
 }
 
@@ -1226,7 +1253,7 @@ pub struct RunContext {
     pub prior: Vec<TurnItem>,
     /// This run's retrieval-gated MCP advertisement (rubric 9), computed ONCE
     /// per run by [`FrameworkAgentRuntime::select_mcp_tools`] and consulted by
-    /// [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names) on
+    /// [`advertised_tool_definitions`](FrameworkAgentRuntime::advertised_tool_definitions) on
     /// every step.
     ///
     /// `None` — the default, and the value for every run whose bridge offers at
@@ -1741,6 +1768,7 @@ pub struct FrameworkAgentRuntime {
     /// process-wide (one registry of operator-declared servers), so it lives on
     /// the runtime, not the run context.
     mcp: Option<Arc<dyn McpBridge>>,
+    desktop_tools: Option<DesktopTools>,
     /// The web-search client the `web.search` tool calls (PR C1), if a Tavily
     /// key was discovered at startup. Process-wide (one daemon key), so it
     /// lives on the runtime, not the run context.
@@ -1761,6 +1789,7 @@ pub struct FrameworkAgentRuntime {
     /// gate outright (advertise every offered built-in — the behavior before
     /// this existed). Set from `models.toml`'s `[retrieval] builtin_top_k`.
     builtin_top_k: usize,
+    semantic_embedder: Option<Arc<dyn SemanticEmbedder>>,
     /// The code graph the `graph.*` tools query (outcome 5), if wired. Like
     /// `registry`, a process-wide read seam over the daemon's own derived
     /// projection; `None` leaves the three tools unoffered.
@@ -1864,10 +1893,12 @@ impl FrameworkAgentRuntime {
             sink,
             github: None,
             mcp: None,
+            desktop_tools: DesktopTools::resolve().ok(),
             search: None,
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
             builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
+            semantic_embedder: None,
             code_graph: None,
             code_graph_assertions: None,
             registry: None,
@@ -1952,6 +1983,48 @@ impl FrameworkAgentRuntime {
         self
     }
 
+    pub fn with_desktop_tools(mut self, desktop: DesktopTools) -> Self {
+        self.desktop_tools = Some(desktop);
+        self
+    }
+
+    pub async fn call_desktop_tool(
+        &self,
+        run: &RunContext,
+        actor: &Actor,
+        name: &str,
+        args: Value,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
+        if !crate::agent_guidance::application_tool(name)
+            || !self
+                .offered_tool_names(run)
+                .iter()
+                .any(|offered| offered == name)
+        {
+            return Err(
+                "desktop.tool_not_available: the tool is not permitted for this run".into(),
+            );
+        }
+        let mut actions = Vec::new();
+        let mut paused = Duration::ZERO;
+        match self
+            .run_tool(run, actor, name, args, &mut actions, cancel, &mut paused)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            ToolFlow::Observation { observation, .. } => {
+                if actions.last().and_then(|action| action["outcome"].as_str()) == Some("succeeded")
+                {
+                    Ok(observation)
+                } else {
+                    Err(observation)
+                }
+            }
+            ToolFlow::Cancelled => Err("desktop.cancelled: the run was cancelled".into()),
+        }
+    }
+
     /// Inject the web-search client the `web.search` tool calls (PR C1).
     /// Without it the tool is never offered (a call returns a clean failure).
     /// The daemon builds the client from the `TAVILY_API_KEY` at startup.
@@ -1990,6 +2063,12 @@ impl FrameworkAgentRuntime {
     #[must_use]
     pub fn with_builtin_top_k(mut self, builtin_top_k: usize) -> Self {
         self.builtin_top_k = builtin_top_k;
+        self
+    }
+
+    #[must_use]
+    pub fn with_semantic_embedder(mut self, embedder: Option<Arc<dyn SemanticEmbedder>>) -> Self {
+        self.semantic_embedder = embedder;
         self
     }
 
@@ -2209,6 +2288,12 @@ impl FrameworkAgentRuntime {
         // configured gate alone decides and no mode overlay removes it.
         if self.code_graph.is_some() {
             names.extend(
+                GRAPH_TRAVERSAL_TOOLS
+                    .iter()
+                    .filter(|(name, _, _)| *name != GraphCallersOf::NAME)
+                    .map(|(name, _, _)| (*name).to_string()),
+            );
+            names.extend(
                 [
                     GraphCallersOf::NAME,
                     GraphBlastRadius::NAME,
@@ -2302,23 +2387,19 @@ impl FrameworkAgentRuntime {
             names.push(ShellWriteStdin::NAME.to_string());
         }
         if let Some(bridge) = &self.mcp {
-            // Rubric 9: the MCP family is the one UNBOUNDED tool set — a handful
-            // of servers can offer hundreds of tools, all of which used to be
-            // injected in full on every step. When this run's advertisement was
-            // narrowed to a top-k selection (`select_mcp_tools`, computed once
-            // per run), honour it; otherwise offer everything the bridge has,
-            // exactly as before. Dispatch is unaffected either way:
-            // [`mcp_target`](Self::mcp_target) re-verifies against the bridge's
-            // own cache, so narrowing what the model SEES never strands a tool.
             names.extend(
                 bridge
                     .offered_tools()
                     .iter()
-                    .map(|info| format!("mcp.{}.{}", info.server, info.name))
-                    .filter(|name| match &run.mcp_advertised {
-                        Some(selected) => selected.contains(name),
-                        None => true,
-                    }),
+                    .map(|info| format!("mcp.{}.{}", info.server, info.name)),
+            );
+        }
+        if let Some(desktop) = &self.desktop_tools {
+            names.extend(
+                desktop
+                    .definitions(run.session_id)
+                    .into_iter()
+                    .map(|tool| tool.name),
             );
         }
         // PR C2 (plan mode): mirror the mode overlay's denials (see the doc
@@ -2353,7 +2434,9 @@ impl FrameworkAgentRuntime {
                         | ShellWriteStdin::NAME
                         | RepositoryTest::NAME
                         | GitDiff::NAME
-                ) || name.starts_with("mcp."))
+                ) || name.starts_with("mcp.")
+                    || name.starts_with("desktop.")
+                    || name == DESKTOP_RENDER)
             {
                 return false;
             }
@@ -2402,8 +2485,6 @@ impl FrameworkAgentRuntime {
         let advertise = |name: &String| {
             offered.contains(name)
                 && match &run.tools_advertised {
-                    // `mcp.*` has its own gate (`mcp_advertised`, already applied
-                    // inside `offered_tool_names`), so it is never re-filtered here.
                     Some(selected) => name.starts_with("mcp.") || selected.contains(name),
                     None => true,
                 }
@@ -2418,7 +2499,13 @@ impl FrameworkAgentRuntime {
                     .offered_tools()
                     .into_iter()
                     .map(|info| (format!("mcp.{}.{}", info.server, info.name), info))
-                    .filter(|(name, _)| offered.contains(name))
+                    .filter(|(name, _)| {
+                        offered.contains(name)
+                            && run
+                                .mcp_advertised
+                                .as_ref()
+                                .is_none_or(|selected| selected.contains(name))
+                    })
                     .map(|(name, info)| ToolDefinition {
                         name,
                         description: info.description,
@@ -2429,6 +2516,26 @@ impl FrameworkAgentRuntime {
                     }),
             );
         }
+        if let Some(desktop) = &self.desktop_tools {
+            definitions.extend(
+                desktop
+                    .definitions(run.session_id)
+                    .into_iter()
+                    .filter(|tool| offered.contains(&tool.name)),
+            );
+        }
+        definitions
+    }
+
+    pub fn application_tool_definitions(&self, run: &RunContext) -> Vec<ToolDefinition> {
+        let offered = self.offered_tool_names(run);
+        let mut definitions = static_tool_definitions();
+        if let Some(desktop) = &self.desktop_tools {
+            definitions.extend(desktop.definitions(run.session_id));
+        }
+        definitions.retain(|tool| {
+            crate::agent_guidance::application_tool(&tool.name) && offered.contains(&tool.name)
+        });
         definitions
     }
 
@@ -2473,7 +2580,7 @@ impl FrameworkAgentRuntime {
     /// MCP gate and for the same reason: the query is the objective plus the
     /// latest user turn, and neither changes between steps.
     #[must_use]
-    pub fn select_builtin_tools(&self, run: &RunContext) -> Option<Vec<String>> {
+    pub async fn select_builtin_tools(&self, run: &RunContext) -> Option<Vec<String>> {
         if self.builtin_top_k == 0 {
             return None;
         }
@@ -2504,7 +2611,14 @@ impl FrameworkAgentRuntime {
             .cloned()
             .collect();
         let items = builtin_registry_items(&discretionary);
-        let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
+        let text = retrieval_query_text(run);
+        let (indexes, query_vector) = match crate::tool_retrieval::tool_indexes(
+            &items,
+            &text,
+            self.semantic_embedder.as_deref(),
+        )
+        .await
+        {
             Ok(indexes) => indexes,
             Err(error) => {
                 warn_builtin_gate_degraded(&error.to_string());
@@ -2517,11 +2631,8 @@ impl FrameworkAgentRuntime {
         // is a pure relevance ranking. Nothing here is a security decision: the
         // mode overlay in `offered_tool_names`, `prepare`, and the policy engine
         // remain the only things that decide what a run may DO.
-        let query = RetrievalQuery::new(
-            retrieval_query_text(run),
-            vec![Scope::System],
-            RiskClass::High,
-        );
+        let mut query = RetrievalQuery::new(text, vec![Scope::System], RiskClass::High);
+        query.query_vector = query_vector;
         let config = RetrievalConfig {
             disclose_tools_min: self.builtin_top_k,
             disclose_tools_max: self.builtin_top_k,
@@ -2577,7 +2688,7 @@ impl FrameworkAgentRuntime {
     /// of which changes mid-step, so re-running the funnel every step would burn
     /// work for an identical answer.
     #[must_use]
-    pub fn select_mcp_tools(&self, run: &RunContext) -> Option<Vec<String>> {
+    pub async fn select_mcp_tools(&self, run: &RunContext) -> Option<Vec<String>> {
         let bridge = self.mcp.as_ref()?;
         if self.mcp_top_k == 0 {
             return None;
@@ -2588,7 +2699,14 @@ impl FrameworkAgentRuntime {
         }
 
         let items: Vec<RegistryItem> = offered.iter().map(mcp_registry_item).collect();
-        let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
+        let text = retrieval_query_text(run);
+        let (indexes, query_vector) = match crate::tool_retrieval::tool_indexes(
+            &items,
+            &text,
+            self.semantic_embedder.as_deref(),
+        )
+        .await
+        {
             Ok(indexes) => indexes,
             Err(error) => {
                 warn_mcp_gate_degraded(&error.to_string());
@@ -2601,11 +2719,8 @@ impl FrameworkAgentRuntime {
         // decision for an MCP call stays where it already is: the daemon's
         // policy engine at dispatch, plus the mode overlay's `mcp.*` filter
         // below in `offered_tool_names`.
-        let query = RetrievalQuery::new(
-            retrieval_query_text(run),
-            vec![Scope::System],
-            RiskClass::Medium,
-        );
+        let mut query = RetrievalQuery::new(text, vec![Scope::System], RiskClass::Medium);
+        query.query_vector = query_vector;
         let config = RetrievalConfig {
             disclose_tools_min: self.mcp_top_k,
             disclose_tools_max: self.mcp_top_k,
@@ -2664,14 +2779,16 @@ impl FrameworkAgentRuntime {
         // step) then reads this decision instead of re-running the funnel. A
         // `None` result means "advertise every offered MCP tool", the behavior
         // before this existed.
-        run.mcp_advertised = self.select_mcp_tools(&run);
+        let (mcp_advertised, tools_advertised) =
+            tokio::join!(self.select_mcp_tools(&run), self.select_builtin_tools(&run),);
+        run.mcp_advertised = mcp_advertised;
         // Rubric 9, the other half: narrow the BUILT-IN advertisement to the
         // floor plus the top-k most relevant to this objective, ONCE, here — for
         // the same reason as the MCP gate above, and read by
         // `advertised_tool_definitions` on every step. `None` means "advertise
         // every offered built-in", the behavior before this existed. Dispatch is
         // untouched: `offered_tool_names` never consults this.
-        run.tools_advertised = self.select_builtin_tools(&run);
+        run.tools_advertised = tools_advertised;
         let model_id = driver.model_id();
         let run_actor = Actor::Agent {
             agent_id: AgentId::new(),
@@ -2782,10 +2899,18 @@ impl FrameworkAgentRuntime {
         // `mode_seed_instruction`); every other mode's objective is seeded
         // byte-identically. The seed is derived per loop start, so
         // continuations re-derive it and the ledger is untouched.
-        let objective = match mode_seed_instruction(run.mode) {
+        let mut objective = match mode_seed_instruction(run.mode) {
             Some(instruction) => format!("{instruction}\n\n{}", run.objective),
             None => run.objective.clone(),
         };
+        if let Some(context) = self
+            .desktop_tools
+            .as_ref()
+            .and_then(|desktop| desktop.context_text(run.session_id))
+        {
+            objective.push_str("\n\n");
+            objective.push_str(&context);
+        }
         transcript.push(TurnItem::Objective(objective));
         let mut findings: Vec<String> = Vec::new();
         let mut actions: Vec<Value> = Vec::new();
@@ -2795,6 +2920,7 @@ impl FrameworkAgentRuntime {
         // `None` unless a request actually reports usage. An unmeasured run keeps
         // it `None`, so the cost budget charges nothing — the honesty invariant.
         let mut usage: Option<ModelUsage> = None;
+        let mut coverage = codypendent_protocol::UsageCoverage::default();
         let run_started = Instant::now();
         let mut paused_total = Duration::ZERO;
         let mut wall_clock_warned = false;
@@ -2923,7 +3049,8 @@ impl FrameworkAgentRuntime {
                                 text: format!(
                                     "compaction: folded {folded} oldest tool result(s) into \
                                      artifact-ref stubs (≈{before} → ≈{used} of {limit} \
-                                     tokens); folded output can be reopened with artifact.read"
+                                     tokens); {}",
+                                    compaction_recovery_hint(self.artifacts.is_some())
                                 ),
                                 run_id: Some(run.run_id),
                             },
@@ -2938,7 +3065,14 @@ impl FrameworkAgentRuntime {
                     last_token_pct = Some(pct);
                     self.emit(run.session_id, run_actor.clone(), body).await?;
                 }
+                let guidance = crate::agent_guidance::for_tools(
+                    &tool_definitions
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>(),
+                );
                 let system_tokens = ((SYSTEM_PROMPT.chars().count()
+                    + guidance.chars().count()
                     + run.instructions.as_deref().map_or(0, |i| i.chars().count()))
                     / CHARS_PER_TOKEN
                     + PER_ITEM_TOKEN_OVERHEAD) as u64;
@@ -2963,6 +3097,7 @@ impl FrameworkAgentRuntime {
                 }
             }
 
+            coverage.requests = coverage.requests.saturating_add(1);
             let started = Instant::now();
             // Live streaming with COALESCED journaling. The driver pushes each
             // text chunk through the `ChannelSink` AS the model produces it;
@@ -3049,6 +3184,7 @@ impl FrameworkAgentRuntime {
                                     }
                                 }
                                 SinkEvent::Retry(notice) => {
+                                    coverage.unmeasured_retries = coverage.unmeasured_retries.saturating_add(1);
                                     self.flush_deltas(&run, &run_actor, &mut pending).await?;
                                     self.emit(
                                         run.session_id,
@@ -3093,6 +3229,7 @@ impl FrameworkAgentRuntime {
                         pending.push_str(&chunk);
                     }
                     SinkEvent::Retry(notice) => {
+                        coverage.unmeasured_retries = coverage.unmeasured_retries.saturating_add(1);
                         self.flush_deltas(&run, &run_actor, &mut pending).await?;
                         self.emit(
                             run.session_id,
@@ -3131,6 +3268,9 @@ impl FrameworkAgentRuntime {
             // all-unmeasured run keeps `usage == None` and is charged no cost,
             // exactly as today's code behaves. This is the honesty invariant.
             if let Some(step_usage) = step_usage {
+                coverage.prompt_requests += u64::from(step_usage.prompt_tokens.is_some());
+                coverage.completion_requests += u64::from(step_usage.completion_tokens.is_some());
+                coverage.cost_requests += u64::from(step_usage.cost_micros.is_some());
                 let total = usage.get_or_insert_with(ModelUsage::default);
                 *total = total.saturating_add(&step_usage);
             }
@@ -3296,7 +3436,15 @@ impl FrameworkAgentRuntime {
                         }
 
                         match self
-                            .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
+                            .run_tool(
+                                &run,
+                                &run_actor,
+                                &tool,
+                                args,
+                                &mut actions,
+                                &cancel,
+                                &mut paused_total,
+                            )
                             .await?
                         {
                             ToolFlow::Observation {
@@ -3394,6 +3542,7 @@ impl FrameworkAgentRuntime {
                     prompt_tokens: measured.prompt_tokens,
                     completion_tokens: measured.completion_tokens,
                     cost_micros: measured.cost_micros,
+                    coverage: Some(coverage),
                 },
             )
             .await?;
@@ -3668,6 +3817,7 @@ impl FrameworkAgentRuntime {
         original: &HookToolCall,
         actions: &mut Vec<Value>,
         cancel: &CancellationToken,
+        paused_total: &mut Duration,
     ) -> anyhow::Result<ToolFlow> {
         let (lowering, captured) = self.rewrite_lowering(run);
         let adapter = RunPolicyAdapter::new(self.policy.clone(), self.eval_ctx(run))
@@ -3786,10 +3936,12 @@ impl FrameworkAgentRuntime {
                 return Ok(ToolFlow::Cancelled);
             }
         };
-        if cancel.is_cancelled() {
-            return Ok(ToolFlow::Cancelled);
+        // Approval authorizes the action; only ResumeRun releases a pause.
+        match cancel.wait_until_running().await {
+            Some(paused) => *paused_total = paused_total.saturating_add(paused),
+            None => return Ok(ToolFlow::Cancelled),
         }
-        self.transition(run.session_id, run.run_id, RunState::Running)
+        self.transition_if_needed(run.session_id, run.run_id, RunState::Running)
             .await?;
 
         if decision != ApprovalDecision::Approve {
@@ -3874,6 +4026,10 @@ impl FrameworkAgentRuntime {
             }
         };
 
+        match cancel.wait_until_running().await {
+            Some(paused) => *paused_total = paused_total.saturating_add(paused),
+            None => return Ok(ToolFlow::Cancelled),
+        }
         let start_time = Instant::now();
         self.emit(
             run.session_id,
@@ -3893,6 +4049,8 @@ impl FrameworkAgentRuntime {
             result = &mut execution => result,
             _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
         };
+
+        let outcome = reported_tool_outcome(outcome, &observation);
 
         self.emit(
             run.session_id,
@@ -3949,6 +4107,7 @@ impl FrameworkAgentRuntime {
     /// execute under the granted scope, and emit `ToolStarted`/`ToolCompleted`.
     /// Returns the compacted observation to feed back to the model, or
     /// [`ToolFlow::Cancelled`] if the run was cancelled while parked on approval.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool(
         &self,
         run: &RunContext,
@@ -3957,9 +4116,32 @@ impl FrameworkAgentRuntime {
         args: Value,
         actions: &mut Vec<Value>,
         cancel: &CancellationToken,
+        paused_total: &mut Duration,
     ) -> anyhow::Result<ToolFlow> {
+        // Each call in a model's batch is its own safe point.
+        match cancel.wait_until_running().await {
+            Some(paused) => *paused_total = paused_total.saturating_add(paused),
+            None => return Ok(ToolFlow::Cancelled),
+        }
+        let (resolved_tool, args, resolution_error) = if tool == crate::desktop_tools::EXECUTE {
+            match self
+                .desktop_tools
+                .as_ref()
+                .ok_or_else(|| "desktop.host_unavailable".to_string())
+                .and_then(|desktop| desktop.execution_call(run.session_id, &args))
+            {
+                Ok((name, args)) => (name, args, None),
+                Err(error) => (tool.to_string(), args, Some(error)),
+            }
+        } else {
+            (tool.to_string(), args, None)
+        };
+        let tool = resolved_tool.as_str();
         // (a) map the call to a typed tool + proposed action.
-        let prepared = match self.prepare(tool, &args, run).await {
+        let prepared = match match resolution_error {
+            Some(error) => Err(error),
+            None => self.prepare(tool, &args, run).await,
+        } {
             Ok(prepared) => prepared,
             Err(message) => {
                 self.emit(
@@ -4026,154 +4208,73 @@ impl FrameworkAgentRuntime {
                 HookOutcome::Rewritten(unapproved) => {
                     return self
                         .run_rewritten(
-                            run, run_actor, tool, unapproved, &hook_call, actions, cancel,
+                            run,
+                            run_actor,
+                            tool,
+                            unapproved,
+                            &hook_call,
+                            actions,
+                            cancel,
+                            paused_total,
                         )
                         .await;
                 }
             }
         }
 
-        // (b) evaluate policy under the mode overlay.
-        let mut ctx = self.eval_ctx(run);
-        ctx.write_target = prepared_write_target(&prepared.tool, &run.worktree);
-        let decision = self.policy.evaluate(&prepared.action, &ctx);
-        match decision.decision {
-            Decision::Deny => {
-                let first_reason = decision.reasons.first();
-                let reason = first_reason
-                    .map(|r| r.message.clone())
-                    .unwrap_or_else(|| "denied by policy".to_string());
-                let mut text = format!("policy denied: {reason}");
-                // FIX 3 (agent & tool fixes spec): a shell command denied solely
-                // because its program is not on the allow-list gets an actionable
-                // hint appended — otherwise the model tends to retry the same
-                // denied command instead of switching strategy (the evidence: a
-                // Python-repo review looped on file reads after `ls`/`find` were
-                // denied). The reason CODE stays the stable machine contract;
-                // only this human/model-facing text gains the hint, and only for
-                // this one reason code — any other denial (e.g. a write refused
-                // by mode) is unaffected.
-                if first_reason.map(|r| r.code.as_str()) == Some("policy.program-not-allowlisted") {
-                    text.push_str(
-                        " — to inspect the repository use the `workspace.read_file` and \
-                         `workspace.search` tools instead of a shell command.",
-                    );
-                }
-                self.emit(
-                    run.session_id,
-                    run_actor.clone(),
-                    EventBody::ToolDenied {
-                        run_id: run.run_id,
-                        action: prepared.action.clone(),
-                        reasons: decision
-                            .reasons
-                            .iter()
-                            .map(|reason| reason.message.clone())
-                            .collect(),
-                    },
-                )
-                .await?;
-                // (c) on Deny: emit a denial completion and DO NOT execute.
-                self.emit(
-                    run.session_id,
-                    run_actor.clone(),
-                    EventBody::ToolCompleted {
-                        run_id: run.run_id,
-                        tool: tool.to_string(),
-                        outcome: ToolOutcome::Failed {
-                            message: text.clone(),
-                        },
-                        artifact: None,
-                    },
-                )
-                .await?;
-                actions.push(action_digest(tool, "denied", None));
-                return Ok(ToolFlow::Observation {
-                    observation: text,
-                    artifact: None,
-                });
-            }
-            Decision::RequireApproval => {
-                // (c) park the run in WaitingForApproval until an approver
-                // resolves. Publish ToolProposed last, so no ledger append
-                // races the approver's resolution while the run is parked.
-                let capabilities = decision
-                    .capability_grant
-                    .clone()
-                    .map(|grant| vec![grant.capability])
-                    .unwrap_or_default();
-                let risk = Risk {
-                    level: RiskLevel::Medium,
-                    reasons: decision.reasons.iter().map(|r| r.message.clone()).collect(),
+        if let Some(stopped) = self
+            .authorise_action(
+                run,
+                run_actor,
+                tool,
+                &prepared.action,
+                prepared_write_target(&prepared.tool, &run.worktree),
+                actions,
+                cancel,
+                paused_total,
+            )
+            .await?
+        {
+            return Ok(stopped);
+        }
+        if let PreparedTool::Desktop {
+            definition: Some(definition),
+            ..
+        } = &prepared.tool
+        {
+            for capability in &definition.capabilities {
+                let action = ProposedAction::McpToolCall {
+                    server: "desktop".into(),
+                    tool: capability.clone(),
+                    summary: format!(
+                        "Allow {capability} inside generated tool {} version {}",
+                        definition.name, definition.version
+                    ),
+                    args: canonical_json(&json!({"generatedTool":definition,"arguments":args})),
                 };
-                let approval_id = self
-                    .journal
-                    .request(ApprovalRequest {
-                        session_id: run.session_id,
-                        run_id: run.run_id,
-                        repository: run.repository_identity().to_str().map(str::to_string),
-                        action: prepared.action.clone(),
-                        risk,
-                        capabilities,
-                        allow_run_reuse: decision.approval_reusable,
-                    })
-                    .await?;
-                self.transition(run.session_id, run.run_id, RunState::WaitingForApproval)
-                    .await?;
-                self.emit(
-                    run.session_id,
-                    run_actor.clone(),
-                    EventBody::ToolProposed {
-                        run_id: run.run_id,
-                        approval_id,
-                        action: prepared.action.clone(),
-                    },
-                )
-                .await?;
-
-                // Park on the decision, but never block a cancelled run: race the
-                // approval against cancellation. If cancellation wins, stop here
-                // (do not run the tool) and let the loop drive the run to
-                // Cancelled — dropping the broker's waiter entry, which only
-                // `await_decision` consuming a decision would otherwise remove
-                // (it would leak for the daemon's lifetime).
-                let decision = tokio::select! {
-                    decision = self.approvals.await_decision(approval_id) => decision?,
-                    _ = cancel.cancelled() => {
-                        self.approvals.forget_waiter(approval_id);
-                        return Ok(ToolFlow::Cancelled);
-                    }
-                };
-                if cancel.is_cancelled() {
-                    return Ok(ToolFlow::Cancelled);
-                }
-                self.transition(run.session_id, run.run_id, RunState::Running)
-                    .await?;
-                if decision != ApprovalDecision::Approve {
-                    self.emit(
-                        run.session_id,
-                        run_actor.clone(),
-                        EventBody::ToolCompleted {
-                            run_id: run.run_id,
-                            tool: tool.to_string(),
-                            outcome: ToolOutcome::Failed {
-                                message: "approval rejected".to_string(),
-                            },
-                            artifact: None,
-                        },
+                if let Some(stopped) = self
+                    .authorise_action(
+                        run,
+                        run_actor,
+                        tool,
+                        &action,
+                        None,
+                        actions,
+                        cancel,
+                        paused_total,
                     )
-                    .await?;
-                    actions.push(action_digest(tool, "rejected", None));
-                    return Ok(ToolFlow::Observation {
-                        observation: "approval rejected".to_string(),
-                        artifact: None,
-                    });
+                    .await?
+                {
+                    return Ok(stopped);
                 }
             }
-            Decision::Allow => {}
         }
 
         // (d) execute under the granted scope.
+        match cancel.wait_until_running().await {
+            Some(paused) => *paused_total = paused_total.saturating_add(paused),
+            None => return Ok(ToolFlow::Cancelled),
+        }
         let start_time = Instant::now();
         self.emit(
             run.session_id,
@@ -4198,6 +4299,7 @@ impl FrameworkAgentRuntime {
             result = &mut execution => result,
             _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
         };
+        let outcome = reported_tool_outcome(outcome, &observation);
         // (e/f) emit completion referencing any spilled artifact.
         self.emit(
             run.session_id,
@@ -4238,6 +4340,164 @@ impl FrameworkAgentRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn authorise_action(
+        &self,
+        run: &RunContext,
+        run_actor: &Actor,
+        tool: &str,
+        action: &ProposedAction,
+        write_target: Option<PathBuf>,
+        actions: &mut Vec<Value>,
+        cancel: &CancellationToken,
+        paused_total: &mut Duration,
+    ) -> anyhow::Result<Option<ToolFlow>> {
+        // (b) evaluate policy under the mode overlay.
+        let mut ctx = self.eval_ctx(run);
+        ctx.write_target = write_target;
+        let decision = self.policy.evaluate(action, &ctx);
+        match decision.decision {
+            Decision::Deny => {
+                let first_reason = decision.reasons.first();
+                let reason = first_reason
+                    .map(|r| r.message.clone())
+                    .unwrap_or_else(|| "denied by policy".to_string());
+                let mut text = format!("policy denied: {reason}");
+                // FIX 3 (agent & tool fixes spec): a shell command denied solely
+                // because its program is not on the allow-list gets an actionable
+                // hint appended — otherwise the model tends to retry the same
+                // denied command instead of switching strategy (the evidence: a
+                // Python-repo review looped on file reads after `ls`/`find` were
+                // denied). The reason CODE stays the stable machine contract;
+                // only this human/model-facing text gains the hint, and only for
+                // this one reason code — any other denial (e.g. a write refused
+                // by mode) is unaffected.
+                if first_reason.map(|r| r.code.as_str()) == Some("policy.program-not-allowlisted") {
+                    text.push_str(
+                        " — to inspect the repository use the `workspace.read_file` and \
+                         `workspace.search` tools instead of a shell command.",
+                    );
+                }
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolDenied {
+                        run_id: run.run_id,
+                        action: action.clone(),
+                        reasons: decision
+                            .reasons
+                            .iter()
+                            .map(|reason| reason.message.clone())
+                            .collect(),
+                    },
+                )
+                .await?;
+                // (c) on Deny: emit a denial completion and DO NOT execute.
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolCompleted {
+                        run_id: run.run_id,
+                        tool: tool.to_string(),
+                        outcome: ToolOutcome::Failed {
+                            message: text.clone(),
+                        },
+                        artifact: None,
+                    },
+                )
+                .await?;
+                actions.push(action_digest(tool, "denied", None));
+                return Ok(Some(ToolFlow::Observation {
+                    observation: text,
+                    artifact: None,
+                }));
+            }
+            Decision::RequireApproval => {
+                // (c) park the run in WaitingForApproval until an approver
+                // resolves. Publish ToolProposed last, so no ledger append
+                // races the approver's resolution while the run is parked.
+                let capabilities = decision
+                    .capability_grant
+                    .clone()
+                    .map(|grant| vec![grant.capability])
+                    .unwrap_or_default();
+                let risk = Risk {
+                    level: RiskLevel::Medium,
+                    reasons: decision.reasons.iter().map(|r| r.message.clone()).collect(),
+                };
+                let approval_id = self
+                    .journal
+                    .request(ApprovalRequest {
+                        session_id: run.session_id,
+                        run_id: run.run_id,
+                        repository: run.repository_identity().to_str().map(str::to_string),
+                        action: action.clone(),
+                        risk,
+                        capabilities,
+                        allow_run_reuse: decision.approval_reusable,
+                    })
+                    .await?;
+                self.transition(run.session_id, run.run_id, RunState::WaitingForApproval)
+                    .await?;
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolProposed {
+                        run_id: run.run_id,
+                        approval_id,
+                        action: action.clone(),
+                    },
+                )
+                .await?;
+
+                // Park on the decision, but never block a cancelled run: race the
+                // approval against cancellation. If cancellation wins, stop here
+                // (do not run the tool) and let the loop drive the run to
+                // Cancelled — dropping the broker's waiter entry, which only
+                // `await_decision` consuming a decision would otherwise remove
+                // (it would leak for the daemon's lifetime).
+                let decision = tokio::select! {
+                    decision = self.approvals.await_decision(approval_id) => decision?,
+                    _ = cancel.cancelled() => {
+                        self.approvals.forget_waiter(approval_id);
+                        return Ok(Some(ToolFlow::Cancelled));
+                    }
+                };
+                // Resolving an approval must not overwrite Paused or execute
+                // its tool until the operator explicitly resumes the run.
+                match cancel.wait_until_running().await {
+                    Some(paused) => *paused_total = paused_total.saturating_add(paused),
+                    None => return Ok(Some(ToolFlow::Cancelled)),
+                }
+                self.transition_if_needed(run.session_id, run.run_id, RunState::Running)
+                    .await?;
+                if decision != ApprovalDecision::Approve {
+                    self.emit(
+                        run.session_id,
+                        run_actor.clone(),
+                        EventBody::ToolCompleted {
+                            run_id: run.run_id,
+                            tool: tool.to_string(),
+                            outcome: ToolOutcome::Failed {
+                                message: "approval rejected".to_string(),
+                            },
+                            artifact: None,
+                        },
+                    )
+                    .await?;
+                    actions.push(action_digest(tool, "rejected", None));
+                    return Ok(Some(ToolFlow::Observation {
+                        observation: "approval rejected".to_string(),
+                        artifact: None,
+                    }));
+                }
+            }
+            Decision::Allow => {}
+        }
+
+        Ok(None)
+    }
+
     /// Map a tool call to its typed input and [`ProposedAction`]. Applying a
     /// patch is modelled as a `WritePatch` (semantically a write), so the patch
     /// is spilled to an artifact first and referenced by id.
@@ -4247,6 +4507,31 @@ impl FrameworkAgentRuntime {
         args: &Value,
         run: &RunContext,
     ) -> Result<Prepared, String> {
+        if tool == DESKTOP_RENDER || tool.starts_with("desktop.") {
+            let desktop = self
+                .desktop_tools
+                .as_ref()
+                .ok_or("desktop.host_unavailable")?;
+            desktop.validate_call(run.session_id, tool, args)?;
+            let definition = desktop.generated_definition(run.session_id, tool)?;
+            let canonical = canonical_json(&match &definition {
+                Some(definition) => json!({"arguments":args,"generatedTool":definition}),
+                None => args.clone(),
+            });
+            return Ok(Prepared {
+                action: ProposedAction::McpToolCall {
+                    server: "desktop".into(),
+                    tool: tool.into(),
+                    summary: format!("Desktop tool {tool}"),
+                    args: canonical,
+                },
+                tool: PreparedTool::Desktop {
+                    name: tool.into(),
+                    args: args.clone(),
+                    definition,
+                },
+            });
+        }
         match tool {
             Shell::NAME => {
                 let request = parse_command_request(args, &run.worktree)?;
@@ -4689,9 +4974,10 @@ impl FrameworkAgentRuntime {
             // to the unknown-tool refusal the offering already promised. The
             // depth a model asks for is carried, never rejected: the store
             // clamps it, so an absurd number answers narrowly instead of failing.
-            GraphCallersOf::NAME if self.code_graph.is_some() => {
-                let (symbol, _) = parse_symbol_question(args, GraphCallersOf::NAME)?;
-                let question = codypendent_knowledge::GraphQuestion::CallersOf { symbol };
+            tool if self.code_graph.is_some() && traversal_kind(tool).is_some() => {
+                let question = codypendent_knowledge::GraphQuestion::Traverse(
+                    parse_graph_traversal(args, tool)?,
+                );
                 Ok(Prepared {
                     action: graph_proposed_action(
                         run.repository_identity(),
@@ -4915,6 +5201,14 @@ impl FrameworkAgentRuntime {
         let write_scope = self.write_scope(run);
         let command_scope = self.policy.command_scope();
         match prepared.tool {
+            PreparedTool::Desktop {
+                name,
+                args,
+                definition,
+            } => {
+                self.execute_desktop_tool(&name, args, definition.as_ref(), run)
+                    .await
+            }
             PreparedTool::Shell(request) => {
                 match Shell::execute(
                     &request,
@@ -5463,11 +5757,38 @@ impl FrameworkAgentRuntime {
                         repository: run.repository_identity(),
                     };
                     match registry.search(request).await {
-                        Ok(outcome) => (
-                            render_registry_search(&outcome),
-                            None,
-                            ToolOutcome::Succeeded,
-                        ),
+                        Ok(mut outcome) => {
+                            if let Some(name) = input.open.as_deref().filter(|name| {
+                                outcome.tool_schema.is_none()
+                                    && outcome
+                                        .cards
+                                        .iter()
+                                        .any(|card| card.kind == "tool" && card.name == *name)
+                                    && self
+                                        .offered_tool_names(run)
+                                        .iter()
+                                        .any(|offered| offered == name)
+                            }) {
+                                let mut definitions = static_tool_definitions();
+                                if let Some(desktop) = &self.desktop_tools {
+                                    definitions.extend(desktop.definitions(run.session_id));
+                                }
+                                if let Some(definition) =
+                                    definitions.into_iter().find(|tool| tool.name == name)
+                                {
+                                    outcome.tool_schema = Some(crate::tools::ToolSchema {
+                                        name: name.to_string(),
+                                        parameters: definition.parameters,
+                                    });
+                                    outcome.open_note = None;
+                                }
+                            }
+                            (
+                                render_registry_search(&outcome),
+                                None,
+                                ToolOutcome::Succeeded,
+                            )
+                        }
                         Err(reason) => (
                             format!("skills.search failed: {reason}"),
                             None,
@@ -5495,7 +5816,7 @@ impl FrameworkAgentRuntime {
                 // the worktree answered "no results" for every question in the
                 // default Build mode while the graph was fully populated.
                 Some(graph) => match graph.ask(run.repository_identity(), question).await {
-                    Ok(answer) => (answer.render(), None, ToolOutcome::Succeeded),
+                    Ok(answer) => (render_graph_answer(&answer), None, ToolOutcome::Succeeded),
                     Err(reason) => (
                         format!("code-graph query failed: {reason}"),
                         None,
@@ -5663,6 +5984,80 @@ impl FrameworkAgentRuntime {
                     }
                 },
             },
+        }
+    }
+
+    async fn execute_desktop_tool(
+        &self,
+        name: &str,
+        args: Value,
+        definition: Option<&DesktopTool>,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let result = async {
+            let desktop = self
+                .desktop_tools
+                .as_ref()
+                .ok_or("desktop.host_unavailable")?;
+            desktop.validate_call(run.session_id, name, &args)?;
+            match name {
+                DESKTOP_RENDER => {
+                    let mut widget = args.clone();
+                    widget["type"] = json!("open-generative-ui");
+                    Ok(widget)
+                }
+                DESKTOP_DEFINE => desktop.define(run.session_id, &args),
+                DESKTOP_MANAGE => desktop.manage(run.session_id, &args),
+                _ => {
+                    desktop
+                        .invoke_checked(run.session_id, run.run_id, name, args, definition)
+                        .await
+                }
+            }
+        }
+        .await;
+        let value = match result {
+            Ok(value) => value,
+            Err(message) => {
+                return (
+                    format!("tool error: {message}"),
+                    None,
+                    ToolOutcome::Failed { message },
+                )
+            }
+        };
+        let bytes = match serde_json::to_vec(&value) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = error.to_string();
+                return (message.clone(), None, ToolOutcome::Failed { message });
+            }
+        };
+        match self
+            .sink
+            .store(
+                "application/vnd.codypendent.desktop-tool+json",
+                Provenance::tool_output(name, run.run_id),
+                &bytes,
+            )
+            .await
+        {
+            Ok(artifact) => {
+                let observation = if name == DESKTOP_RENDER {
+                    format!(
+                        "Interactive answer saved for the desktop sandbox (artifact {}).",
+                        artifact.id
+                    )
+                } else {
+                    sanitize_untrusted("desktop-tool", &value.to_string(), 32 * 1024)
+                        .as_evidence_block()
+                };
+                (observation, Some(artifact), ToolOutcome::Succeeded)
+            }
+            Err(error) => {
+                let message = format!("desktop.artifact_failed: {error}");
+                (message.clone(), None, ToolOutcome::Failed { message })
+            }
         }
     }
 
@@ -6504,6 +6899,11 @@ struct Prepared {
 
 /// A model tool call parsed into its typed, executable input.
 enum PreparedTool {
+    Desktop {
+        name: String,
+        args: Value,
+        definition: Option<DesktopTool>,
+    },
     Shell(CommandRequest),
     ShellExec {
         request: CommandRequest,
@@ -6776,6 +7176,12 @@ fn mcp_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
 /// overlay that denies writes or commands still removes them — a floor can never
 /// widen what a mode permits.
 const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
+    "graph.find_symbols",
+    "graph.definition",
+    "graph.callers_of",
+    "graph.callees_of",
+    "graph.neighbors",
+    "graph.dependencies",
     Shell::NAME,
     ReadFile::NAME,
     Search::NAME,
@@ -6803,6 +7209,15 @@ const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
 /// applies a risk penalty and a trust bonus; letting real values through would
 /// quietly bias advertisement by danger, and this projection must be pure
 /// relevance — the run's actual security decisions happen in the policy engine.
+fn tool_registry_id(name: &str) -> codypendent_protocol::RegistryItemId {
+    let digest = Sha256::digest(format!("codypendent:tool:{name}"));
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    codypendent_protocol::RegistryItemId(uuid::Uuid::from_bytes(bytes))
+}
+
 fn builtin_registry_items(names: &[String]) -> Vec<RegistryItem> {
     use codypendent_knowledge::{
         builtin_tools, Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus,
@@ -6826,7 +7241,7 @@ fn builtin_registry_items(names: &[String]) -> Vec<RegistryItem> {
                 keywords.extend(item.keywords.iter().cloned());
             }
             Some(RegistryItem {
-                id: codypendent_protocol::RegistryItemId::new(),
+                id: tool_registry_id(name),
                 kind: RegistryItemKind::Tool,
                 name: name.clone(),
                 version: Version("1.0.0".to_string()),
@@ -6864,7 +7279,7 @@ fn mcp_registry_item(info: &McpToolInfo) -> RegistryItem {
     };
     let now = chrono::Utc::now();
     RegistryItem {
-        id: codypendent_protocol::RegistryItemId::new(),
+        id: tool_registry_id(&format!("mcp.{}.{}", info.server, info.name)),
         kind: RegistryItemKind::Tool,
         name: format!("mcp.{}.{}", info.server, info.name),
         version: Version("1.0.0".to_string()),
@@ -7370,6 +7785,33 @@ fn describe_exit(outcome: &crate::tools::ShellOutcome) -> String {
     }
 }
 
+fn reported_tool_outcome(outcome: ToolOutcome, observation: &str) -> ToolOutcome {
+    match outcome {
+        ToolOutcome::Failed { message } => {
+            let diagnostic = observation
+                .rsplit_once("\n--- stderr:")
+                .and_then(|(_, stream)| stream.split_once('\n'))
+                .map(|(_, text)| text.trim())
+                .filter(|text| !text.is_empty())
+                .unwrap_or(observation);
+            let coded = message.contains('.') && !message.chars().any(char::is_whitespace);
+            let reason = codypendent_integrations::format_tool_failure(&message);
+            let detail = codypendent_integrations::format_tool_failure(diagnostic);
+            let text = if diagnostic.trim().is_empty() {
+                reason
+            } else if coded || detail.contains(&reason) {
+                detail
+            } else {
+                format!("{reason}\n{detail}")
+            };
+            ToolOutcome::Failed {
+                message: codypendent_integrations::format_tool_failure(&text),
+            }
+        }
+        other => other,
+    }
+}
+
 fn outcome_label(outcome: &ToolOutcome) -> &'static str {
     match outcome {
         ToolOutcome::Succeeded => "succeeded",
@@ -7510,16 +7952,11 @@ fn build_chronicle(
 /// becomes [`ModelStep::CallTool`], any other completed turn becomes
 /// [`ModelStep::Finish`] carrying its text.
 ///
-/// This is a focused implementation compiled behind `provider-openai`; a live
-/// endpoint is not available in this environment, so it has no live test. The
-/// transcript translation is intentionally simple: tool results are replayed
-/// as clearly-marked **user** turns rather than threaded by `call_id`. That is
-/// a wire-safety requirement, not just simplicity — the loop's transcript does
-/// not retain the assistant's `tool_calls` turn, and OpenAI-compatible servers
-/// reject a `role: tool` message that is not preceded by an assistant message
-/// carrying the matching `tool_call_id` (HTTP 400). A user-role replay is
-/// valid everywhere and sufficient for the Phase 1 single-tool-at-a-time loop
-/// (`to_messages_never_emits_orphan_tool_roles` pins this).
+/// Adjacent tool-call/result pairs replay as structured function messages with
+/// matching request-local IDs. This preserves the provider's tool protocol;
+/// assistant prose such as `[calling ...]` can teach a model to imitate a call
+/// instead of executing one. Legacy or compacted orphan observations remain
+/// explicitly marked user turns, never invalid unpaired tool-role messages.
 #[cfg(feature = "provider-openai")]
 pub struct FrameworkModelDriver {
     client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
@@ -7529,6 +7966,7 @@ pub struct FrameworkModelDriver {
     /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
     /// honestly returns `None`, never a fabricated default.
     context_tokens: Option<u64>,
+    ollama_context_hint: bool,
     /// The endpoint (base URL) this model is served from, sourced from
     /// `ModelConfig.base_url` by [`Self::from_registry`]. `None` (the default
     /// via [`Self::new`]) means "unknown", which suppresses the routing-outcome
@@ -7544,6 +7982,9 @@ pub struct FrameworkModelDriver {
     /// Concatenated AGENTS.md/CLAUDE.md/.codypendent instructions, appended to
     /// the system prompt (Spec 20 Action 17).
     instructions: Option<String>,
+    /// Gemini's signed function parts are not retained by the durable
+    /// transcript yet; do not manufacture unsigned native function history.
+    structured_tool_history: bool,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -7560,9 +8001,11 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens: None,
+            ollama_context_hint: false,
             endpoint: None,
             price_per_1k_usd: None,
             instructions: None,
+            structured_tool_history: true,
         }
     }
 
@@ -7606,11 +8049,21 @@ impl FrameworkModelDriver {
         // own documented window, so an overstated reading for a curated model
         // is caught even when it sits under the absolute cap.
         let context_tokens = models.context_tokens_for(&model_id);
+        let ollama_context_hint = models.get(&model_id).is_some_and(|config| {
+            config.provider_id.as_deref() == Some("ollama")
+                || (config.provider_id.is_none() && config.id.0.starts_with("ollama/"))
+                || reqwest::Url::parse(&config.base_url).is_ok_and(|url| {
+                    url.port_or_known_default() == Some(11434)
+                        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+                })
+        });
         // The endpoint the profile store keys on alongside the model id:
         // `codypendent models bench <id>` persists under `ModelConfig::base_url`
         // (`crates/cli/src/commands.rs`), so a routing-outcome writeback must
         // report the same string or it lands under a key no profile row has.
         let endpoint = models.get(&model_id).map(|cfg| cfg.base_url.clone());
+        let structured_tool_history =
+            models.protocol_for(&model_id)? != codypendent_providers::Protocol::GeminiNative;
         let client = models
             .client_for(&model_id)
             .await
@@ -7619,12 +8072,14 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens,
+            ollama_context_hint,
             endpoint,
             // The registry knows no price: `ModelConfig` carries none, and the
             // provider catalog's cost fields are display-only (T1/T7). A caller
             // holding a routing decision adds it with `with_price_per_1k_usd`.
             price_per_1k_usd: None,
             instructions: None,
+            structured_tool_history,
         })
     }
 }
@@ -7736,7 +8191,7 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
         approval_mode: ApprovalMode::NeverRequire,
         executor: None,
     };
-    vec![
+    let mut definitions = vec![
         // Schema/parser drift fix: every parameter `parse_command_request`
         // accepts is advertised — a model cannot use (or even discover) a
         // longer timeout or a subdirectory cwd the schema hides.
@@ -7964,8 +8419,8 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
         decl(
             SkillsSearch::NAME,
             "Search the tool/skill registry for what fits a task, returning compact cards \
-                 (name, kind, summary, declared permissions). Pass `open` with a skill name \
-                 from an earlier result to also receive that skill's written procedure. Use \
+                 (name, kind, summary, declared permissions). Pass `open` with a returned tool name \
+                 for its input schema, or a skill name for its written procedure. Use \
                  when you suspect a capability exists but is not in your tool list.",
             json!({
                 "type": "object",
@@ -8238,11 +8693,7 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
             "List the symbols that call a function, method, or type in this repository. Name \
                  the symbol as it appears in the source (`decide`, `Router::decide`); you do not \
                  need a file path. Use this before changing a signature.",
-            json!({
-                "type": "object",
-                "properties": {"symbol": {"type": "string"}},
-                "required": ["symbol"]
-            }),
+            graph_traversal_schema(codypendent_knowledge::codegraph::GraphTraversalKind::Callers),
         ),
         decl(
             GraphBlastRadius::NAME,
@@ -8437,7 +8888,16 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         ),
-    ]
+    ];
+    definitions.extend(
+        GRAPH_TRAVERSAL_TOOLS
+            .iter()
+            .filter(|(name, _, _)| *name != GraphCallersOf::NAME)
+            .map(|(name, kind, description)| {
+                decl(name, description, graph_traversal_schema(*kind))
+            }),
+    );
+    definitions
 }
 
 #[cfg(feature = "provider-openai")]
@@ -8445,8 +8905,12 @@ impl FrameworkModelDriver {
     fn to_messages(
         transcript: &[TurnItem],
         instructions: Option<&str>,
+        structured_tool_history: bool,
+        tools: &[ToolDefinition],
     ) -> Vec<agent_framework_core::types::Message> {
-        use agent_framework_core::types::Message;
+        use agent_framework_core::types::{
+            Content, FunctionArguments, FunctionCallContent, FunctionResultContent, Message, Role,
+        };
         let system = match instructions {
             Some(inst) if !inst.trim().is_empty() => {
                 format!(
@@ -8456,19 +8920,59 @@ impl FrameworkModelDriver {
             }
             _ => SYSTEM_PROMPT.to_string(),
         };
-        let mut messages = vec![Message::system(system)];
-        for item in transcript {
+        let guidance = crate::agent_guidance::for_tools(
+            &tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        );
+        let mut messages = vec![Message::system(format!("{system}\n\n{guidance}"))];
+        let mut items = transcript.iter().enumerate().peekable();
+        while let Some((index, item)) = items.next() {
+            if let TurnItem::ToolCall { tool, args } = item {
+                if let Some((
+                    _,
+                    TurnItem::ToolResult {
+                        tool: result_tool,
+                        output,
+                        ..
+                    },
+                )) = items.peek().copied()
+                {
+                    if structured_tool_history && tool == result_tool {
+                        // IDs need to match within this replayed request. The
+                        // durable transcript retains ordering, including calls
+                        // to the same tool with different arguments.
+                        let call_id = format!("cody_call_{index}");
+                        messages.push(Message::with_contents(
+                            Role::assistant(),
+                            vec![Content::FunctionCall(FunctionCallContent::new(
+                                call_id.clone(),
+                                tool.clone(),
+                                Some(FunctionArguments::Raw(args.to_string())),
+                            ))],
+                        ));
+                        messages.push(Message::with_contents(
+                            Role::tool(),
+                            vec![Content::FunctionResult(FunctionResultContent::new(
+                                call_id,
+                                Some(Value::String(output.clone())),
+                            ))],
+                        ));
+                        items.next();
+                        continue;
+                    }
+                }
+            }
             let message = match item {
                 TurnItem::Objective(text) => Message::user(text.clone()),
                 TurnItem::Assistant(text) => Message::assistant(text.clone()),
-                // Rendered as an ASSISTANT turn — it's the model's own prior
-                // request, replayed back to it (FIX 1). Kept immediately before
-                // its `ToolResult` below so the asked→result pairing survives
-                // the replay, which is exactly what lets the model notice "I
-                // already asked for this" instead of re-issuing the same call.
-                TurnItem::ToolCall { tool, args } => {
-                    Message::assistant(format!("[calling {tool}: {}]", compact_args(args)))
-                }
+                // Calls that cannot be replayed as structured history remain
+                // descriptive user context, not assistant text to imitate.
+                TurnItem::ToolCall { tool, args } => Message::user(format!(
+                    "[prior tool request: {tool}]\n{}",
+                    compact_args(args)
+                )),
                 // NOT `Role::tool()`: an orphan tool message (no preceding
                 // assistant `tool_calls` with a matching id) is rejected with a
                 // 400 by strict OpenAI-wire servers. See the type-level docs.
@@ -8488,15 +8992,12 @@ impl FrameworkModelDriver {
     }
 }
 
-/// Bound on the rendered length of a replayed `[calling …]` tool-call marker's
-/// arguments (FIX 1, loop-fix Task 1): a huge argument blob (e.g. a full patch
-/// body) must not be dumped a second time into the transcript — the marker is
-/// a short pointer to what was asked, not a duplicate payload.
+/// Bound the argument preview for a legacy call without its retained result.
+/// Paired calls use complete JSON arguments in structured function messages.
 #[cfg(feature = "provider-openai")]
 const MAX_ARGS_PREVIEW_CHARS: usize = 200;
 
-/// Render tool-call arguments compactly and boundedly for the `[calling …]`
-/// transcript marker: the value collapses to single-line JSON, then anything
+/// Render orphan tool-call arguments compactly: collapse to single-line JSON, then anything
 /// longer than [`MAX_ARGS_PREVIEW_CHARS`] is truncated with an explicit
 /// ellipsis + original-length marker rather than shown whole.
 #[cfg(feature = "provider-openai")]
@@ -8593,15 +9094,33 @@ impl FrameworkModelDriver {
         let mut options = ChatOptions::new();
         // The loop already projected the exact definition set for this run
         // (FIX 1) — advertise it verbatim, MCP definitions included.
-        options.tools = tools.to_vec();
-        apply_context_window(&mut options, self.context_tokens);
+        options.tools = tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                let canonical = tool.name.clone();
+                tool.name = crate::tool_names::encode(&canonical);
+                if tool.name != canonical {
+                    tool.description = format!("{} [native tool: {canonical}]", tool.description);
+                }
+                tool
+            })
+            .collect();
+        if self.ollama_context_hint {
+            apply_context_window(&mut options, self.context_tokens);
+        }
+
+        let mut messages = Self::to_messages(
+            transcript,
+            self.instructions.as_deref(),
+            self.structured_tool_history,
+            tools,
+        );
+        crate::tool_names::encode_history(&mut messages);
 
         let mut stream = self
             .client
-            .get_streaming_response(
-                Self::to_messages(transcript, self.instructions.as_deref()),
-                options,
-            )
+            .get_streaming_response(messages, options)
             .await
             .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
 
@@ -8641,7 +9160,10 @@ impl FrameworkModelDriver {
         // for `Say`/`Finish`, whose text already rides the step), and
         // `extra_calls` carries every function call beyond the first.
         assembled.finalize();
-        Ok(chat_response_to_step(&assembled, self.price_per_1k_usd))
+        Ok(crate::tool_names::decode_step(
+            chat_response_to_step(&assembled, self.price_per_1k_usd),
+            tools,
+        ))
     }
 }
 
@@ -8658,9 +9180,8 @@ impl FrameworkModelDriver {
 ///
 /// If `additional_properties["options"]` already holds an object (e.g. other
 /// Ollama generation parameters set elsewhere), `num_ctx` is merged into it
-/// rather than overwriting the existing keys. This is a pure, dependency-free
-/// body-field tweak: an endpoint that ignores it is unaffected, so it never
-/// changes whether a request succeeds.
+/// rather than overwriting the existing keys. Callers restrict this hint to
+/// Ollama endpoints; strict hosted APIs reject its extra `options` property.
 #[cfg(feature = "provider-openai")]
 fn apply_context_window(
     options: &mut agent_framework_core::types::ChatOptions,
@@ -8911,9 +9432,7 @@ mod tests {
             10
         );
 
-        // ToolCall: must grow with both the tool name and the args, mirroring
-        // to_messages' "[calling {tool}: {args}]" framing — never just a
-        // constant regardless of payload size.
+        // ToolCall must grow with both the tool name and complete arguments.
         let small_call = TurnItem::ToolCall {
             tool: "shell.run".to_string(),
             args: json!({"cmd": "ls"}),
@@ -8924,8 +9443,7 @@ mod tests {
         };
         assert!(turn_item_text_len(&big_call) > turn_item_text_len(&small_call));
 
-        // ToolResult: must grow with the output, mirroring to_messages'
-        // "[tool result: {tool}]\n{output}" framing.
+        // ToolResult must grow with the complete output.
         let small_result = TurnItem::ToolResult {
             tool: "shell.run".to_string(),
             output: "ok".to_string(),
@@ -9288,7 +9806,7 @@ mod tests {
             },
             TurnItem::Steering("also check CI".to_string()),
         ];
-        let messages = FrameworkModelDriver::to_messages(&transcript, None);
+        let messages = FrameworkModelDriver::to_messages(&transcript, None, true, &[]);
         assert_eq!(messages.len(), 5, "system + four transcript items");
         assert!(
             messages.iter().all(|m| m.role != Role::tool()),
@@ -9302,11 +9820,8 @@ mod tests {
     #[cfg(feature = "provider-openai")]
     #[test]
     fn to_messages_pairs_a_tool_call_with_its_result() {
-        // FIX 1 (transcript fidelity, loop-fix Task 1): a `ToolCall` renders
-        // as its own ASSISTANT turn — the model's own prior request, replayed
-        // back to it — immediately followed by the matching `ToolResult`, so
-        // the asked->result pairing survives the replay.
-        use agent_framework_core::types::Role;
+        // Check the actual provider wire: prose call markers can be copied by
+        // the model as its final answer instead of invoking the next tool.
         let transcript = vec![
             TurnItem::Objective("read the config".to_string()),
             TurnItem::ToolCall {
@@ -9319,29 +9834,93 @@ mod tests {
                 artifact: None,
             },
         ];
-        let messages = FrameworkModelDriver::to_messages(&transcript, None);
+        let messages = FrameworkModelDriver::to_messages(&transcript, None, true, &[]);
         assert_eq!(messages.len(), 4, "system + three transcript items");
 
-        let call = &messages[2];
+        let wire = agent_framework_openai::convert::messages_to_openai(&messages);
+        assert_eq!(wire[2]["role"], "assistant");
+        assert_eq!(wire[2]["tool_calls"][0]["type"], "function");
         assert_eq!(
-            call.role,
-            Role::assistant(),
-            "the replayed call is the model's own prior turn, not a user turn"
+            wire[2]["tool_calls"][0]["function"]["name"],
+            "workspace.read_file"
         );
-        assert!(
-            call.text().contains("workspace.read_file"),
-            "the call marker must name the tool: {}",
-            call.text()
+        assert_eq!(
+            wire[2]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"config.toml"}"#
         );
-        assert!(
-            call.text().contains("config.toml"),
-            "the call marker must show the (compacted) args: {}",
-            call.text()
+        assert_eq!(wire[3]["role"], "tool");
+        assert_eq!(wire[3]["tool_call_id"], wire[2]["tool_calls"][0]["id"]);
+        assert_eq!(
+            wire[3]["content"],
+            "config.toml (lines 1-3 of 3)\n     1\t[x]\n"
         );
+        // Native Gemini needs signed provider parts that the durable
+        // transcript does not retain. Keep descriptive context for that wire.
+        let conservative = FrameworkModelDriver::to_messages(&transcript, None, false, &[]);
+        let conservative_wire = agent_framework_openai::convert::messages_to_openai(&conservative);
+        assert_eq!(conservative_wire[2]["role"], "user");
+        assert_eq!(conservative_wire[3]["role"], "user");
+        assert!(conservative_wire
+            .iter()
+            .all(|message| message.get("tool_calls").is_none()));
+    }
 
-        let result = &messages[3];
-        assert_eq!(result.role, Role::user());
-        assert!(result.text().contains("[tool result: workspace.read_file]"));
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_repeated_tool_calls_have_distinct_ids_and_complete_json() {
+        let args = json!({"patch": "long patch body\n".repeat(100)});
+        let transcript: Vec<_> = (0..2)
+            .flat_map(|i| {
+                [
+                    TurnItem::ToolCall {
+                        tool: "workspace.apply_patch".into(),
+                        args: args.clone(),
+                    },
+                    TurnItem::ToolResult {
+                        tool: "workspace.apply_patch".into(),
+                        output: format!("applied {i}"),
+                        artifact: None,
+                    },
+                ]
+            })
+            .collect();
+        let messages = FrameworkModelDriver::to_messages(&transcript, None, true, &[]);
+        let wire = agent_framework_openai::convert::messages_to_openai(&messages);
+        assert_ne!(
+            wire[1]["tool_calls"][0]["id"],
+            wire[3]["tool_calls"][0]["id"]
+        );
+        for index in [1, 3] {
+            let call = &wire[index]["tool_calls"][0];
+            assert_eq!(
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+                args
+            );
+            assert_eq!(wire[index + 1]["tool_call_id"], call["id"]);
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_unmatched_calls_remain_context_without_orphan_tool_messages() {
+        let transcript = vec![
+            TurnItem::ToolCall {
+                tool: "workspace.read_file".into(),
+                args: json!({"path": "a.rs"}),
+            },
+            TurnItem::ToolResult {
+                tool: "shell.run".into(),
+                output: "exit 0".into(),
+                artifact: None,
+            },
+        ];
+        let messages = FrameworkModelDriver::to_messages(&transcript, None, true, &[]);
+        let wire = agent_framework_openai::convert::messages_to_openai(&messages);
+        assert!(wire
+            .iter()
+            .all(|message| message["role"] != "tool" && message.get("tool_calls").is_none()));
+        assert!(messages[1].text().contains("prior tool request"));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -9556,6 +10135,31 @@ context_tokens = 1000000
             Some(1_000_000),
             "an overstated provider reading must not reach num_ctx or the context-usage denominator"
         );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn hosted_context_windows_do_not_enable_ollama_wire_options() {
+        use agent_framework_core::types::ChatOptions;
+        let id = ModelId("hosted-cerebras".to_string());
+        let models = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.cerebras.ai/v1".to_string(),
+            model: "gpt-oss-120b".to_string(),
+            api_key_env: String::new(),
+            provider_id: None,
+            context_tokens: Some(131_072),
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&models, id)
+            .await
+            .unwrap();
+        assert_eq!(driver.context_window(), Some(131_072));
+        let mut options = ChatOptions::new();
+        if driver.ollama_context_hint {
+            apply_context_window(&mut options, driver.context_tokens);
+        }
+        assert!(!options.additional_properties.contains_key("options"));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -9920,10 +10524,14 @@ context_tokens = 1000000
         }
         async fn read(
             &self,
-            _document_id: Option<&str>,
+            document_id: Option<&str>,
             _repository: &str,
         ) -> Result<String, DocsChannelError> {
-            Ok(String::new())
+            match document_id {
+                Some("missing") => Err(DocsChannelError::NotFound("missing".into())),
+                Some("desktop-prefix") => Ok("desktop.saved source evidence".into()),
+                _ => Ok(String::new()),
+            }
         }
         async fn edit(
             &self,
@@ -9953,8 +10561,8 @@ context_tokens = 1000000
     /// in `advertised_tool_definitions` dropped all four, and no real model could
     /// call a tool it was never shown. This is the `task.*` pattern
     /// (`the_task_tools_are_advertised_to_a_plain_chat_run`) applied to `docs.*`.
-    #[test]
-    fn the_docs_tools_are_advertised_when_a_document_channel_is_wired() {
+    #[tokio::test]
+    async fn the_docs_tools_are_advertised_when_a_document_channel_is_wired() {
         let (runtime, _events, session_id) = test_runtime();
         let repo = tempfile::tempdir().expect("tempdir");
 
@@ -9979,7 +10587,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         );
-        run.tools_advertised = wired.select_builtin_tools(&run);
+        run.tools_advertised = wired.select_builtin_tools(&run).await;
 
         let advertised: Vec<String> = wired
             .advertised_tool_definitions(&run)
@@ -9999,6 +10607,34 @@ context_tokens = 1000000
         }
     }
 
+    #[tokio::test]
+    async fn graph_traversal_tools_are_discoverable_even_for_an_unrelated_objective() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_code_graph(Arc::new(RecordingCodeGraph::default()));
+        let repo = tempfile::tempdir().unwrap();
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "Say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.tools_advertised = runtime.select_builtin_tools(&run).await;
+        let definitions = runtime.advertised_tool_definitions(&run);
+        for (name, _, _) in GRAPH_TRAVERSAL_TOOLS {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name == *name)
+                .unwrap_or_else(|| panic!("{name} must be discoverable without a graph dump"));
+            assert_eq!(definition.parameters["properties"]["limit"]["maximum"], 40);
+            assert_eq!(
+                definition.parameters["properties"]["offset"]["maximum"],
+                1000
+            );
+        }
+    }
+
     /// The same advertisement half, for the agent lever: `graph.assert_edge` must
     /// reach the model's tool array on an objective about how two parts of a
     /// repository are connected — not merely be dispatchable if the model
@@ -10009,8 +10645,8 @@ context_tokens = 1000000
     /// guard already covers) and would say nothing about the funnel, which is
     /// where `docs.*` was actually lost: it had a catalog entry from the day it
     /// shipped and was still never shown.
-    #[test]
-    fn the_edge_assertion_tool_is_advertised_when_the_write_seam_is_wired() {
+    #[tokio::test]
+    async fn the_edge_assertion_tool_is_advertised_when_the_write_seam_is_wired() {
         let (runtime, _events, session_id) = test_runtime();
         let repo = tempfile::tempdir().expect("tempdir");
         let objective = "work out which service the /charge route dispatches to and record \
@@ -10027,7 +10663,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         );
-        bare.tools_advertised = read_only.select_builtin_tools(&bare);
+        bare.tools_advertised = read_only.select_builtin_tools(&bare).await;
         assert!(
             !read_only
                 .offered_tool_names(&bare)
@@ -10053,7 +10689,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         );
-        run.tools_advertised = wired.select_builtin_tools(&run);
+        run.tools_advertised = wired.select_builtin_tools(&run).await;
         let advertised: Vec<String> = wired
             .advertised_tool_definitions(&run)
             .into_iter()
@@ -10163,6 +10799,7 @@ context_tokens = 1000000
                 .expect("stub lock")
                 .push(repository_root.to_path_buf());
             Ok(codypendent_knowledge::GraphAnswer {
+                traversal: None,
                 question: summarize_graph_question(&question),
                 targets: Vec::new(),
                 candidates: Vec::new(),
@@ -10256,6 +10893,14 @@ context_tokens = 1000000
                        "range_start": 0, "range_end": 1, "replacement": "y"}),
             ),
             (GraphCallersOf::NAME, json!({"symbol": "charge"})),
+            ("graph.find_symbols", json!({"query": "charge"})),
+            ("graph.definition", json!({"symbol": "charge"})),
+            ("graph.callees_of", json!({"symbol": "charge"})),
+            (
+                "graph.neighbors",
+                json!({"symbol": "charge", "direction": "both"}),
+            ),
+            ("graph.dependencies", json!({"symbol": "charge"})),
             (GraphTestsCovering::NAME, json!({"path": "src/charge.rs"})),
             (
                 GraphAssertEdge::NAME,
@@ -10320,8 +10965,8 @@ context_tokens = 1000000
 
         assert_eq!(
             scoped_by.len(),
-            8,
-            "every one of the eight calls reached its seam: {scoped_by:?}"
+            13,
+            "every repository-scoped call reached its seam: {scoped_by:?}"
         );
         let identity = checkout.path().display().to_string();
         let orphan = worktree.path().display().to_string();
@@ -10389,14 +11034,14 @@ context_tokens = 1000000
     /// Rubric 9's headline claim, as a unit: the advertisement a run gets now
     /// DEPENDS on what the run is doing. Before this, two unrelated objectives
     /// produced byte-identical tool arrays.
-    #[test]
-    fn retrieval_narrows_the_builtin_advertisement_per_objective() {
+    #[tokio::test]
+    async fn retrieval_narrows_the_builtin_advertisement_per_objective() {
         let (runtime, _events, session_id) = test_runtime();
         let runtime = runtime
             .with_docs(Arc::new(StubDocsChannel))
             .with_task_board(Arc::new(RecordingTaskBoard::default()));
         let repo = tempfile::tempdir().expect("tempdir");
-        let advertise = |objective: &str| -> Vec<String> {
+        let advertise = async |objective: &str| -> Vec<String> {
             let mut run = RunContext::new(
                 session_id,
                 RunId::new(),
@@ -10406,7 +11051,7 @@ context_tokens = 1000000
                 repo.path(),
             )
             .with_repository_identity("/repo");
-            run.tools_advertised = runtime.select_builtin_tools(&run);
+            run.tools_advertised = runtime.select_builtin_tools(&run).await;
             let mut names: Vec<String> = runtime
                 .advertised_tool_definitions(&run)
                 .into_iter()
@@ -10416,7 +11061,7 @@ context_tokens = 1000000
             names
         };
 
-        let offered_count = {
+        let offered = {
             let run = RunContext::new(
                 session_id,
                 RunId::new(),
@@ -10426,11 +11071,12 @@ context_tokens = 1000000
                 repo.path(),
             )
             .with_repository_identity("/repo");
-            runtime.offered_tool_names(&run).len()
+            runtime.offered_tool_names(&run)
         };
+        let offered_count = offered.len();
 
-        let docs = advertise("document the charge path and write it up as a knowledge doc");
-        let backlog = advertise("break this feature into kanban backlog cards for the board");
+        let docs = advertise("document the charge path and write it up as a knowledge doc").await;
+        let backlog = advertise("break this feature into kanban backlog cards for the board").await;
 
         assert_ne!(
             docs, backlog,
@@ -10453,26 +11099,21 @@ context_tokens = 1000000
         );
         // The floor holds in BOTH, whatever the ranking did.
         for names in [&docs, &backlog] {
-            for floor in ALWAYS_ADVERTISED_TOOLS {
-                // `skills.search`, `user.ask`, and `plan_*` need a wired registry/channel seam,
-                // which this runtime has not got, so they are not offered here and cannot be floored in.
-                if *floor == SkillsSearch::NAME
-                    || *floor == AskUser::NAME
-                    || *floor == PlanEnter::NAME
-                    || *floor == PlanExit::NAME
-                {
-                    continue;
-                }
+            assert!(names.iter().all(|name| offered.contains(name)));
+            for floor in ALWAYS_ADVERTISED_TOOLS
+                .iter()
+                .filter(|floor| offered.iter().any(|name| name.as_str() == **floor))
+            {
                 assert!(
-                    names.iter().any(|name| name == floor),
+                    names.iter().any(|name| name.as_str() == *floor),
                     "{floor} is in the floor and must always be advertised: {names:?}"
                 );
             }
         }
     }
 
-    #[test]
-    fn retrieval_budget_is_reserved_for_non_floor_tools() {
+    #[tokio::test]
+    async fn retrieval_budget_is_reserved_for_non_floor_tools() {
         let (runtime, _events, session_id) = test_runtime();
         let runtime = runtime
             .with_docs(Arc::new(StubDocsChannel))
@@ -10490,6 +11131,7 @@ context_tokens = 1000000
         .with_repository_identity("/repo");
         let selected = runtime
             .select_builtin_tools(&run)
+            .await
             .expect("the offered set is large enough to narrow");
         let discretionary = selected
             .iter()
@@ -10529,7 +11171,7 @@ context_tokens = 1000000
             repo.path(),
         )
         .with_repository_identity("/repo");
-        run.tools_advertised = runtime.select_builtin_tools(&run);
+        run.tools_advertised = runtime.select_builtin_tools(&run).await;
 
         let advertised: Vec<String> = runtime
             .advertised_tool_definitions(&run)
@@ -10578,15 +11220,15 @@ context_tokens = 1000000
     /// `builtin_top_k = 0` restores full injection exactly — the operator escape
     /// hatch, and the property that makes this change reversible in production
     /// without a rebuild.
-    #[test]
-    fn a_zero_builtin_budget_disables_the_gate() {
+    #[tokio::test]
+    async fn a_zero_builtin_budget_disables_the_gate() {
         let (runtime, _events, session_id) = test_runtime();
         let runtime = runtime
             .with_docs(Arc::new(StubDocsChannel))
             .with_builtin_top_k(0);
         let repo = tempfile::tempdir().expect("tempdir");
         let mut run = solo_run(session_id, repo.path());
-        run.tools_advertised = runtime.select_builtin_tools(&run);
+        run.tools_advertised = runtime.select_builtin_tools(&run).await;
         assert!(run.tools_advertised.is_none(), "the gate is disabled");
 
         let advertised: Vec<String> = runtime
@@ -10808,12 +11450,84 @@ context_tokens = 1000000
         })
     }
 
+    #[derive(Default)]
+    struct ToolSelectionEmbedder {
+        queries: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SemanticEmbedder for ToolSelectionEmbedder {
+        fn model(&self) -> &str {
+            "tool-selection"
+        }
+
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, codypendent_knowledge::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.starts_with("docs.create ") || text.starts_with("mcp.big.book_flight ")
+                    {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+
+        async fn embed_query(
+            &self,
+            _: &str,
+        ) -> Result<Vec<f32>, codypendent_knowledge::EmbedError> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_tool_selection_reaches_builtins_and_mcp_without_keyword_overlap() {
+        let (runtime, _events, session_id) = test_runtime();
+        let semantic = Arc::new(ToolSelectionEmbedder::default());
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_mcp(bridge_with(many_mcp_tools()))
+            .with_builtin_top_k(1)
+            .with_mcp_top_k(1)
+            .with_semantic_embedder(Some(semantic.clone()));
+        let repo = tempfile::tempdir().unwrap();
+        let mut run = solo_run(session_id, repo.path());
+        run.objective = "quux".to_string();
+        let (builtin, mcp) = tokio::join!(
+            runtime.select_builtin_tools(&run),
+            runtime.select_mcp_tools(&run),
+        );
+        assert!(builtin.unwrap().iter().any(|name| name == "docs.create"));
+        assert_eq!(mcp.unwrap(), vec!["mcp.big.book_flight"]);
+        assert_eq!(semantic.queries.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn projected_tool_identity_is_stable_across_runs() {
+        let names = vec!["workspace.read_file".to_string()];
+        assert_eq!(
+            builtin_registry_items(&names)[0].id,
+            builtin_registry_items(&names)[0].id,
+        );
+        assert_eq!(
+            mcp_registry_item(&fake_search_tool()).id,
+            mcp_registry_item(&fake_search_tool()).id,
+        );
+        assert_ne!(tool_registry_id("a"), tool_registry_id("b"));
+    }
+
     /// Rubric 9: past the threshold, a run is advertised only the top-k MCP
     /// tools relevant to its objective — the unrelated majority is dropped from
-    /// BOTH the offered set and the advertised definitions, while every core
-    /// built-in tool stays advertised in full.
-    #[test]
-    fn a_large_mcp_surface_is_narrowed_to_the_relevant_top_k() {
+    /// the advertised definitions, while discovery and dispatch retain access.
+    #[tokio::test]
+    async fn a_large_mcp_surface_is_narrowed_to_the_relevant_top_k() {
         let (runtime, _events, session_id) = test_runtime();
         let runtime = runtime
             .with_mcp(bridge_with(many_mcp_tools()))
@@ -10828,7 +11542,7 @@ context_tokens = 1000000
             repo.path(),
         );
 
-        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        run.mcp_advertised = runtime.select_mcp_tools(&run).await;
         let selected = run
             .mcp_advertised
             .clone()
@@ -10836,8 +11550,16 @@ context_tokens = 1000000
         assert_eq!(selected.len(), 8, "exactly top-k: {selected:?}");
 
         let names = runtime.offered_tool_names(&run);
-        let mcp: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp.")).collect();
-        assert_eq!(mcp.len(), 8, "only the selection is offered: {mcp:?}");
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        let mcp: Vec<&String> = advertised
+            .iter()
+            .filter(|n| n.starts_with("mcp."))
+            .collect();
+        assert_eq!(mcp.len(), 8, "only the selection is advertised: {mcp:?}");
         for relevant in [
             "mcp.big.run_tests",
             "mcp.big.test_report",
@@ -10845,46 +11567,45 @@ context_tokens = 1000000
             "mcp.big.coverage",
         ] {
             assert!(
-                names.iter().any(|n| n == relevant),
+                advertised.iter().any(|n| n == relevant),
                 "the test-related tools must survive the gate: {mcp:?}"
             );
         }
         assert!(
-            !names.iter().any(|n| n == "mcp.big.book_flight"
+            !advertised.iter().any(|n| n == "mcp.big.book_flight"
                 || n == "mcp.big.recipe"
                 || n == "mcp.big.plant_care"),
             "clearly irrelevant tools must be dropped: {mcp:?}"
         );
 
-        // CORE tools are never gated, and advertised ≡ offered still holds.
         assert!(
             names.iter().any(|n| n == Shell::NAME)
                 && names.iter().any(|n| n == ReadFile::NAME)
                 && names.iter().any(|n| n == MemoryRemember::NAME),
             "the core built-ins stay static and fully advertised: {names:?}"
         );
-        let mut advertised: Vec<String> = runtime
-            .advertised_tool_definitions(&run)
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
-        let mut offered = names.clone();
-        advertised.sort();
-        offered.sort();
-        assert_eq!(advertised, offered, "advertised ≡ offered under the gate");
+        assert!(advertised.iter().all(|name| names.contains(name)));
+        assert_eq!(
+            names.iter().filter(|name| name.starts_with("mcp.")).count(),
+            20
+        );
+        assert!(runtime
+            .prepare("mcp.big.book_flight", &json!({}), &run)
+            .await
+            .is_ok());
     }
 
     /// At or below the threshold nothing is gated: every offered MCP tool is
     /// advertised, exactly as before the gate existed.
-    #[test]
-    fn an_mcp_surface_at_or_below_the_threshold_is_advertised_in_full() {
+    #[tokio::test]
+    async fn an_mcp_surface_at_or_below_the_threshold_is_advertised_in_full() {
         let (runtime, _events, session_id) = test_runtime();
         let eight: Vec<McpToolInfo> = many_mcp_tools().into_iter().take(8).collect();
         let runtime = runtime.with_mcp(bridge_with(eight)).with_mcp_top_k(8);
         let repo = tempfile::tempdir().expect("tempdir");
         let mut run = solo_run(session_id, repo.path());
 
-        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        run.mcp_advertised = runtime.select_mcp_tools(&run).await;
         assert!(
             run.mcp_advertised.is_none(),
             "at the threshold the gate must not fire"
@@ -10900,8 +11621,8 @@ context_tokens = 1000000
     /// `mcp_top_k = 0` turns the gate off entirely: full injection returns even
     /// for a large surface — the escape hatch for an operator who wants the old
     /// behavior.
-    #[test]
-    fn a_zero_threshold_restores_full_mcp_injection() {
+    #[tokio::test]
+    async fn a_zero_threshold_restores_full_mcp_injection() {
         let (runtime, _events, session_id) = test_runtime();
         let runtime = runtime
             .with_mcp(bridge_with(many_mcp_tools()))
@@ -10916,7 +11637,7 @@ context_tokens = 1000000
             repo.path(),
         );
 
-        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        run.mcp_advertised = runtime.select_mcp_tools(&run).await;
         assert!(run.mcp_advertised.is_none(), "the gate is disabled");
         let mcp = runtime
             .offered_tool_names(&run)
@@ -11749,7 +12470,13 @@ context_tokens = 1000000
         };
         assert!(output.contains(&artifact.id.to_string()), "cites the id");
         assert!(output.contains("abcdef012345"), "cites the digest prefix");
-        assert!(output.contains("artifact.read"), "says how to reopen it");
+        assert!(
+            !output.contains("artifact.read"),
+            "an unwired reader is not promised"
+        );
+        assert!(output.contains("re-read relevant source"));
+        let wired = folded_result_stub("shell.run", "long output", Some(&artifact), true);
+        assert!(wired.contains("artifact.read using its cited ID"));
 
         // Idempotent: nothing left to fold, so a second pass folds nothing.
         assert_eq!(fold_oldest_tool_results(&mut transcript, &[], 1), 0);
@@ -11849,10 +12576,11 @@ context_tokens = 1000000
             "crossing the threshold must fold and report it, notes: {notes:?}"
         );
         assert!(
-            compactions[0].contains("artifact.read"),
-            "the note must say how to get the folded output back: {}",
+            compactions[0].contains("re-read relevant source"),
+            "the note must give a real available recovery path: {}",
             compactions[0]
         );
+        assert!(!compactions[0].contains("artifact.read"));
     }
 
     // -----------------------------------------------------------------------
@@ -12467,7 +13195,58 @@ context_tokens = 1000000
                     content: "1. read the failing job log\n2. reproduce locally".to_string(),
                 }),
                 open_note: None,
+                ..Default::default()
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_schema_opening_preserves_the_run_mode_boundary() {
+        struct DisclosedTool;
+
+        #[async_trait]
+        impl RegistrySearch for DisclosedTool {
+            async fn search(
+                &self,
+                request: RegistrySearchRequest<'_>,
+            ) -> Result<crate::tools::RegistrySearchOutcome, String> {
+                Ok(crate::tools::RegistrySearchOutcome {
+                    cards: vec![crate::tools::RegistryCard {
+                        name: request.open.unwrap().to_string(),
+                        kind: "tool".to_string(),
+                        summary: "Disclosed tool".to_string(),
+                        permissions: Vec::new(),
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let (runtime, _, session) = test_runtime();
+        let runtime = runtime.with_registry_search(Arc::new(DisclosedTool));
+        let directory = tempfile::tempdir().unwrap();
+        let run = RunContext::new(
+            session,
+            RunId::new(),
+            "Read source",
+            AgentMode::Ask,
+            directory.path(),
+            directory.path(),
+        );
+        for (name, opened) in [(ReadFile::NAME, true), (WriteFile::NAME, false)] {
+            let prepared = runtime
+                .prepare(
+                    SkillsSearch::NAME,
+                    &json!({"query":"source", "open":name}),
+                    &run,
+                )
+                .await
+                .unwrap();
+            let (observation, _, outcome) = runtime
+                .execute_prepared(prepared, &run, &Actor::System)
+                .await;
+            assert_eq!(outcome, ToolOutcome::Succeeded);
+            assert_eq!(observation.contains("(input schema)"), opened);
         }
     }
 
@@ -14783,10 +15562,271 @@ context_tokens = 1000000
     #[test]
     fn to_messages_includes_instructions() {
         let transcript = vec![TurnItem::Objective("test objective".to_string())];
-        let messages = FrameworkModelDriver::to_messages(&transcript, Some("Always write tests."));
+        let messages =
+            FrameworkModelDriver::to_messages(&transcript, Some("Always write tests."), true, &[]);
         assert_eq!(messages.len(), 2);
         assert!(messages[0].text().contains("# Workspace Instructions"));
         assert!(messages[0].text().contains("Always write tests."));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_explains_only_the_current_tool_families() {
+        let tools = static_tool_definitions()
+            .into_iter()
+            .filter(|tool| {
+                ["workspace.search", "skills.search", "graph.find_symbols"]
+                    .contains(&tool.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let messages = FrameworkModelDriver::to_messages(&[], None, true, &tools);
+        let system = messages[0].text();
+        assert!(system.contains("Codypendent feature guide"));
+        assert!(system.contains("exactly the same query and scope"));
+        assert!(system.contains("Never load the whole graph"));
+        assert!(system.contains("open with a returned skill name"));
+        assert!(!system.contains("desktop.defineTool"));
+        assert!(!system.contains("council.run"));
+    }
+
+    struct EmptyCouncilService;
+    #[async_trait]
+    impl codypendent_council::CouncilService for EmptyCouncilService {
+        async fn create(
+            &self,
+            _definition: codypendent_council::CouncilDefinition,
+        ) -> anyhow::Result<codypendent_council::CouncilDefinition> {
+            unreachable!("read-only test")
+        }
+        async fn run(
+            &self,
+            _name: &str,
+            _objective: String,
+            _repository: PathBuf,
+            _origin_session_id: Option<SessionId>,
+            _evidence: bool,
+        ) -> anyhow::Result<codypendent_council::CouncilRunOutcome> {
+            unreachable!("read-only test")
+        }
+        async fn result(
+            &self,
+            _selector: &str,
+        ) -> anyhow::Result<Option<codypendent_council::StoredCouncilResult>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn recorded_failures_keep_exit_status_and_stderr_ahead_of_long_commands() {
+        let observation = format!("$ {}\nexit 7 (20 ms)\n--- stdout: lines ---\n{}\n--- stderr: lines ---\npackage could not be found\n", "long command ".repeat(1000), "output ".repeat(1000));
+        let ToolOutcome::Failed { message } = reported_tool_outcome(
+            ToolOutcome::Failed {
+                message: "exited with status 7".into(),
+            },
+            &observation,
+        ) else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("exited with status 7"), "{message}");
+        assert!(message.contains("package could not be found"), "{message}");
+        assert!(!message.contains("long command"));
+        let observation = "--- stdout: empty ---\n--- stderr: lines ---\n{\"message\":\"request denied\",\"private_metadata\":\"do not show\"}";
+        let ToolOutcome::Failed { message } = reported_tool_outcome(
+            ToolOutcome::Failed {
+                message: "exited with status 7".into(),
+            },
+            observation,
+        ) else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("exited with status 7"));
+        assert!(message.contains("request denied"));
+        assert!(!message.contains("private_metadata"));
+        assert!(!message.contains('{'));
+    }
+
+    #[tokio::test]
+    async fn desktop_mcp_records_search_diagnostics_in_failed_events() {
+        let (runtime, mut events, session) = test_runtime();
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::write(repository.path().join("README.md"), "source evidence").unwrap();
+        let mut run = solo_run(session, repository.path());
+        run.mode = AgentMode::Ask;
+        let error = runtime
+            .call_desktop_tool(
+                &run,
+                &Actor::System,
+                "workspace.search",
+                json!({"pattern":"["}),
+                &CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("unclosed character class"), "{error}");
+        let mut recorded = None;
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Failed { message },
+                ..
+            } = event.body
+            {
+                if tool == "workspace.search" {
+                    recorded = Some(message);
+                }
+            }
+        }
+        let recorded = recorded.expect("the actual failed call is journalled");
+        assert!(recorded.contains("unclosed character class"), "{recorded}");
+        assert_ne!(recorded, "tool.error");
+    }
+
+    #[tokio::test]
+    async fn desktop_mcp_preserves_native_failure_status_without_guessing_from_prose() {
+        let (runtime, _events, session) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_councils(Arc::new(EmptyCouncilService));
+        let repository = tempfile::tempdir().unwrap();
+        let mut run = solo_run(session, repository.path()).with_repository_identity("/base");
+        run.mode = AgentMode::Ask;
+        let missing_doc = runtime
+            .call_desktop_tool(
+                &run,
+                &Actor::System,
+                "docs.read",
+                json!({"document_id":"missing"}),
+                &CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing_doc.contains("document error: no such document: missing"));
+        let missing_council = runtime
+            .call_desktop_tool(
+                &run,
+                &Actor::System,
+                "council.result",
+                json!({"selector":"missing"}),
+                &CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing_council.contains("no durable result matches"));
+        let success = runtime
+            .call_desktop_tool(
+                &run,
+                &Actor::System,
+                "docs.read",
+                json!({"document_id":"desktop-prefix"}),
+                &CancellationToken::never(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(success, "desktop.saved source evidence");
+    }
+
+    #[tokio::test]
+    async fn desktop_mcp_keeps_scoped_reads_and_skill_discovery_available_after_narrowing() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repository.path().join("README.md"),
+            "scoped source evidence",
+        )
+        .unwrap();
+        let desktop = DesktopTools::new(repository.path().join("desktop"));
+        let registry = Arc::new(StubRegistry {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (runtime, _events, session) = test_runtime();
+        let runtime = runtime
+            .with_desktop_tools(desktop.clone())
+            .with_registry_search(registry.clone());
+        let mut run =
+            solo_run(session, repository.path()).with_repository_identity("/base-repository");
+        run.mode = AgentMode::Ask;
+        run.tools_advertised = Some(Vec::new());
+        assert!(runtime.advertised_tool_definitions(&run).is_empty());
+        let server = crate::desktop_mcp::DesktopMcpServer::start(
+            runtime,
+            desktop,
+            run,
+            Actor::System,
+            CancellationToken::never(),
+        )
+        .unwrap();
+        assert!(server.instructions().contains("Read-only mode"));
+        assert!(server.instructions().contains("skills.search"));
+        assert!(!server.instructions().contains("desktop.defineTool"));
+        let stream = tokio::net::UnixStream::connect(server.socket())
+            .await
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        for (id, method, params) in [
+            (1, "tools/list", json!({})),
+            (
+                2,
+                "tools/call",
+                json!({"name":crate::tool_names::encode("skills.search"),"arguments":{"query":"fix CI","open":"rust.fix-ci"}}),
+            ),
+            (
+                3,
+                "tools/call",
+                json!({"name":crate::tool_names::encode("workspace.read_file"),"arguments":{"path":"README.md"}}),
+            ),
+            (
+                4,
+                "tools/call",
+                json!({"name":crate::tool_names::encode("workspace.read_file"),"arguments":{"path":"/outside/secret"}}),
+            ),
+        ] {
+            let mut request = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            )
+            .unwrap();
+            request.push(b'\n');
+            stream.get_mut().write_all(&request).await.unwrap();
+            let response: Value = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let response: Value = serde_json::from_str(&line).unwrap();
+                    if response["id"] == id {
+                        break response;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            match id {
+                1 => {
+                    let listed = response["result"]["tools"].as_array().unwrap();
+                    for name in ["workspace.search", "workspace.read_file", "skills.search"] {
+                        assert!(listed
+                            .iter()
+                            .any(|tool| tool["name"] == crate::tool_names::encode(name)));
+                    }
+                    assert!(!listed
+                        .iter()
+                        .any(|tool| tool["name"]
+                            == crate::tool_names::encode("workspace.write_file")));
+                }
+                2 => {
+                    assert_eq!(response["result"]["isError"], false, "{response}");
+                    assert!(response.to_string().contains("read the failing job log"));
+                }
+                3 => {
+                    assert_eq!(response["result"]["isError"], false, "{response}");
+                    assert!(response.to_string().contains("scoped source evidence"));
+                }
+                4 => assert_eq!(response["result"]["isError"], true, "{response}"),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            registry.seen.lock().unwrap()[0].2,
+            PathBuf::from("/base-repository")
+        );
     }
 
     #[test]
@@ -14904,5 +15944,258 @@ context_tokens = 1000000
 
         let latest = latest_plan_file(dir.path());
         assert_eq!(latest, Some(p2));
+    }
+
+    #[tokio::test]
+    async fn desktop_tools_are_advertised_dispatched_and_saved_as_durable_artifacts() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let desktop = DesktopTools::new(temporary.path().join("desktop"));
+        let (runtime, _events, session) = test_runtime();
+        desktop
+            .publish(session, json!({"view":"chat"}), Vec::new())
+            .expect("publish desktop");
+        let runtime = runtime
+            .with_desktop_tools(desktop.clone())
+            .with_builtin_top_k(1);
+        let run = solo_run(session, temporary.path());
+        assert!(runtime
+            .advertised_tool_definitions(&run)
+            .iter()
+            .any(|tool| tool.name == DESKTOP_RENDER));
+        let args = json!({"html":"<p>Workspace report</p>","css":"p { color: gold; }"});
+        let prepared = runtime
+            .prepare(DESKTOP_RENDER, &args, &run)
+            .await
+            .expect("prepare widget");
+        assert!(
+            matches!(&prepared.action, ProposedAction::McpToolCall { server, tool, .. } if server == "desktop" && tool == DESKTOP_RENDER)
+        );
+        let (observation, artifact, outcome) = runtime
+            .execute_prepared(prepared, &run, &Actor::System)
+            .await;
+        assert_eq!(outcome, ToolOutcome::Succeeded);
+        assert!(observation.contains("Interactive answer saved"));
+        assert_eq!(
+            artifact.expect("durable artifact").media_type,
+            "application/vnd.codypendent.desktop-tool+json"
+        );
+        desktop.define(session, &json!({"name":"desktop.custom.double","description":"Double a number","parameters":{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]},"functionBody":"return args.value * 2;","capabilities":[]})).expect("define tool");
+        assert!(runtime
+            .advertised_tool_definitions(&run)
+            .iter()
+            .any(|tool| tool.name == "desktop.custom.double"));
+        assert!(runtime
+            .prepare("desktop.custom.double", &json!({"value":"wrong"}), &run)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn desktop_execute_tool_reaches_the_generated_tools_native_policy_gate() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let desktop = DesktopTools::new(temporary.path().join("desktop"));
+        let (runtime, mut events, session) = test_runtime();
+        desktop
+            .publish(session, json!({"view":"chat"}), Vec::new())
+            .unwrap();
+        desktop.define(session, &json!({"name":"desktop.custom.readiness","description":"Return readiness","parameters":{"type":"object","properties":{},"additionalProperties":false},"functionBody":"return {ready:true};","capabilities":[]})).unwrap();
+        let runtime = runtime.with_desktop_tools(desktop);
+        let run = solo_run(session, temporary.path());
+        let error = runtime
+            .call_desktop_tool(
+                &run,
+                &Actor::System,
+                crate::desktop_tools::EXECUTE,
+                json!({"name":"desktop.custom.readiness","args":{}}),
+                &CancellationToken::never(),
+            )
+            .await
+            .expect_err("an explicit approval remains required");
+        assert!(error.contains("approval unexpected"));
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.body, EventBody::ToolStarted { .. }));
+            if let EventBody::ToolCompleted { tool, .. } = event.body {
+                assert_eq!(tool, "desktop.custom.readiness");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_mcp_exposes_bounded_graph_reads_without_a_renderer_lease() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let temporary = tempfile::tempdir().unwrap();
+        let desktop = DesktopTools::new(temporary.path().join("desktop"));
+        let (runtime, _events, session) = test_runtime();
+        let graph = Arc::new(RecordingCodeGraph::default());
+        let runtime = runtime
+            .with_desktop_tools(desktop.clone())
+            .with_code_graph(graph.clone());
+        let mut run =
+            solo_run(session, temporary.path()).with_repository_identity("/actual-checkout");
+        run.mode = AgentMode::Ask;
+        let server = crate::desktop_mcp::DesktopMcpServer::start(
+            runtime,
+            desktop,
+            run,
+            Actor::System,
+            CancellationToken::never(),
+        )
+        .unwrap();
+        let stream = tokio::net::UnixStream::connect(server.socket())
+            .await
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        for (id, method, params) in [
+            (1, "tools/list", json!({})),
+            (
+                2,
+                "tools/call",
+                json!({"name":crate::tool_names::encode("graph.find_symbols"),"arguments":{"query":"charge","limit":2}}),
+            ),
+            (
+                3,
+                "tools/call",
+                json!({"name":"shell.run","arguments":{"program":"sh"}}),
+            ),
+            (
+                4,
+                "tools/call",
+                json!({"name":"graph.assert_edge","arguments":{}}),
+            ),
+            (
+                5,
+                "tools/call",
+                json!({"name":"desktop.defineTool","arguments":{}}),
+            ),
+        ] {
+            let mut request = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            )
+            .unwrap();
+            request.push(b'\n');
+            stream.get_mut().write_all(&request).await.unwrap();
+            let response: Value = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let response: Value = serde_json::from_str(&line).unwrap();
+                    if response["id"] == id {
+                        break response;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            match id {
+                1 => {
+                    let tools = response["result"]["tools"].as_array().unwrap();
+                    for (name, _, _) in GRAPH_TRAVERSAL_TOOLS {
+                        assert!(tools
+                            .iter()
+                            .any(|tool| tool["name"] == crate::tool_names::encode(name)));
+                    }
+                    assert!(!tools.iter().any(|tool| tool["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("[native tool: shell.run]")));
+                    assert!(!tools.iter().any(|tool| tool["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("[native tool: graph.assert_edge]")));
+                }
+                2 => assert_eq!(response["result"]["isError"], false),
+                3..=5 => assert_eq!(response["result"]["isError"], true),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            *graph.seen.lock().unwrap(),
+            vec![PathBuf::from("/actual-checkout")]
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_mcp_lists_live_schemas_and_preserves_the_native_approval_gate() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let desktop = DesktopTools::new(temporary.path().join("desktop"));
+        let (runtime, mut events, session) = test_runtime();
+        desktop
+            .publish(session, json!({"view":"chat"}), Vec::new())
+            .expect("publish");
+        let runtime = runtime.with_desktop_tools(desktop.clone());
+        let run = solo_run(session, temporary.path());
+        let server = crate::desktop_mcp::DesktopMcpServer::start(
+            runtime,
+            desktop,
+            run,
+            Actor::System,
+            CancellationToken::never(),
+        )
+        .expect("MCP server");
+        let stream = tokio::net::UnixStream::connect(server.socket())
+            .await
+            .expect("connect MCP");
+        let mut stream = BufReader::new(stream);
+        for (id, method, params) in [
+            (1, "initialize", json!({})),
+            (2, "tools/list", json!({})),
+            (
+                3,
+                "tools/call",
+                json!({"name":"shell.run","arguments":{"program":"sh"}}),
+            ),
+            (
+                4,
+                "tools/call",
+                json!({"name":DESKTOP_RENDER,"arguments":{"html":"<p>Report</p>"}}),
+            ),
+        ] {
+            let mut request = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            )
+            .expect("request");
+            request.push(b'\n');
+            stream
+                .get_mut()
+                .write_all(&request)
+                .await
+                .expect("write MCP");
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.expect("read MCP");
+                    let response: Value = serde_json::from_str(&line).expect("JSON response");
+                    if response.get("id") == Some(&json!(id)) {
+                        break response;
+                    }
+                }
+            })
+            .await
+            .expect("MCP response");
+            match id {
+                1 => assert_eq!(
+                    response["result"]["serverInfo"]["name"],
+                    "codypendent-desktop"
+                ),
+                2 => assert!(response["result"]["tools"]
+                    .as_array()
+                    .expect("tools")
+                    .iter()
+                    .any(|tool| tool["name"] == DESKTOP_RENDER)),
+                3 => {
+                    assert_eq!(response["result"]["isError"], true);
+                    assert!(response.to_string().contains("tool_not_available"));
+                }
+                4 => {
+                    assert_eq!(response["result"]["isError"], true);
+                    assert!(response.to_string().contains("approval unexpected"));
+                }
+                _ => unreachable!(),
+            }
+        }
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.body, EventBody::ToolStarted { .. }));
+        }
     }
 }

@@ -39,8 +39,9 @@ import React, { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import type { DesktopView } from "./Navigation.js";
-import { describeError, shellAvailable, NO_SHELL } from "./localConfig";
+import { describeError, localConfigClient, shellAvailable, NO_SHELL } from "./localConfig";
 import { surfaceStyles, surfaceButton } from "./surfaceChrome.js";
+import { ModelDiscoveryPanel } from "./ModelDiscoveryPanel.js";
 
 /**
  * One first-run condition, exactly as `bridge::OnboardCheck` serializes it.
@@ -275,11 +276,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({
     <div style={surfaceStyles.page} data-testid="onboarding">
       <header style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Set up Codypendent</div>
+          <div style={surfaceStyles.title}>{allDone ? "Your workspace is ready" : "Your workspace is getting ready"}</div>
           <div style={surfaceStyles.subtitle}>
-            {status
-              ? `Read from ${status.models_path || "the local configuration files"} and the stored repository preference.`
-              : "Reads local configuration; no daemon connection is required."}
+            Codypendent uses the tools and sign-ins already on your computer.
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -301,6 +300,8 @@ export const Onboarding: React.FC<OnboardingProps> = ({
           )}
         </div>
       </header>
+
+      {shellAvailable() && <ModelDiscoveryPanel client={localConfigClient} onDiscovered={() => { void refresh(); }} />}
 
       <div style={surfaceStyles.scroll}>
         {load.kind === "loading" && (
@@ -351,8 +352,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
                 and a repository is selected. Runs are submitted from the composer in Sessions.
                 {connected === false && (
                   <div style={{ marginTop: 6, color: "var(--cody-warning-text)" }} data-testid="onboarding-daemon-down">
-                    codypendentd is not reachable right now, so runs cannot start until it is
-                    running. The banner in Sessions can start it for you.
+                    Your workspace is reconnecting automatically. Your saved models and chats will be ready when it returns.
                   </div>
                 )}
                 <div style={{ marginTop: 8 }}>
@@ -364,15 +364,13 @@ export const Onboarding: React.FC<OnboardingProps> = ({
             )}
 
             <p style={{ fontSize: 12, color: "var(--cody-text-muted)", lineHeight: 1.6, margin: "0 0 12px" }}>
-              These steps report what is CONFIGURED. Whether a configured model can actually start a
-              run is decided by the daemon when one is submitted — this shell writes the files, it
-              does not execute the model, so nothing here claims a model is verified.
+              Installed agents and local models are found automatically. You can also connect a provider or choose a repository below.
             </p>
 
             <Step
               index={1}
-              title="Configure a model"
-              summary="Choose a hosted API, a local endpoint such as Ollama or LM Studio, or an already-installed agent, then add one of its models. Providers lists what is available; Models writes the entry to models.toml."
+              title="Choose your model"
+              summary="Use an installed agent, a local model, or a provider you already have access to. Models found on this computer are added for you."
               check={status.model}
               actions={[
                 { label: "Browse providers", view: "providers" },
@@ -383,8 +381,8 @@ export const Onboarding: React.FC<OnboardingProps> = ({
 
             <Step
               index={2}
-              title="Provide a credential"
-              summary="A hosted provider needs an API key, stored in auth.json or supplied as the environment variable its entry names. A local endpoint needs none, and this step says so rather than asking for one."
+              title="Use your existing sign-in"
+              summary="Installed agents keep their own sign-in. Codypendent uses existing provider keys when available, and local models need no key."
               check={status.credential}
               actions={[{ label: "Manage API keys", view: "keys" }]}
               onOpen={onOpen}
@@ -393,7 +391,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
             <Step
               index={3}
               title="Choose a repository"
-              summary="The checkout every session, run and repository-scoped command is anchored to. Optional — a session can be created without one — but the task board and code graph have nothing to work on until it is set, and changing it needs a reconnect."
+              summary="Choose the project you want to work on. You can start a conversation first and add a repository later."
               check={status.repository}
               actions={[{ label: "Choose a repository", view: "repository" }]}
               onOpen={onOpen}

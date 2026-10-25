@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * Mode selection.
  *
@@ -82,12 +83,11 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
   };
 
   return (
-    <div style={PANEL} data-testid="mode-picker">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
+    <PageShell style={PANEL} data-testid="mode-picker">
+      <header className="cody-page-header" style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Mode</h2>
         <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
-          Applies to your next run. Modes are enforced by the daemon&rsquo;s policy engine, not by
-          the prompt.
+          Choose how much your agent can do. This applies to the next run.
         </p>
       </header>
 
@@ -140,7 +140,7 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
           {notice.text}
         </div>
       )}
-    </div>
+    </PageShell>
   );
 };
 

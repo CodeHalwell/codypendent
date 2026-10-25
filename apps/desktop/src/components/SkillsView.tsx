@@ -1,3 +1,4 @@
+import { EmptyState, PageShell } from "./PageShell.js";
 /**
  * Skill Studio — read only, exactly as the TUI's `Overlay::Skills` is.
  *
@@ -31,19 +32,19 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
         );
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Skill Studio</div>
+          <h1 style={surfaceStyles.title}>Skills</h1>
           <div style={surfaceStyles.subtitle}>
-            Registered skills and the capabilities they request — read only.
+            Reusable knowledge and tools available to your agents.
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <input
             value={query}
             aria-label="Filter skills"
-            placeholder="Filter…"
+            placeholder="Search skills…"
             onChange={(event) => setQuery(event.target.value)}
             style={{
               background: "var(--cody-canvas)",
@@ -62,17 +63,18 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
         </div>
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         <SurfaceBody
+          emptyTitle="Your agents’ skills"
+          onRetry={onRefresh}
           status={skills.status}
           detail={skills.detail}
           count={skills.items.length}
           emptyMessage="No skills are registered in this workspace."
         >
           {rows.length === 0 ? (
-            <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
-              No skill matches “{query.trim()}”. {skills.items.length} registered.
-            </div>
+            <EmptyState title="No matching skills" description={`No skill matches “${query.trim()}”. ${skills.items.length} registered.`}
+              action={<button style={surfaceButton()} onClick={() => setQuery("")}>Clear search</button>} />
           ) : (
             rows.map((skill) => (
               <div key={`${skill.scope}/${skill.name}`} style={surfaceStyles.card}>
@@ -118,6 +120,6 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
           )}
         </SurfaceBody>
       </div>
-    </div>
+    </PageShell>
   );
 };

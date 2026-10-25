@@ -33,6 +33,10 @@
 
 pub mod acp;
 pub mod acp_client;
+mod acp_google_home;
+mod acp_tool_failure;
+mod acp_tool_history;
+pub use acp_tool_failure::format_tool_failure;
 pub mod acp_registry;
 pub mod github;
 pub mod ide;

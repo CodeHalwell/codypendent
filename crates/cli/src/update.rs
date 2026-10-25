@@ -1,36 +1,20 @@
 //! `codypendent update` — self-update by installing the latest GitHub release
 //! over the running binary, then picking up the new build via the idle-guarded
 //! auto-restart. Mirrors `install.sh` (target detection → `gh release download`
-//! → tar → macOS quarantine clear → `install`), but in-process. The repo is
+//! → checksum verification → tar → `install`), but in-process. The repo is
 //! private, so downloads authenticate through `gh` exactly as the installer.
 //!
 //! The pure decision ([`decide_update`]) and target detection
 //! ([`detect_target`]) are unit-tested; the effectful driver shells out to the
 //! same tools `install.sh` is proven against.
 //!
-//! # KNOWN GAP: the downloaded binaries are not integrity-verified
-//!
-//! [`download_and_install`] extracts `codypendent-<target>.tar.gz` and installs
-//! the binaries inside it — with `sudo` when the destination is not writable —
-//! against no digest, signature or provenance attestation. The bundled Node
-//! runtime IS verified (`verify_bundled_runtime_root` checks the
-//! `.codypendent-runtime-seal.json` the release workflow writes), which makes
-//! the omission for the binaries themselves easy to miss.
-//!
-//! This is stated rather than fixed because THERE IS NOTHING TO VERIFY AGAINST.
-//! `.github/workflows/release.yml`'s `publish` job attaches exactly
-//! `dist/*.tar.gz`, `dist/*.AppImage` and `dist/*.vsix`; it publishes no
-//! `checksums.txt`, no per-asset `.sha256`, and runs no attestation step. A
-//! check added here could only hash the bytes just downloaded and compare them
-//! against themselves, which is assurance theatre — it would make the code look
-//! verified without any independent value to verify against.
-//!
-//! Closing it is a release-workflow change first: emit a checksum manifest (or
-//! `actions/attest-build-provenance`) at publish time, then verify it here (or
-//! with `gh attestation verify`) before anything is extracted or installed.
-//! Until then the trust boundary is `gh`'s authenticated TLS session to the
-//! private repository, and nothing narrower.
+//! Release assets are checked against the SHA256SUMS manifest downloaded from
+//! the same authenticated GitHub release before extraction or installation.
+//! This detects damaged or mismatched assets; release authenticity still rests
+//! on the repository and, for Apple distribution, Developer ID notarization.
 
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +22,7 @@ use anyhow::{bail, Context};
 use codypendent_daemon::remote_ui_plugins::verify_bundled_runtime_root;
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::BUILD_ID;
+use sha2::{Digest, Sha256};
 
 use crate::commands;
 
@@ -138,11 +123,8 @@ pub async fn run(paths: &RuntimePaths, check: bool, tag: Option<String>) -> anyh
 /// What `codypendent install` can put on this machine, alongside the CLI that
 /// `codypendent update` maintains.
 ///
-/// Both arms install a GitHub release asset through the SAME machinery
-/// `update` uses (`gh release download` → extract → macOS quarantine clear),
-/// because that path is the one that actually yields a usable artefact on an
-/// unsigned build: `gh` never sets `com.apple.quarantine`, a browser always
-/// does, and macOS 15 removed the right-click→Open bypass.
+/// Both arms verify the published checksum before installing a release asset.
+/// Apple signatures and quarantine attributes are preserved during installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallTarget {
     /// The Tauri desktop shell (`Codypendent.app` / the Linux AppImage).
@@ -168,9 +150,7 @@ pub enum InstallTarget {
 /// "looks installed, is not" failure this command exists to avoid.
 pub fn desktop_asset_name(target: &str) -> Option<String> {
     match target {
-        // A tar.gz of `Codypendent.app`, NOT a .dmg: the release is unsigned,
-        // and an unsigned .dmg is only installable through a path that does not
-        // set the quarantine bit — which a .dmg's own double-click flow is not.
+        // CLI installation uses the archive; the DMG provides the Finder flow.
         "aarch64-apple-darwin" => Some(format!("codypendent-desktop-{target}.tar.gz")),
         // Self-contained AppImage: it carries the GTK/WebKit stack the bare
         // binary would need preinstalled, and needs no root to install.
@@ -223,8 +203,8 @@ fn install_desktop(tag: &str) -> anyhow::Result<()> {
     }
 }
 
-/// macOS: unpack `Codypendent.app`, strip the quarantine attribute, and copy it
-/// into an Applications directory this user can actually write.
+/// Verify and stage the complete app before replacing the previous installation.
+/// Preserve quarantine: the installer must not bypass Gatekeeper decisions.
 fn install_macos_app(tmp_path: &Path, downloaded: &Path, asset: &str) -> anyhow::Result<()> {
     run_ok(
         "tar",
@@ -236,41 +216,139 @@ fn install_macos_app(tmp_path: &Path, downloaded: &Path, asset: &str) -> anyhow:
         ],
     )
     .context("extracting the desktop bundle")?;
-
     let app = tmp_path.join(APP_BUNDLE_NAME);
     if !app.is_dir() {
         bail!("desktop bundle {asset} did not contain {APP_BUNDLE_NAME}");
     }
-    // The build is NOT notarized. `gh` does not set com.apple.quarantine, but
-    // clear it unconditionally so the result launches even if something in the
-    // download path did.
-    let _ = Command::new("xattr")
-        .args(["-dr", "com.apple.quarantine"])
-        .arg(&app)
-        .status();
-
-    let dest_dir = applications_dir()?;
-    let dest = dest_dir.join(APP_BUNDLE_NAME);
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest)
-            .with_context(|| format!("replacing the existing {}", dest.display()))?;
+    let signed = verify_macos_app(&app)?;
+    let dest = applications_dir()?.join(APP_BUNDLE_NAME);
+    for executable in [
+        "codypendent-desktop",
+        "codypendent",
+        "codypendent-ui-worker-launcher",
+    ] {
+        let path = dest.join("Contents/MacOS").join(executable);
+        if path.exists() {
+            let open = Command::new("/usr/sbin/lsof")
+                .arg("-t")
+                .arg(&path)
+                .output()
+                .context("checking whether the installed app is running")?;
+            let installer_pid = std::process::id().to_string();
+            if String::from_utf8_lossy(&open.stdout)
+                .lines()
+                .any(|pid| pid.trim() != installer_pid)
+            {
+                bail!("{} is in use; quit Codypendent and stop its idle daemon before replacing the app", dest.display());
+            }
+        }
     }
-    run_ok(
-        "cp",
-        &["-R", &app.to_string_lossy(), &dest.to_string_lossy()],
-    )
-    .with_context(|| format!("installing {APP_BUNDLE_NAME} into {}", dest_dir.display()))?;
-
+    replace_app_bundle(
+        &app,
+        &dest,
+        &|source, staged| {
+            run_ok(
+                "ditto",
+                &[&source.to_string_lossy(), &staged.to_string_lossy()],
+            )
+        },
+        &|staged| verify_macos_app(staged).map(|_| ()),
+    )?;
     println!("codypendent: installed {}", dest.display());
-    println!(
-        "codypendent: NOTE — this build is not code-signed or notarized. It launches because \
-         `gh` never sets the macOS quarantine attribute and this command clears any that was \
-         set. The SAME bundle downloaded through a web browser is quarantined and Gatekeeper \
-         blocks it (macOS 15 removed the right-click → Open bypass), so `codypendent install \
-         desktop` is the supported install path. If you ever do end up with a quarantined copy: \
-         xattr -dr com.apple.quarantine '{}'",
-        dest.display()
-    );
+    if signed {
+        println!("codypendent: Developer ID signature and Gatekeeper assessment passed");
+    } else {
+        println!("codypendent: unsigned preview installed; use a signed, notarized release for normal macOS distribution");
+    }
+    Ok(())
+}
+
+fn verify_macos_app(app: &Path) -> anyhow::Result<bool> {
+    let identifier = capture(
+        "/usr/bin/plutil",
+        &[
+            "-extract",
+            "CFBundleIdentifier",
+            "raw",
+            "-o",
+            "-",
+            &app.join("Contents/Info.plist").to_string_lossy(),
+        ],
+    )?;
+    if identifier.trim() != "com.codypendent.desktop" {
+        bail!("downloaded app has an unexpected bundle identifier");
+    }
+    let bin = app.join("Contents/MacOS");
+    for name in [
+        "codypendent-desktop",
+        "codypendent",
+        "codypendent-ui-worker-launcher",
+        "node-runtime/bin/node",
+    ] {
+        if !bin.join(name).is_file() {
+            bail!("desktop bundle is incomplete: missing {name}");
+        }
+    }
+    verify_bundled_runtime_root(&bin.join("node-runtime"))
+        .context("validating the desktop's pinned Node runtime seal")?;
+    let detail = Command::new("codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(app)
+        .output()?;
+    let signed = String::from_utf8_lossy(&detail.stderr)
+        .lines()
+        .any(|line| line.starts_with("Authority=Developer ID Application:"));
+    if signed {
+        run_ok(
+            "codesign",
+            &["--verify", "--deep", "--strict", &app.to_string_lossy()],
+        )
+        .context("verifying the Developer ID signed desktop bundle")?;
+        run_ok(
+            "spctl",
+            &["--assess", "--type", "execute", &app.to_string_lossy()],
+        )
+        .context("Gatekeeper did not accept this desktop release")?;
+    }
+    Ok(signed)
+}
+
+fn replace_app_bundle(
+    source: &Path,
+    destination: &Path,
+    copy: &dyn Fn(&Path, &Path) -> anyhow::Result<()>,
+    verify: &dyn Fn(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = destination
+        .parent()
+        .context("app destination has no parent")?;
+    if std::fs::symlink_metadata(destination)
+        .is_ok_and(|meta| !meta.is_dir() || meta.file_type().is_symlink())
+    {
+        bail!(
+            "refusing to replace a non-directory app destination: {}",
+            destination.display()
+        );
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".codypendent-install-")
+        .tempdir_in(parent)?;
+    let staged = temporary.path().join(APP_BUNDLE_NAME);
+    copy(source, &staged).context("staging the replacement app")?;
+    verify(&staged).context("verifying the staged replacement app")?;
+    let backup = temporary.path().join("previous.app");
+    if destination.exists() {
+        std::fs::rename(destination, &backup).context("retaining the previous app for rollback")?;
+    }
+    if let Err(error) = std::fs::rename(&staged, destination) {
+        if backup.exists() {
+            if let Err(rollback) = std::fs::rename(&backup, destination) {
+                let recovery = temporary.keep();
+                bail!("app replacement failed: {error}; rollback failed: {rollback}; previous app retained at {}", recovery.join("previous.app").display());
+            }
+        }
+        return Err(error).context("activating the replacement app");
+    }
     Ok(())
 }
 
@@ -342,23 +420,60 @@ fn install_editor_extension(tag: &str, binary: &str, name: &str) -> anyhow::Resu
 
 const APP_BUNDLE_NAME: &str = "Codypendent.app";
 
+const CHECKSUM_ASSET: &str = "SHA256SUMS";
+
 fn download_asset(tag: &str, pattern: &str, into: &Path) -> anyhow::Result<()> {
-    run_ok(
-        "gh",
-        &[
-            "release",
-            "download",
-            tag,
-            "-R",
-            REPO,
-            "-p",
-            pattern,
-            "-D",
-            &into.to_string_lossy(),
-            "--clobber",
-        ],
-    )
-    .with_context(|| format!("downloading {pattern} from release {tag}"))
+    run_ok("gh", &["release", "download", tag, "-R", REPO, "-p", pattern,
+        "-p", CHECKSUM_ASSET, "-D", &into.to_string_lossy(), "--clobber"])
+        .with_context(|| format!("downloading {pattern} and its published checksum from release {tag}; older releases without SHA256SUMS cannot be installed by this updater"))?;
+    let manifest = std::fs::read_to_string(into.join(CHECKSUM_ASSET))
+        .context("release is missing SHA256SUMS")?;
+    for entry in std::fs::read_dir(into)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name != CHECKSUM_ASSET) {
+            verify_asset_checksum(&manifest, &path)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_asset_checksum(manifest: &str, asset: &Path) -> anyhow::Result<()> {
+    let mut checksums = HashMap::new();
+    for line in manifest.lines().filter(|line| !line.is_empty()) {
+        let (digest, name) = line
+            .split_once("  ")
+            .context("malformed release checksum manifest")?;
+        if digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || name.is_empty()
+            || name.contains(['/', '\\'])
+            || name.trim() != name
+            || checksums.insert(name, digest).is_some()
+        {
+            bail!("malformed or duplicate release checksum entry");
+        }
+    }
+    let name = asset
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid release asset name")?;
+    let expected = checksums
+        .get(name)
+        .with_context(|| format!("SHA256SUMS has no entry for {name}"))?;
+    let mut file = std::fs::File::open(asset)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 65536];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected) {
+        bail!("release asset checksum mismatch: {name}; nothing was installed");
+    }
+    Ok(())
 }
 
 /// Exactly one `.vsix` must have arrived; two would make "which one did we just
@@ -382,6 +497,15 @@ fn sole_vsix(dir: &Path) -> anyhow::Result<PathBuf> {
 /// per-user install is a real install, and is preferable to escalating to
 /// `sudo` for a GUI app.
 fn applications_dir() -> anyhow::Result<PathBuf> {
+    if let Some(directory) = std::env::var_os("CODYPENDENT_APPLICATIONS_DIR") {
+        let directory = PathBuf::from(directory);
+        if !directory.is_absolute() {
+            bail!("CODYPENDENT_APPLICATIONS_DIR must name an absolute directory");
+        }
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+        return Ok(directory);
+    }
     let system = PathBuf::from("/Applications");
     if system.is_dir() && is_dir_writable(&system) {
         return Ok(system);
@@ -463,13 +587,19 @@ fn release_commit(tag: &str) -> anyhow::Result<String> {
 /// The directory the running binary lives in — where the new one is installed.
 fn install_dir() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("resolving the running binary's path")?;
+    if exe
+        .parent()
+        .is_some_and(|bin| bin.ends_with("Contents/MacOS"))
+    {
+        bail!("this CLI belongs to Codypendent.app; replace the complete app with `codypendent install desktop` instead of updating a signed bundle's individual files");
+    }
     Ok(exe
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(".")))
 }
 
-/// Download the release tarball, extract it, clear the macOS quarantine, and
+/// Verify the release tarball, extract it, and
 /// install `codypendent`, its mandatory UI worker launcher, and optional `codypendentd` over
 /// `dest_dir` — `sudo install` only when `dest_dir` is not writable, exactly as
 /// `install.sh`.
@@ -478,22 +608,7 @@ fn download_and_install(tag: &str, target: &str, dest_dir: &Path) -> anyhow::Res
     let tmp_path = tmp.path();
     let asset = format!("codypendent-{target}.tar.gz");
 
-    run_ok(
-        "gh",
-        &[
-            "release",
-            "download",
-            tag,
-            "-R",
-            REPO,
-            "-p",
-            &asset,
-            "-D",
-            &tmp_path.to_string_lossy(),
-            "--clobber",
-        ],
-    )
-    .with_context(|| format!("downloading {asset} for {tag}"))?;
+    download_asset(tag, &asset, tmp_path)?;
 
     run_ok(
         "tar",
@@ -510,14 +625,6 @@ fn download_and_install(tag: &str, target: &str, dest_dir: &Path) -> anyhow::Res
     let bin = src.join("codypendent");
     if !bin.exists() {
         bail!("release tarball {asset} did not contain a codypendent binary");
-    }
-
-    // macOS: clear the Gatekeeper quarantine so the fresh binary runs.
-    if std::env::consts::OS == "macos" {
-        let _ = Command::new("xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(&src)
-            .status();
     }
 
     let mut bins = vec![bin];
@@ -723,19 +830,7 @@ fn remove_path_if_present(path: &Path, privileged: bool) -> anyhow::Result<()> {
 /// A best-effort writability probe for a directory (create + remove a probe
 /// file), so we only escalate to `sudo` when we truly cannot write.
 fn is_dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(".codypendent-update-write-probe");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&probe)
-    {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+    tempfile::NamedTempFile::new_in(dir).is_ok()
 }
 
 // --- small process helpers ------------------------------------------------
@@ -784,6 +879,47 @@ fn run_ok(program: &str, args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloaded_assets_require_matching_unique_published_checksums() {
+        let temp = tempfile::tempdir().unwrap();
+        let asset = temp.path().join("codypendent-test.tar.gz");
+        std::fs::write(&asset, b"verified release").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"verified release"));
+        let manifest = format!("{digest}  codypendent-test.tar.gz\n");
+        verify_asset_checksum(&manifest, &asset).unwrap();
+        assert!(verify_asset_checksum(&format!("{manifest}{manifest}"), &asset).is_err());
+        assert!(
+            verify_asset_checksum(&format!("{digest}  ../codypendent-test.tar.gz\n"), &asset)
+                .is_err()
+        );
+        assert!(verify_asset_checksum("", &asset).is_err());
+        std::fs::write(&asset, b"damaged release").unwrap();
+        assert!(verify_asset_checksum(&manifest, &asset)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn failed_app_staging_keeps_the_installed_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("new.app");
+        let destination = temp.path().join("Codypendent.app");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("new"), b"new app").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("old"), b"old app").unwrap();
+        let rejected = replace_app_bundle(&source, &destination, &copy_tree_local, &|_| {
+            bail!("invalid replacement")
+        });
+        assert!(rejected.is_err());
+        assert_eq!(std::fs::read(destination.join("old")).unwrap(), b"old app");
+        assert!(!destination.join("new").exists());
+        replace_app_bundle(&source, &destination, &copy_tree_local, &|_| Ok(())).unwrap();
+        assert!(!destination.join("old").exists());
+        assert_eq!(std::fs::read(destination.join("new")).unwrap(), b"new app");
+    }
 
     #[test]
     fn decide_update_matches_by_embedded_git_sha() {

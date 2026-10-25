@@ -7,8 +7,8 @@
  * webview. The tests below check both halves — that Markdown becomes structure,
  * and that markup in the text stays text.
  */
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import { renderMarkdown } from "../src/markdown.js";
 
@@ -62,11 +62,12 @@ describe("markdown rendering", () => {
     expect(root.querySelector("b")).toBeNull();
   });
 
-  it("leaves a link as text plus its target rather than a clickable anchor", () => {
+  it("keeps external destinations visible and copyable", () => {
     draw("see [the docs](https://example.com/x)");
     const root = screen.getByTestId("md");
     expect(root.querySelector("a")).toBeNull();
-    expect(root.textContent).toContain("the docs (https://example.com/x)");
+    expect(root.textContent).toBe("see the docs (https://example.com/x)");
+    expect(screen.getByTitle("https://example.com/x")).toBeTruthy();
   });
 
   it("leaves unsupported syntax as the plain text it already was", () => {
@@ -136,5 +137,65 @@ describe("fences and tables", () => {
     render(<div>{renderMarkdown("| just some text |")}</div>);
     expect(screen.getByText("| just some text |")).toBeTruthy();
     expect(document.querySelector("table")).toBeNull();
+  });
+});
+
+describe("source references", () => {
+  it("opens angle-wrapped absolute paths with spaces through the source callback", async () => {
+    const open = vi.fn().mockResolvedValue(undefined);
+    const target = "/Users/daniel/My Project/codypendent-worktrees/triage/run-123/prompts/system_prompt.py:42";
+    render(<div>{renderMarkdown(`See [triage prompt](<${target}>) and [agent](freshservice_triage_agent/agent.py:68).`, { onOpenSource: open })}</div>);
+    const prompt = screen.getByRole("button", { name: "Open triage prompt at line 42" });
+    expect(prompt.getAttribute("title")).toBe(`<${target}>`);
+    expect(document.body.textContent).not.toContain("/Users/daniel");
+    fireEvent.click(prompt);
+    await waitFor(() => expect(open).toHaveBeenCalledWith(target.slice(0, -3), 42));
+    fireEvent.click(screen.getByRole("button", { name: "Open agent at line 68" }));
+    await waitFor(() => expect(open).toHaveBeenCalledWith("freshservice_triage_agent/agent.py", 68));
+  });
+
+  it("shortens path labels and supports bare filenames and encoded spaces", async () => {
+    const open = vi.fn().mockResolvedValue(undefined);
+    render(<div>{renderMarkdown("[docs/Project Notes.md:12](docs/Project%20Notes.md:12) and [README](README.md:91)", { onOpenSource: open })}</div>);
+    expect(screen.getByRole("button", { name: "Open Project Notes.md:12" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open Project Notes.md:12" }));
+    await waitFor(() => expect(open).toHaveBeenCalledWith("docs/Project Notes.md", 12));
+    fireEvent.click(screen.getByRole("button", { name: "Open README at line 91" }));
+    await waitFor(() => expect(open).toHaveBeenCalledWith("README.md", 91));
+  });
+
+  it("preserves code literals and never turns unsafe destinations into navigation", () => {
+    const open = vi.fn();
+    render(<div>{renderMarkdown("`[source](src/main.py:2)`\n\n[script](javascript:alert) [encoded](javascript%3Aalert) [file](file:///etc/passwd) [data](data:text/plain,bad) [up](../secret.txt) [host](//example.com/a.py)", { onOpenSource: open })}</div>);
+    expect(document.querySelector("code")?.textContent).toBe("[source](src/main.py:2)");
+    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    expect(document.querySelector("a")).toBeNull();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("does not attach a late open failure to a replacement source reference", async () => {
+    let reject: (reason: Error) => void = () => undefined;
+    const open = vi.fn().mockImplementation(() => new Promise<void>((_, fail) => { reject = fail; }));
+    const view = render(<div>{renderMarkdown("[source](src/old.py:2)", { onOpenSource: open })}</div>);
+    fireEvent.click(screen.getByRole("button", { name: "Open source at line 2" }));
+    view.rerender(<div>{renderMarkdown("[source](src/new.py:4)", { onOpenSource: open })}</div>);
+    await act(async () => reject(new Error("Old source unavailable")));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open source at line 4" })).toBeTruthy());
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows rejected native source openings rather than dropping the failure", async () => {
+    const open = vi.fn().mockRejectedValue(new Error("File is outside this checkout"));
+    render(<div>{renderMarkdown("[source](/Users/elsewhere/src/main.py:2)", { onOpenSource: open })}</div>);
+    fireEvent.click(screen.getByRole("button", { name: "Open source at line 2" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("File is outside this checkout"));
+  });
+
+  it("explains when an earlier run's files are no longer available", async () => {
+    const open = vi.fn().mockRejectedValue(new Error("The run's worktree is no longer available: No such file or directory (os error 2)"));
+    render(<div>{renderMarkdown("[agent](src/agent.py:68)", { onOpenSource: open })}</div>);
+    fireEvent.click(screen.getByRole("button", { name: "Open agent at line 68" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("The files from this earlier run are no longer available."));
+    expect(screen.getByRole("alert").textContent).not.toContain("os error");
   });
 });

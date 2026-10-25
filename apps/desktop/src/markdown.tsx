@@ -1,4 +1,6 @@
 import React from "react";
+import { MarkdownLink, type MarkdownOptions } from "./markdownLinks.js";
+export type { MarkdownOptions } from "./markdownLinks.js";
 
 /**
  * The little of Markdown that model output actually uses, rendered to React
@@ -13,8 +15,8 @@ import React from "react";
  * Supported, because it is what the models emit: ATX headings, fenced code
  * blocks (with a language strip and a Copy button), pipe tables, unordered
  * and ordered lists, blockquotes, horizontal rules, and inline `code`,
- * `**bold**`, `*italic*` and `[text](href)` — links render as their text
- * plus the href, never as a navigable anchor.
+ * `**bold**`, `*italic*` and `[text](href)`. Source references use the
+ * validated editor callback; web links retain a visible, copyable destination.
  *
  * Anything unrecognised is left exactly as written, which is the important
  * property: unsupported syntax degrades to the plain text it already was
@@ -152,12 +154,11 @@ const QUOTE: React.CSSProperties = {
 const LIST: React.CSSProperties = { margin: "6px 0", paddingLeft: 22 };
 const PARAGRAPH: React.CSSProperties = { margin: "6px 0", whiteSpace: "pre-wrap" };
 const RULE: React.CSSProperties = { border: 0, borderTop: "1px solid var(--cody-border-strong)", margin: "12px 0" };
-const LINK: React.CSSProperties = { color: "var(--cody-link)" };
 
 /** `**bold**`, `*italic*`, `` `code` `` and `[text](href)`, in one pass. */
-const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)\s]+\))/g;
+const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\((?:<[^>\n]+>|[^)\n]+)\))/g;
 
-function inline(text: string, key: string): React.ReactNode[] {
+function inline(text: string, key: string, options: MarkdownOptions): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let last = 0;
   let index = 0;
@@ -177,18 +178,13 @@ function inline(text: string, key: string): React.ReactNode[] {
     } else if (token.startsWith("**")) {
       // Recursed, so `**`code`**` renders as bold code rather than bold
       // backticks. The slice is strictly shorter, so this terminates.
-      out.push(<strong key={id}>{inline(token.slice(2, -2), id)}</strong>);
+      out.push(<strong key={id}>{inline(token.slice(2, -2), id, options)}</strong>);
     } else if (token.startsWith("[")) {
-      // Rendered as text plus its target, never as a navigable anchor: a click
-      // target the model chose is not one the operator asked for.
       const split = token.indexOf("](");
-      out.push(
-        <span key={id} style={LINK}>
-          {token.slice(1, split)} ({token.slice(split + 2, -1)})
-        </span>,
-      );
+      const destination = token.slice(split + 2, -1);
+      out.push(<MarkdownLink key={`${id}:${destination}`} label={token.slice(1, split)} destination={destination} {...options} />);
     } else {
-      out.push(<em key={id}>{inline(token.slice(1, -1), id)}</em>);
+      out.push(<em key={id}>{inline(token.slice(1, -1), id, options)}</em>);
     }
     last = at + token.length;
   }
@@ -199,7 +195,7 @@ function inline(text: string, key: string): React.ReactNode[] {
 }
 
 /** Render `text` as Markdown. Returns React elements; never HTML. */
-export function renderMarkdown(text: string): React.ReactNode {
+export function renderMarkdown(text: string, options: MarkdownOptions = {}): React.ReactNode {
   const lines = text.split("\n");
   const blocks: React.ReactNode[] = [];
   let paragraph: string[] = [];
@@ -210,7 +206,7 @@ export function renderMarkdown(text: string): React.ReactNode {
       const body = paragraph.join("\n");
       blocks.push(
         <div key={`p${key++}`} style={PARAGRAPH}>
-          {inline(body, `p${key}`)}
+          {inline(body, `p${key}`, options)}
         </div>,
       );
       paragraph = [];
@@ -258,7 +254,7 @@ export function renderMarkdown(text: string): React.ReactNode {
             <tr>
               {header.map((cell, at) => (
                 <th key={`th${at}`} style={{ ...TABLE_CELL, fontWeight: 600 }}>
-                  {inline(cell, `t${key}-h${at}`)}
+                  {inline(cell, `t${key}-h${at}`, options)}
                 </th>
               ))}
             </tr>
@@ -268,7 +264,7 @@ export function renderMarkdown(text: string): React.ReactNode {
               <tr key={`tr${rowAt}`}>
                 {cells.map((cell, at) => (
                   <td key={`td${at}`} style={TABLE_CELL}>
-                    {inline(cell, `t${key}-${rowAt}-${at}`)}
+                    {inline(cell, `t${key}-${rowAt}-${at}`, options)}
                   </td>
                 ))}
               </tr>
@@ -285,7 +281,7 @@ export function renderMarkdown(text: string): React.ReactNode {
       const level = heading[1].length;
       blocks.push(
         <div key={`h${key++}`} style={H_STYLES[level]}>
-          {inline(heading[2], `h${key}`)}
+          {inline(heading[2], `h${key}`, options)}
         </div>,
       );
       continue;
@@ -307,7 +303,7 @@ export function renderMarkdown(text: string): React.ReactNode {
       i -= 1;
       blocks.push(
         <div key={`q${key++}`} style={QUOTE}>
-          {inline(body.join("\n"), `q${key}`)}
+          {inline(body.join("\n"), `q${key}`, options)}
         </div>,
       );
       continue;
@@ -323,7 +319,7 @@ export function renderMarkdown(text: string): React.ReactNode {
       }
       i -= 1;
       const children = items.map((item, at) => (
-        <li key={`li${at}`}>{inline(item, `l${key}-${at}`)}</li>
+        <li key={`li${at}`}>{inline(item, `l${key}-${at}`, options)}</li>
       ));
       blocks.push(
         ordered ? (

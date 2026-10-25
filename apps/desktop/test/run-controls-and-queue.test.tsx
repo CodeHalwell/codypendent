@@ -12,10 +12,11 @@
  *   - the queue drawn is the daemon's `PendingPromptsChanged` snapshot, and a
  *     REFUSED mutation renders as a refusal rather than as an empty queue.
  */
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { App } from "../src/App.js";
+import { useDaemon } from "../src/useDaemon.js";
 import type {
   ConnectionInfo,
   DaemonFrame,
@@ -43,6 +44,7 @@ class QueueStub implements DesktopTransport {
   readonly updated: Array<{ promptId: string; text?: string | null }> = [];
   /** Set to make the next queue mutation fail the way a daemon refusal does. */
   queueFailure: string | null = null;
+  queueGate: Promise<void> | null = null;
   private frames: ((frame: DaemonFrame) => void) | null = null;
 
   socketPath(): Promise<string> {
@@ -123,7 +125,7 @@ class QueueStub implements DesktopTransport {
       return Promise.reject(new Error(this.queueFailure));
     }
     this.updated.push({ promptId, text });
-    return Promise.resolve();
+    return this.queueGate ?? Promise.resolve();
   }
 
   promoteQueuedPrompt(promptId: string): Promise<void> {
@@ -377,6 +379,7 @@ describe("the pending-prompt queue", () => {
     expect(alert.getAttribute("role")).toBe("alert");
     expect(alert.textContent).toContain("The queue command failed.");
     expect(alert.textContent).toContain("prompt-queue.empty");
+    expect((box as HTMLTextAreaElement).value).toBe("something the daemon will refuse");
     // The empty-queue wording is a different, non-alarming element. A refusal
     // must never be shown as "nothing is queued" alone.
     expect(screen.getByTestId("prompt-queue-empty")).toBeTruthy();
@@ -412,5 +415,43 @@ describe("the pending-prompt queue", () => {
     expect(transport.updated).toEqual([
       { promptId: "prompt-1", text: "then add TWO regression tests" },
     ]);
+  });
+});
+
+// These use the real controller so a retired request cannot reach the global
+// queue/error banners even when its row's own feedback has already retired.
+describe("queue transport generations", () => {
+  it("ignores a late refusal after switching away and back to the same session", async () => {
+    let refuse!: (error: Error) => void;
+    const transport = new QueueStub();
+    const { result } = renderHook(() => useDaemon(() => transport));
+    await act(async () => undefined);
+    await transport.push(event(1, { type: "PendingPromptsChanged", prompts: [] }));
+    transport.queueGate = new Promise<void>((_, reject) => { refuse = reject; });
+    let changing!: Promise<boolean>;
+    act(() => { changing = result.current.updateQueuedPrompt("prompt-1", "old"); });
+    await act(async () => { await result.current.selectSession("session-2"); });
+    await act(async () => { await result.current.selectSession("session-1"); });
+    await act(async () => { refuse(new Error("retired queue refusal")); expect(await changing).toBe(false); });
+    expect(result.current.state.promptQueueError).toBeNull();
+    expect(result.current.state.error).toBeNull();
+  });
+
+  it("does not let old acceptance clear a new refusal after reconnecting the same transport", async () => {
+    let finish!: () => void;
+    const transport = new QueueStub();
+    const { result } = renderHook(() => useDaemon(() => transport));
+    await act(async () => undefined);
+    await transport.push(event(1, { type: "PendingPromptsChanged", prompts: [] }));
+    transport.queueGate = new Promise<void>((resolve) => { finish = resolve; });
+    let changing!: Promise<boolean>;
+    act(() => { changing = result.current.updateQueuedPrompt("prompt-1", "old"); });
+    await act(async () => { void result.current.reconnect(); });
+    expect(result.current.state.status).toBe("connected");
+    transport.queueFailure = "new connection refused removal";
+    await act(async () => { expect(await result.current.deleteQueuedPrompt("prompt-2")).toBe(false); });
+    await act(async () => { finish(); expect(await changing).toBe(false); });
+    expect(result.current.state.promptQueueError).toContain("new connection refused removal");
+    expect(result.current.state.error).toContain("new connection refused removal");
   });
 });

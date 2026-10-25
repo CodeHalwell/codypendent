@@ -69,11 +69,19 @@ macro_rules! run_journal {
             move |session: SessionId, actor: Actor, body: EventBody| {
                 let pool = persist_pool.clone();
                 async move {
-                    // A RunStateChanged updates the run projection in step with
-                    // its ledger append (STEP 1.10 rule 1).
+                    // Use the daemon's atomic transition guard: a permissive
+                    // projection write can hide duplicate or stale transitions.
                     match &body {
                         EventBody::RunStateChanged { run_id, state } => {
-                            projections::set_run_state(&pool, *run_id, *state).await?;
+                            return ledger::append_run_state_changed(
+                                &pool,
+                                session,
+                                &actor,
+                                *run_id,
+                                *state,
+                                Utc::now(),
+                            )
+                            .await;
                         }
                         body @ EventBody::RunUsage { .. } => {
                             return ledger::append_run_usage(
@@ -1076,6 +1084,117 @@ async fn cancellation_while_parked_on_approval_reaches_cancelled() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn approving_a_paused_run_waits_for_resume_or_cancellation() {
+    for resume in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        repo_with_committed_file(&repo, "a.txt", "hello\n").await;
+        let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let broker = ApprovalBroker::new();
+        let hub = SubscriptionHub::new();
+        let session = SessionId::new();
+        let run = RunId::new();
+        ledger::create_session(&pool, session, "paused approval")
+            .await
+            .unwrap();
+        projections::insert_run(
+            &pool,
+            run,
+            session,
+            "inspect",
+            AgentMode::Build,
+            "hosted",
+            "{}",
+        )
+        .await
+        .unwrap();
+        let runtime = build_runtime!(pool, store, broker, hub);
+        let mut rx = hub.subscribe(session);
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: "shell.run".to_string(),
+                args: json!({"program": "git", "args": ["--version"]}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        let ctx = RunContext::new(session, run, "inspect", AgentMode::Build, &repo, &repo);
+        let (handle, token) = cancellation();
+        let task = tokio::spawn(async move { runtime.execute_run(&driver, ctx, token).await });
+        let approval_id = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("approval proposal arrives")
+                .unwrap();
+            if let EventBody::ToolProposed { approval_id, .. } = event.body {
+                break approval_id;
+            }
+        };
+        // Mirror PauseRun's durable state and runtime control before resolving.
+        projections::set_run_state(&pool, run, RunState::Paused)
+            .await
+            .unwrap();
+        handle.pause();
+        broker
+            .resolve(
+                &pool,
+                approval_id,
+                ApprovalDecision::Approve,
+                ApprovalScope::Once,
+                "tester".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "approval must neither publish Running nor start a tool while paused"
+        );
+        assert_eq!(
+            projections::load_run_state(&pool, run).await.unwrap(),
+            Some(RunState::Paused)
+        );
+        assert!(!task.is_finished());
+        if resume {
+            // ResumeRun persists Running before waking the runtime. Its
+            // approval continuation must not emit another Running transition.
+            projections::set_run_state(&pool, run, RunState::Running)
+                .await
+                .unwrap();
+            handle.resume();
+        } else {
+            handle.cancel();
+        }
+        let disposition = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("run settles after explicit control")
+            .unwrap()
+            .unwrap()
+            .disposition;
+        assert_eq!(
+            matches!(disposition, RunDisposition::Completed { .. }),
+            resume
+        );
+        assert_eq!(
+            matches!(disposition, RunDisposition::Cancelled { .. }),
+            !resume
+        );
+        let events = ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::ToolStarted { .. }))
+                .count(),
+            usize::from(resume),
+            "an approved command executes exactly once after resume, or never after cancel"
+        );
+    }
 }
 
 // --- Phase 3 STEP 3.2: GitHub tools in the agent loop ----------------------
@@ -2628,4 +2747,125 @@ async fn mcp_call_the_bridge_does_not_offer_is_an_unknown_tool() {
         })
         .expect("the call completed as a refusal");
     assert_eq!(failure, "unknown tool `mcp.fake.nonexistent`");
+}
+
+/// Coverage survives persistence and failures without discarding the measured
+/// subtotal used by budgets. Each dimension is independently measured.
+#[tokio::test]
+async fn usage_coverage_preserves_partial_zero_retry_and_failed_requests() {
+    use codypendent_runtime::agent::ToolDefinition;
+    use codypendent_runtime::agent::{DeltaSink, ModelDriver, RetryNotice, TurnItem};
+    struct Mixed {
+        calls: Mutex<usize>,
+        fail: bool,
+    }
+    #[async_trait]
+    impl ModelDriver for Mixed {
+        fn model_id(&self) -> codypendent_protocol::ModelId {
+            codypendent_protocol::ModelId("mixed".into())
+        }
+        async fn next_step(
+            &self,
+            _: &[TurnItem],
+            _: &[ToolDefinition],
+            sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls == 1
+            };
+            if !first && self.fail {
+                anyhow::bail!("provider disconnected");
+            }
+            if first {
+                sink.on_retry(&RetryNotice {
+                    attempt: 2,
+                    max_attempts: 3,
+                    message: "temporary failure".into(),
+                    delay_ms: 0,
+                });
+            }
+            Ok(StepOutcome {
+                step: if first {
+                    ModelStep::Say("working".into())
+                } else {
+                    ModelStep::Finish {
+                        summary: "done".into(),
+                    }
+                },
+                usage: Some(if first {
+                    ModelUsage {
+                        prompt_tokens: Some(0),
+                        completion_tokens: Some(5),
+                        cost_micros: None,
+                    }
+                } else {
+                    ModelUsage {
+                        prompt_tokens: None,
+                        completion_tokens: Some(7),
+                        cost_micros: Some(11),
+                    }
+                }),
+                preface: None,
+                extra_calls: vec![],
+            })
+        }
+    }
+    for fail in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let pool = open_database(&dir.path().join("usage.sqlite"))
+            .await
+            .unwrap();
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let broker = ApprovalBroker::new();
+        let hub = SubscriptionHub::new();
+        let runtime = build_runtime!(pool, store, broker, hub);
+        let session = SessionId::new();
+        let run = RunId::new();
+        ledger::create_session(&pool, session, "mixed usage")
+            .await
+            .unwrap();
+        seed_started_run!(pool, session, run, "read", AgentMode::Explore);
+        let outcome = runtime
+            .execute_run(
+                &Mixed {
+                    calls: Mutex::new(0),
+                    fail,
+                },
+                RunContext::new(session, run, "read", AgentMode::Explore, repo.clone(), repo),
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.usage.unwrap().prompt_tokens, Some(0));
+        let events = ledger::load_events(&pool, session).await.unwrap();
+        let (coverage, cost) = events
+            .iter()
+            .find_map(|event| match event.body {
+                EventBody::RunUsage {
+                    coverage: Some(coverage),
+                    cost_micros,
+                    ..
+                } => Some((coverage, cost_micros)),
+                _ => None,
+            })
+            .expect("durable usage coverage");
+        assert_eq!(coverage.requests, 2, "failed attempts count too");
+        assert_eq!(coverage.prompt_requests, 1);
+        assert_eq!(coverage.completion_requests, if fail { 1 } else { 2 });
+        assert_eq!(coverage.cost_requests, u64::from(!fail));
+        assert_eq!(coverage.unmeasured_retries, 1);
+        assert_eq!(cost, if fail { None } else { Some(11) });
+        let (stored,): (String,) = sqlx::query_as("SELECT usage_coverage FROM runs WHERE id = ?")
+            .bind(run.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<codypendent_protocol::UsageCoverage>(&stored).unwrap(),
+            coverage
+        );
+    }
 }

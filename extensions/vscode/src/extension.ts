@@ -27,6 +27,7 @@ import * as vscode from "vscode";
 
 import { DaemonClient, type ConnectionStatus } from "./client.js";
 import { registerEditorActions } from "./editor-actions.js";
+import { parseHandoff, validateHandoff, workspaceMatches, type SessionHandoff } from "./handoff.js";
 import {
   applyUnifiedPatch,
   isWorkspaceUriPath,
@@ -125,6 +126,8 @@ let client: DaemonClient | undefined;
  * client attached to a different one.
  */
 let attachedSessionId: Uuid | undefined;
+let attachedSocketPath: string | undefined;
+let attachedRepository: string | undefined;
 let view: vscode.WebviewView | undefined;
 let latestWebviewCapabilities: UiCapabilities | undefined;
 let currentLibraryQuery = "";
@@ -432,7 +435,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // --- daemon client --------------------------------------------------------
 
-  function connect(sessionId: Uuid): void {
+  function connect(sessionId: Uuid, handoff?: SessionHandoff): void {
     client?.stop();
     let socketPath: string;
     const configured = vscode.workspace
@@ -440,7 +443,8 @@ export function activate(context: vscode.ExtensionContext): void {
       .get<string>("socketPath")
       ?.trim();
     try {
-      socketPath = configured && configured.length > 0 ? configured : resolveRuntimePaths().socketPath;
+      socketPath = handoff?.socket ?? attachedSocketPath
+        ?? (configured && configured.length > 0 ? configured : resolveRuntimePaths().socketPath);
     } catch (err) {
       void vscode.window.showErrorMessage(
         `Codypendent: cannot resolve daemon socket: ${err instanceof Error ? err.message : String(err)}`,
@@ -455,6 +459,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const nextClient = new DaemonClient({ socketPath, sessionId });
     client = nextClient;
     attachedSessionId = sessionId;
+    attachedSocketPath = socketPath;
+    attachedRepository = handoff?.repository ?? attachedRepository;
     // A new attach is a new projection: forget which ids were already
     // announced so the fresh catch-up can speak for itself.
     notifier.reset();
@@ -600,6 +606,83 @@ export function activate(context: vscode.ExtensionContext): void {
 
     nextClient.start();
     context.subscriptions.push({ dispose: () => nextClient.stop() });
+  }
+
+  // A URI can originate in a browser, so it never silently attaches to a new
+  // daemon or changes workspace. The approved continuation is local, expires,
+  // and is consumed only by the extension host for the requested checkout.
+  const pendingHandoffKey = "codypendent.pendingHandoff.v1";
+  async function acceptHandoff(raw: SessionHandoff, confirmed = false): Promise<void> {
+    const handoff = await validateHandoff(raw);
+    if (!confirmed && (attachedSessionId !== handoff.session || attachedSocketPath !== handoff.socket
+        || attachedRepository !== handoff.repository)) {
+      const choice = await vscode.window.showInformationMessage(
+        "Open this Codypendent session?",
+        { modal: true, detail: `Repository: ${handoff.repository}${handoff.checkout !== handoff.repository ? `\nRun checkout: ${handoff.checkout}` : ""}\nSession: ${handoff.session}\nLocal daemon: ${handoff.socket}` },
+        "Open Session",
+      );
+      if (choice !== "Open Session") return;
+    }
+    const roots = (vscode.workspace.workspaceFolders ?? [])
+      .filter((folder) => folder.uri.scheme === "file").map((folder) => folder.uri.fsPath);
+    if (!await workspaceMatches(handoff.checkout ?? handoff.repository, roots)) {
+      await context.globalState.update(pendingHandoffKey, { handoff, expires: Date.now() + 120_000 });
+      await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(handoff.checkout ?? handoff.repository), { forceNewWindow: true });
+      return;
+    }
+    if (!vscode.workspace.isTrusted) {
+      const listener = vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        listener.dispose();
+        void acceptHandoff(handoff, true).catch(handoffError);
+      });
+      context.subscriptions.push(listener);
+      const choice = await vscode.window.showWarningMessage(
+        "Trust this workspace before attaching Codypendent.", "Manage Workspace Trust",
+      );
+      if (choice === "Manage Workspace Trust") {
+        await vscode.commands.executeCommand("workbench.trust.manage");
+      }
+      return;
+    }
+    const validated = await validateHandoff(handoff);
+    await vscode.commands.executeCommand("codypendent.sessionView.focus");
+    if (attachedSessionId !== validated.session || attachedSocketPath !== validated.socket
+        || attachedRepository !== validated.repository) {
+      connect(validated.session, validated);
+    }
+    if (validated.file) {
+      const uri = vscode.Uri.joinPath(vscode.Uri.file(validated.checkout ?? validated.repository), validated.file);
+      const document = await vscode.workspace.openTextDocument(uri);
+      const row = Math.min((validated.line ?? 1) - 1, document.lineCount - 1);
+      const editor = await vscode.window.showTextDocument(document, {
+        preview: false, selection: new vscode.Range(row, 0, row, 0),
+      });
+      editor.revealRange(new vscode.Range(row, 0, row, 0), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    }
+  }
+  const handoffError = (error: unknown) => {
+    void vscode.window.showErrorMessage(`Codypendent: could not open session: ${error instanceof Error ? error.message : String(error)}`);
+  };
+  context.subscriptions.push(vscode.window.registerUriHandler({
+    async handleUri(uri) {
+      try {
+        if (uri.authority !== "codypendent.codypendent" || uri.path !== "/attach" || uri.fragment) {
+          throw new Error("Unsupported session link");
+        }
+        await acceptHandoff(parseHandoff(uri.query));
+      } catch (error) { handoffError(error); }
+    },
+  }));
+  const pending = context.globalState.get<{ handoff: SessionHandoff; expires: number }>(pendingHandoffKey);
+  if (pending && pending.expires > Date.now()) {
+    void workspaceMatches(pending.handoff.checkout ?? pending.handoff.repository,
+      (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)).then(async (matches) => {
+      if (!matches) return;
+      await context.globalState.update(pendingHandoffKey, undefined);
+      await acceptHandoff(pending.handoff, true);
+    }).catch(handoffError);
+  } else if (pending) {
+    void context.globalState.update(pendingHandoffKey, undefined);
   }
 
   async function ensureSession(promptTitle: string): Promise<Uuid | undefined> {
@@ -784,14 +867,14 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Register editor-native actions (Explain, Refactor, Fix Diagnostic, Generate Tests, Review)
-  registerEditorActions(context, () => client, () => diagnosticsRevision);
+  registerEditorActions(context, () => client, () => diagnosticsRevision, workspaceRepo);
 
   // Auto-attach on startup when a session id is already configured.
   const configuredSession = vscode.workspace
     .getConfiguration("codypendent")
     .get<string>("sessionId")
     ?.trim();
-  if (configuredSession && isUuid(configuredSession)) {
+  if (!pending && vscode.workspace.isTrusted && configuredSession && isUuid(configuredSession)) {
     connect(configuredSession);
   }
 }
@@ -814,6 +897,8 @@ export function deactivate(): void {
   client?.stop();
   client = undefined;
   attachedSessionId = undefined;
+  attachedSocketPath = undefined;
+  attachedRepository = undefined;
   view = undefined;
 }
 
@@ -888,10 +973,14 @@ function handleEvent(
       post({ kind: "event", sequence: event.sequence, label: "run completed", detail: body.disposition.type });
       break;
     case "ToolStarted":
-      post({ kind: "event", sequence: event.sequence, label: "tool", detail: body.tool });
+      post({ kind: "event", sequence: event.sequence, label: "tool", detail: body.label || body.tool });
       break;
     case "ToolCompleted":
-      post({ kind: "event", sequence: event.sequence, label: "tool done", detail: `${body.tool}: ${body.outcome.type}` });
+      post({ kind: "event", sequence: event.sequence, label: "tool done", detail: body.tool.startsWith("acp:")
+        ? body.outcome.type : `${body.tool}: ${body.outcome.type}` });
+      break;
+    case "ToolUpdated":
+      if (body.label) post({ kind: "event", sequence: event.sequence, label: "tool action", detail: body.label });
       break;
     case "BudgetWarning":
       post({
@@ -1036,5 +1125,5 @@ function isUuid(value: string): boolean {
  * daemon's own startup directory (issue #6 item 1). Undefined outside a folder.
  */
 function workspaceRepo(): string | undefined {
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  return attachedRepository ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }

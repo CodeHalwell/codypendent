@@ -1,3 +1,4 @@
+import { EmptyState, PageShell } from "./PageShell.js";
 /**
  * `/context` — the context-usage breakdown for the active run.
  *
@@ -89,19 +90,19 @@ export const ContextView: React.FC<ContextViewProps> = ({ events, activeRunId })
   const percent = contextPercent(breakdown);
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Context usage</div>
+          <h1 style={surfaceStyles.title}>Context</h1>
           <div style={surfaceStyles.subtitle}>
-            Reported by the provider for the active run. Nothing here is estimated.
+            See how much of the current model’s context your conversation is using.
           </div>
         </div>
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         {activeRunId === null ? (
-          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>No active run in current session.</div>
+          <EmptyState title="Your conversation’s context" description="No active run in current session." />
         ) : (
           <div style={surfaceStyles.card}>
             <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
@@ -141,6 +142,6 @@ export const ContextView: React.FC<ContextViewProps> = ({ events, activeRunId })
           </div>
         )}
       </div>
-    </div>
+    </PageShell>
   );
 };

@@ -28,7 +28,9 @@
 
 pub mod accessible;
 pub mod action;
+mod approval;
 pub mod dag;
+mod failure;
 pub mod input;
 pub mod markdown;
 pub mod palette;
@@ -36,12 +38,14 @@ pub mod reduce;
 pub mod remote_ui;
 pub mod remote_ui_host;
 pub mod render;
+mod splash;
 pub mod state;
 pub mod streaming;
 pub mod table_detect;
 pub mod terminal;
 pub mod theme;
 pub mod theme_pack;
+pub mod usage;
 #[cfg(feature = "vt100-tests")]
 pub mod vt100_backend;
 

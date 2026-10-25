@@ -53,7 +53,14 @@ pub struct ProtocolVersion {
 /// (an older daemon never sends the reply, and a client only sends the command
 /// to a daemon whose negotiated minor is ≥ 9), so `major` remains `1` and
 /// `minor` advances to `9`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
+/// Optional `RunUsage.coverage` records measured versus unmeasured requests.
+/// Old records retain unknown coverage; older clients ignore this additive field.
+/// Tool display refinements add `ToolUpdated`. Older clients fold this event
+/// to `Unknown` while retaining the original start and completion events.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 11,
+};
 
 /// The lowest negotiated minor that understands
 /// [`CommandBody::ProbeModel`](crate::CommandBody::ProbeModel). A client MUST

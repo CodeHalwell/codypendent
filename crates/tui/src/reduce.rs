@@ -329,6 +329,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::LinkRestored => state.link = Link::Connected,
         Action::LocalEndpointsProbed(endpoints) => on_local_endpoints_probed(state, endpoints),
+        Action::ProviderCatalogLoaded(providers) => replace_provider_catalog(state, providers),
         Action::RunnableModelsRefreshed {
             model_ids,
             onboard_attempt,
@@ -806,6 +807,40 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Expand => expand_selected(state),
         Action::BrowseFoldPrev => browse_fold(state, -1),
         Action::BrowseFoldNext => browse_fold(state, 1),
+        Action::NavigatePatch { forward, files } => {
+            if matches!(state.overlay, Overlay::None) && state.transcript_browse {
+                let run_idx = state.fold_focus_run();
+                if let Some(run) = state.runs.get_mut(run_idx) {
+                    if let Some(TranscriptEntry::Patch(patch)) =
+                        run.transcript.get_mut(run.transcript_selected)
+                    {
+                        patch.navigate(forward, files);
+                    }
+                }
+            }
+        }
+        Action::OpenReviewedSource => {
+            if matches!(state.overlay, Overlay::None) && state.transcript_browse {
+                let source = state.fold_focus().and_then(|run| {
+                    match run.transcript.get(run.transcript_selected) {
+                        Some(TranscriptEntry::Patch(patch)) => {
+                            Some((run.run_id, patch.reviewed_source()))
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some((run_id, source)) = source {
+                    match source {
+                        Ok((file, line)) => {
+                            state
+                                .outbox
+                                .push(Intent::OpenReviewedSource { run_id, file, line })
+                        }
+                        Err(message) => state.notice = Some((message.to_owned(), state.tick + 40)),
+                    }
+                }
+            }
+        }
         Action::CopyFocusedCard => copy_focused_card(state),
         Action::RetryFailedRun => retry_failed_run(state),
         Action::ReauthenticateFailedModel => reauthenticate_failed_model(state),
@@ -1074,6 +1109,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 detach_history_on_edit(state);
             }
         }
+        Action::InsertNewline => {
+            edit_prompt(state, &Edit::Insert("\n".to_owned()));
+            detach_history_on_edit(state);
+            state.transcript_browse = false;
+        }
         // Enter confirms an open composer popup (history search first, then
         // @-mention) instead of submitting the half-edited draft out from
         // under the popup.
@@ -1282,6 +1322,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 _ => {
                     // Always open at the top, however the last visit was left.
                     state.help_scroll = 0;
+                    state.help_query.clear();
                     Overlay::Help
                 }
             }
@@ -2280,18 +2321,27 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 // Cloned before `tool` moves into the card below: the tool
                 // card entering `Running` is what `RunActivity::RunningTool`
                 // names.
-                let tool_name = tool.clone();
+                let tool_name = if tool.starts_with("acp:") {
+                    label.clone().unwrap_or_else(|| "Tool".to_owned())
+                } else {
+                    tool.clone()
+                };
+                let mut live = true;
                 match last_card(run, |c| {
-                    c.status == ToolStatus::Proposed
-                        && c.action
-                            .as_ref()
-                            .is_some_and(|action| tool_matches_action(&tool, action))
+                    (tool.starts_with("acp:") && c.tool == tool)
+                        || (c.status == ToolStatus::Proposed
+                            && c.action
+                                .as_ref()
+                                .is_some_and(|action| tool_matches_action(&tool, action)))
                 }) {
                     Some(card) => {
+                        live = card.status != ToolStatus::Completed;
                         card.tool = tool;
                         card.args_digest = Some(args_digest);
                         card.label = label;
-                        card.status = ToolStatus::Running;
+                        if card.status != ToolStatus::Completed {
+                            card.status = ToolStatus::Running;
+                        }
                     }
                     None => AppState::push_entry(
                         run,
@@ -2310,7 +2360,30 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         at,
                     ),
                 }
-                run.activity = RunActivity::RunningTool(tool_name);
+                if live {
+                    run.activity = RunActivity::RunningTool(tool_name);
+                }
+            }
+        }
+        EventBody::ToolUpdated {
+            run_id,
+            tool,
+            label,
+        } => {
+            let tool = crate::remote_ui::sanitize_terminal_text(&tool);
+            let label = label
+                .as_deref()
+                .map(crate::remote_ui::sanitize_terminal_text);
+            if let Some(run) = state.run_mut(run_id) {
+                if let Some(card) = last_card(run, |card| card.tool == tool) {
+                    if let Some(label) = label {
+                        let live = card.status == ToolStatus::Running;
+                        card.label = Some(label.clone());
+                        if live {
+                            run.activity = RunActivity::RunningTool(label);
+                        }
+                    }
+                }
             }
         }
         EventBody::ToolCompleted {
@@ -2343,7 +2416,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 }
                 // The tool finished; the agent is back to composing its next
                 // step.
-                run.activity = RunActivity::Thinking;
+                run.activity = running_tool_activity(run).unwrap_or(RunActivity::Thinking);
             }
         }
         EventBody::PatchProposed {
@@ -2368,6 +2441,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         preview,
                         preview_truncated,
                         expanded: false,
+                        review: None,
                     }),
                     at,
                 );
@@ -2464,51 +2538,41 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             let pending = PendingQuestion {
                 question_id,
                 run_id,
-                questions: questions.clone(),
+                questions,
                 asked_at: at,
             };
-            // A re-issued question can carry a DIFFERENT number of
-            // sub-questions, and the card holds one `picked`/`custom_text` slot
-            // per sub-question. Replacing the question without resizing the card
-            // left it sized for the previous shape: `custom_text[card.index]`
-            // then panicked the whole TUI on a longer question, and a shorter
-            // one stranded the cursor past the end where no key could move it.
-            // Both were daemon-triggerable, while a question was blocking the
-            // operator.
-            let replaced_shape = state
+            // A new issue owns fresh answers even when its shape is unchanged.
+            // Only the front question owns the editor: background queue events
+            // must never replace the draft the operator is currently typing.
+            let refresh_card = state
+                .pending_questions
+                .first()
+                .is_none_or(|front| front.question_id == question_id);
+            if let Some(existing) = state
                 .pending_questions
                 .iter_mut()
                 .find(|q| q.question_id == question_id)
-                .map(|existing| {
-                    let previous = existing.questions.len();
-                    *existing = pending;
-                    previous
-                });
-            match replaced_shape {
-                Some(previous) if previous != questions.len() => {
-                    // Answers already given are for a question that no longer
-                    // exists in this shape; start the card clean rather than
-                    // carry selections across a redefinition.
-                    state.question_card_state = Some(QuestionCardState::new(questions.len()));
-                }
-                Some(_) => {}
-                None => {
-                    state.pending_questions.push(PendingQuestion {
-                        question_id,
-                        run_id,
-                        questions: questions.clone(),
-                        asked_at: at,
-                    });
-                }
+            {
+                *existing = pending;
+            } else {
+                state.pending_questions.push(pending);
             }
-            if state.question_card_state.is_none() {
-                state.question_card_state = Some(QuestionCardState::new(questions.len()));
+            state.outbox.retain(|intent| {
+                !matches!(intent,
+                Intent::ResolveQuestion { question_id: id, .. } if *id == question_id)
+            });
+            if refresh_card || state.question_card_state.is_none() {
+                reset_question_card(state);
             }
         }
         EventBody::QuestionResolved {
             question_id,
             outcome,
         } => {
+            let resolved_front = state
+                .pending_questions
+                .first()
+                .is_some_and(|front| front.question_id == question_id);
             // The event carries no run_id, but the parked PendingQuestion it
             // resolves does — capture it BEFORE retaining so a Rejected outcome
             // closes exactly that run's question card, never another concurrent
@@ -2521,10 +2585,12 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             state
                 .pending_questions
                 .retain(|p| p.question_id != question_id);
-            if state.pending_questions.is_empty() {
-                state.question_card_state = None;
-            } else if let Some(first) = state.pending_questions.first() {
-                state.question_card_state = Some(QuestionCardState::new(first.questions.len()));
+            state.outbox.retain(|intent| {
+                !matches!(intent,
+                Intent::ResolveQuestion { question_id: id, .. } if *id == question_id)
+            });
+            if resolved_front || state.pending_questions.is_empty() {
+                reset_question_card(state);
             }
             if matches!(outcome, QuestionOutcome::Rejected { .. }) {
                 if let Some(card) = resolved_run_id.and_then(|run_id| {
@@ -2684,8 +2750,10 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             prompt_tokens,
             completion_tokens,
             cost_micros,
+            coverage,
         } => {
             if let Some(run) = state.run_mut(run_id) {
+                run.usage_coverage = coverage;
                 if prompt_tokens.is_some() {
                     run.prompt_tokens = prompt_tokens;
                 }
@@ -2816,6 +2884,19 @@ fn finish_tool_card(
     card.artifact = artifact;
 }
 
+fn running_tool_activity(run: &RunView) -> Option<RunActivity> {
+    run.transcript.iter().rev().find_map(|entry| match entry {
+        TranscriptEntry::Tool(card) if card.status == ToolStatus::Running => {
+            Some(RunActivity::RunningTool(if card.tool.starts_with("acp:") {
+                card.label.clone().unwrap_or_else(|| "Tool".to_owned())
+            } else {
+                card.tool.clone()
+            }))
+        }
+        _ => None,
+    })
+}
+
 /// Reconcile a completion with the most specific preceding lifecycle card.
 /// The wire has no invocation id, so precedence is important: exact Running,
 /// then capability-compatible Proposed (approval rejected before start), then a
@@ -2832,6 +2913,11 @@ fn reconcile_tool_completion(
     }) {
         finish_tool_card(card, Some(tool), outcome, artifact);
         return true;
+    }
+    // A current ACP identity or an older Claude invocation id is authoritative:
+    // never give its outcome to a differently-identified running invocation.
+    if tool.starts_with("acp:") || tool.starts_with("toolu_") {
+        return false;
     }
     if let Some(card) = last_card(run, |card| {
         card.status == ToolStatus::Proposed
@@ -2895,6 +2981,14 @@ fn terminalize_open_tool_cards(run: &mut RunView, disposition: &RunDisposition) 
     for entry in &mut run.transcript {
         if let TranscriptEntry::Tool(card) = entry {
             if card.status != ToolStatus::Completed {
+                // Older ACP ledgers discarded the invocation id on start and
+                // used it on completion. Their per-card outcome is unavailable;
+                // a finished run proves only that the card is no longer live.
+                if card.args_digest.as_deref() == Some("") {
+                    card.status = ToolStatus::Completed;
+                    card.outcome = None;
+                    continue;
+                }
                 finish_tool_card(
                     card,
                     None,
@@ -3556,6 +3650,11 @@ fn nav(state: &mut AppState, delta: i32) {
 /// transcript paging so `Home`/`End` remain model-list navigation while a
 /// palette-mode overlay owns input.
 fn nav_to_edge(state: &mut AppState, last: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if last { state.help_max_scroll.get() } else { 0 };
+        return;
+    }
+
     let edge = |len: usize| if last { len.saturating_sub(1) } else { 0 };
     match &mut state.overlay {
         Overlay::Onboard { step } => match step {
@@ -3979,7 +4078,11 @@ fn expand_selected(state: &mut AppState) {
         if let Some(entry) = run.transcript.get_mut(run.transcript_selected) {
             match entry {
                 TranscriptEntry::Tool(card) => card.expanded = !card.expanded,
-                TranscriptEntry::Patch(patch) => patch.expanded = !patch.expanded,
+                TranscriptEntry::Patch(patch) => {
+                    if patch.review.take().is_none() {
+                        patch.expanded = !patch.expanded;
+                    }
+                }
                 TranscriptEntry::Note { expanded, .. } => *expanded = !*expanded,
                 TranscriptEntry::Backstage { expanded, .. } => *expanded = !*expanded,
                 TranscriptEntry::Completed { expanded, .. } => *expanded = !*expanded,
@@ -4697,6 +4800,10 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
     // The host-owned approval card is always drawn above ordinary overlays,
     // and input_mode gives it exclusive decision keys until it is resolved.
     if let Some(pending) = state.focused_approval() {
+        if decision == ApprovalDecision::Approve && !crate::approval::can_review(&pending.action) {
+            state.notice = Some((crate::approval::UNREVIEWABLE.to_owned(), state.tick + 10));
+            return;
+        }
         if matches!(scope, ApprovalScope::Pattern | ApprovalScope::Repository)
             && pending.pattern.is_none()
         {
@@ -4709,6 +4816,18 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
             scope,
         });
     }
+}
+
+/// The front of the queue exclusively owns the editor and its viewport geometry.
+fn reset_question_card(state: &mut AppState) {
+    state.question_card_state = state
+        .pending_questions
+        .first()
+        .map(|first| QuestionCardState::new(first.questions.len()));
+    state.question_scroll = 0;
+    state.question_max_scroll.set(0);
+    state.question_row_bounds.borrow_mut().clear();
+    state.question_body_height.set(0);
 }
 
 fn resolve_focused_question(state: &mut AppState, outcome: QuestionOutcome) {
@@ -5598,6 +5717,12 @@ fn composer_down(state: &mut AppState) {
 
 fn edit_prompt(state: &mut AppState, edit: &Edit) {
     match &mut state.overlay {
+        Overlay::Help => {
+            append(&mut state.help_query, edit);
+            state.help_query = state.help_query.chars().take(256).collect();
+            state.help_scroll = 0;
+            state.help_max_scroll.set(0);
+        }
         Overlay::NewRun(buf) | Overlay::Steering(buf) => append(buf, edit),
         Overlay::WorkflowInputs { buffer, .. } => append(buffer, edit),
         Overlay::KanbanNew { buffer } | Overlay::BlackboardPost { buffer, .. } => {
@@ -5762,6 +5887,8 @@ fn input_char(state: &mut AppState, c: char) {
         && state.composer.is_empty()
         && state.queue_editing.is_none()
     {
+        state.help_scroll = 0;
+        state.help_query.clear();
         state.overlay = Overlay::Help;
         return;
     }
@@ -6778,8 +6905,8 @@ fn submit_prompt(state: &mut AppState) {
             let can_list_models = card.can_list_models;
             let catalog_models = card.catalog_models;
             let has_key = card.has_key;
-            let requires_community_consent =
-                provider_id == "antigravity-acp" && card.auth.contains("third-party ToS risk");
+            let requires_community_consent = provider_id == "antigravity-community"
+                && card.auth.contains("third-party ToS risk");
             state.selected_provider = idx;
             state.onboard_flow = Some(OnboardFlow {
                 class,
@@ -7470,7 +7597,7 @@ fn submit_prompt(state: &mut AppState) {
                     let available = card.available;
                     let catalog_models = card.catalog_models;
                     let has_key = card.has_key;
-                    let requires_community_consent = provider_id == "antigravity-acp"
+                    let requires_community_consent = provider_id == "antigravity-community"
                         && card.auth.contains("third-party ToS risk");
                     if available {
                         if requires_community_consent {
@@ -8120,16 +8247,16 @@ fn begin_verify_key(state: &mut AppState) {
 /// Fold a key-verification result back in: the notice reports it, and the
 /// model's card readiness is replaced with the honest answer so a hosted model
 /// stops claiming `Unverified` once it has actually been probed.
-fn on_model_key_verified(state: &mut AppState, model_id: &str, ok: bool, reason: &str) {
+fn on_model_key_verified(state: &mut AppState, model_id: &str, ok: Option<bool>, reason: &str) {
     if let Some(card) = state.models.iter_mut().find(|card| card.id.0 == model_id) {
-        card.readiness = if ok {
-            ModelReadiness::Ready
-        } else {
-            ModelReadiness::Unavailable(reason.to_owned())
+        card.readiness = match ok {
+            Some(true) => ModelReadiness::Ready,
+            Some(false) => ModelReadiness::Unavailable(reason.to_owned()),
+            None => ModelReadiness::Unverified,
         };
     }
     state.notice = Some((
-        if ok {
+        if ok == Some(true) {
             format!("{model_id}: key verified")
         } else {
             format!("{model_id}: {reason}")
@@ -8176,7 +8303,7 @@ fn begin_add_model(state: &mut AppState) {
                 card.available,
                 card.catalog_models,
                 card.has_key,
-                card.id == "antigravity-acp" && card.auth.contains("third-party ToS risk"),
+                card.id == "antigravity-community" && card.auth.contains("third-party ToS risk"),
                 query.clone(),
                 *selected,
             ),
@@ -8510,6 +8637,58 @@ fn parse_council_result_query(query: &str) -> Option<Option<String>> {
     Some(words.next().map(str::to_owned))
 }
 
+/// Catalogue refreshes may reorder rows while a picker is open. Keep focus on
+/// the provider's stable identity, including the onboarding lane's filter.
+fn replace_provider_catalog(state: &mut AppState, providers: Vec<crate::state::ProviderCard>) {
+    let (indices, selected) = match &state.overlay {
+        Overlay::ProviderPicker { query, selected } => {
+            (filter_providers(&state.providers, query), *selected)
+        }
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => (
+            filter_onboard_providers(&state.providers, *class, query),
+            *selected,
+        ),
+        _ => (
+            (0..state.providers.len()).collect(),
+            state.selected_provider,
+        ),
+    };
+    let focused = indices
+        .get(selected)
+        .and_then(|index| state.providers.get(*index))
+        .map(|card| card.id.clone());
+    state.providers = providers;
+    let restore = |indices: &[usize]| {
+        indices
+            .iter()
+            .position(|index| Some(&state.providers[*index].id) == focused.as_ref())
+            .unwrap_or_else(|| selected.min(indices.len().saturating_sub(1)))
+    };
+    match &mut state.overlay {
+        Overlay::ProviderPicker { query, selected } => {
+            let indices = filter_providers(&state.providers, query);
+            *selected = restore(&indices);
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
+        }
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => {
+            let indices = filter_onboard_providers(&state.providers, *class, query);
+            *selected = restore(&indices);
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
+        }
+        _ => {
+            state.selected_provider = restore(&(0..state.providers.len()).collect::<Vec<_>>());
+        }
+    }
+}
+
 fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCommand) {
     use crate::palette::PaletteCommand;
     match command {
@@ -8575,6 +8754,10 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 selected: 0,
             };
         }
+        PaletteCommand::RefreshAgents => {
+            state.overlay = Overlay::None;
+            state.outbox.push(Intent::RefreshAgentCatalog);
+        }
         // PR C2: open the mode picker with the cursor pre-selected on the
         // CURRENT default, so the picker's starting point reflects what the
         // next run would use.
@@ -8637,6 +8820,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         }
         PaletteCommand::Help => {
             state.help_scroll = 0;
+            state.help_query.clear();
             state.overlay = Overlay::Help;
         }
         PaletteCommand::Detach => state.should_detach = true,
@@ -8822,6 +9006,14 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
         ProposedAction::NetworkRequest { destination } => format!("NetworkConnect ({destination})"),
         ProposedAction::GitCommit { repository } => format!("GitCommit ({repository})"),
         ProposedAction::GitPush { remote, branch } => format!("GitPush ({remote} {branch})"),
+        ProposedAction::GitHubMutation { repository, .. } => format!("GitHub write ({repository})"),
+        ProposedAction::RestoreCheckpoint { worktree, .. } => {
+            format!("FileWrite (restore {worktree})")
+        }
+        ProposedAction::AcpToolCall { agent, .. } => format!("ACP tool ({agent})"),
+        ProposedAction::WriteProcessStdin { process_id, .. } => {
+            format!("CommandExecute (stdin to {process_id})")
+        }
         ProposedAction::PublishDocument { target, .. } => format!("GitCommit ({target})"),
         ProposedAction::McpToolCall { server, tool, .. } => {
             format!("McpToolCall ({server}.{tool})")
@@ -10565,6 +10757,128 @@ mod tests {
         assert_eq!(card.status, ToolStatus::Completed);
         assert_eq!(card.outcome, Some(ToolOutcome::Succeeded));
         assert!(card.artifact.is_some());
+    }
+
+    #[test]
+    fn acp_tool_refinements_and_out_of_order_completions_keep_call_identity() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "review".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        for id in ["acp:first", "acp:second"] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::ToolStarted {
+                    run_id,
+                    tool: id.to_owned(),
+                    args_digest: String::new(),
+                    label: Some("Terminal".to_owned()),
+                }),
+            );
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolUpdated {
+                run_id,
+                tool: "acp:first".to_owned(),
+                label: Some("Terminal · git status".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "acp:second".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "failed second".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+        assert_eq!(
+            s.runs[0].activity,
+            RunActivity::RunningTool("Terminal · git status".to_owned())
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "acp:first".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        let tools: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].label.as_deref(), Some("Terminal · git status"));
+        assert_eq!(tools[0].outcome, Some(ToolOutcome::Succeeded));
+        assert!(
+            matches!(&tools[1].outcome, Some(ToolOutcome::Failed { message }) if message == "failed second")
+        );
+    }
+
+    #[test]
+    fn older_acp_tool_with_a_lost_call_identity_finishes_without_an_invented_outcome() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "review".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "Terminal".to_owned(),
+                args_digest: String::new(),
+                label: None,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "toolu_missing_start_id".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact(),
+            }),
+        );
+        let tools: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools[0].status, ToolStatus::Completed);
+        assert_eq!(tools[0].outcome, None);
+        assert_eq!(tools[1].outcome, Some(ToolOutcome::Succeeded));
     }
 
     #[test]
@@ -15117,7 +15431,7 @@ mod tests {
     fn antigravity_requires_explicit_risk_consent_before_install_or_probe() {
         let mut s = AppState::new();
         let mut antigravity = provider_card(
-            "antigravity-acp",
+            "antigravity-community",
             "Google Antigravity (community bridge)",
             "acp",
             "acp: verified install · third-party ToS risk",
@@ -15140,7 +15454,7 @@ mod tests {
                 ref query,
                 selected: 0,
                 onboard_class: None,
-            } if provider_id == "antigravity-acp" && query == "anti"
+            } if provider_id == "antigravity-community" && query == "anti"
         ));
         assert!(
             s.drain_outbox().is_empty(),
@@ -15161,7 +15475,7 @@ mod tests {
     fn antigravity_consent_enters_the_verified_acp_model_probe() {
         let mut s = AppState::new();
         s.overlay = Overlay::ConfirmCommunityAcpInstall {
-            provider_id: "antigravity-acp".to_owned(),
+            provider_id: "antigravity-community".to_owned(),
             query: "anti".to_owned(),
             selected: 0,
             onboard_class: None,
@@ -15172,14 +15486,14 @@ mod tests {
         assert_eq!(
             s.overlay,
             Overlay::AddModelQuerying {
-                provider_id: "antigravity-acp".to_owned(),
+                provider_id: "antigravity-community".to_owned(),
                 api_key: None,
             }
         );
         assert_eq!(
             s.drain_outbox(),
             vec![Intent::QueryProviderModels {
-                provider_id: "antigravity-acp".to_owned(),
+                provider_id: "antigravity-community".to_owned(),
                 api_key: None,
                 refresh: false,
             }]
@@ -15190,7 +15504,7 @@ mod tests {
     fn installed_antigravity_bridge_does_not_repeat_the_consent_prompt() {
         let mut s = AppState::new();
         let mut antigravity = provider_card(
-            "antigravity-acp",
+            "antigravity-community",
             "Google Antigravity (community bridge)",
             "acp",
             "acp: local · pinned community bridge",
@@ -15209,7 +15523,7 @@ mod tests {
         assert!(matches!(s.overlay, Overlay::AddModelQuerying { .. }));
         assert!(matches!(
             s.drain_outbox().as_slice(),
-            [Intent::QueryProviderModels { provider_id, .. }] if provider_id == "antigravity-acp"
+            [Intent::QueryProviderModels { provider_id, .. }] if provider_id == "antigravity-community"
         ));
     }
 
@@ -16830,7 +17144,7 @@ mod tests {
             &mut s,
             Action::ModelKeyVerified {
                 model_id: "groq/llama".to_owned(),
-                ok: true,
+                ok: Some(true),
                 reason: String::new(),
             },
         );
@@ -16840,7 +17154,7 @@ mod tests {
             &mut s,
             Action::ModelKeyVerified {
                 model_id: "groq/llama".to_owned(),
-                ok: false,
+                ok: Some(false),
                 reason: "provider returned HTTP 401 from /models".to_owned(),
             },
         );
@@ -17245,6 +17559,227 @@ mod tests {
             unreachable!()
         };
         patch.expanded
+    }
+
+    #[test]
+    fn patch_navigation_preserves_draft_and_walks_files_and_hunks() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut s = run_with_two_folds();
+        let TranscriptEntry::Patch(patch) = &mut s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.preview = "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n@@ -8 +8 @@\n-c\n+d\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -2 +2 @@\n-e\n+f".into();
+        s.composer = "keep this draft".into();
+        s.composer_cursor = s.composer.len();
+        s.drain_outbox();
+        reduce(&mut s, Action::BrowseFoldPrev);
+        let press = |s: &mut AppState, c, modifiers| {
+            let action = crate::input::map_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char(c), modifiers)),
+                s.input_mode(),
+                100,
+                &[],
+            );
+            reduce(s, action);
+        };
+        press(&mut s, 'n', KeyModifiers::ALT);
+        let selected = |s: &AppState| {
+            let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+                unreachable!()
+            };
+            patch.review.as_ref().unwrap().start
+        };
+        assert_eq!(selected(&s), 3);
+        press(&mut s, 'n', KeyModifiers::ALT);
+        assert_eq!(selected(&s), 6);
+        press(&mut s, 'N', KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(selected(&s), 9);
+        press(&mut s, 'p', KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(selected(&s), 0);
+        press(&mut s, 'p', KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(selected(&s), 0, "file navigation saturates");
+        assert_eq!(s.composer, "keep this draft");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        assert!(
+            s.outbox.is_empty(),
+            "reviewing a preview never issues a command"
+        );
+        reduce(&mut s, Action::InputNewline);
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        assert!(patch.expanded);
+        assert!(
+            patch.review.is_none(),
+            "Alt-Enter restores the full preview first"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(!patch_expanded(&s));
+    }
+
+    #[test]
+    fn reviewed_source_handoff_keeps_draft_and_originating_run() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut s = run_with_two_folds();
+        let original = s.runs[0].run_id;
+        let TranscriptEntry::Patch(patch) = &mut s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.preview = "diff --git a/b/source.rs b/b/source.rs\n--- a/b/source.rs\n+++ b/b/source.rs\n@@ -2,2 +42,2 @@\n-old\n+new\n@@ -7 +100 @@\n-x\n+y".into();
+        add_a_second_turn(&mut s);
+        s.composer = "unfinished draft".into();
+        s.composer_cursor = 4;
+        s.drain_outbox();
+        reduce(&mut s, Action::ActivateFold { run: 0, entry: 3 });
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: false,
+            },
+        );
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: false,
+            },
+        );
+        let action = crate::input::map_event(
+            &Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT)),
+            s.input_mode(),
+            100,
+            &[],
+        );
+        assert_eq!(action, Action::OpenReviewedSource);
+        reduce(&mut s, action);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::OpenReviewedSource {
+                run_id: original,
+                file: "b/source.rs".into(),
+                line: 100,
+            }]
+        );
+        assert_eq!(
+            s.selected_run, 1,
+            "editor request belongs to the browsed older run"
+        );
+        assert_eq!(s.composer, "unfinished draft");
+        assert_eq!(s.composer_cursor, 4);
+        s.overlay = Overlay::Help;
+        reduce(&mut s, Action::OpenReviewedSource);
+        assert!(s.outbox.is_empty(), "modal overlays never launch an editor");
+    }
+
+    #[test]
+    fn reviewed_source_handoff_handles_diff_metadata_and_refuses_bad_targets() {
+        let mut s = run_with_two_folds();
+        let TranscriptEntry::Patch(patch) = &mut s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.files = vec!["image.png".into()];
+        for (preview, expected) in [
+            (
+                "diff --git a/old b/new\nrename from old\nrename to b/new",
+                Some(("b/new", 1)),
+            ),
+            (
+                "diff --git a/image.png b/image.png\nBinary files differ",
+                Some(("image.png", 1)),
+            ),
+            (
+                "diff --git a/a b/a\n+++ \"b/a space.rs\"\n@@ -1 +9 @@\n+++ not-metadata",
+                Some(("a space.rs", 9)),
+            ),
+            (
+                "diff --git a/a space.rs b/a space.rs\n+++ b/a space.rs\t\n@@ -1 +9 @@",
+                Some(("a space.rs", 9)),
+            ),
+            (
+                "diff --git a/a b/a\n+++ b/a\n@@ -1 +0,0 @@\n-old",
+                Some(("a", 1)),
+            ),
+            (
+                "diff --git a/a b/a\ndeleted file mode 100644\n+++ /dev/null",
+                None,
+            ),
+            ("diff --git a/a b/a\n+++ b/../outside\n@@ -1 +2 @@", None),
+            ("diff --git a/a b/a\n+++ /absolute\n@@ -1 +2 @@", None),
+            ("diff --git a/a b/a\n+++ b/a\n@@ malformed @@", None),
+        ] {
+            patch.preview = preview.into();
+            patch.review = None;
+            let actual = patch.reviewed_source();
+            assert_eq!(
+                actual.ok(),
+                expected.map(|(file, line)| (file.to_owned(), line)),
+                "{preview}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_navigation_handles_metadata_only_and_overlay_scope() {
+        let mut s = run_with_two_folds();
+        let TranscriptEntry::Patch(patch) = &mut s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.preview = "diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\ndiff --git a/image b/image\nBinary files differ".into();
+        patch.preview_truncated = true;
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: false,
+            },
+        );
+        assert!(
+            !patch_expanded(&s),
+            "no invented hunks for metadata-only changes"
+        );
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: true,
+            },
+        );
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        assert_eq!(patch.review.as_ref().unwrap().end, 4);
+        let first = patch.clone();
+        s.overlay = Overlay::Help;
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: true,
+            },
+        );
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        assert_eq!(patch, &first);
+        s.overlay = Overlay::None;
+        reduce(
+            &mut s,
+            Action::NavigatePatch {
+                forward: true,
+                files: true,
+            },
+        );
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        assert_eq!(patch.review.as_ref().unwrap().start, 4);
+        assert_eq!(patch.review.as_ref().unwrap().end, 6);
+        assert!(
+            patch.preview_truncated,
+            "navigation must not claim an entire artifact"
+        );
     }
 
     #[test]
@@ -17941,6 +18476,7 @@ mod tests {
             preview: "@@".to_owned(),
             preview_truncated: false,
             expanded: false,
+            review: None,
         })
         .is_foldable());
         assert!(TranscriptEntry::Backstage {
@@ -19212,6 +19748,7 @@ mod tests {
                 prompt_tokens: Some(10_000),
                 completion_tokens: Some(642),
                 cost_micros: Some(3_400),
+                coverage: None,
             }),
         );
         let run = state.runs.first().expect("the run");
@@ -19251,6 +19788,7 @@ mod tests {
                 prompt_tokens: Some(1_234),
                 completion_tokens: Some(567),
                 cost_micros: None,
+                coverage: None,
             }),
         );
         reduce(
@@ -19260,6 +19798,7 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: None,
                 cost_micros: Some(2_500),
+                coverage: None,
             }),
         );
         let run = state.runs.first().expect("the run");

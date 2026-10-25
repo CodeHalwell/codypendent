@@ -1,0 +1,63 @@
+.cody-navigation {
+  width: var(--workspace-sidebar-width);
+  height: 100%;
+  min-height: 0;
+  flex-shrink: 0;
+  flex-direction: column;
+  background: var(--cody-panel);
+  user-select: none;
+}
+.cody-nav-brand { display: flex; align-items: center; gap: 9px; padding: 19px 18px 15px; flex-shrink: 0; font-size: 14px; font-weight: 650; letter-spacing: -.25px; }
+.cody-nav-status { width: 6px; height: 6px; border-radius: 50%; margin-left: auto; background: var(--cody-danger); }
+.cody-nav-status[data-status="connected"] { background: var(--cody-success); }
+.cody-nav-status[data-status="connecting"] { background: var(--cody-warning); }
+.cody-navigation .cody-nav-brand .cody-nav-close { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--cody-text-secondary); cursor: pointer; }
+.cody-nav-close:hover { background: var(--cody-panel-hover); }
+.cody-nav-actions { display: flex; flex-direction: column; gap: 5px; padding: 0 12px 12px; flex-shrink: 0; }
+.cody-nav-actions button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; border-radius: 8px; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.cody-nav-actions button span { flex: 1; }
+.cody-nav-actions kbd { font: inherit; font-size: 10px; opacity: .65; }
+.cody-nav-new { background: var(--cody-text); border: 1px solid transparent; color: var(--cody-canvas); font-weight: 550 !important; }
+.cody-nav-new:hover:not(:disabled) { opacity: .88; }
+.cody-nav-search { background: transparent; border: 1px solid var(--cody-border); color: var(--cody-text-muted); }
+.cody-nav-search:hover { color: var(--cody-text); background: var(--cody-panel-hover); }
+.cody-nav-primary { flex-shrink: 0; padding: 0 12px 13px; }
+.cody-navigation .cody-nav-link { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--cody-text-secondary); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.cody-navigation .cody-nav-link[aria-current="page"] { color: var(--cody-text); background: var(--cody-panel-hover); box-shadow: none; }
+.cody-nav-link > span:first-of-type { flex: 1; }
+.cody-nav-badge { flex: 0 !important; padding: 1px 6px; border-radius: 6px; font-size: 10px; font-weight: 600; color: var(--cody-on-accent); background: var(--cody-accent-strong); }
+.cody-nav-recents { display: flex; flex-direction: column; flex: 1 1 150px; min-height: 80px; padding: 0 12px 10px; overflow: hidden; }
+.cody-nav-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 29px; padding: 0 10px; color: var(--cody-text-muted); font-size: 10px; font-weight: 550; letter-spacing: .15px; }
+.cody-nav-small-button { display: grid; place-items: center; width: 23px; height: 23px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--cody-text-faint); cursor: pointer; }
+.cody-nav-small-button:hover { background: var(--cody-panel-hover); color: var(--cody-text); }
+.cody-nav-filter { width: calc(100% - 8px); margin: 2px 4px 7px; padding: 7px 9px; border: 1px solid var(--cody-border-strong); border-radius: 7px; background: var(--cody-canvas); color: var(--cody-text); font: inherit; font-size: 11px; }
+.cody-nav-filter::placeholder { color: var(--cody-text-faint); }
+.cody-nav-session-list { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+.cody-nav-empty { margin: 8px 10px; color: var(--cody-text-faint); font-size: 12px; line-height: 1.6; }
+.cody-nav-session { display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 7px; margin-bottom: 2px; background: transparent; color: var(--cody-text-secondary); text-align: left; cursor: pointer; }
+.cody-nav-session[aria-current="true"] { background: var(--cody-panel-hover); color: var(--cody-text); }
+.cody-nav-session-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 450; line-height: 1.5; }
+.cody-nav-session[aria-current="true"] .cody-nav-session-title { font-weight: 600; }
+.cody-nav-session-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; color: var(--cody-text-faint); font-size: 10px; line-height: 1.4; }
+.cody-nav-tools { flex: 0 1 auto; min-height: 85px; max-height: 43%; overflow-y: auto; padding: 6px 12px 10px; border-top: 1px solid var(--cody-border); scrollbar-width: thin; }
+.cody-nav-tools[data-collapsed="true"] { flex: 0 0 auto; min-height: 0; max-height: none; padding-bottom: 6px; overflow: hidden; }
+.cody-nav-workspace-toggle { width: 100%; border: 0; border-radius: 6px; background: transparent; font-family: inherit; text-align: left; cursor: pointer; }
+.cody-nav-workspace-toggle:hover { color: var(--cody-text); background: var(--cody-panel-hover); }
+.cody-nav-workspace-toggle:focus-visible { outline: 2px solid var(--cody-accent); outline-offset: -2px; }
+.cody-nav-group-toggle { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--cody-text-muted); font: inherit; font-size: 11px; cursor: pointer; text-align: left; }
+.cody-nav-group-toggle:hover { background: var(--cody-panel-hover); color: var(--cody-text); }
+.cody-nav-group-toggle > span { flex: 1; }
+.cody-nav-chevron { color: var(--cody-text-faint); transition: transform 120ms ease; }
+.cody-nav-chevron[data-open="true"] { transform: rotate(90deg); }
+.cody-nav-group-links { border-left: 1px solid var(--cody-border); margin: 0 0 4px 17px; padding-left: 6px; }
+.cody-navigation .cody-nav-tool { gap: 5px; padding: 7px 8px; font-size: 11px; flex-wrap: wrap; }
+.cody-nav-unavailable { flex: none !important; font-size: 9px; color: var(--cody-text-faint); }
+.cody-nav-version { flex-shrink: 0; padding: 10px 18px; border-top: 1px solid var(--cody-border); color: var(--cody-text-faint); font-size: 9px; line-height: 1.6; overflow-wrap: anywhere; }
+.cody-nav-version[data-mismatch="true"] { color: var(--cody-warning-text); }
+@media (max-height: 640px) {
+  .cody-nav-brand { padding-block: 12px; }
+  .cody-nav-actions { padding-bottom: 7px; }
+  .cody-nav-primary { padding-bottom: 7px; }
+  .cody-nav-tools { max-height: 34%; }
+  .cody-nav-session-meta { display: none; }
+}

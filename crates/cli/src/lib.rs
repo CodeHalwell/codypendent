@@ -12,6 +12,7 @@ pub mod commands;
 pub mod connection;
 pub mod council;
 pub mod doctor;
+mod editor_handoff;
 pub mod eval;
 pub mod finetune;
 pub mod local_endpoints;

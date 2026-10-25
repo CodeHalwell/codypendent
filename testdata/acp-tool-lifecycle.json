@@ -1,0 +1,8 @@
+[
+  {"sessionUpdate":"tool_call","toolCallId":"fixture-terminal","title":"Terminal","kind":"execute","status":"pending","rawInput":{}},
+  {"sessionUpdate":"tool_call_update","toolCallId":"fixture-terminal","title":"Terminal","kind":"execute","status":"in_progress","rawInput":{"command":"git status --short"}},
+  {"sessionUpdate":"tool_call","toolCallId":"fixture-read","title":"Read File","kind":"read","status":"in_progress"},
+  {"sessionUpdate":"tool_call_update","toolCallId":"fixture-read","title":"Read File","kind":"read","status":"completed","rawInput":{"file_path":"src/main.rs"}},
+  {"sessionUpdate":"tool_call_update","toolCallId":"fixture-terminal","title":"Terminal","status":"in_progress"},
+  {"sessionUpdate":"tool_call_update","toolCallId":"fixture-terminal","title":"Terminal","kind":"execute","status":"failed","rawInput":{"command":"git status --short"},"content":[{"type":"content","content":{"type":"text","text":"fixture command failed"}}]}
+]

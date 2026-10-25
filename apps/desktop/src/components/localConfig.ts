@@ -60,6 +60,22 @@ export type ModelsView = {
   pinned: string | null;
 };
 
+export type DetectedProvider = {
+  id: string;
+  name: string;
+  kind: "local" | "agent" | "hosted";
+  state: "ready" | "connected" | "listed" | "credential-found" | "unavailable" | "empty";
+  detail: string;
+};
+
+export type ModelDiscovery = {
+  added: string[];
+  default_model: string | null;
+  detected: DetectedProvider[];
+  warnings: string[];
+  available_default_profiles?: string[];
+};
+
 export type ProviderRow = {
   id: string;
   name: string;
@@ -102,23 +118,9 @@ export type CatalogModelsView = {
   live_listing_unavailable: string;
 };
 
-/**
- * Truthful readiness of one configured model, as the shell computes it
- * (`src-tauri/src/models.rs`, the TUI's `ModelReadiness` ported): a local
- * endpoint is asked for its model list, a hosted model has its credential
- * resolved without the network, an ACP profile is left to the daemon. `probed`
- * says whether the network was consulted for this verdict.
- */
-export type ModelReadiness =
-  | { state: "ready"; detail: string }
-  | { state: "unverified"; detail: string }
-  | { state: "unavailable"; detail: string };
-
-export type ModelReadinessRow = {
-  id: string;
-  readiness: ModelReadiness;
-  probed: boolean;
-};
+/** Daemon-owned verdict. Passive listing never probes provider endpoints. */
+export type ModelReadiness = import("@codypendent/protocol").ModelReadiness;
+export type ModelReadinessRow = import("@codypendent/protocol").ModelProbe;
 
 /**
  * A surface's outcome sentence, with how loud to say it. Success and failure
@@ -172,6 +174,7 @@ export type RunDefaults = {
  * can substitute one without a Tauri shell — the components take it as a prop.
  */
 export interface LocalConfigClient {
+  discoverModels?(preferAvailable?: boolean): Promise<ModelDiscovery>;
   listModels(): Promise<ModelsView>;
   setRunModel(model: string | null): Promise<void>;
   addModel(input: {
@@ -183,6 +186,8 @@ export interface LocalConfigClient {
   }): Promise<void>;
   removeModel(modelId: string): Promise<void>;
   listProviders(): Promise<ProvidersView>;
+  refreshAgents?(): Promise<ProvidersView>;
+  connectAcp?(providerId: string, repository: string, acceptCommunityRisk: boolean): Promise<{ profileId: string; coordinate: string; models: string[] }>;
   listCatalogModels(providerId: string): Promise<CatalogModelsView>;
   listApiKeys(): Promise<KeysView>;
   setApiKey(target: KeyTarget, key: string): Promise<void>;
@@ -191,7 +196,7 @@ export interface LocalConfigClient {
   runDefaults(): Promise<RunDefaults>;
   setRunMode(mode: AgentMode): Promise<void>;
   /**
-   * Readiness for every configured model, without touching hosted providers.
+   * Readiness for every configured model, without touching provider endpoints.
    * Optional: an older shell has no such command, and the list then shows no
    * badge rather than a guessed one.
    */
@@ -208,6 +213,7 @@ export interface LocalConfigClient {
  * reply is `void`.
  */
 export const localConfigClient: LocalConfigClient = {
+  discoverModels: (preferAvailable = false) => invoke<ModelDiscovery>("discover_models", { preferAvailable }),
   listModels: () => invoke<ModelsView>("list_models"),
   setRunModel: (model) => invoke<void>("set_run_model", { model }),
   addModel: ({ displayId, providerId, model, apiKey, contextTokens }) =>
@@ -220,6 +226,8 @@ export const localConfigClient: LocalConfigClient = {
     }),
   removeModel: (modelId) => invoke<void>("remove_model", { modelId }),
   listProviders: () => invoke<ProvidersView>("list_providers"),
+  refreshAgents: () => invoke<ProvidersView>("refresh_agents"),
+  connectAcp: (providerId, repository, acceptCommunityRisk) => invoke("connect_acp", { providerId, repository, acceptCommunityRisk }),
   listCatalogModels: (providerId) => invoke<CatalogModelsView>("list_catalog_models", { providerId }),
   listApiKeys: () => invoke<KeysView>("list_api_keys"),
   setApiKey: (target, key) => invoke<void>("set_api_key", { target, key }),
@@ -236,6 +244,8 @@ export function describeReadiness(readiness: ModelReadiness): { glyph: string; l
   switch (readiness.state) {
     case "ready":
       return { glyph: "●", label: "ready", color: "var(--cody-success)" };
+    default:
+      return { glyph: "?", label: "unknown", color: "var(--cody-text-muted)" };
     case "unverified":
       return { glyph: "◐", label: "unverified", color: "var(--cody-warning)" };
     case "unavailable":

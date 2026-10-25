@@ -58,6 +58,15 @@ export interface CodeGraphStatusView {
   stale_reason?: string;
 }
 
+/** One-based lines/Unicode-character columns; optional end is exclusive. */
+export interface CodeGraphSourceLocation {
+  source_path: string;
+  line: number;
+  column: number;
+  end_line?: number;
+  end_column?: number;
+}
+
 export interface CodeGraphNodeView {
   id: string;
   language: string;
@@ -66,6 +75,7 @@ export interface CodeGraphNodeView {
   qualified_name: string;
   kind: string;
   revision: string;
+  location?: CodeGraphSourceLocation;
 }
 
 export interface CodeGraphEdgeAssertion {
@@ -83,6 +93,7 @@ export interface CodeGraphEdgeView {
   confidence: number;
   evidence_kind: string;
   revision: string;
+  call_site?: CodeGraphSourceLocation;
   asserted_by?: CodeGraphEdgeAssertion;
 }
 
@@ -93,6 +104,8 @@ export interface CodeGraphQuery {
   kind?: string;
   name?: string;
   node_id?: string;
+  connected_view?: boolean;
+  include_neighbors?: boolean;
   include_edges?: boolean;
   include_nodes?: boolean;
   limit?: number;
@@ -101,6 +114,7 @@ export interface CodeGraphQuery {
 export interface CodeGraphPage {
   nodes: CodeGraphNodeView[];
   edges: CodeGraphEdgeView[];
+  related_nodes?: CodeGraphNodeView[];
   total_nodes: number;
   total_edges: number;
   limit: number;

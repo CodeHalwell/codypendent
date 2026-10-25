@@ -86,8 +86,8 @@ describe("command palette ranking", () => {
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     // Palette rows are listbox options now (aria-activedescendant follows
     // the keyboard highlight), so the accessible role is option, not button.
-    fireEvent.click(screen.getByRole("option", { name: /Skill Studio/ }));
-    expect(screen.getByText("Skill Studio")).toBeTruthy();
+    fireEvent.click(screen.getByRole("option", { name: /Skills/ }));
+    expect(screen.getByRole("heading", { name: "Skills" })).toBeTruthy();
   });
 });
 

@@ -28,6 +28,7 @@ import {
 } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
 import type { QuestionOutcomeView } from "./types.js";
+import type { ApprovalGrant } from "./approval.js";
 import { publishFrame } from "./frameBus.js";
 import {
   BlockingWorkNotifier,
@@ -86,6 +87,8 @@ export interface DaemonController {
    * the error banner. The composer keeps the draft on `false`.
    */
   submit: (objective: string) => Promise<boolean>;
+  /** Prepare a separate chat; keeps the previous durable session and draft. */
+  newSession: () => boolean;
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
   steer: (text: string) => Promise<SteerOutcome>;
@@ -117,9 +120,10 @@ export interface DaemonController {
   promoteQueuedPrompt: (promptId: string) => Promise<boolean>;
   /** Remove a queued prompt without running it. */
   deleteQueuedPrompt: (promptId: string) => Promise<boolean>;
-  selectSession: (sessionId: string) => Promise<void>;
-  resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
-  /** Answer or reject a parked question. Absent-shell and refusals go to the banner. */
+  /** True only after the daemon confirms the attachment. */
+  selectSession: (sessionId: string) => Promise<boolean>;
+  resolveApproval: (approvalId: string, decision: ApprovalChoice, scope?: ApprovalGrant) => Promise<void>;
+  /** Answer or reject a parked question; the caller presents refusal feedback. */
   resolveQuestion: (questionId: string, outcome: QuestionOutcomeView) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
   acknowledgeInbox: (entryId: string) => Promise<void>;
@@ -148,9 +152,19 @@ export function useDaemon(
    */
   notify?: NotificationSink,
 ): DaemonController {
-  const [state, dispatch] = useReducer(reduce, initialState);
+  // The first render precedes the transport effect. A null bridge here means
+  // "not checked yet", not "browser preview"; only shell-missing can establish
+  // that the native bridge is absent.
+  const [state, dispatch] = useReducer(reduce, initialState, (initial): DaemonState => ({
+    ...initial,
+    status: "connecting",
+    detail: "Checking the local workspace connection…",
+  }));
   const factory = useRef(makeTransport);
   const transport = useRef<DesktopTransport | null>(null);
+  const connectionGeneration = useRef(0);
+  const connectionReady = useRef(false);
+  const inboxReadGeneration = useRef(0);
   /**
    * The transport as render-visible state, mirrored from the ref: callbacks
    * read the ref (they are event handlers, so a stale read never matters),
@@ -199,12 +213,18 @@ export function useDaemon(
   const attachmentQueue = useRef<Promise<void> | null>(null);
   /** Session the current native connection has actually confirmed. */
   const confirmedAttachment = useRef<string | null>(null);
+  /** A new chat waits for its first accepted run; old subscription frames cannot reopen it. */
+  const freshSession = useRef(false);
   /**
    * True from the moment a launch is sent until the daemon has answered it.
    * `state.isRunning` only turns true on `RunStateChanged`, so it cannot serve
    * as this guard.
    */
   const launchInFlight = useRef(false);
+  // A first objective creates a session before its reply names it. Retain
+  // early frames until the accepted handle binds them; follow-ups keep the
+  // current confirmed session and its history.
+  const launchFrames = useRef<DaemonFrame[] | null>(null);
   /** The session a reconnect re-attaches; mirrors `state.activeSessionId`. */
   const activeSession = useRef<string | null>(null);
   activeSession.current = state.activeSessionId;
@@ -226,8 +246,12 @@ export function useDaemon(
   }
 
   const deliverFrame = useCallback((frame: DaemonFrame) => {
+    if (freshSession.current && (frame.kind === "event" || frame.kind === "history" || frame.kind === "catchup" || frame.kind === "remote_ui")) return;
     if (frame.kind === "disconnected") {
+      connectionReady.current = false;
+      connectionGeneration.current += 1;
       confirmedAttachment.current = null;
+      launchFrames.current = null;
     } else {
       const frameSessionId = sessionFrameId(frame);
       if (
@@ -261,6 +285,7 @@ export function useDaemon(
       return false;
     }
     pendingAttachment.current = null;
+    freshSession.current = false;
     confirmedAttachment.current = pending.sessionId;
     activeSession.current = pending.sessionId;
     dispatch({
@@ -375,23 +400,25 @@ export function useDaemon(
 
   const loadInbox = useCallback(async (query?: InboxListQuery) => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "inbox-unavailable", detail: NO_SHELL_DETAIL });
+    if (!client || !connectionReady.current) {
+      dispatch({ type: "inbox-unavailable", detail: "Reconnect to read the inbox." });
       return;
     }
+    const connection = connectionGeneration.current;
+    const request = ++inboxReadGeneration.current;
+    const current = () => connection === connectionGeneration.current && request === inboxReadGeneration.current;
     try {
       const page = await client.listInbox(query);
-      dispatch({ type: "inbox-loaded", entries: page.items });
+      if (current()) dispatch({ type: "inbox-loaded", entries: page.items });
     } catch (error) {
-      // The inbox view must say it could not read, rather than draw the empty
-      // state and imply there is no pending human work.
-      dispatch({ type: "inbox-unavailable", detail: describe(error) });
-      dispatch({ type: "command-failed", message: describe(error) });
+      if (current()) dispatch({ type: "inbox-unavailable", detail: describe(error) });
     }
   }, []);
 
   useEffect(() => {
     let live = true;
+    connectionGeneration.current += 1;
+    connectionReady.current = false;
     const client = factory.current();
     transport.current = client;
     setBridge(client);
@@ -401,6 +428,7 @@ export function useDaemon(
     // wait for a dead command's timeout.
     pendingAttachment.current = null;
     attachmentQueue.current = null;
+    launchFrames.current = null;
 
     if (!client) {
       dispatch({ type: "shell-missing", detail: NO_SHELL_DETAIL });
@@ -409,7 +437,7 @@ export function useDaemon(
 
     dispatch({ type: "connecting", detail: "Connecting to codypendentd…" });
     // This attempt's identity, so its teardown cannot close a later one.
-    const generation = reconnectTick;
+    const generation = connectionGeneration.current;
     const attempt = client.connect((frame) => {
       if (live) {
         const pending = pendingAttachment.current;
@@ -425,6 +453,10 @@ export function useDaemon(
           // restores any session event that mattered.
           return;
         }
+        if (launchFrames.current && frameSessionId !== null && frameSessionId !== activeSession.current) {
+          launchFrames.current.push(frame);
+          return;
+        }
         deliverFrame(frame);
       }
     }, generation);
@@ -433,6 +465,7 @@ export function useDaemon(
         if (!live) {
           return;
         }
+        connectionReady.current = true;
         reconnectAttempts.current = 0;
         dispatch({ type: "connected", info });
         settleReconnect();
@@ -456,18 +489,7 @@ export function useDaemon(
             dispatch({ type: "command-failed", message: describe(error) });
           }
         }
-        try {
-          const page = await client.listInbox();
-          if (live) {
-            dispatch({ type: "inbox-loaded", entries: page.items });
-          }
-        } catch (error) {
-          // A connected daemon that cannot serve `ListInbox` leaves the inbox
-          // unread, not empty. Record why so the view can say so.
-          if (live) {
-            dispatch({ type: "inbox-unavailable", detail: describe(error) });
-          }
-        }
+        if (live) await loadInbox();
       })
       .catch(async (error) => {
         if (!live) {
@@ -479,6 +501,7 @@ export function useDaemon(
         } catch {
           socket = "";
         }
+        if (!live) return;
         const detail = socket
           ? `No daemon on ${socket}: ${describe(error)}`
           : `No daemon: ${describe(error)}`;
@@ -488,6 +511,8 @@ export function useDaemon(
 
     return () => {
       live = false;
+      connectionReady.current = false;
+      connectionGeneration.current += 1;
       // Disconnect only once the connect attempt has SETTLED: tearing down
       // mid-handshake races the shell's connection setup, and StrictMode's
       // dev double-mount hits exactly that sequence.
@@ -501,7 +526,7 @@ export function useDaemon(
         .catch(() => undefined)
         .then(() => client.disconnect(generation).catch(() => undefined));
     };
-  }, [deliverFrame, enqueueAttachment, reconnectTick, settleReconnect]);
+  }, [deliverFrame, enqueueAttachment, loadInbox, reconnectTick, settleReconnect]);
 
   /**
    * Reconnect on demand, for a surface that needs the daemon to pick up a
@@ -580,7 +605,7 @@ export function useDaemon(
           pendingGap.after,
           pendingGap.through,
         );
-        if (!live) {
+        if (!live || freshSession.current || activeSession.current !== pendingGap.sessionId) {
           return;
         }
         dispatch({
@@ -598,7 +623,7 @@ export function useDaemon(
           through: pendingGap.through,
         });
       } catch (error) {
-        if (live) {
+        if (live && !freshSession.current && activeSession.current === pendingGap.sessionId) {
           // Reported, not swallowed: an unrepairable gap is a transcript the
           // operator should not read as complete. The gap stays recorded, so a
           // later reconnect re-attempts it.
@@ -642,6 +667,10 @@ export function useDaemon(
       dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
       return false;
     }
+    if (!freshSession.current && activeSession.current !== null && confirmedAttachment.current === null) {
+      dispatch({ type: "command-failed", message: attachmentUnavailableDetail() });
+      return false;
+    }
     // A launch is not visible in `isRunning` until the daemon's
     // `RunStateChanged` arrives, several round trips later. Without this
     // guard a double-click on Send — or on a failure card's Retry, which is
@@ -651,9 +680,23 @@ export function useDaemon(
       return false;
     }
     launchInFlight.current = true;
+    const frames: DaemonFrame[] = [];
+    launchFrames.current = frames;
+    const connection = connectionGeneration.current;
+    const attachment = attachmentGeneration.current;
     try {
-      const handle = await client.startObjective(objective);
+      const handle = await client.startObjective(objective, confirmedAttachment.current);
+      if (connection !== connectionGeneration.current || attachment !== attachmentGeneration.current) {
+        return false;
+      }
+      launchFrames.current = null;
+      freshSession.current = false;
       confirmedAttachment.current = handle.session_id;
+      activeSession.current = handle.session_id;
+      dispatch({ type: "session-reattached", sessionId: handle.session_id });
+      for (const frame of frames) {
+        if (sessionFrameId(frame) === handle.session_id) deliverFrame(frame);
+      }
       dispatch({ type: "run-submitted", handle, objective });
       try {
         const sessions = await client.listSessions();
@@ -667,9 +710,23 @@ export function useDaemon(
       dispatch({ type: "command-failed", message: describe(error) });
       return false;
     } finally {
+      if (launchFrames.current === frames) launchFrames.current = null;
       launchInFlight.current = false;
     }
-  }, []);
+  }, [deliverFrame]);
+
+  const newSession = useCallback(() => {
+    if (launchInFlight.current || state.isRunning || pendingAttachment.current) {
+      dispatch({ type: "command-failed", message: "Finish or cancel the current run before starting a new chat." });
+      return false;
+    }
+    attachmentGeneration.current += 1;
+    freshSession.current = true;
+    confirmedAttachment.current = null;
+    activeSession.current = null;
+    dispatch({ type: "new-session" });
+    return true;
+  }, [state.isRunning]);
 
   const activeRunId = state.activeRunId;
   const cancel = useCallback(async () => {
@@ -815,11 +872,18 @@ export function useDaemon(
         dispatch({ type: "command-failed", message: detail });
         return false;
       }
+      const connection = connectionGeneration.current;
+      const attachment = attachmentGeneration.current;
+      const session = confirmedAttachment.current;
+      const current = () => connection === connectionGeneration.current
+        && attachment === attachmentGeneration.current && session === confirmedAttachment.current;
       try {
         await call(client);
+        if (!current()) return false;
         dispatch({ type: "prompt-queue-accepted" });
         return true;
       } catch (error) {
+        if (!current()) return false;
         dispatch({ type: "prompt-queue-failed", detail: describe(error) });
         dispatch({ type: "command-failed", message: describe(error) });
         return false;
@@ -892,97 +956,48 @@ export function useDaemon(
   );
 
   const selectSession = useCallback(async (sessionId: string) => {
-    await enqueueAttachment(sessionId);
+    return enqueueAttachment(sessionId);
   }, [enqueueAttachment]);
 
-  const resolveApproval = useCallback(async (approvalId: string, decision: ApprovalChoice) => {
+  // The decision card owns pending/refusal feedback. Preserve the promise so
+  // it cannot mistake a swallowed rejection for an accepted decision.
+  const resolveApproval = useCallback(async (approvalId: string, decision: ApprovalChoice, scope: ApprovalGrant = "Once") => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return;
-    }
-    try {
-      await client.resolveApproval(approvalId, decision);
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-    }
+    if (!client || !connectionReady.current) throw new Error("Reconnect before deciding this approval.");
+    await client.resolveApproval(approvalId, decision, scope);
   }, []);
 
-  const resolveQuestion = useCallback(
-    async (questionId: string, outcome: QuestionOutcomeView) => {
-      const client = transport.current;
-      if (!client?.resolveQuestion) {
-        dispatch({
-          type: "command-failed",
-          message: client
-            ? "This shell cannot answer questions; answer from the TUI."
-            : NO_SHELL_DETAIL,
-        });
-        return;
-      }
-      try {
-        await client.resolveQuestion(questionId, outcome);
-      } catch (error) {
-        dispatch({ type: "command-failed", message: describe(error) });
-      }
-    },
-    [],
-  );
-
-  const acknowledgeInbox = useCallback(async (entryId: string) => {
+  const resolveQuestion = useCallback(async (questionId: string, outcome: QuestionOutcomeView) => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return;
-    }
-    try {
-      const entry = await client.mutateInbox({ type: "Acknowledge", entry_id: entryId });
-      dispatch({ type: "inbox-entry-updated", entry });
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-    }
+    if (!client || !connectionReady.current) throw new Error("Reconnect before answering this question.");
+    if (!client.resolveQuestion) throw new Error("This shell cannot answer questions; answer from the TUI.");
+    await client.resolveQuestion(questionId, outcome);
   }, []);
 
-  const dismissInbox = useCallback(async (entryId: string) => {
+  const mutateInbox = useCallback(async (entryId: string, type: "Acknowledge" | "Dismiss") => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return;
-    }
-    try {
-      const entry = await client.mutateInbox({ type: "Dismiss", entry_id: entryId });
-      dispatch({ type: "inbox-entry-updated", entry });
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-    }
+    if (!client || !connectionReady.current) throw new Error("Reconnect to update the inbox.");
+    const connection = connectionGeneration.current;
+    // A list requested before a mutation cannot later restore the old row.
+    inboxReadGeneration.current += 1;
+    const entry = await client.mutateInbox({ type, entry_id: entryId });
+    if (connection !== connectionGeneration.current) return;
+    inboxReadGeneration.current += 1;
+    dispatch({ type: "inbox-entry-updated", entry });
   }, []);
+  const acknowledgeInbox = useCallback((entryId: string) => mutateInbox(entryId, "Acknowledge"), [mutateInbox]);
+  const dismissInbox = useCallback((entryId: string) => mutateInbox(entryId, "Dismiss"), [mutateInbox]);
 
+  // Analytics owns its request generations and error presentation. A retired
+  // filter/connection must not leak its eventual failure into the app banner.
   const queryAnalytics = useCallback(async (query?: AnalyticsQuery) => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return null;
-    }
-    try {
-      return await client.queryAnalytics(query);
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-      return null;
-    }
+    return client ? client.queryAnalytics(query) : null;
   }, []);
 
   const exportAnalytics = useCallback(async (request: AnalyticsExportRequest) => {
     const client = transport.current;
-    if (!client) {
-      dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return null;
-    }
-    try {
-      return await client.exportAnalytics(request);
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-      return null;
-    }
+    return client ? client.exportAnalytics(request) : null;
   }, []);
 
   const readArtifact = useCallback(async (artifact: ArtifactRef) => {
@@ -1010,6 +1025,7 @@ export function useDaemon(
     startDaemon,
     dismissError,
     submit,
+    newSession,
     cancel,
     steer,
     pauseRun,
@@ -1067,6 +1083,7 @@ function sessionFrameId(frame: DaemonFrame): string | null {
     case "catchup":
     case "history":
       return frame.session_id;
+    case "remote_ui":
     case "workflow_event":
     case "blackboard_posted":
     case "disconnected":

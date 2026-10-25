@@ -8,6 +8,8 @@ import { useFocusTrap } from "../useFocusTrap.js";
  * nowhere but a `title` tooltip on the ⌘K button.
  */
 const SHORTCUTS: ReadonlyArray<{ keys: string; does: string }> = [
+  { keys: "⌘N / Ctrl-N", does: "start a new chat after the current run finishes; keep the draft" },
+  { keys: "⌘B / Ctrl-B", does: "show or hide the sidebar" },
   { keys: "⌘K / Ctrl-K", does: "open the command palette from anywhere" },
   { keys: "/", does: "open the command palette (when not typing in a field)" },
   { keys: "Esc", does: "close the topmost overlay, else go back to the previous view" },
@@ -16,9 +18,9 @@ const SHORTCUTS: ReadonlyArray<{ keys: string; does: string }> = [
   { keys: "↑ / ↓ + Enter", does: "move and run the palette selection" },
 ];
 
-export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+export const ShortcutsCard: React.FC<{ onClose: () => void; restoreFocusFallback?: React.RefObject<HTMLElement | null> }> = ({ onClose, restoreFocusFallback }) => {
   const dialogRef = useRef<HTMLDivElement | null>(null);
-  useFocusTrap(dialogRef, { active: true, onEscape: onClose });
+  useFocusTrap(dialogRef, { active: true, onEscape: onClose, restoreFocusFallback });
   return (
   <div
     style={{

@@ -7,14 +7,18 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "icons": "node scripts/generate-icons.mjs",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev -f app",
+    "tauri:dev": "node scripts/dev-desktop.mjs",
+    "desktop:dev": "node scripts/dev-desktop.mjs",
     "tauri:build": "tauri build -f app",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "perf": "vitest run --config vitest.perf.config.ts"
   },
   "dependencies": {
+    "@ag-ui/client": "1.0.1",
+    "@ag-ui/core": "1.0.1",
     "@codypendent/protocol": "file:../../sdk/protocol",
     "@codypendent/ui": "file:../../sdk/ui",
     "@tauri-apps/api": "^2.11.1",
@@ -22,7 +26,8 @@
     "clsx": "^2.1.1",
     "lucide-react": "^0.475.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "rxjs": "7.8.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

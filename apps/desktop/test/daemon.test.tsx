@@ -1,5 +1,5 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AnalyticsExportRequest,
   AnalyticsExportResult,
@@ -15,6 +15,7 @@ import type {
   SessionSummary,
 } from "@codypendent/protocol";
 import { App } from "../src/App.js";
+import { useDaemon } from "../src/useDaemon.js";
 import type {
   ApprovalChoice,
   ConnectionInfo,
@@ -152,8 +153,12 @@ class MockDesktopTransport implements DesktopTransport {
 
   async push(frame: DaemonFrame): Promise<void> {
     await act(async () => {
-      this.frameHandler?.(frame);
+      this.emit(frame);
     });
+  }
+
+  emit(frame: DaemonFrame): void {
+    this.frameHandler?.(frame);
   }
 }
 
@@ -171,6 +176,137 @@ function makeEvent(
 }
 
 describe("daemon transport and session lifecycle integration", () => {
+  it("opens and focuses an inbox approval in its owning session before a decision", async () => {
+    const transport = new MockDesktopTransport();
+    const entry: InboxEntry = { id: "entry", repository_id: "repo", kind: { type: "ApprovalRequest" },
+      title: "Review tests", state: { type: "Unread" }, created_at: "2026-09-08T00:00:00Z",
+      deep_link: { type: "Approval", approval_id: "approval" },
+      source: { session_id: "owning-session", dedup_key: "approval", identity: { type: "Approval", approval_id: "approval" } } };
+    transport.listInbox = vi.fn().mockResolvedValue({ items: [entry] });
+    transport.attachSession = vi.fn().mockImplementation(async () => {
+      transport.emit({ kind: "event", session_id: "owning-session", event: makeEvent(1, {
+        type: "ApprovalRequested", approval_id: "approval", risk: { level: { type: "Low" }, reasons: [] },
+        action: { type: "ExecuteCommand", program: "cargo", args: ["test"], environment: [], cwd: "/work" },
+      }) });
+    });
+    await act(async () => { render(<App makeTransport={() => transport} />); });
+    fireEvent.click(screen.getByRole("button", { name: "Inbox View" }));
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Review Review tests" })));
+    expect(transport.attachSession).toHaveBeenCalledExactlyOnceWith("owning-session");
+    expect(screen.getByLabelText("Proposed action details").textContent).toContain("/work");
+    expect(document.activeElement).toBe(screen.getByRole("group", { name: "Approval required" }));
+    expect(transport.resolveApprovalCalls).toEqual([]);
+  });
+
+  it("shows missing inbox session provenance instead of opening an unrelated conversation", async () => {
+    const transport = new MockDesktopTransport();
+    transport.listInbox = vi.fn().mockResolvedValue({ items: [{ id: "entry", repository_id: "repo", kind: { type: "AgentQuestion" },
+      title: "Question elsewhere", state: { type: "Unread" }, created_at: "2026-09-08T00:00:00Z",
+      deep_link: { type: "Question", question_id: "q" }, source: { dedup_key: "q", identity: { type: "Question", question_id: "q" } } }] });
+    await act(async () => { render(<App makeTransport={() => transport} />); });
+    fireEvent.click(screen.getByRole("button", { name: "Inbox View" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Review Question elsewhere" })));
+    expect(screen.getByRole("alert").textContent).toContain("does not identify its session");
+    expect(screen.getByRole("region", { name: "Inbox" })).toBeTruthy();
+    expect(transport.attachSessionCalls).toEqual([]);
+  });
+
+  it("does not reopen a session after the operator leaves and returns to the inbox during attach", async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    const transport = new MockDesktopTransport();
+    transport.attachSession = vi.fn().mockReturnValue(pending);
+    transport.listInbox = vi.fn().mockResolvedValue({ items: [{ id: "entry", repository_id: "repo", kind: { type: "AgentQuestion" },
+      title: "Question elsewhere", state: { type: "Unread" }, created_at: "2026-09-08T00:00:00Z",
+      deep_link: { type: "Question", question_id: "q" }, source: { session_id: "elsewhere", dedup_key: "q", identity: { type: "Question", question_id: "q" } } }] });
+    await act(async () => { render(<App makeTransport={() => transport} />); });
+    fireEvent.click(screen.getByRole("button", { name: "Inbox View" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review Question elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run group" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Usage View" })));
+    fireEvent.click(screen.getByRole("button", { name: "Inbox View" }));
+    await act(async () => finish());
+    expect(screen.getByRole("region", { name: "Inbox" })).toBeTruthy();
+  });
+
+  it("returns an approval refusal to the card instead of reporting acceptance", async () => {
+    const transport = new MockDesktopTransport();
+    transport.resolveApproval = vi.fn().mockRejectedValue(new Error("Approval already decided elsewhere"));
+    await act(async () => { render(<App makeTransport={() => transport} />); });
+    await transport.push({ kind: "event", session_id: "session", event: makeEvent(1, {
+      type: "ApprovalRequested", approval_id: "a", risk: { level: { type: "Low" }, reasons: [] },
+      action: { type: "ExecuteCommand", program: "cargo", args: ["test"], environment: [], cwd: null },
+    }) });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Approve" })));
+    const card = screen.getByRole("group", { name: "Approval required" });
+    expect(card.textContent).toContain("Approval already decided elsewhere");
+    expect(card.textContent).not.toContain("Decision sent");
+    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("does not let a slow inbox refresh undo an acknowledged row", async () => {
+    let finishRead!: (page: InboxPage) => void;
+    const old = new Promise<InboxPage>((resolve) => { finishRead = resolve; });
+    const transport = new MockDesktopTransport();
+    const { result } = renderHook(() => useDaemon(() => transport));
+    await act(async () => undefined);
+    transport.listInbox = vi.fn().mockReturnValue(old);
+    let reading!: Promise<void>;
+    act(() => { reading = result.current.loadInbox(); });
+    await act(async () => result.current.acknowledgeInbox("entry"));
+    const acknowledged = result.current.state.inbox[0]!;
+    expect(acknowledged.state?.type).toBe("Acknowledged");
+    await act(async () => { finishRead({ items: [{ ...acknowledged, state: { type: "Unread" } }] }); await reading; });
+    expect(result.current.state.inbox[0]?.state?.type).toBe("Acknowledged");
+  });
+
+  it("discards inbox mutation results from a retired connection even when the transport instance is reused", async () => {
+    let finish!: (entry: InboxEntry) => void;
+    const old = new Promise<InboxEntry>((resolve) => { finish = resolve; });
+    const transport = new MockDesktopTransport();
+    const entry = await transport.mutateInbox({ type: "Dismiss", entry_id: "old-entry" });
+    transport.mutateInbox = vi.fn().mockReturnValue(old);
+    const { result } = renderHook(() => useDaemon(() => transport));
+    await act(async () => undefined);
+    let changing!: Promise<void>;
+    act(() => { changing = result.current.dismissInbox("old-entry"); });
+    await act(async () => { void result.current.reconnect(); });
+    expect(result.current.state.status).toBe("connected");
+    await act(async () => { finish(entry); await changing; });
+    expect(result.current.state.inbox).toEqual([]);
+  });
+
+  it("ignores an old connection failure whose socket-path lookup finishes after reconnect", async () => {
+    let finish!: (path: string) => void;
+    const oldPath = new Promise<string>((resolve) => { finish = resolve; });
+    const transport = new MockDesktopTransport();
+    transport.connect = vi.fn().mockRejectedValueOnce(new Error("Old connect failed")).mockResolvedValue(transport.connectionInfo);
+    transport.socketPath = vi.fn().mockReturnValue(oldPath);
+    const { result } = renderHook(() => useDaemon(() => transport));
+    await act(async () => undefined);
+    await act(async () => { void result.current.reconnect(); });
+    expect(result.current.state.status).toBe("connected");
+    await act(async () => finish("/retired/socket"));
+    expect(result.current.state.status).toBe("connected");
+    expect(result.current.state.detail).not.toContain("Old connect failed");
+  });
+
+  it("keeps obsolete analytics errors out of the global application banner", async () => {
+    let rejectOld!: (error: Error) => void;
+    const old = new Promise<AnalyticsPage>((_, reject) => { rejectOld = reject; });
+    const transport = new MockDesktopTransport();
+    transport.queryAnalytics = vi.fn().mockReturnValueOnce(old)
+      .mockResolvedValueOnce({ items: [{ dimensions: ["fresh provider"], metrics: {} }] });
+    await act(async () => { render(<App makeTransport={() => transport} />); });
+    fireEvent.click(screen.getByRole("button", { name: "Run group" }));
+    fireEvent.click(screen.getByRole("button", { name: "Usage View" }));
+    await act(async () => fireEvent.change(screen.getByLabelText("Group By:"), { target: { value: "provider" } }));
+    await act(async () => rejectOld(new Error("Retired query refused")));
+    expect(screen.getByText("fresh provider")).toBeTruthy();
+    expect(screen.queryByText(/Retired query refused/)).toBeNull();
+  });
+
   it("desktop_projects_a_full_session_lifecycle", async () => {
     // 1. Discovery: retrieve socket path
     const transport = new MockDesktopTransport({

@@ -28,6 +28,8 @@ use crate::principal::PeerPrincipal;
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 200;
 const CURSOR_VERSION: u8 = 1;
+const NOTE_BASE_SCORE: f64 = 600.0;
+const MODEL_STREAM_BASE_SCORE: f64 = 550.0;
 
 /// A Session Library failure safe to translate at the protocol boundary.
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +126,12 @@ pub async fn search_sessions(
         .as_ref()
         .map(|cursor| decode_cursor(cursor, &query_hash))
         .transpose()?;
+    let limit = usize::try_from(if query.limit == 0 {
+        DEFAULT_PAGE_SIZE
+    } else {
+        query.limit.min(MAX_PAGE_SIZE)
+    })
+    .unwrap_or(MAX_PAGE_SIZE as usize);
     let rows = load_visible_sessions(&mut tx, daemon_uid, principal, query).await?;
     let sessions = rows
         .into_iter()
@@ -135,12 +143,32 @@ pub async fn search_sessions(
         .filter_map(|session| title_candidate(session, &query.query))
         .collect::<Vec<_>>();
     if !query.query.trim().is_empty() {
+        // A title page with an extra higher-ranked result cannot contain these
+        // lower-ranked transcripts. Avoid materializing/decoding every matching
+        // note in a long history just to sort it below that page. Re-evaluate
+        // after the cursor on every request so later pages still include them.
+        // The extra result preserves next_cursor without probing skipped rows.
+        let transcript_ceiling =
+            text_score_ceiling(NOTE_BASE_SCORE.max(MODEL_STREAM_BASE_SCORE), &query.query);
+        let skip_transcripts = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.result.score > transcript_ceiling
+                    && cursor
+                        .as_ref()
+                        .is_none_or(|cursor| candidate_is_after(candidate, cursor))
+            })
+            .take(limit + 1)
+            .count()
+            > limit;
         let summaries = sessions
             .iter()
             .map(|session| (session.session_id, session))
             .collect::<HashMap<_, _>>();
         let prefilter = body_prefilter(&query.query);
-        for row in load_visible_events(&mut tx, &sessions, prefilter.as_ref()).await? {
+        for row in
+            load_visible_events(&mut tx, &sessions, prefilter.as_ref(), skip_transcripts).await?
+        {
             let session_id = row.session_id.parse().map_err(|error| {
                 SessionLibraryError::InvalidData(format!("invalid event session id: {error}"))
             })?;
@@ -174,12 +202,6 @@ pub async fn search_sessions(
         candidates.retain(|candidate| candidate_is_after(candidate, cursor));
     }
 
-    let limit = usize::try_from(if query.limit == 0 {
-        DEFAULT_PAGE_SIZE
-    } else {
-        query.limit.min(MAX_PAGE_SIZE)
-    })
-    .unwrap_or(MAX_PAGE_SIZE as usize);
     let has_more = candidates.len() > limit;
     let items = candidates
         .iter()
@@ -872,6 +894,7 @@ async fn load_visible_events(
     conn: &mut SqliteConnection,
     sessions: &[SessionSummary],
     prefilter: Option<&BodyPrefilter>,
+    skip_transcripts: bool,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
     let mut events = Vec::new();
     // Stay comfortably below SQLite's host-parameter ceiling even for a large
@@ -886,6 +909,11 @@ async fn load_visible_events(
             ids.push_bind(session.session_id.to_string());
         }
         ids.push_unseparated(")");
+        if skip_transcripts {
+            sql.push(
+                " AND json_extract(body, '$.type') NOT IN ('NoteAppended', 'ModelStreamDelta')",
+            );
+        }
         push_body_prefilter(&mut sql, prefilter);
         sql.push(" ORDER BY session_id, sequence");
         events.extend(
@@ -966,7 +994,7 @@ fn event_candidates(
             event_link,
             text,
             query,
-            600.0,
+            NOTE_BASE_SCORE,
         ),
         EventBody::RunStarted { objective, .. } => push_text_candidate(
             &mut candidates,
@@ -986,7 +1014,7 @@ fn event_candidates(
             event_link,
             text,
             query,
-            550.0,
+            MODEL_STREAM_BASE_SCORE,
         ),
         EventBody::ToolStarted { tool, label, .. } => {
             let text = label
@@ -1214,6 +1242,12 @@ fn text_score(text: &str, query: &str, base: f64) -> Option<f64> {
     Some(base + quality)
 }
 
+fn text_score_ceiling(base: f64, query: &str) -> f64 {
+    // Discontiguous multi-term matches use 40 + term count, which can exceed
+    // the exact-match bonus for long queries. Keep pruning conservative there.
+    base + 100.0_f64.max(40.0 + query.split_whitespace().count() as f64)
+}
+
 fn bounded_excerpt(text: &str) -> String {
     const MAX_EXCERPT_CHARS: usize = 240;
     let mut excerpt = text.chars().take(MAX_EXCERPT_CHARS).collect::<String>();
@@ -1427,7 +1461,10 @@ fn run_state_from_db(value: &str) -> Result<RunState, SessionLibraryError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_prefilter, load_visible_events, load_visible_sessions, BodyPrefilter};
+    use super::{
+        body_prefilter, load_visible_events, load_visible_sessions, text_score, text_score_ceiling,
+        BodyPrefilter, NOTE_BASE_SCORE,
+    };
     use crate::principal::PeerPrincipal;
     use codypendent_protocol::{
         EventBody, RunId, SessionId, SessionSearchFilters, SessionSearchQuery, SessionSummary,
@@ -1440,6 +1477,17 @@ mod tests {
             limit: 50,
             cursor: None,
         }
+    }
+
+    #[test]
+    fn transcript_score_ceiling_covers_long_discontiguous_queries() {
+        let query = std::iter::repeat_n("needle", 200)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let score = text_score("needle x", &query, NOTE_BASE_SCORE).unwrap();
+        assert_eq!(score, 840.0);
+        assert_eq!(score, text_score_ceiling(NOTE_BASE_SCORE, &query));
+        assert_eq!(text_score_ceiling(NOTE_BASE_SCORE, "needle"), 700.0);
     }
 
     /// The filter exists to skip rows, so what it must never do is skip one that
@@ -1541,10 +1589,14 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("summaries");
 
-        let filtered =
-            load_visible_events(&mut conn, &sessions, body_prefilter(&search.query).as_ref())
-                .await
-                .expect("events");
+        let filtered = load_visible_events(
+            &mut conn,
+            &sessions,
+            body_prefilter(&search.query).as_ref(),
+            false,
+        )
+        .await
+        .expect("events");
         assert_eq!(
             filtered.len(),
             1,
@@ -1553,9 +1605,13 @@ mod tests {
 
         // And with no filter the loader still reads everything, which is what
         // makes the filter — not a changed query — the thing being measured.
-        let everything = load_visible_events(&mut conn, &sessions, None)
+        let everything = load_visible_events(&mut conn, &sessions, None, false)
             .await
             .expect("events");
         assert_eq!(everything.len(), total as usize);
+        let pruned = load_visible_events(&mut conn, &sessions, None, true)
+            .await
+            .expect("rank-pruned events");
+        assert!(pruned.is_empty(), "low-ranked streams stay in SQLite");
     }
 }

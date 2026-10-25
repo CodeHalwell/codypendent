@@ -47,18 +47,30 @@ echo "codypendent: installing $tag ($target) -> $BINDIR"
 
 # 3. Download + extract into a temp dir that is always cleaned up.
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-gh release download "$tag" -R "$REPO" -p "$asset" -D "$tmp" --clobber
+gh release download "$tag" -R "$REPO" -p "$asset" -p SHA256SUMS -D "$tmp" --clobber
+# Verify before extraction or any privileged install. Old releases without a
+# published manifest fail closed; a digest of the download alone proves nothing.
+expected="$(awk -v name="$asset" '$2 == name { digest=$1; count++ } END { if (count != 1) exit 1; print digest }' "$tmp/SHA256SUMS")" || {
+  echo "error: release manifest has no unique checksum for $asset" >&2; exit 1;
+}
+[[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { echo "error: malformed release checksum" >&2; exit 1; }
+if command -v sha256sum >/dev/null; then
+  actual="$(sha256sum "$tmp/$asset" | cut -d ' ' -f 1)"
+else
+  command -v shasum >/dev/null || { echo "error: sha256sum or shasum is required" >&2; exit 1; }
+  actual="$(shasum -a 256 "$tmp/$asset" | cut -d ' ' -f 1)"
+fi
+[ "$actual" = "$expected" ] || { echo "error: release checksum mismatch; nothing installed" >&2; exit 1; }
 tar -xzf "$tmp/$asset" -C "$tmp"
 src="$tmp/codypendent-$target"
 [ -x "$src/codypendent" ] || { echo "error: codypendent binary missing in $asset" >&2; exit 1; }
 [ -x "$src/codypendent-ui-worker-launcher" ] || { echo "error: UI worker launcher missing in $asset" >&2; exit 1; }
 [ -x "$src/node-runtime/bin/node" ] || { echo "error: pinned Remote UI Node runtime missing in $asset" >&2; exit 1; }
+[ -x "$src/embedding-runtime/llama-server" ] && [ -f "$src/embedding-runtime/model.gguf" ] && [ -f "$src/embedding-runtime/embedding-runtime.json" ] || {
+  echo "error: pinned local embedding runtime missing in $asset" >&2; exit 1;
+}
 
-# 4. macOS: clear the Gatekeeper quarantine on the unsigned binaries so they run
-#    without the "developer cannot be verified" block.
-if [ "$os" = Darwin ]; then
-  xattr -dr com.apple.quarantine "$src" 2>/dev/null || true
-fi
+# macOS releases are signed/notarized in CI; do not clear Gatekeeper quarantine.
 
 # 5. Install `codypendent` (self-sufficient — it runs the daemon from itself
 #    via `codypendent __daemon`). Also install the OPTIONAL standalone
@@ -68,31 +80,26 @@ bins=("$src/codypendent" "$src/codypendent-ui-worker-launcher")
 [ -x "$src/codypendentd" ] && bins+=("$src/codypendentd")
 mkdir -p "$BINDIR" 2>/dev/null || true
 mkdir -p "$LIBDIR" 2>/dev/null || true
-if [ -w "$BINDIR" ] && [ -w "$LIBDIR" ]; then
-  install -m 0755 "${bins[@]}" "$BINDIR"/
-  mkdir -p "$LIBDIR"
-  runtime_stage="$LIBDIR/node-runtime.new.$$"
-  runtime_old="$LIBDIR/node-runtime.old.$$"
-  cp -R "$src/node-runtime" "$runtime_stage"
-  [ ! -e "$LIBDIR/node-runtime" ] || mv "$LIBDIR/node-runtime" "$runtime_old"
-  mv "$runtime_stage" "$LIBDIR/node-runtime"
-  [ ! -e "$runtime_old" ] || rm -rf "$runtime_old"
-else
+privilege=(command)
+if [ ! -w "$BINDIR" ] || [ ! -w "$LIBDIR" ]; then
   echo "codypendent: $BINDIR is not writable — using sudo"
-  sudo install -m 0755 "${bins[@]}" "$BINDIR"/
-  sudo mkdir -p "$LIBDIR"
-  runtime_stage="$LIBDIR/node-runtime.new.$$"
-  runtime_old="$LIBDIR/node-runtime.old.$$"
-  sudo cp -R "$src/node-runtime" "$runtime_stage"
-  [ ! -e "$LIBDIR/node-runtime" ] || sudo mv "$LIBDIR/node-runtime" "$runtime_old"
-  sudo mv "$runtime_stage" "$LIBDIR/node-runtime"
-  [ ! -e "$runtime_old" ] || sudo rm -rf "$runtime_old"
+  privilege=(sudo)
 fi
+"${privilege[@]}" install -m 0755 "${bins[@]}" "$BINDIR"/
+"${privilege[@]}" mkdir -p "$LIBDIR"
+for runtime in node-runtime embedding-runtime; do
+  runtime_stage="$LIBDIR/$runtime.new.$$"
+  runtime_old="$LIBDIR/$runtime.old.$$"
+  "${privilege[@]}" cp -R "$src/$runtime" "$runtime_stage"
+  [ ! -e "$LIBDIR/$runtime" ] || "${privilege[@]}" mv "$LIBDIR/$runtime" "$runtime_old"
+  "${privilege[@]}" mv "$runtime_stage" "$LIBDIR/$runtime"
+  [ ! -e "$runtime_old" ] || "${privilege[@]}" rm -rf "$runtime_old"
+done
 
 if [ -x "$src/codypendentd" ]; then
-  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, pinned UI runtime, and codypendentd"
+  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, pinned UI and embedding runtimes, and codypendentd"
 else
-  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, and pinned UI runtime"
+  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, and pinned UI and embedding runtimes"
 fi
 case ":$PATH:" in
   *":$BINDIR:"*) echo "codypendent: run  codypendent" ;;

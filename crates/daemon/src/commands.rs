@@ -4356,11 +4356,12 @@ pub async fn session_run_provenance(
     pool: &SqlitePool,
     session_id: SessionId,
 ) -> anyhow::Result<SessionRunProvenance> {
+    let mut connection = pool.acquire().await?;
     let mut provenance = SessionRunProvenance::default();
     let mut model_found = false;
     let mut repository_found = false;
     session_run_provenance_inner(
-        pool,
+        &mut connection,
         session_id,
         0,
         i64::MAX,
@@ -4373,7 +4374,7 @@ pub async fn session_run_provenance(
 }
 
 async fn session_run_provenance_inner(
-    pool: &SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     session_id: SessionId,
     depth: usize,
     max_command_rowid: i64,
@@ -4394,7 +4395,7 @@ async fn session_run_provenance_inner(
     )
     .bind(session_id.to_string())
     .bind(max_command_rowid)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     for (body,) in bodies {
         let command_body = serde_json::from_str::<CommandBody>(&body).map_err(|error| {
@@ -4437,13 +4438,13 @@ async fn session_run_provenance_inner(
         let parent_row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT forked_from_session_id FROM sessions WHERE id = ?")
                 .bind(session_id.to_string())
-                .fetch_optional(pool)
+                .fetch_optional(&mut *connection)
                 .await?;
 
         if let Some((Some(parent_id_str),)) = parent_row {
             if let Ok(parent_id) = SessionId::from_str(&parent_id_str) {
                 Box::pin(session_run_provenance_inner(
-                    pool,
+                    connection,
                     parent_id,
                     depth + 1,
                     max_command_rowid,
@@ -4474,12 +4475,21 @@ pub async fn run_launch_provenance(
     run_id: RunId,
     session_id: SessionId,
 ) -> anyhow::Result<SessionRunProvenance> {
+    let mut connection = pool.acquire().await?;
+    run_launch_provenance_in(&mut connection, run_id, session_id).await
+}
+
+pub(crate) async fn run_launch_provenance_in(
+    connection: &mut sqlx::SqliteConnection,
+    run_id: RunId,
+    session_id: SessionId,
+) -> anyhow::Result<SessionRunProvenance> {
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT rowid, body FROM commands \
          WHERE status = 'applied' AND json_extract(result_json, '$.created_run') = ?",
     )
     .bind(run_id.to_string())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
 
     let Some((origin_rowid, body_json)) = row else {
@@ -4516,7 +4526,7 @@ pub async fn run_launch_provenance(
             let mut model_found = false;
             let mut repository_found = false;
             session_run_provenance_inner(
-                pool,
+                connection,
                 session_id,
                 0,
                 origin_rowid,

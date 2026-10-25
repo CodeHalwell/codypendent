@@ -11,9 +11,8 @@ import { describe, expect, it } from "vitest";
 import { App } from "../src/App.js";
 
 describe("the sidebar does not shout every destination at once", () => {
-  it("opens the session groups and leaves the rest folded away", () => {
+  it("keeps chat navigation visible and leaves tools folded away", () => {
     render(<App />);
-    // "Run" is open on first paint.
     expect(screen.getByLabelText("Sessions View")).toBeTruthy();
     // "Configuration" is not — its destinations are absent from the DOM, not
     // merely hidden, so they cost nothing to render either.
@@ -28,13 +27,15 @@ describe("the sidebar does not shout every destination at once", () => {
     expect(screen.getByLabelText("Models View")).toBeTruthy();
   });
 
-  it("never folds away the group holding the current view", () => {
+  it("lets the current group collapse and reopen without changing views", () => {
     render(<App />);
     fireEvent.click(screen.getByLabelText("Configuration group"));
     fireEvent.click(screen.getByLabelText("Models View"));
-    // Collapsing the group you are standing in would strand the reader.
     fireEvent.click(screen.getByLabelText("Configuration group"));
-    expect(screen.getByLabelText("Models View")).toBeTruthy();
+    expect(screen.queryByLabelText("Models View")).toBeNull();
+    expect(screen.getByRole("navigation", { name: "View navigation" }).textContent).toContain("Models");
+    fireEvent.click(screen.getByLabelText("Configuration group"));
+    expect(screen.getByLabelText("Models View").getAttribute("aria-current")).toBe("page");
   });
 });
 

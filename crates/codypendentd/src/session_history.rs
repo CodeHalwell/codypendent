@@ -61,12 +61,7 @@ pub(crate) const CONTEXT_PSEUDO_TOOL: &str = "context.assemble";
 /// matches it.
 pub(crate) const CONTEXT_NOTE_PREFIX: &str = "=== CONTEXT";
 
-/// Bound on the context-manifest text seeded into the model transcript, per
-/// turn (2026-08-11 review item 1). The manifest's own producers are bounded
-/// (repo-map module/API caps, 6–12 tool cards, ≤32 memories), so this is the
-/// safety net — an outlier repository map must not dominate a run's opening
-/// prompt. The head is kept: the evidence preamble and repository map lead the
-/// render, and the truncation marker keeps the cut honest.
+/// Maximum initial context after removing legacy repository-map contents.
 const CONTEXT_TURN_MAX_BYTES: usize = 8 * 1024;
 
 /// Appended when [`context_turn`] truncated the manifest — truthful: the text
@@ -79,6 +74,8 @@ const CONTEXT_TRUNCATION_MARKER: &str = "\n… (context truncated)";
 /// the pseudo-tool label and the bound can never diverge.
 #[must_use]
 pub(crate) fn context_turn(manifest_text: &str) -> TurnItem {
+    let sanitized = codypendent_knowledge::context::without_repository_map(manifest_text);
+    let manifest_text = sanitized.as_str();
     let mut output = if manifest_text.len() <= CONTEXT_TURN_MAX_BYTES {
         manifest_text.to_string()
     } else {
@@ -742,7 +739,7 @@ mod tests {
             Some(TurnItem::ToolResult { tool, output, .. }) => {
                 assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
                 assert!(
-                    output.contains("REPOSITORY MAP") && output.contains("pkg app"),
+                    output.contains("graph.find_symbols") && !output.contains("pkg app"),
                     "the manifest content must ride the head turn: {output}"
                 );
             }
@@ -815,6 +812,19 @@ mod tests {
             }
             other => panic!("expected a ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_graph_is_removed_before_the_seed_budget_without_losing_tools() {
+        let old = format!("=== CONTEXT ===\n=== REPOSITORY MAP ===\n{}\n=== TOOLS ===\ngraph.find_symbols\n=== MEMORIES ===\nkeep this memory", "private_symbol\n".repeat(2000));
+        let TurnItem::ToolResult { output, .. } = context_turn(&old) else {
+            panic!("context turn")
+        };
+        assert!(!output.contains("private_symbol"));
+        assert!(!output.contains("REPOSITORY MAP"));
+        assert!(output.contains("graph.find_symbols"));
+        assert!(output.contains("keep this memory"));
+        assert!(!output.contains(CONTEXT_TRUNCATION_MARKER));
     }
 
     #[test]

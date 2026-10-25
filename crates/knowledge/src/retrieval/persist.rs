@@ -19,12 +19,12 @@
 //! the full-scan form the daemon runs at startup so items written while no
 //! embedding model was configured are picked up).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use codypendent_protocol::RegistryItemId;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::outbox::{self, OutboxRow};
 use crate::registry::Registry;
@@ -32,6 +32,12 @@ use crate::types::RegistryItem;
 
 use super::embed::{EmbedError, SemanticEmbedder};
 use super::{embedding_text, HashingEmbedder, RetrievalIndexes, VectorIndex};
+
+const EMBEDDING_BATCH_SIZE: usize = 64;
+const LOOKUP_BATCH_SIZE: usize = 500;
+const UPSERT_EMBEDDING: &str = "INSERT OR REPLACE INTO registry_embeddings \
+    (item_id, content_hash, model, dims, vector, updated_at) VALUES (?, ?, ?, ?, ?, ?)";
+type EmbeddingRow = (String, String, String, i64, Vec<u8>);
 
 /// A failure loading/storing persisted vectors or draining the outbox.
 #[derive(Debug, thiserror::Error)]
@@ -76,11 +82,12 @@ fn encode_vector(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Decode a `vector BLOB` back into f32s. A ragged byte length (not a multiple
-/// of 4) truncates to whole values — the dims check upstream treats such a row
-/// as stale rather than erroring.
+/// Decode a persisted vector, rejecting incomplete values as stale data.
 fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    let (values, _ragged) = bytes.as_chunks::<4>();
+    let (values, ragged) = bytes.as_chunks::<4>();
+    if !ragged.is_empty() {
+        return Vec::new();
+    }
     values.iter().copied().map(f32::from_le_bytes).collect()
 }
 
@@ -89,11 +96,41 @@ fn decode_vector(bytes: &[u8]) -> Vec<f32> {
 pub async fn load_embeddings(
     pool: &SqlitePool,
 ) -> Result<HashMap<RegistryItemId, StoredEmbedding>, PersistError> {
-    let rows: Vec<(String, String, String, i64, Vec<u8>)> = sqlx::query_as(
+    let rows: Vec<EmbeddingRow> = sqlx::query_as(
         "SELECT item_id, content_hash, model, dims, vector FROM registry_embeddings",
     )
     .fetch_all(pool)
     .await?;
+    Ok(decode_rows(rows))
+}
+
+async fn load_item_embeddings(
+    pool: &SqlitePool,
+    items: &[RegistryItem],
+    space: &str,
+) -> Result<HashMap<RegistryItemId, StoredEmbedding>, PersistError> {
+    let mut stored = HashMap::with_capacity(items.len());
+    for batch in items.chunks(LOOKUP_BATCH_SIZE) {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT item_id, content_hash, model, dims, vector FROM registry_embeddings WHERE model = ",
+        );
+        query.push_bind(space).push(" AND item_id IN (");
+        let mut ids = query.separated(", ");
+        for item in batch {
+            ids.push_bind(item.id.to_string());
+        }
+        ids.push_unseparated(")");
+        stored.extend(decode_rows(
+            query
+                .build_query_as::<EmbeddingRow>()
+                .fetch_all(pool)
+                .await?,
+        ));
+    }
+    Ok(stored)
+}
+
+fn decode_rows(rows: Vec<EmbeddingRow>) -> HashMap<RegistryItemId, StoredEmbedding> {
     let mut out = HashMap::with_capacity(rows.len());
     for (item_id, content_hash, model, dims, vector) in rows {
         let Ok(id) = item_id.parse::<RegistryItemId>() else {
@@ -109,7 +146,7 @@ pub async fn load_embeddings(
             },
         );
     }
-    Ok(out)
+    out
 }
 
 /// Insert or replace one item's persisted vector.
@@ -121,19 +158,15 @@ pub async fn upsert_embedding(
     vector: &[f32],
     now: DateTime<Utc>,
 ) -> Result<(), PersistError> {
-    sqlx::query(
-        "INSERT OR REPLACE INTO registry_embeddings \
-         (item_id, content_hash, model, dims, vector, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(item_id.to_string())
-    .bind(content_hash)
-    .bind(model)
-    .bind(vector.len() as i64)
-    .bind(encode_vector(vector))
-    .bind(now.to_rfc3339())
-    .execute(pool)
-    .await?;
+    sqlx::query(UPSERT_EMBEDDING)
+        .bind(item_id.to_string())
+        .bind(content_hash)
+        .bind(model)
+        .bind(vector.len() as i64)
+        .bind(encode_vector(vector))
+        .bind(now.to_rfc3339())
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -157,6 +190,26 @@ fn is_fresh(stored: &StoredEmbedding, model: &str, content_hash: &str) -> bool {
     stored.model == model
         && stored.content_hash == content_hash
         && stored.dims == stored.vector.len()
+        && valid_vector(&stored.vector)
+}
+
+fn valid_vector(vector: &[f32]) -> bool {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>();
+    vector.iter().all(|value| value.is_finite()) && norm.is_finite() && norm > 0.0
+}
+
+fn validate_vectors(vectors: &[Vec<f32>], count: usize, width: usize) -> Result<(), PersistError> {
+    if vectors.len() != count
+        || width == 0
+        || vectors
+            .iter()
+            .any(|vector| vector.len() != width || !valid_vector(vector))
+    {
+        return Err(
+            EmbedError("embedding model returned invalid or inconsistent vectors".into()).into(),
+        );
+    }
+    Ok(())
 }
 
 /// What one maintenance pass did — logged by the daemon job, asserted by tests.
@@ -201,25 +254,32 @@ pub async fn drain_outbox(
     limit: i64,
 ) -> Result<DrainReport, PersistError> {
     let rows = outbox::unprocessed(pool, limit).await?;
-    let mut report = DrainReport::default();
     let registry = Registry::new();
-    for row in rows {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    let mut deleted = Vec::new();
+    for row in &rows {
         if row.event_kind == "registry_item_changed" {
             if let Ok(item_id) = row.entity_id.parse::<RegistryItemId>() {
-                match registry.get(pool, item_id).await? {
-                    Some(item) => {
-                        if let Some(embedder) = embedder {
-                            report.embedded +=
-                                refresh_item_embedding(pool, embedder, &item).await?;
-                        }
-                    }
-                    None => {
-                        delete_embedding(pool, item_id).await?;
-                        report.deleted += 1;
+                if seen.insert(item_id) {
+                    match registry.get(pool, item_id).await? {
+                        Some(item) => items.push(item),
+                        None => deleted.push(item_id),
                     }
                 }
             }
-        } else {
+        }
+    }
+    let mut report = DrainReport::default();
+    if let Some(embedder) = embedder {
+        report.embedded = refresh_embeddings(pool, embedder, &items).await?;
+    }
+    for item_id in deleted {
+        delete_embedding(pool, item_id).await?;
+        report.deleted += 1;
+    }
+    for row in rows {
+        if row.event_kind != "registry_item_changed" {
             handle_non_registry_event(&row);
             report.deferred_kinds += 1;
         }
@@ -229,66 +289,71 @@ pub async fn drain_outbox(
     Ok(report)
 }
 
-/// Refresh one item's persisted vector if stale; returns how many vectors were
-/// written (0 or 1).
-async fn refresh_item_embedding(
+async fn refresh_embeddings(
     pool: &SqlitePool,
     embedder: &dyn SemanticEmbedder,
-    item: &RegistryItem,
+    items: &[RegistryItem],
 ) -> Result<usize, PersistError> {
-    let text = embedding_text(item);
-    let hash = embedding_content_hash(&text);
-    let stored: Option<(String, String, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT content_hash, model, dims, vector FROM registry_embeddings WHERE item_id = ?",
-    )
-    .bind(item.id.to_string())
-    .fetch_optional(pool)
-    .await?;
-    if let Some((content_hash, model, dims, vector)) = stored {
-        let stored = StoredEmbedding {
-            content_hash,
-            model,
-            dims: usize::try_from(dims).unwrap_or(0),
-            vector: decode_vector(&vector),
-        };
-        if is_fresh(&stored, embedder.model(), &hash) {
-            return Ok(0);
-        }
-    }
-    let mut vectors = embedder.embed_batch(std::slice::from_ref(&text)).await?;
-    let Some(vector) = vectors.pop().filter(|v| !v.is_empty()) else {
-        return Err(PersistError::Embed(EmbedError(
-            "embedding model returned no vector".to_string(),
-        )));
-    };
-    upsert_embedding(pool, item.id, &hash, embedder.model(), &vector, Utc::now()).await?;
-    Ok(1)
+    let stored = load_item_embeddings(pool, items, embedder.space_id()).await?;
+    let pending: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let text = embedding_text(item);
+            let hash = embedding_content_hash(&text);
+            (!stored
+                .get(&item.id)
+                .is_some_and(|row| is_fresh(row, embedder.space_id(), &hash)))
+            .then_some((item, text, hash))
+        })
+        .collect();
+    Ok(embed_and_store(pool, embedder, &pending, None).await?.len())
 }
 
-/// Full-scan reconcile: persist a fresh vector for every listed registry item
-/// whose stored row is missing or stale for `embedder`'s model. Returns how
-/// many vectors were written. The daemon runs this at startup (and after model
-/// changes), so items written while embeddings were unconfigured — whose outbox
-/// rows an earlier drain already consumed — still get vectors.
+async fn embed_and_store(
+    pool: &SqlitePool,
+    embedder: &dyn SemanticEmbedder,
+    pending: &[(&RegistryItem, String, String)],
+    mut width: Option<usize>,
+) -> Result<Vec<(RegistryItemId, Vec<f32>)>, PersistError> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut vectors = Vec::with_capacity(pending.len());
+    for batch in pending.chunks(EMBEDDING_BATCH_SIZE) {
+        let texts: Vec<_> = batch.iter().map(|(_, text, _)| text.clone()).collect();
+        let embedded = embedder.embed_batch(&texts).await?;
+        let expected_width = *width.get_or_insert_with(|| embedded.first().map_or(0, Vec::len));
+        validate_vectors(&embedded, texts.len(), expected_width)?;
+        vectors.extend(embedded);
+    }
+    let mut transaction = pool.begin().await?;
+    let now = Utc::now().to_rfc3339();
+    for ((item, _, hash), vector) in pending.iter().zip(&vectors) {
+        sqlx::query(UPSERT_EMBEDDING)
+            .bind(item.id.to_string())
+            .bind(hash)
+            .bind(embedder.space_id())
+            .bind(vector.len() as i64)
+            .bind(encode_vector(vector))
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(pending
+        .iter()
+        .zip(vectors)
+        .map(|((item, _, _), vector)| (item.id, vector))
+        .collect())
+}
+
+/// Refresh missing or stale registry vectors in bounded document batches.
 pub async fn reconcile_embeddings(
     pool: &SqlitePool,
     embedder: &dyn SemanticEmbedder,
 ) -> Result<usize, PersistError> {
     let items = Registry::new().list(pool).await?;
-    let stored = load_embeddings(pool).await?;
-    let mut written = 0;
-    for item in &items {
-        let text = embedding_text(item);
-        let hash = embedding_content_hash(&text);
-        let fresh = stored
-            .get(&item.id)
-            .is_some_and(|row| is_fresh(row, embedder.model(), &hash));
-        if fresh {
-            continue;
-        }
-        written += refresh_item_embedding(pool, embedder, item).await?;
-    }
-    Ok(written)
+    refresh_embeddings(pool, embedder, &items).await
 }
 
 /// Build the derived retrieval indexes for `items`, plus the query vector for
@@ -299,11 +364,10 @@ pub async fn reconcile_embeddings(
 ///   the query inline — and the returned query vector is `None`, so
 ///   [`retrieve`](super::retrieve) embeds the query through the retained
 ///   hashing embedder. Behavior-identical to the pre-embedding code.
-/// - **With a model**: item vectors come from `registry_embeddings` where fresh
-///   (the drain keeps them so); items missing a fresh vector — plus the query —
-///   are embedded in ONE batch call, and the freshly computed item vectors are
-///   persisted so the next assembly is warm. The returned query vector is in
-///   the same space as the index, and the caller passes it through
+/// - **With a model**: fresh item vectors come from `registry_embeddings`;
+///   missing vectors are embedded in bounded document batches and persisted.
+///   Queries use the model's query task in the same space as the index. The
+///   caller passes the query vector through
 ///   [`RetrievalQuery::query_vector`](super::RetrievalQuery::query_vector) so
 ///   the funnel never mixes embedding spaces.
 ///
@@ -339,82 +403,32 @@ pub async fn semantic_indexes(
 }
 
 /// The semantic half of [`semantic_indexes`]: assemble the item vector index
-/// from persisted + freshly batched vectors, and embed the query in the same
-/// call. Fails (for the caller to degrade on) rather than mixing spaces.
+/// from persisted and batched document vectors in the query's embedding space.
 async fn semantic_vectors(
     pool: &SqlitePool,
     items: &[RegistryItem],
     embedder: &dyn SemanticEmbedder,
     query_text: &str,
 ) -> Result<(VectorIndex, Vec<f32>), PersistError> {
-    let stored = load_embeddings(pool).await?;
-
-    // Split items into (persisted-fresh) and (must-embed-now).
-    let mut fresh: Vec<(RegistryItemId, Vec<f32>)> = Vec::new();
-    let mut missing: Vec<(&RegistryItem, String, String)> = Vec::new(); // (item, text, hash)
+    let query_vector = embedder.embed_query(query_text).await?;
+    validate_vectors(std::slice::from_ref(&query_vector), 1, query_vector.len())?;
+    let mut stored = load_item_embeddings(pool, items, embedder.space_id()).await?;
+    let mut index = VectorIndex::new();
+    let mut pending = Vec::new();
     for item in items {
         let text = embedding_text(item);
         let hash = embedding_content_hash(&text);
-        match stored.get(&item.id) {
-            Some(row) if is_fresh(row, embedder.model(), &hash) => {
-                fresh.push((item.id, row.vector.clone()));
+        match stored.remove(&item.id) {
+            Some(row)
+                if is_fresh(&row, embedder.space_id(), &hash) && row.dims == query_vector.len() =>
+            {
+                index.insert(item.id, row.vector)
             }
-            _ => missing.push((item, text, hash)),
+            _ => pending.push((item, text, hash)),
         }
     }
-
-    // One batch call: every missing item's text, then the query, last.
-    let mut batch: Vec<String> = missing.iter().map(|(_, text, _)| text.clone()).collect();
-    batch.push(query_text.to_string());
-    let mut vectors = embedder.embed_batch(&batch).await?;
-    if vectors.len() != batch.len() {
-        return Err(PersistError::Embed(EmbedError(format!(
-            "embedding model returned {} vectors for {} inputs",
-            vectors.len(),
-            batch.len()
-        ))));
-    }
-    let query_vector = vectors.pop().expect("batch always includes the query");
-
-    let mut index = VectorIndex::new();
-    // A persisted row is only usable if it is the SAME WIDTH as the query we
-    // will score it against. An endpoint that changes output width while
-    // keeping its model name passes `is_fresh` (each row's recorded dims match
-    // its own blob), and `VectorIndex` scores a width mismatch as zero rather
-    // than failing — silently draining the dense signal out of the ranking.
-    // Comparing against the live query width turns that into a re-embed.
-    let width = query_vector.len();
-    let (usable, stale_width): (Vec<_>, Vec<_>) = fresh
-        .into_iter()
-        .partition(|(_, vector)| vector.len() == width);
-    for (id, vector) in usable {
+    for (id, vector) in embed_and_store(pool, embedder, &pending, Some(query_vector.len())).await? {
         index.insert(id, vector);
-    }
-    if !stale_width.is_empty() {
-        // Re-embed exactly the rows whose stored width no longer matches, so a
-        // width change costs one extra batch rather than a degraded ranking.
-        let widened: Vec<String> = stale_width
-            .iter()
-            .filter_map(|(id, _)| items.iter().find(|item| item.id == *id))
-            .map(embedding_text)
-            .collect();
-        let refreshed = embedder.embed_batch(&widened).await?;
-        let now = Utc::now();
-        for ((id, _), vector) in stale_width.iter().zip(refreshed) {
-            if let Some(item) = items.iter().find(|item| item.id == *id) {
-                let text = embedding_text(item);
-                let hash = embedding_content_hash(&text);
-                upsert_embedding(pool, item.id, &hash, embedder.model(), &vector, now).await?;
-                index.insert(item.id, vector);
-            }
-        }
-    }
-    let now = Utc::now();
-    for ((item, _text, hash), vector) in missing.iter().zip(vectors) {
-        // Persist opportunistically so the next assembly (and the drain) find
-        // the row fresh; the drain remains the authoritative refresher.
-        upsert_embedding(pool, item.id, hash, embedder.model(), &vector, now).await?;
-        index.insert(item.id, vector);
     }
     Ok((index, query_vector))
 }
@@ -430,10 +444,10 @@ mod tests {
     }
 
     #[test]
-    fn ragged_blob_decodes_whole_values_only() {
+    fn ragged_blob_is_stale() {
         let mut bytes = encode_vector(&[1.0, 2.0]);
         bytes.push(0xFF); // a trailing partial value
-        assert_eq!(decode_vector(&bytes), vec![1.0, 2.0]);
+        assert!(decode_vector(&bytes).is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Pre-exec resource boundary for long-lived UI workers.
 //!
 //! This program is deliberately tiny: parse host-generated numeric limits, set
-//! inherited kernel rlimits, then `exec` the already-lowered sandbox frontend.
+//! supported inherited kernel rlimits, then `exec` the already-lowered sandbox frontend.
 //! No shell, package-controlled path lookup, environment widening, or fallback
 //! execution exists. A setup failure exits before any component JavaScript can
 //! start.
@@ -78,25 +78,17 @@ fn set_limits(launch: &Launch) -> Result<(), String> {
     setrlimit(Resource::RLIMIT_CPU, launch.cpu_seconds, launch.cpu_seconds)
         .map_err(|error| format!("cannot set RLIMIT_CPU: {error}"))?;
 
-    #[cfg(target_os = "linux")]
-    setrlimit(
-        Resource::RLIMIT_AS,
-        launch.memory_bytes,
-        launch.memory_bytes,
-    )
-    .map_err(|error| format!("cannot set RLIMIT_AS: {error}"))?;
-
-    #[cfg(target_os = "macos")]
-    {
-        // Darwin does not expose a dependable hard address-space/RSS rlimit via
-        // nix. DATA constrains the traditional heap; the host's process-group
-        // RSS watchdog and V8 heap ceiling remain required secondary controls.
-        setrlimit(
-            Resource::RLIMIT_DATA,
-            launch.memory_bytes,
-            launch.memory_bytes,
-        )
-        .map_err(|error| format!("cannot set RLIMIT_DATA: {error}"))?;
+    // Darwin's RLIMIT_DATA compares the limit with the entire current virtual
+    // map, including reserved address space. A resident-memory budget therefore
+    // rejects even this tiny launcher before exec (EINVAL), and cannot account
+    // for V8's large virtual reservations. On macOS the host's mandatory process-
+    // group RSS watchdog and V8 heap ceiling enforce the memory budget; it is a
+    // sampled limit, not a kernel RSS cap. Do not clear inherited limits or turn
+    // a failed supported setrlimit call into an unsandboxed fallback.
+    let memory_resource = cfg!(target_os = "linux").then_some(Resource::RLIMIT_AS);
+    if let Some(resource) = memory_resource {
+        setrlimit(resource, launch.memory_bytes, launch.memory_bytes)
+            .map_err(|error| format!("cannot set RLIMIT_AS: {error}"))?;
     }
     Ok(())
 }

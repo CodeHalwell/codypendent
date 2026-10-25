@@ -3670,6 +3670,17 @@
           ],
           "description": "Present exactly when this edge's stored evidence is an agent assertion — i.e. for an `agent_asserted` edge written by `graph.assert_edge`. Absent for every mechanically-derived edge (whose evidence points at bytes, not a judgement), so the common case stays byte-identical on the wire."
         },
+        "call_site": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CodeGraphSourceLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recorded call occurrence, verified against its parsed source bytes. Repeated calls may share one stored edge; this is not an exhaustive list."
+        },
         "confidence": {
           "format": "float",
           "type": "number"
@@ -3772,6 +3783,17 @@
         "language": {
           "type": "string"
         },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CodeGraphSourceLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Recorded definition span, present only when the source still matches the parser's evidence. Unresolved references have no definition location."
+        },
         "package": {
           "type": [
             "string",
@@ -3821,6 +3843,13 @@
           },
           "type": "array"
         },
+        "related_nodes": {
+          "description": "Optional endpoint metadata requested by `include_neighbors`. These are not additional filter matches and do not change `total_nodes`.",
+          "items": {
+            "$ref": "#/definitions/CodeGraphNodeView"
+          },
+          "type": "array"
+        },
         "total_edges": {
           "description": "Edges incident to the filter's nodes, likewise **before** the limit and likewise over the whole filtered node set — a client renders it as the `M` in \"showing N of M\", so a total clamped to the page, or narrowed to the nodes one page showed, is a wrong number presented as a fact.",
           "format": "uint64",
@@ -3846,8 +3875,16 @@
     "CodeGraphQuery": {
       "description": "The filter `graph show` applies. Every field narrows; absent fields do not.\n\n**Scoping is not one of these fields.** The repository is carried by the command, resolved by the daemon from a filesystem path with its own single source of truth, and applied to every branch of this query — including [`node_id`](Self::node_id). There is no way to spell \"some other checkout\" here.",
       "properties": {
+        "connected_view": {
+          "description": "An unfiltered visual overview follows one recorded connected neighbourhood, including endpoint metadata.",
+          "type": "boolean"
+        },
         "include_edges": {
           "description": "Include the edges incident to the selected nodes — **every** node the filter selects, not only the ones this page of nodes happens to show. The two row kinds are paged independently (see [`limit`](Self::limit)), so an edge between two nodes that both fall past the node page is still returned and still counted.",
+          "type": "boolean"
+        },
+        "include_neighbors": {
+          "description": "Return metadata for endpoints of the returned edges in `related_nodes`, separately from the matching node page and its total. At most twice the edge limit can be returned; other query filters still select the main page.",
           "type": "boolean"
         },
         "include_nodes": {
@@ -4021,6 +4058,46 @@
       "required": [
         "extension",
         "files"
+      ],
+      "type": "object"
+    },
+    "CodeGraphSourceLocation": {
+      "description": "A location in the parsed repository source. Lines and Unicode-character columns are one-based; the optional end position is exclusive.",
+      "properties": {
+        "column": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "end_column": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "end_line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "line",
+        "source_path"
       ],
       "type": "object"
     },
@@ -7664,6 +7741,36 @@
           "type": "object"
         },
         {
+          "description": "Refines the display details of an existing call without starting another tool execution. ACP agents commonly publish the command or path after their initial generic tool title. `tool` retains the call's identity. Older clients fold this additive variant to `Unknown` and retain the initial label and eventual completion.",
+          "properties": {
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ToolUpdated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "tool",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "artifact": {
               "anyOf": [
@@ -7989,6 +8096,16 @@
               "type": [
                 "integer",
                 "null"
+              ]
+            },
+            "coverage": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UsageCoverage"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "prompt_tokens": {
@@ -10446,6 +10563,12 @@
         "approval_id": {
           "format": "uuid",
           "type": "string"
+        },
+        "pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "risk": {
           "$ref": "#/definitions/Risk"
@@ -16374,6 +16497,44 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "UsageCoverage": {
+      "description": "Completeness of the measured subtotal. Requests count calls to the model driver, including failed/cancelled calls; each measured dimension counts the calls that reported it. Retries without their own usage leave the subtotal partial even when the final attempt reports a measurement. Absent metadata on older events means coverage is unknown.",
+      "properties": {
+        "completion_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cost_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "prompt_requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requests": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unmeasured_retries": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "completion_requests",
+        "cost_requests",
+        "prompt_requests",
+        "requests"
+      ],
       "type": "object"
     },
     "UserAction": {

@@ -705,7 +705,7 @@ impl Presentation for InteractivePresentation<'_> {
         } else {
             "codypendent".to_string()
         };
-        let _ = codypendent_tui::terminal::set_terminal_title(&title);
+        let _ = self.guard.set_title(&title);
 
         self.guard
             .terminal_mut()
@@ -1196,7 +1196,7 @@ async fn boot_phase(
     refresh_runnable_models(state, None);
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
-    state.providers = load_provider_cards(paths, &mut loader_warnings).await;
+    state.providers = load_provider_cards(paths, &mut loader_warnings);
     // P12: which local model servers are answering right now, so first-run
     // setup can say "Ollama is answering on localhost:11434" instead of
     // listing three servers as if any might be running. Loopback, a TCP
@@ -1594,6 +1594,12 @@ async fn event_loop<P: Presentation>(
     // that is still attached.
     let mut history_generation = 0_u64;
     let mut session_transitions = SessionTransitionCoordinator::default();
+    // A missing/stale ACP cache must never hold the welcome screen behind a
+    // network timeout. The cached and locally installed rows are already live;
+    // refresh independently, surviving session switches and aborting on detach.
+    let mut catalog_refresh = tokio::task::JoinSet::new();
+    spawn_agent_catalog_refresh(&mut catalog_refresh, paths, false);
+    let mut catalog_refresh_requested = false;
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1752,9 +1758,19 @@ async fn event_loop<P: Presentation>(
                     quant,
                     result,
                 },
-                Some(ReaderSignal::ModelKeyVerified { model_id, result }) => match result {
-                    Ok(()) => Action::ModelKeyVerified { model_id, ok: true, reason: String::new() },
-                    Err(reason) => Action::ModelKeyVerified { model_id, ok: false, reason },
+                Some(ReaderSignal::ModelKeyVerified { model_id, result }) => {
+                    let (ok, reason) = match result {
+                        Ok(verdict) => {
+                            let ok = match verdict {
+                                codypendent_protocol::ModelReadiness::Ready { .. } => Some(true),
+                                codypendent_protocol::ModelReadiness::Unavailable { .. } => Some(false),
+                                _ => None,
+                            };
+                            (ok, verdict.detail().to_owned())
+                        }
+                        Err(reason) => (None, reason),
+                    };
+                    Action::ModelKeyVerified { model_id, ok, reason }
                 },
                 Some(ReaderSignal::AcpConnected { display_id, provider_id, request_id, result }) => {
                     if provider_requests.is_current(&provider_id, request_id) {
@@ -1955,6 +1971,16 @@ async fn event_loop<P: Presentation>(
                         }
                     }
                     None => Action::NoOp,
+                },
+                Some(ReaderSignal::EditorOpened { session: opened_session, result }) => {
+                    if opened_session == session_id {
+                        match result {
+                            Ok(message) => Action::Notice(message),
+                            Err(message) => Action::Issue(format!("Could not open reviewed source: {message}")),
+                        }
+                    } else {
+                        Action::NoOp
+                    }
                 },
                 Some(ReaderSignal::FileSearchResults {
                     query,
@@ -2205,6 +2231,35 @@ async fn event_loop<P: Presentation>(
                     PendingActions::Many(map_accessible_input(&line, state.input_mode()))
                 }
                 None => return Ok(()), // input bridge ended
+            },
+            refreshed = catalog_refresh.join_next(), if !catalog_refresh.is_empty() => {
+                PendingActions::One(match refreshed {
+                    // A manual request must bypass the cache even if it
+                    // arrived during the passive startup refresh. In that
+                    // case run a forced refresh next: passive success may
+                    // only mean that an offline stale cache was usable.
+                    Some(Ok((false, _))) if catalog_refresh_requested => {
+                        spawn_agent_catalog_refresh(&mut catalog_refresh, paths, true);
+                        Action::NoOp
+                    }
+                    Some(Ok((_, Ok(())))) => {
+                        let mut warnings = Vec::new();
+                        let providers = load_provider_cards(paths, &mut warnings);
+                        for warning in warnings {
+                            reduce(state, Action::Issue(warning));
+                        }
+                        if std::mem::take(&mut catalog_refresh_requested) {
+                            reduce(state, Action::Notice("agent catalogue updated".to_owned()));
+                        }
+                        Action::ProviderCatalogLoaded(providers)
+                    }
+                    Some(Ok((_, Err(error)))) => {
+                        catalog_refresh_requested = false;
+                        Action::Issue(format!("agent catalogue refresh failed: {error}; /refresh-agents to retry"))
+                    }
+                    Some(Err(error)) => Action::Issue(format!("agent catalogue refresh failed: {error}")),
+                    None => Action::NoOp,
+                })
             },
             _ = ticker.tick() => PendingActions::One({
                 // FP-2b: a repair whose catch-up reply never arrived (the
@@ -2560,7 +2615,8 @@ async fn event_loop<P: Presentation>(
                             let mut warnings = Vec::new();
                             state.models = load_model_cards(paths, &mut warnings).await;
                             refresh_runnable_models(state, Some(model_id));
-                            state.providers = load_provider_cards(paths, &mut warnings).await;
+                            let providers = load_provider_cards(paths, &mut warnings);
+                            reduce(state, Action::ProviderCatalogLoaded(providers));
                             state.local_endpoints =
                                 crate::local_endpoints::probe_catalog_defaults(paths).await;
                             for warning in warnings {
@@ -2627,7 +2683,7 @@ async fn event_loop<P: Presentation>(
         // keep-alive for notice expiry and the periodic projection refresh.
         let redraw = !tick_action
             || state.notice != notice_before
-            || state.is_animating()
+            || (state.terminal_focused && state.is_animating())
             || state.tick.is_multiple_of(25)
             || presentation.wants_periodic_draw();
 
@@ -2709,6 +2765,46 @@ async fn event_loop<P: Presentation>(
                         ),
                     );
                 }
+                continue;
+            }
+            if matches!(intent, Intent::RefreshAgentCatalog) {
+                if catalog_refresh.is_empty() {
+                    spawn_agent_catalog_refresh(&mut catalog_refresh, paths, true);
+                }
+                catalog_refresh_requested = true;
+                reduce(
+                    state,
+                    Action::Notice("refreshing agent catalogue…".to_owned()),
+                );
+                continue;
+            }
+            if let Intent::OpenReviewedSource { run_id, file, line } = &intent {
+                let (run_id, file, line) = (*run_id, file.clone(), *line);
+                let paths = paths.clone();
+                let repository = PathBuf::from(repository);
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::editor_handoff::open_reviewed_source(
+                        &paths,
+                        session_id,
+                        run_id,
+                        &repository,
+                        &file,
+                        line,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = tx
+                        .send(ReaderSignal::EditorOpened {
+                            session: session_id,
+                            result,
+                        })
+                        .await;
+                });
+                reduce(
+                    state,
+                    Action::Notice("Opening reviewed source in the IDE…".to_owned()),
+                );
                 continue;
             }
             if let Intent::LoadCouncilResults { selector } = &intent {
@@ -3110,17 +3206,13 @@ async fn event_loop<P: Presentation>(
                 });
                 continue;
             }
-            // `VerifyApiKey` (`/keys`, `Ctrl-T`) is client-only for the same
-            // reason `SetApiKey` is: the key stays on this machine. One
-            // `/models` call through the real registry — the same credential
-            // precedence and headers a run would use — answered back as
-            // `Action::ModelKeyVerified`.
+            // Verification is an explicit daemon probe; no credential leaves its owner.
             if let Intent::VerifyApiKey { model_id } = &intent {
                 let model_id = model_id.clone();
-                let data_dir = paths.data_dir.clone();
+                let paths = paths.clone();
                 let tx = live.query_tx.clone();
                 tokio::spawn(async move {
-                    let result = verify_model_key(&data_dir, &model_id).await;
+                    let result = verify_model_key(&paths, &model_id).await;
                     let _ = tx
                         .send(ReaderSignal::ModelKeyVerified { model_id, result })
                         .await;
@@ -4144,6 +4236,11 @@ fn apply_projection(state: &mut AppState, projection: ProjectionLoad) {
 
 /// What the reader task forwards to the loop.
 enum ReaderSignal {
+    /// Local editor launcher completion; never a daemon mutation.
+    EditorOpened {
+        session: SessionId,
+        result: Result<String, String>,
+    },
     /// A validated Remote UI frame for the reducer-owned host session.
     RemoteUi(Box<codypendent_protocol::UiWireMessage>),
     /// Host-owned lifecycle projection for `/plugins`.
@@ -4223,7 +4320,7 @@ enum ReaderSignal {
     /// with a key-free reason otherwise.
     ModelKeyVerified {
         model_id: String,
-        result: Result<(), String>,
+        result: Result<codypendent_protocol::ModelReadiness, String>,
     },
     /// Completion of an off-UI-thread ACP install + handshake + typed profile
     /// write. The loop refreshes model/key projections after success.
@@ -5157,6 +5254,12 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
+        Intent::RefreshAgentCatalog => unreachable!(
+            "RefreshAgentCatalog is handled by the client background registry task"
+        ),
+        Intent::OpenReviewedSource { .. } => unreachable!(
+            "OpenReviewedSource is a local editor handoff, never a daemon command"
+        ),
         Intent::ProbeLocalEndpoints => unreachable!(
             "ProbeLocalEndpoints is a local TCP probe performed by the harness, never sent to the daemon"
         ),
@@ -5167,7 +5270,7 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
         ),
         Intent::VerifyApiKey { .. } => unreachable!(
-            "VerifyApiKey is probed locally by the harness (verify_model_key), never sent to the daemon"
+            "VerifyApiKey is dispatched as an auxiliary daemon probe by the harness"
         ),
         Intent::SetTheme { .. } => unreachable!(
             "SetTheme is a local display preference persisted by the harness, never sent to the daemon"
@@ -5458,27 +5561,19 @@ fn provider_has_resolvable_key(
     resolve_provider_api_key(provider_id, auth, env_names).is_some()
 }
 
-/// One-shot verification of a configured model's credentials (`/keys`,
-/// `Ctrl-T`): run the real [`ModelRegistry::check_model`], which resolves the
-/// key through the same precedence a run uses and sends the same
-/// catalog-declared headers, so an "ok" here means the run would authenticate.
-/// The returned reason is the registry's own error text, which never contains
-/// key material.
-async fn verify_model_key(data_dir: &Path, model_id: &str) -> Result<(), String> {
-    use codypendent_runtime::models::{load_models, ModelRegistry};
-
-    let models_path = data_dir.join("models.toml");
-    let configs = load_models(&models_path).map_err(|error| error.to_string())?;
-    let auth = codypendent_runtime::auth::AuthStore::load(data_dir).unwrap_or_default();
-    let catalog =
-        codypendent_providers::Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
-            .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
-    ModelRegistry::new(configs)
-        .with_auth(auth)
-        .with_catalog(catalog)
-        .check_model(&ModelId(model_id.to_owned()))
+/// Explicit verification runs at the daemon; credentials never cross the socket.
+async fn verify_model_key(
+    paths: &RuntimePaths,
+    model_id: &str,
+) -> Result<codypendent_protocol::ModelReadiness, String> {
+    let probes = crate::commands::probe_models(paths, Some(ModelId(model_id.to_owned())), true)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    probes
+        .into_iter()
+        .find(|probe| probe.id.0 == model_id)
+        .map(|probe| probe.readiness)
+        .ok_or_else(|| "The daemon returned no readiness for this model".to_owned())
 }
 
 /// Whether `provider_id` names an agent from the official ACP registry (rather
@@ -5513,56 +5608,9 @@ async fn probe_acp_agent(
     paths: &RuntimePaths,
     provider_id: &str,
     repository: &Path,
-) -> anyhow::Result<AcpProbe> {
-    let store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
-    let spec = store.install(provider_id, false).await?;
-    let command = spec.command.to_string_lossy().into_owned();
-    let client = codypendent_integrations::acp_client::AcpClient::spawn(
-        &command,
-        &spec.args,
-        &spec.env,
-        repository.to_string_lossy().as_ref(),
-    )
-    .await
-    .with_context(|| format!("ACP handshake with `{provider_id}` failed"))?;
-    let models = client
-        .discovered_models()
-        .into_iter()
-        .map(|model| model.id)
-        .collect();
-    drop(client);
-    Ok(AcpProbe {
-        registry_id: spec.registry_id,
-        version: spec.version,
-        models,
-    })
-}
-
-/// What a live handshake with an ACP agent taught the TUI.
-struct AcpProbe {
-    registry_id: String,
-    version: String,
-    /// The agent's own model ids, in the agent's order. Empty when it exposes
-    /// no model selector — its default model then applies, as before.
-    models: Vec<String>,
-}
-
-impl AcpProbe {
-    /// The coordinate a profile stores: `id@version`, or `id@version#model`
-    /// when the user picked one of the agent's own models.
-    fn coordinate(&self, model: Option<&str>) -> String {
-        match model {
-            Some(model) => codypendent_integrations::acp_registry::agent_coordinate_with_model(
-                &self.registry_id,
-                &self.version,
-                model,
-            ),
-            None => codypendent_integrations::acp_registry::agent_coordinate(
-                &self.registry_id,
-                &self.version,
-            ),
-        }
-    }
+) -> anyhow::Result<codypendent_runtime::acp_setup::AcpProbe> {
+    codypendent_runtime::acp_setup::probe_agent(&paths.data_dir, provider_id, repository, true)
+        .await
 }
 
 /// Install, handshake, and resolve the coordinate one ACP profile stores. The
@@ -5634,159 +5682,9 @@ async fn apply_add_model(
     }
 }
 
-/// Remove one exact `[[model]]` entry without reserializing the surrounding
-/// document. `models.toml` also contains voice, speech, embedding, retrieval,
-/// and user-defined future tables; `toml_edit` preserves all of them — plus
-/// comments and formatting — while only the matching array-of-tables row is
-/// removed.
-///
-/// The model-specific `auth.json` credential is removed as part of the same
-/// operation. Provider-wide credentials remain because other models from that
-/// provider may still use them. Both inputs are fully parsed before either is
-/// changed, so malformed configuration cannot cause a partial deletion.
+/// Remove through the same configuration transaction as the desktop.
 fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()> {
-    use codypendent_runtime::auth::AuthStore;
-
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        bail!("model id must not be blank");
-    }
-    let models_path = paths.data_dir.join("models.toml");
-
-    // Held across the WHOLE two-file transaction below, load included: this
-    // writes `auth.json` and `models.toml` together and undoes one half when
-    // the other fails, so another writer landing between those steps would see
-    // — or overwrite — a half-committed pair. Released when this returns.
-    let _auth_hold = codypendent_runtime::auth::hold(&paths.data_dir)
-        .with_context(|| format!("locking {}", paths.data_dir.join("auth.json").display()))?;
-
-    // Validate the key store before touching models.toml. A corrupt auth.json
-    // must never be silently overwritten or leave the operator unsure which
-    // half of the requested cleanup happened.
-    let mut auth = AuthStore::load(&paths.data_dir)
-        .with_context(|| format!("reading {}", paths.data_dir.join("auth.json").display()))?;
-    let original_auth = auth.clone();
-    let removed_key = auth.remove(model_id);
-
-    let parent = models_path
-        .parent()
-        .ok_or_else(|| anyhow!("{}: has no parent directory", models_path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let lock_path = parent.join(".models.toml.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing {}", lock_path.display()))?;
-    }
-    fs4::FileExt::lock_exclusive(&lock)
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-
-    let raw = std::fs::read_to_string(&models_path)
-        .with_context(|| format!("reading {}", models_path.display()))?;
-    let mut doc: toml_edit::DocumentMut = raw
-        .parse()
-        .with_context(|| format!("parsing {}", models_path.display()))?;
-
-    // Remove EVERY entry carrying this id, not just the first: a hand-edited
-    // `models.toml` can list the same id twice, and `auth.remove` above is
-    // unconditional — leaving one copy behind would leave a listed model with
-    // no credential.
-    let emptied = {
-        let Some(item) = doc.get_mut("model") else {
-            bail!("model `{model_id}` is not configured");
-        };
-        let Some(array) = item.as_array_of_tables_mut() else {
-            bail!(
-                "`model` entry in {} is not an array of tables",
-                models_path.display()
-            );
-        };
-        let matching: Vec<usize> = array
-            .iter()
-            .enumerate()
-            .filter_map(|(index, table)| {
-                (table.get("id").and_then(toml_edit::Item::as_str) == Some(model_id))
-                    .then_some(index)
-            })
-            .collect();
-        if matching.is_empty() {
-            bail!("model `{model_id}` is not configured");
-        }
-        for index in matching.into_iter().rev() {
-            array.remove(index);
-        }
-        array.is_empty()
-    };
-    if emptied {
-        doc.remove("model");
-    }
-
-    // Unique per write, not per process: two removals inside one process
-    // (the TUI's own and a background reload) collided on a pid-only name,
-    // exactly the hazard `models_file::update_model_entries` documents.
-    static REMOVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ticket = REMOVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".models-{}-{ticket}.toml.tmp", std::process::id()));
-    let write_tmp = || -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.write_all(doc.to_string().as_bytes())?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&tmp_path, doc.to_string())?;
-        Ok(())
-    };
-    if let Err(error) = write_tmp() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error).with_context(|| format!("writing {}", tmp_path.display()));
-    }
-
-    // Commit the secret cleanup first, then make the already-written model temp
-    // visible. Either half can still fail, so each failure path undoes the
-    // other half: a failed `auth.save` leaves models.toml untouched (the temp is
-    // discarded, never renamed), and a failed rename restores the original key
-    // store. The operation is all-or-nothing in both directions.
-    if removed_key {
-        if let Err(error) = auth.save(&paths.data_dir) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(error).with_context(|| {
-                format!("writing {}", paths.data_dir.join("auth.json").display())
-            });
-        }
-    }
-    if let Err(error) = std::fs::rename(&tmp_path, &models_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        if removed_key {
-            original_auth.save(&paths.data_dir).with_context(|| {
-                format!(
-                    "restoring {} after models.toml replacement failed",
-                    paths.data_dir.join("auth.json").display()
-                )
-            })?;
-        }
-        return Err(error).with_context(|| format!("replacing {}", models_path.display()));
-    }
-    let _ = fs4::FileExt::unlock(&lock);
-
-    Ok(())
+    codypendent_runtime::models_file::remove_model(&paths.data_dir, model_id)
 }
 
 /// Apply the model-removal intent and keep the open picker coherent. A removed
@@ -7633,45 +7531,25 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
         pool.close().await;
     }
 
-    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
-    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
-        &paths.data_dir.join("providers.toml"),
-    )
-    .unwrap_or_else(|error| {
-        warnings.push(format!(
-            "model auth catalog fell back to built-ins ({error})"
-        ));
-        codypendent_providers::Catalog::builtin()
-    });
-    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone())
-        .with_auth(auth)
-        .with_catalog(catalog);
-    let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
+    let probes = match crate::commands::probe_models(paths, None, false).await {
+        Ok(probes) => probes
+            .into_iter()
+            .map(|probe| (probe.id, probe.readiness))
+            .collect::<HashMap<_, _>>(),
+        Err(error) => {
+            warnings.push(format!("model readiness is unknown: {error}"));
+            HashMap::new()
+        }
+    };
     let mut cards = Vec::with_capacity(configs.len());
     for config in configs {
         let local = local_model_endpoint(&config.base_url);
-        let readiness = if config.provider == "acp" {
-            match acp_store.launch_spec(&config.model) {
-                Ok(_) => ModelReadiness::Ready,
-                Err(error) => ModelReadiness::Unavailable(error.to_string()),
+        let readiness = match probes.get(&config.id) {
+            Some(codypendent_protocol::ModelReadiness::Ready { .. }) => ModelReadiness::Ready,
+            Some(codypendent_protocol::ModelReadiness::Unavailable { detail, .. }) => {
+                ModelReadiness::Unavailable(detail.clone())
             }
-        } else if config.base_url.trim().is_empty() {
-            ModelReadiness::Unavailable("base URL is missing".to_owned())
-        } else if local {
-            match registry.check_model(&config.id).await {
-                Ok(()) => ModelReadiness::Ready,
-                Err(error) => ModelReadiness::Unavailable(error.to_string()),
-            }
-        } else {
-            // Hosted models are not probed during boot, but their auth and
-            // protocol must resolve exactly as a real StartRun would. This
-            // makes `Unverified` mean runnable-but-not-network-verified;
-            // `Unavailable` is therefore an authoritative zero-runnable gate.
-            match registry.credentials_resolvable(&config.id).await {
-                Ok(true) => ModelReadiness::Unverified,
-                Ok(false) => ModelReadiness::Unavailable("API key is not configured".to_owned()),
-                Err(error) => ModelReadiness::Unavailable(error.to_string()),
-            }
+            _ => ModelReadiness::Unverified,
         };
         cards.push(model_card(config, &profiles, readiness, local));
     }
@@ -7705,10 +7583,7 @@ fn refresh_runnable_models(state: &mut AppState, onboard_attempt: Option<ModelId
 }
 
 fn local_model_endpoint(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
-        .iter()
-        .any(|host| lower.contains(host))
+    codypendent_runtime::models::is_local_base_url(url)
 }
 
 /// Seed (and re-seed after create/run/delete) the `/council` browser's
@@ -7965,11 +7840,24 @@ fn model_card(
 /// Never fails the TUI: a missing user `providers.toml` is fine (the loader
 /// treats it as absent and returns the built-ins); a *malformed* one degrades
 /// to the built-ins alone, with a diagnostic in `warnings`.
-async fn load_provider_cards(
+fn spawn_agent_catalog_refresh(
+    tasks: &mut tokio::task::JoinSet<(bool, Result<(), String>)>,
     paths: &RuntimePaths,
-    warnings: &mut Vec<String>,
-) -> Vec<ProviderCard> {
-    use codypendent_integrations::acp_registry::AcpRegistryStore;
+    force: bool,
+) {
+    let store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
+    tasks.spawn(async move {
+        let result = if force {
+            store.refresh().await
+        } else {
+            store.load_or_refresh().await
+        };
+        (force, result.map(|_| ()).map_err(|error| error.to_string()))
+    });
+}
+
+fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<ProviderCard> {
+    use codypendent_integrations::acp_registry::{AcpRegistryError, AcpRegistryStore};
     use codypendent_providers::{AuthMethod, Catalog};
 
     let providers_path = paths.data_dir.join("providers.toml");
@@ -8047,8 +7935,11 @@ async fn load_provider_cards(
         })
         .collect();
     let acp_store = AcpRegistryStore::new(&paths.data_dir);
-    let acp_registry = match acp_store.load_or_refresh().await {
+    let acp_registry = match acp_store.load_cached() {
         Ok(registry) => Some(registry),
+        Err(AcpRegistryError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            None
+        }
         Err(error) => {
             warnings.push(format!("official ACP registry unavailable ({error})"));
             None
@@ -8120,12 +8011,9 @@ async fn load_provider_cards(
             has_key: false,
         });
     }
-    // Google does not currently ship a native Antigravity ACP server. The
-    // community bridge is actionable only on platforms for which Codypendent
-    // carries an immutable URL+SHA-256 descriptor. The pure reducer presents a
-    // host-owned risk confirmation before this can reach the install/probe
-    // intent; nothing is downloaded merely by opening the catalog.
-    let community = codypendent_integrations::acp_registry::community_acp_agent("antigravity-acp");
+    // Keep the legacy community bridge separate from the official Google server.
+    let community =
+        codypendent_integrations::acp_registry::community_acp_agent("antigravity-community");
     let installable = community.as_ref().is_some_and(|agent| {
         agent
             .distribution
@@ -8133,9 +8021,9 @@ async fn load_provider_cards(
             .get(codypendent_integrations::acp_registry::current_platform())
             .is_some_and(|binary| binary.sha256.is_some())
     });
-    let ready = acp_store.launch_spec("antigravity-acp").is_ok();
+    let ready = acp_store.launch_spec("antigravity-community").is_ok();
     let antigravity = ProviderCard {
-        id: "antigravity-acp".to_string(),
+        id: "antigravity-community".to_string(),
         name: "Google Antigravity (community bridge)".to_string(),
         protocol: "acp".to_string(),
         auth: if ready {
@@ -8152,7 +8040,10 @@ async fn load_provider_cards(
         catalog_models: 0,
         has_key: false,
     };
-    if let Some(card) = cards.iter_mut().find(|card| card.id == "antigravity-acp") {
+    if let Some(card) = cards
+        .iter_mut()
+        .find(|card| card.id == "antigravity-community")
+    {
         // Keep this host-owned warning even if an upstream catalog later
         // publishes a row with the same id. It must not be possible for a
         // remote registry update to bypass the explicit community-risk gate.
@@ -9437,6 +9328,19 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn provider_catalogue_starts_offline_without_a_registry_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let mut warnings = Vec::new();
+        let cards = load_provider_cards(&paths, &mut warnings);
+        assert!(cards
+            .iter()
+            .any(|card| card.id == "ollama" && card.available));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!paths.data_dir.join("acp/registry.json").exists());
+    }
 
     /// A snapshot catch-up needs its transcript paged in; an event one does not.
     ///
@@ -12527,57 +12431,96 @@ api_key_env = "{api_key_env}"
     }
 
     #[tokio::test]
-    async fn hosted_model_projection_is_unavailable_until_catalog_env_resolves() {
-        const ENV: &str = "CODYPENDENT_TEST_RUNNABLE_MODEL_KEY_846f";
-        std::env::remove_var(ENV);
+    async fn model_projection_uses_daemon_verdicts_instead_of_local_credentials() {
+        use codypendent_protocol::{
+            read_envelope, write_envelope, DaemonInstanceId, ModelProbe, ServerHello,
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
-        std::fs::write(
-            paths.data_dir.join("providers.toml"),
-            format!(
-                r#"
-[[provider]]
-id = "runnable-test"
-name = "Runnable test"
-protocol = "openai-chat"
-base_url = "https://example.invalid/v1"
-[[provider.auth]]
-kind = "api_key"
-env = ["{ENV}"]
-header = "Authorization"
-prefix = "Bearer "
-"#
-            ),
-        )
-        .expect("provider config");
+        paths.ensure_directories().unwrap();
         std::fs::write(
             paths.data_dir.join("models.toml"),
             r#"
 [[model]]
-id = "runnable-test/model"
+id = "daemon/model"
 provider = "openai-compatible"
-provider_id = "runnable-test"
 base_url = "https://example.invalid/v1"
 model = "model"
-api_key_env = ""
+api_key_env = "CODYPENDENT_TEST_NOT_CONFIGURED"
 "#,
         )
-        .expect("model config");
-
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&paths.socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for readiness in [
+                codypendent_protocol::ModelReadiness::Unavailable {
+                    detail: "daemon reports missing credential".into(),
+                    error: None,
+                },
+                codypendent_protocol::ModelReadiness::Unverified {
+                    detail: "daemon credential resolves".into(),
+                },
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let hello = read_envelope(&mut socket).await.unwrap().unwrap();
+                write_envelope(
+                    &mut socket,
+                    &Envelope::reply_to(
+                        &hello,
+                        Payload::ServerHello(ServerHello {
+                            selected_protocol: codypendent_protocol::PROTOCOL_V1,
+                            daemon_version: "test".into(),
+                            daemon_instance: DaemonInstanceId::new(),
+                            heartbeat_interval_ms: 15_000,
+                            resume_token: None,
+                            build_id: "test".into(),
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+                let request = read_envelope(&mut socket).await.unwrap().unwrap();
+                let Payload::Command(command) = &request.payload else {
+                    panic!("expected probe")
+                };
+                assert!(matches!(
+                    command.body,
+                    CommandBody::ProbeModel {
+                        model: None,
+                        network: false
+                    }
+                ));
+                write_envelope(
+                    &mut socket,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::ModelProbes {
+                            command_id: command.command_id,
+                            models: vec![ModelProbe {
+                                id: ModelId("daemon/model".into()),
+                                readiness,
+                                probed: false,
+                            }],
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        });
         let mut warnings = Vec::new();
         let cards = load_model_cards(&paths, &mut warnings).await;
-        assert_eq!(cards.len(), 1);
-        assert!(matches!(cards[0].readiness, ModelReadiness::Unavailable(_)));
+        assert!(
+            matches!(&cards[0].readiness, ModelReadiness::Unavailable(reason) if reason.contains("daemon reports"))
+        );
         assert!(runnable_model_ids(&cards).is_empty());
-
-        std::env::set_var(ENV, "resolved-secret");
         let cards = load_model_cards(&paths, &mut warnings).await;
         assert_eq!(cards[0].readiness, ModelReadiness::Unverified);
         assert_eq!(
             runnable_model_ids(&cards),
-            vec![ModelId("runnable-test/model".to_owned())]
+            vec![ModelId("daemon/model".into())]
         );
-        std::env::remove_var(ENV);
+        server.await.unwrap();
     }
 
     // -- provider_can_list_models (model-discovery gate) ----------------------
@@ -12799,7 +12742,7 @@ api_key_env = ""
 
     #[test]
     fn an_acp_probe_pins_only_a_model_that_was_asked_for() {
-        let probe = AcpProbe {
+        let probe = codypendent_runtime::acp_setup::AcpProbe {
             registry_id: "demo-acp".to_string(),
             version: "1.2.3".to_string(),
             models: vec!["agent-model-1".to_string()],

@@ -1,0 +1,42 @@
+.patch-review { margin-top: 10px; min-width: 0; text-align: left; font-size: 12px; color: var(--cody-text); }
+.patch-review button, .patch-review select { border: 1px solid var(--cody-border); border-radius: 5px; padding: 5px 8px; background: var(--cody-panel); color: var(--cody-text-secondary); font: inherit; cursor: pointer; }
+.patch-review button:hover:not(:disabled) { background: var(--cody-panel-hover); border-color: var(--cody-border-strong); }
+.patch-review-files { display: flex; gap: 5px; flex-wrap: wrap; max-height: 150px; overflow-y: auto; padding: 2px; margin-bottom: 12px; }
+.patch-review-files button { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 9px; text-align: left; }
+.patch-review-files button span { overflow-wrap: anywhere; font-family: var(--cody-mono); }
+.patch-review-files button small { flex-shrink: 0; color: var(--cody-text-muted); font-size: 10px; }
+.patch-review-files button[aria-current="true"] { border-color: var(--cody-accent); background: var(--cody-info-bg); }
+.patch-review-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.patch-review-toolbar > button { flex-shrink: 0; }
+.patch-review-heading { display: flex; flex-direction: column; min-width: 0; gap: 3px; }
+.patch-review-heading strong { font-family: var(--cody-mono); overflow-wrap: anywhere; }
+.patch-review-heading > span { color: var(--cody-text-muted); overflow-wrap: anywhere; font-size: 11px; }
+.patch-review-controls { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 7px; margin: 8px 0; }
+.patch-review-controls label { display: flex; gap: 5px; align-items: center; }
+.patch-review-controls select { max-width: 180px; }
+.patch-review-table-scroll { overflow: auto; max-height: 480px; border: 1px solid var(--cody-border); border-radius: 6px; background: var(--cody-canvas); }
+.patch-review-table { width: 100%; border-collapse: collapse; font-family: var(--cody-mono); font-size: 11px; line-height: 1.6; text-align: left; }
+.patch-review-table caption { text-align: left; padding: 7px 9px; color: var(--cody-link); background: var(--cody-info-bg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.patch-review-table th { position: sticky; top: 0; z-index: 1; padding: 3px 8px; font-weight: 400; white-space: nowrap; color: var(--cody-text-muted); background: var(--cody-panel); border-bottom: 1px solid var(--cody-border); }
+.patch-review-table td { vertical-align: top; padding: 0 8px; }
+.patch-review-table td:nth-child(-n+2) { color: var(--cody-text-muted); width: 1%; min-width: 50px; text-align: right; user-select: none; }
+.patch-review-table td:nth-child(3) { width: 1%; user-select: none; }
+.patch-review-table td:last-child { white-space: pre; min-width: 180px; }
+.patch-review-table tr[data-kind="addition"] { background: var(--cody-success-bg); }
+.patch-review-table tr[data-kind="addition"] td:nth-child(3) { color: var(--cody-success-text); }
+.patch-review-table tr[data-kind="deletion"] { background: var(--cody-danger-bg); }
+.patch-review-table tr[data-kind="deletion"] td:nth-child(3) { color: var(--cody-danger-text); }
+.patch-review-table tr[data-kind="note"] { color: var(--cody-text-muted); font-style: italic; }
+.patch-review-table .patch-review-line-link { display: inline; border: 0; padding: 0 2px; background: transparent; border-radius: 1px; color: var(--cody-link); text-align: right; line-height: inherit; }
+.patch-review-table .patch-review-line-link:hover:not(:disabled) { background: transparent; text-decoration: underline; }
+.patch-review-line-limit, .patch-review-notice { color: var(--cody-text-muted); line-height: 1.5; }
+.patch-review-notice { margin: 8px 0; }
+.patch-review-error { color: var(--cody-danger-text); overflow-wrap: anywhere; }
+.patch-review-raw { margin: 10px 0; color: var(--cody-text-muted); }
+.patch-review-raw summary { cursor: pointer; }
+.patch-review-source { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--cody-mono); font-size: 11px; color: var(--cody-text); }
+@media (max-width: 760px) {
+  .patch-review-toolbar { flex-wrap: wrap; }
+  .patch-review-files button { flex-wrap: wrap; gap: 3px; }
+  .patch-review-controls select { max-width: 140px; }
+}

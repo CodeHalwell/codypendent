@@ -10,6 +10,7 @@
  * view, with the view's own name beside it.
  */
 import React from "react";
+import { ArrowLeft } from "lucide-react";
 
 import { NAV_GROUPS, type DesktopView } from "./Navigation.js";
 
@@ -34,9 +35,9 @@ const BAR: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   gap: 10,
-  padding: "6px 16px",
+  padding: "10px 24px",
   borderBottom: "1px solid var(--cody-border)",
-  background: "var(--cody-panel)",
+  background: "var(--cody-canvas)",
   fontSize: 12,
   color: "var(--cody-text-muted)",
   flexShrink: 0,
@@ -56,11 +57,11 @@ const BACK: React.CSSProperties = {
 export const ViewBar: React.FC<ViewBarProps> = ({ view, onBack }) => (
   <nav aria-label="View navigation" data-testid="view-bar" style={BAR}>
     <button type="button" onClick={onBack} title="Back to the previous view (Esc)" style={BACK}>
-      ‹ Back
+      <ArrowLeft size={14} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 6 }} />Back
     </button>
     <span aria-current="page" style={{ color: "var(--cody-text-secondary)" }}>
       {viewLabel(view)}
     </span>
-    <span style={{ marginLeft: "auto" }}>Esc goes back · ⌘K / Ctrl-K for every view</span>
+    <span style={{ marginLeft: "auto", fontSize: 11 }} title="Press Escape to go back">Esc to go back</span>
   </nav>
 );

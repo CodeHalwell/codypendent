@@ -12,6 +12,16 @@
     "repository": "/home/user/project",
     "type": "ReadCodeGraphStatus"
   },
+  "CommandBody_ReadCodeGraph_connected_view": {
+    "query": {
+      "connected_view": true,
+      "include_edges": true,
+      "include_nodes": true,
+      "limit": 100
+    },
+    "repository": "/home/user/project",
+    "type": "ReadCodeGraph"
+  },
   "CommandBody_ReadCodeGraph_filtered": {
     "query": {
       "include_edges": true,

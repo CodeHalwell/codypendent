@@ -26,6 +26,7 @@ use std::collections::HashMap;
 #[cfg(feature = "provider-openai")]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "provider-openai")]
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -51,7 +52,9 @@ pub type Result<T> = std::result::Result<T, ModelsError>;
 
 /// Live provider transports fail a dead connect promptly and do not let a
 /// streaming peer hold a request open forever without delivering bytes.
+#[cfg(feature = "provider-openai")]
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "provider-openai")]
 const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
@@ -769,6 +772,7 @@ pub fn provider_auth_id(provider_id: &str) -> String {
 /// The process-wide built-in provider catalog, parsed once. The fallback for
 /// registries built without [`ModelRegistry::with_catalog`] (e.g. the daemon
 /// executor), so catalog-declared auth headers resolve there too.
+#[cfg(feature = "provider-openai")]
 fn builtin_catalog() -> &'static Catalog {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
     CATALOG.get_or_init(Catalog::builtin)
@@ -1590,6 +1594,14 @@ impl ModelRegistry {
                 protocol: format!("{other:?}"),
             }),
         }
+    }
+
+    /// Resolve the same wire protocol used to construct this model's client.
+    pub(crate) fn protocol_for(&self, id: &ModelId) -> Result<Protocol> {
+        let cfg = self
+            .get(id)
+            .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
+        config_to_protocol_auth(cfg, self.catalog()).map(|(protocol, _)| protocol)
     }
 }
 
@@ -2953,6 +2965,7 @@ impl HeaderAuthChatClient {
 /// header-derived hint is clamped here (well under the retry module's own
 /// `RETRY_MAX_DELAY_MS` ceiling — a few minutes is the most a header hint should
 /// ever be honored for).
+#[cfg(feature = "provider-openai")]
 const RETRY_AFTER_HEADER_MAX_MS: u64 = 5 * 60 * 1000;
 
 /// `retry-after-ms` (ms) wins over `retry-after` (integer/float seconds, or
@@ -2960,6 +2973,7 @@ const RETRY_AFTER_HEADER_MAX_MS: u64 = 5 * 60 * 1000;
 /// header-derived hint is clamped to [`RETRY_AFTER_HEADER_MAX_MS`], and a
 /// non-finite or negative `Retry-After` (e.g. `inf`, `-5`) is treated as no
 /// hint — never a multi-day sleep and never an instant hot-retry.
+#[cfg(feature = "provider-openai")]
 fn retry_after_hint_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     if let Some(val) = headers.get("retry-after-ms") {
         if let Ok(s) = val.to_str() {

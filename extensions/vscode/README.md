@@ -115,6 +115,22 @@ parity.
 Settings: `codypendent.sessionId` (auto-attach on startup when set) and
 `codypendent.socketPath` (override the discovered socket path).
 
+## Continue from the desktop or terminal
+
+Install this extension in VS Code or Cursor, then choose that editor from the
+desktop workspace menu or run `codypendent open <session> --in vscode` (use `cursor`
+for Cursor). The editor receives the current repository, daemon socket and
+session together, so there is no UUID to copy. Accept **Open Session** to attach;
+an already attached matching session is reused. A repository opened in a new
+window continues the approved handoff after the workspace is trusted.
+
+Opening a line from a desktop patch review also carries the patch's originating
+run. The editor opens that run's worktree at the selected line while keeping the
+original session attached. Missing or retired checkouts produce an error instead
+of opening an unrelated copy. Handoff links contain local paths and identifiers,
+never credentials. The extension checks socket ownership, checkout provenance
+and file containment before opening them.
+
 ## Cursor compatibility
 
 Cursor is a VS Code fork and loads this extension unchanged — it uses the same

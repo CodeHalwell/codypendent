@@ -1532,7 +1532,12 @@ fn bundled_ui_runtime() -> Result<Option<UiWorkerRuntime>, RemoteUiPluginStoreEr
         if !executable.starts_with(&root) || !trusted_runtime_permissions(&root, &executable) {
             return Err(RemoteUiPluginStoreError::Authentication);
         }
+        let verification_started = std::time::Instant::now();
         verify_bundled_runtime_root(&root)?;
+        tracing::info!(
+            elapsed_ms = verification_started.elapsed().as_millis(),
+            "bundled Node runtime integrity verified"
+        );
         return UiWorkerRuntime::new(executable, root)
             .map(Some)
             .map_err(Into::into);

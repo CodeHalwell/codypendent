@@ -9,6 +9,7 @@ export interface PendingApprovalProjection {
   run_id: RunId;
   action: ProposedAction;
   risk: Risk;
+  pattern?: string;
 }
 
 export interface SessionProjection {

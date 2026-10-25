@@ -48,9 +48,16 @@ jobs:
       - name: Check migration immutability
         run: |
           python3 .github/scripts/check_migration_immutability.py
+          python3 .github/scripts/check_release_versions.py
           python3 .github/scripts/check_migration_immutability.py --directory crates/control-plane/migrations
       - name: Check release workflow security invariants
         run: python3 .github/scripts/check_release_workflow_security.py
+      - name: Check Apple release tooling
+        run: |
+          python3 apps/desktop/scripts/test_apple_release.py
+          python3 apps/desktop/scripts/test_prepare_embedding_runtime.py
+          python3 .github/scripts/tests/test_release_install.py
+          bash -n install.sh apps/desktop/scripts/apple-signing-env.sh apps/desktop/scripts/sign-apple-release.sh apps/desktop/scripts/sign-apple-runtime.sh apps/desktop/scripts/package-apple-release.sh
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -224,11 +231,14 @@ jobs:
   # single line of it. Until this job existed, nothing in the repository
   # compiled it at all: a broken bridge would have shipped green.
   #
-  # It runs on Linux because that is the fragile half (macOS's WKWebView needs
-  # no system packages), so this job is also the standing proof that the Linux
-  # half of release.yml's `desktop-bundle` can still build.
+  # Both shipped desktop targets run native quality checks. Linux additionally
+  # needs the system libraries used by release.yml's AppImage bundle.
   desktop-tauri:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -237,6 +247,7 @@ jobs:
       # 2.0 (→ webkit2gtk-4.1), soup3, javascriptcore-rs 1.1, libappindicator
       # 0.9. Their build scripts fail at pkg-config time without these.
       - name: Install the Tauri Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -517,7 +528,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.3"
           cache: npm
           cache-dependency-path: |
             sdk/protocol/package-lock.json
@@ -562,7 +573,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.3"
           cache: npm
           cache-dependency-path: |
             sdk/control-plane/package-lock.json

@@ -4,6 +4,7 @@
 //! model/dims change invalidates stored rows (re-embed on the next pass).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use codypendent_knowledge::retrieval::{
     drain_outbox, embedding_content_hash, load_embeddings, reconcile_embeddings, retrieve,
@@ -24,6 +25,7 @@ use codypendent_protocol::RegistryItemId;
 struct MarkerEmbedder {
     model: String,
     calls: AtomicUsize,
+    batches: Mutex<Vec<usize>>,
     fail: bool,
 }
 
@@ -32,6 +34,7 @@ impl MarkerEmbedder {
         Self {
             model: model.to_string(),
             calls: AtomicUsize::new(0),
+            batches: Mutex::new(Vec::new()),
             fail: false,
         }
     }
@@ -40,6 +43,7 @@ impl MarkerEmbedder {
         Self {
             model: "unreachable-model".to_string(),
             calls: AtomicUsize::new(0),
+            batches: Mutex::new(Vec::new()),
             fail: true,
         }
     }
@@ -56,6 +60,8 @@ impl MarkerEmbedder {
             for x in &mut v {
                 *x /= norm;
             }
+        } else {
+            v[0] = 1.0;
         }
         v
     }
@@ -69,6 +75,7 @@ impl SemanticEmbedder for MarkerEmbedder {
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.batches.lock().unwrap().push(texts.len());
         if self.fail {
             return Err(EmbedError("endpoint unreachable".to_string()));
         }
@@ -304,4 +311,174 @@ async fn semantic_index_build_falls_back_to_hashing_on_model_failure() {
     );
     // The failing model left an unprocessed-free table untouched.
     assert!(load_embeddings(&pool).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconciliation_batches_requests_and_skips_fresh_rows() {
+    let (_tmp, pool) = temp_pool().await;
+    let registry = Registry::new();
+    for index in 0..65 {
+        registry
+            .upsert(&pool, &tool(&format!("tests.{index}"), "run tests"))
+            .await
+            .unwrap();
+    }
+    let embedder = MarkerEmbedder::new("batched-model");
+    assert_eq!(reconcile_embeddings(&pool, &embedder).await.unwrap(), 65);
+    assert_eq!(*embedder.batches.lock().unwrap(), vec![64, 1]);
+    assert_eq!(reconcile_embeddings(&pool, &embedder).await.unwrap(), 0);
+    assert_eq!(embedder.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn outbox_coalesces_repeated_changes_before_embedding() {
+    let (_tmp, pool) = temp_pool().await;
+    let registry = Registry::new();
+    let mut item = tool("tests.repeat", "run tests");
+    for index in 0..5 {
+        item.description = format!("run tests {index}");
+        registry.upsert(&pool, &item).await.unwrap();
+    }
+    let other = tool("tests.other", "run other tests");
+    registry.upsert(&pool, &other).await.unwrap();
+    let embedder = MarkerEmbedder::new("batched-model");
+    let report = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
+    assert_eq!((report.processed, report.embedded), (6, 2));
+    assert_eq!(*embedder.batches.lock().unwrap(), vec![2]);
+    let stored = load_embeddings(&pool).await.unwrap();
+    assert_eq!(
+        stored[&item.id].content_hash,
+        embedding_content_hash(&embedding_text(&item))
+    );
+}
+
+struct TaskEmbedder {
+    space: &'static str,
+    output: Option<Vec<Vec<f32>>>,
+    query: Vec<f32>,
+    documents: Mutex<Vec<usize>>,
+    queries: AtomicUsize,
+}
+
+impl TaskEmbedder {
+    fn new(space: &'static str) -> Self {
+        Self {
+            space,
+            output: None,
+            query: vec![1.0, 0.0, 0.0],
+            documents: Mutex::new(Vec::new()),
+            queries: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SemanticEmbedder for TaskEmbedder {
+    fn model(&self) -> &str {
+        "shared-model-alias"
+    }
+    fn space_id(&self) -> &str {
+        self.space
+    }
+
+    async fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        Ok(self.query.clone())
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.documents.lock().unwrap().push(texts.len());
+        Ok(self
+            .output
+            .clone()
+            .unwrap_or_else(|| vec![self.query.clone(); texts.len()]))
+    }
+}
+
+#[tokio::test]
+async fn retrieval_keeps_query_tasks_separate_and_refreshes_changed_spaces_and_widths() {
+    let (_tmp, pool) = temp_pool().await;
+    let item = tool("tests.task", "run tests");
+    Registry::new().upsert(&pool, &item).await.unwrap();
+    let items = vec![item];
+    let first = TaskEmbedder::new("endpoint-one:digest-one:task-v1");
+    for _ in 0..2 {
+        assert!(semantic_indexes(&pool, &items, Some(&first), "test this")
+            .await
+            .unwrap()
+            .1
+            .is_some());
+    }
+    assert_eq!(*first.documents.lock().unwrap(), vec![1]);
+    assert_eq!(first.queries.load(Ordering::SeqCst), 2);
+    let mut changed = TaskEmbedder::new("endpoint-two:digest-two:task-v1");
+    semantic_indexes(&pool, &items, Some(&changed), "test this")
+        .await
+        .unwrap();
+    assert_eq!(*changed.documents.lock().unwrap(), vec![1]);
+    assert_eq!(
+        load_embeddings(&pool).await.unwrap()[&items[0].id].model,
+        changed.space
+    );
+    changed.query = vec![1.0, 0.0];
+    semantic_indexes(&pool, &items, Some(&changed), "test this")
+        .await
+        .unwrap();
+    assert_eq!(*changed.documents.lock().unwrap(), vec![1, 1]);
+    assert_eq!(load_embeddings(&pool).await.unwrap()[&items[0].id].dims, 2);
+}
+
+#[tokio::test]
+async fn malformed_document_vectors_fall_back_without_persisting_partial_rows() {
+    for output in [
+        vec![vec![1.0, 0.0, 0.0]],
+        vec![vec![1.0, 0.0, 0.0], vec![1.0, 0.0]],
+        vec![vec![f32::NAN, 0.0, 0.0]; 2],
+        vec![vec![0.0, 0.0, 0.0]; 2],
+    ] {
+        let (_tmp, pool) = temp_pool().await;
+        let items = vec![
+            tool("tests.first", "first tests"),
+            tool("tests.second", "second tests"),
+        ];
+        for item in &items {
+            Registry::new().upsert(&pool, item).await.unwrap();
+        }
+        let mut embedder = TaskEmbedder::new("invalid-response");
+        embedder.output = Some(output);
+        assert!(
+            semantic_indexes(&pool, &items, Some(&embedder), "test this")
+                .await
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(load_embeddings(&pool).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn failed_batch_leaves_the_outbox_available_for_retry() {
+    let (_tmp, pool) = temp_pool().await;
+    let item = tool("tests.retry", "run tests");
+    Registry::new().upsert(&pool, &item).await.unwrap();
+    let mut embedder = TaskEmbedder::new("invalid-response");
+    embedder.output = Some(Vec::new());
+    assert!(drain_outbox(&pool, Some(&embedder), 100).await.is_err());
+    assert!(load_embeddings(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        codypendent_knowledge::outbox::unprocessed(&pool, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    embedder.output = None;
+    assert_eq!(
+        drain_outbox(&pool, Some(&embedder), 100)
+            .await
+            .unwrap()
+            .embedded,
+        1
+    );
 }

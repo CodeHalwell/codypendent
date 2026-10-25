@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * The measured-analytics surface.
  *
@@ -13,7 +14,10 @@
  *    case renders as an explicit unavailable panel — never as "no observations
  *    recorded", which would assert a measurement we never made.
  */
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArtifactSaveButton, type SaveArtifact } from "./ArtifactActions.js";
+import { formatCostMicros } from "../runActivity.js";
+import { modelLabel } from "../modelPresentation.js";
 import type {
   AnalyticsBucket,
   AnalyticsExportFormat,
@@ -30,6 +34,9 @@ export interface AnalyticsDashboardProps {
   onQueryAnalytics?: (query?: AnalyticsQuery) => Promise<AnalyticsPage | null>;
   onExportAnalytics?: (request: AnalyticsExportRequest) => Promise<AnalyticsExportResult | null>;
   initialPage?: AnalyticsPage | null;
+  /** Invalidate in-flight requests when the native connection is replaced. */
+  connectionEpoch?: number;
+  onSaveArtifact?: SaveArtifact;
 }
 
 export function formatMetric(
@@ -41,7 +48,7 @@ export function formatMetric(
   }
   switch (formatType) {
     case "currency":
-      return `$${(value / 1_000_000).toFixed(4)}`;
+      return formatCostMicros(value);
     case "latency":
       return `${value.toLocaleString()} ms`;
     case "score":
@@ -163,7 +170,9 @@ export function timeRangeFilter(range: string, now: number = Date.now()): Analyt
 export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
   onQueryAnalytics,
   onExportAnalytics,
+  onSaveArtifact,
   initialPage,
+  connectionEpoch = 0,
 }) => {
   const [grouping, setGrouping] = useState<AnalyticsGrouping["type"]>("model");
   const [timeRange, setTimeRange] = useState<string>("7d");
@@ -179,95 +188,87 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       : "No analytics source is wired to this view, so nothing here has been measured.",
   );
 
-  /** The query whose answer may still be painted. A response for anything
-   * else — e.g. a slow query under an older Group By / Window — is dropped, so
-   * the numbers never settle under newer filter controls. */
-  const liveQuery = useRef<string | null>(null);
-  /** Same guard for the export, keyed by the full request. */
-  const liveExport = useRef<string | null>(null);
-
-  const buildQuery = (): AnalyticsQuery => {
-    const groupingParam: AnalyticsGrouping[] = grouping === "unknown" ? [] : [{ type: grouping }];
+  const [refreshTick, setRefreshTick] = useState(0);
+  const queryGeneration = useRef(0);
+  const exportGeneration = useRef(0);
+  const queryInFlight = useRef<number | null>(null);
+  const exportInFlight = useRef<number | null>(null);
+  // Cursor hashes include the time filter. Freeze the window across pages;
+  // recomputing "seven days ago" on each click makes the next cursor invalid.
+  const query = useMemo<AnalyticsQuery>(() => {
     const time = timeRangeFilter(timeRange);
     return {
-      group_by: groupingParam,
+      group_by: grouping === "unknown" ? [] : [{ type: grouping }],
       ...(time ? { filters: { time } } : {}),
     };
-  };
+  }, [grouping, timeRange, refreshTick]);
 
-  const fetchAnalytics = async () => {
-    if (!onQueryAnalytics) return;
-    const query = buildQuery();
-    const key = JSON.stringify(query);
-    liveQuery.current = key;
+  const fetchAnalytics = useCallback(async (cursor?: string) => {
+    if (!onQueryAnalytics || queryInFlight.current !== null) return;
+    const generation = ++queryGeneration.current;
+    queryInFlight.current = generation;
     setLoading(true);
     setError(null);
     try {
-      const res = await onQueryAnalytics(query);
-      if (liveQuery.current !== key) {
-        // A newer Group By / Window query is in flight; its own answer paints.
-        return;
-      }
-      // `null` means the command never reached a daemon that answers it. That
-      // is not an empty result set and must not be drawn as one.
-      if (res === null) {
-        setPage(null);
-        setUnavailable(
-          "The daemon did not answer the analytics query, so no measurements could be read.",
-        );
-      } else {
-        setPage(res);
-        setUnavailable(null);
-      }
+      const res = await onQueryAnalytics({ ...query, ...(cursor ? { cursor } : {}) });
+      if (queryGeneration.current !== generation) return;
+      if (res === null) throw new Error("The daemon did not answer the analytics query, so no measurements could be read.");
+      setPage((previous) => cursor && previous
+        ? { ...res, items: [...previous.items, ...res.items] }
+        : res);
+      setUnavailable(null);
     } catch (err) {
-      if (liveQuery.current !== key) {
-        return;
+      if (queryGeneration.current !== generation) return;
+      const detail = err instanceof Error ? err.message : String(err);
+      if (!cursor) {
+        setPage(null);
+        setUnavailable(detail);
       }
-      setPage(null);
-      setUnavailable(err instanceof Error ? err.message : String(err));
-      setError(err instanceof Error ? err.message : String(err));
+      setError(cursor ? `The next page failed: ${detail}. Loaded measurements are retained; retry below.` : detail);
     } finally {
-      if (liveQuery.current === key) {
+      if (queryGeneration.current === generation) {
+        queryInFlight.current = null;
         setLoading(false);
       }
     }
-  };
+  }, [onQueryAnalytics, query]);
 
-  useEffect(() => {
-    if (!initialPage && onQueryAnalytics) {
-      void fetchAnalytics();
-    }
-  }, [grouping, timeRange]);
+  useLayoutEffect(() => {
+    ++queryGeneration.current;
+    queryInFlight.current = null;
+    setPage(onQueryAnalytics ? null : initialPage ?? null);
+    setLoading(false);
+    setError(null);
+    setUnavailable(onQueryAnalytics || initialPage ? null : "No analytics source is wired to this view, so nothing here has been measured.");
+    void fetchAnalytics();
+    return () => { ++queryGeneration.current; queryInFlight.current = null; };
+  }, [fetchAnalytics, initialPage, connectionEpoch, onQueryAnalytics]);
+
+  useLayoutEffect(() => {
+    ++exportGeneration.current;
+    exportInFlight.current = null;
+    setExporting(false);
+    setExportResult(null);
+    return () => { ++exportGeneration.current; exportInFlight.current = null; };
+  }, [query, onExportAnalytics, connectionEpoch]);
 
   const handleExport = async (format: AnalyticsExportFormat["type"]) => {
-    if (!onExportAnalytics) return;
-    const request: AnalyticsExportRequest = {
-      format: { type: format },
-      query: buildQuery(),
-    };
-    const key = JSON.stringify(request);
-    liveExport.current = key;
+    if (!onExportAnalytics || exportInFlight.current !== null) return;
+    const generation = ++exportGeneration.current;
+    exportInFlight.current = generation;
     setExporting(true);
+    setExportResult(null);
     setError(null);
     try {
-      const res = await onExportAnalytics(request);
-      if (liveExport.current !== key) {
-        // A newer export is in flight; its own result is reported.
-        return;
-      }
-      if (res === null) {
-        setExportResult(null);
-        setError("The daemon did not answer the export request, so no artifact was produced.");
-      } else {
-        setExportResult(res);
-      }
+      const res = await onExportAnalytics({ format: { type: format }, query });
+      if (exportGeneration.current !== generation) return;
+      if (res === null) throw new Error("The daemon did not answer the export request, so no artifact was produced.");
+      setExportResult(res);
     } catch (err) {
-      if (liveExport.current !== key) {
-        return;
-      }
-      setError(err instanceof Error ? err.message : String(err));
+      if (exportGeneration.current === generation) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (liveExport.current === key) {
+      if (exportGeneration.current === generation) {
+        exportInFlight.current = null;
         setExporting(false);
       }
     }
@@ -279,14 +280,14 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
   const truncated = Boolean(page?.next_cursor);
 
   return (
-    <div
+    <PageShell
       role="region"
       aria-label="Analytics Dashboard"
       style={{
         flex: 1,
         display: "flex",
         flexDirection: "column",
-        height: "100vh",
+        height: "100%",
         background: "var(--cody-canvas)",
         color: "var(--cody-text)",
         overflowY: "auto",
@@ -294,6 +295,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
     >
       {/* Header */}
       <div
+        className="cody-page-header"
         style={{
           padding: "20px 24px 16px",
           borderBottom: "1px solid var(--cody-inset)",
@@ -305,16 +307,16 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         }}
       >
         <div>
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Analytics & Quality Center</h1>
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Usage</h1>
           <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
-            Measured execution observations, token usage, cost breakdowns, and latency metrics
+            See what your agents use, how much they cost and how they perform.
           </p>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button
-            onClick={() => void fetchAnalytics()}
-            disabled={loading}
+            onClick={() => setRefreshTick((tick) => tick + 1)}
+            disabled={loading || !onQueryAnalytics}
             style={{
               padding: "6px 12px",
               background: "var(--cody-inset)",
@@ -329,7 +331,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </button>
           <button
             onClick={() => handleExport("json")}
-            disabled={exporting}
+            disabled={exporting || !onExportAnalytics}
             style={{
               padding: "6px 12px",
               background: "var(--cody-inset)",
@@ -344,7 +346,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </button>
           <button
             onClick={() => handleExport("csv")}
-            disabled={exporting}
+            disabled={exporting || !onExportAnalytics}
             style={{
               padding: "6px 12px",
               background: "var(--cody-inset)",
@@ -378,6 +380,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </label>
           <select
             id="grouping-select"
+            disabled={!onQueryAnalytics}
             value={grouping}
             onChange={(e) => setGrouping(e.target.value as AnalyticsGrouping["type"])}
             style={{
@@ -406,6 +409,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </label>
           <select
             id="timerange-select"
+            disabled={!onQueryAnalytics}
             value={timeRange}
             onChange={(e) => setTimeRange(e.target.value)}
             style={{
@@ -424,7 +428,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </select>
         </div>
 
-        {loading && <span style={{ fontSize: 12, color: "var(--cody-link)" }}>Loading observations…</span>}
+        {loading && <span role="status" style={{ fontSize: 12, color: "var(--cody-link)" }}>Loading observations…</span>}
       </div>
 
       {exportResult && (
@@ -442,6 +446,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         >
           Export ready ({exportResult.format.type}): {exportResult.row_count} rows, artifact {exportResult.artifact.id}
           {exportResult.truncated && " (truncated)"}
+          <ArtifactSaveButton key={exportResult.artifact.id} artifact={exportResult.artifact} onSave={onSaveArtifact} />
         </div>
       )}
 
@@ -462,16 +467,15 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         </div>
       )}
 
-      {/* Main Dashboard Content. Dimmed while a re-query is in flight: the
-          numbers on screen are the PREVIOUS query's until the new page lands,
-          and painting them at full strength read as fresh answers. */}
+      {/* New filters clear old measurements; continuation requests keep the
+          confirmed pages visible while another page is loading. */}
       <div
         style={{
           padding: "20px 24px",
           display: "flex",
           flexDirection: "column",
           gap: 24,
-          opacity: loading ? 0.55 : 1,
+          opacity: loading ? 0.7 : 1,
           transition: "opacity 120ms ease",
         }}
       >
@@ -484,10 +488,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             {/* Say what the numbers cover. Counts are summed over the buckets on
                 this page; per-observation averages are weighted by completions,
                 and read "unavailable" when this page lacks the weights. */}
-            Counts totalled across the {buckets.length} bucket
-            {buckets.length === 1 ? "" : "s"} on this page; latency, grader score and cost per task
+            Measured subtotals across the {buckets.length} loaded bucket
+            {buckets.length === 1 ? "" : "s"} in this view; latency, grader score and cost per task
             are completion-weighted averages.
-            {truncated && " More buckets remain beyond this page, so these are not totals for the whole query."}
+            {truncated && " More buckets remain beyond the loaded pages, so these are not totals for the whole query."}
           </p>
           <div
             style={{
@@ -509,6 +513,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Input Tokens</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.input_tokens)}
+                <MeasurementCoverage buckets={buckets} metric="input_tokens" />
               </div>
             </div>
 
@@ -525,6 +530,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Output Tokens</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.output_tokens)}
+                <MeasurementCoverage buckets={buckets} metric="output_tokens" />
               </div>
             </div>
 
@@ -541,6 +547,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Cached Tokens</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.cached_tokens)}
+                <MeasurementCoverage buckets={buckets} metric="cached_tokens" />
               </div>
             </div>
 
@@ -557,6 +564,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Reasoning Tokens</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.reasoning_tokens)}
+                <MeasurementCoverage buckets={buckets} metric="reasoning_tokens" />
               </div>
             </div>
 
@@ -570,9 +578,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Total Cost</div>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Measured Cost</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-success)" }}>
                 {formatMetric(totals.cost_micros, "currency")}
+                <MeasurementCoverage buckets={buckets} metric="cost_micros" />
               </div>
             </div>
 
@@ -589,6 +598,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Cost / Successful Task</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-success)" }}>
                 {formatMetric(totals.cost_per_successful_task_micros, "currency")}
+                <MeasurementCoverage buckets={buckets} metric="cost_per_successful_task_micros" />
               </div>
             </div>
 
@@ -605,6 +615,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Avg Latency</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.latency_ms, "latency")}
+                <MeasurementCoverage buckets={buckets} metric="latency_ms" />
               </div>
             </div>
 
@@ -621,6 +632,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Grader Score</div>
               <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.grader_score_micros, "score")}
+                <MeasurementCoverage buckets={buckets} metric="grader_score_micros" />
               </div>
             </div>
           </div>
@@ -649,6 +661,8 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             >
               Analytics unavailable — {unavailable}
             </div>
+          ) : loading && buckets.length === 0 ? (
+            <div data-testid="analytics-loading" role="status">Loading measurements for the selected filters…</div>
           ) : buckets.length === 0 ? (
             <div
               data-testid="analytics-empty"
@@ -687,7 +701,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
                 </thead>
                 <tbody>
                   {buckets.map((bucket, i) => {
-                    const dimLabel = bucket.dimensions?.join(" / ") || `Bucket #${i + 1}`;
+                    const dimLabel = bucket.dimensions?.map((dimension) => grouping === "model" ? modelLabel(dimension) : dimension).join(" / ") || `Bucket #${i + 1}`;
                     return (
                       <tr key={i} style={{ borderBottom: "1px solid var(--cody-inset)" }}>
                         <td style={{ padding: "10px 16px", fontWeight: 500 }}>{dimLabel}</td>
@@ -707,7 +721,20 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             </div>
           )}
         </div>
+        {truncated && <button type="button" disabled={loading || !onQueryAnalytics}
+          onClick={() => void fetchAnalytics(page?.next_cursor ?? undefined)}
+          style={{ alignSelf: "flex-start", padding: "8px 14px", background: "var(--cody-inset)", color: "var(--cody-text)", border: "1px solid var(--cody-border-strong)", borderRadius: 6 }}>
+          {loading ? "Loading more…" : "Load more measurements"}
+        </button>}
       </div>
-    </div>
+    </PageShell>
   );
 };
+
+function MeasurementCoverage({ buckets, metric }: { buckets: AnalyticsBucket[]; metric: keyof AnalyticsMetrics }) {
+  const measured = buckets.filter((bucket) => bucket.metrics[metric] != null).length;
+  if (measured === 0 || measured === buckets.length) return null;
+  return <div style={{ marginTop: 4, fontSize: 12, fontWeight: 400, color: "var(--cody-warning-text)" }}>
+    Partial: {measured} of {buckets.length} loaded buckets reported this metric
+  </div>;
+}

@@ -1,3 +1,4 @@
+import contract from "../../../testdata/failure-sanitization.json";
 import { describe, expect, it } from "vitest";
 import { diagnoseFailure, sanitizeFailureText, summarizeError } from "../src/failure.js";
 import { describeActivity, formatCostMicros, thousands, usageLabel } from "../src/runActivity.js";
@@ -41,7 +42,7 @@ describe("sanitizeFailureText", () => {
     const safe = sanitizeFailureText("failed[31m hard‮ text");
     expect(safe).not.toContain("");
     expect(safe).not.toContain("‮");
-    expect(safe).toBe("failed[31m hard text");
+    expect(safe).toBe("failed hard text");
   });
 
   it("redacts an inline token= value but keeps the label", () => {
@@ -77,6 +78,14 @@ describe("summarizeError", () => {
 });
 
 describe("diagnoseFailure", () => {
+  it("explains402 billing before interpreting the provider quota field", () => {
+    const diagnosis = diagnoseFailure('model driver error: API error402 Payment Required: {"type":"payment_required_error","param":"quota"}');
+    expect(diagnosis.summary).toBe("The provider requires billing access");
+    expect(diagnosis.remedy).toBe("none");
+    expect(diagnosis.authRelated).toBe(false);
+    expect(diagnosis.hint).toContain("billing");
+    expect(diagnosis.hint).not.toContain("API Keys");
+  });
   it("points a 401 at the API keys surface", () => {
     const diagnosis = diagnoseFailure(
       'model driver error: OpenAI-compatible API error 401 Unauthorized: {"error":{"message":"Incorrect API key sk-abc"}}',
@@ -115,12 +124,12 @@ describe("usage and activity labels", () => {
     expect(formatCostMicros(2_500_000)).toBe("$2.5000");
     expect(
       usageLabel({ runId: "r", promptTokens: 1234, completionTokens: 567, costMicros: 3400 }),
-    ).toBe("1,234 in · 567 out · $0.0034");
+    ).toBe("1,234 in · 567 out · $0.0034 · coverage unknown");
   });
 
   it("never invents a price for an unpriced run", () => {
     expect(usageLabel({ runId: "r", promptTokens: 10, completionTokens: null, costMicros: null })).toBe(
-      "10 in",
+      "10 in · coverage unknown",
     );
     expect(usageLabel({ runId: "r", promptTokens: null, completionTokens: null, costMicros: null })).toBeNull();
     expect(usageLabel(null)).toBeNull();
@@ -319,5 +328,28 @@ describe("a compact JSON credential with escaped quotes", () => {
     expect(safe).not.toContain("correct");
     expect(safe).not.toContain("battery staple");
     expect(safe).toContain("nothing else was wrong");
+  });
+});
+
+
+describe("shared failure contract", () => {
+  for (const [index, vector] of contract.cases.entries()) {
+    it(`preserves context and redacts credentials (vector ${index + 1})`, () => {
+      expect(sanitizeFailureText(vector.raw)).toBe(vector.safe);
+    });
+  }
+});
+
+describe("usage completeness", () => {
+  const coverage = { requests: 2, prompt_requests: 2, completion_requests: 2, cost_requests: 2, unmeasured_retries: 0 };
+  const usage = { runId: "r", promptTokens: 0, completionTokens: 12, costMicros: 11, coverage };
+  it("shows exact measured zero only when all requests reported it", () => {
+    expect(usageLabel(usage)).toBe("0 in · 12 out · $0.000011");
+    expect(usageLabel({ ...usage, coverage: { ...coverage, prompt_requests: 1 } })).toContain("partial");
+    expect(usageLabel({ ...usage, coverage: { ...coverage, unmeasured_retries: 1 } })).toContain("partial");
+  });
+  it("treats absent historical coverage as unknown and missing amounts as unmeasured", () => {
+    expect(usageLabel({ ...usage, coverage: null })).toContain("coverage unknown");
+    expect(usageLabel({ ...usage, promptTokens: null, costMicros: null, coverage: { ...coverage, prompt_requests: 0, cost_requests: 0 } })).toBe("12 out");
   });
 });

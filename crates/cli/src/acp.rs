@@ -8,6 +8,7 @@
 //! events stream back as `session/update`s; a tool that needs approval surfaces
 //! as an ACP permission request; the client's answer resolves the approval.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::connection::Connection;
@@ -15,8 +16,8 @@ use crate::stream::event_run_id;
 use async_trait::async_trait;
 use codypendent_integrations::acp::{
     agent_message_chunk, agent_thought_chunk, permission_tool_call, serve as acp_serve,
-    tool_call_pending, tool_call_started, AcpBackend, AcpError, PermissionOption,
-    PermissionOutcome, PromptSink, StopReason,
+    tool_call_completed, tool_call_pending, tool_call_refined, tool_call_started, AcpBackend,
+    AcpError, PermissionOption, PermissionOutcome, PromptSink, StopReason,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -194,6 +195,7 @@ impl AcpBackend for DaemonAcpBackend {
         // Mints the `toolCallId`s this turn's ACP tool calls are referred to by
         // (see the `ToolStarted` arm).
         let mut tool_calls = 0_u64;
+        let mut tool_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
         loop {
             tokio::select! {
                 // The client cancelled this turn: stop the run and report it.
@@ -247,13 +249,28 @@ impl AcpBackend for DaemonAcpBackend {
                         EventBody::ModelStreamDelta { text, .. } => {
                             ctx.update(agent_message_chunk(text)).await;
                         }
-                        EventBody::ToolStarted { tool, .. } => {
+                        EventBody::ToolStarted { tool, label, .. } => {
                             // ACP requires a `toolCallId` on every tool call.
                             // The daemon event carries none (its tools are
                             // named, not id'd), so the bridge mints the id this
                             // ACP session uses to refer to the call.
                             tool_calls += 1;
-                            ctx.update(tool_call_started(format!("tool-{tool_calls}"), tool)).await;
+                            let id = format!("tool-{tool_calls}");
+                            let title = if tool.starts_with("acp:") {
+                                label.unwrap_or_else(|| "Tool".to_owned())
+                            } else { tool.clone() };
+                            tool_ids.entry(tool).or_default().push(id.clone());
+                            ctx.update(tool_call_started(id, title)).await;
+                        }
+                        EventBody::ToolUpdated { tool, label, .. } => {
+                            if let (Some(id), Some(label)) = (tool_ids.get(&tool).and_then(|ids| ids.last()), label) {
+                                ctx.update(tool_call_refined(id.clone(), label)).await;
+                            }
+                        }
+                        EventBody::ToolCompleted { tool, outcome, .. } => {
+                            if let Some(id) = tool_ids.get_mut(&tool).and_then(Vec::pop) {
+                                ctx.update(tool_call_completed(id, &outcome)).await;
+                            }
                         }
                         // A run note is host commentary, not model output, so it
                         // must not arrive as an agent message chunk.

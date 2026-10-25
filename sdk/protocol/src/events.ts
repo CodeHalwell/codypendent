@@ -1,6 +1,6 @@
 /** Stable public facade for schema-generated event contracts. */
 
-export type { Actor, EventBody, SessionEvent } from "./generated/events.js";
+export type { Actor, EventBody, SessionEvent, UsageCoverage } from "./generated/events.js";
 
 import type { EventBody } from "./generated/events.js";
 

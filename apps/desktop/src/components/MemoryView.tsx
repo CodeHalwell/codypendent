@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * Memory + Journey — the TUI's `Overlay::Memory` and `Overlay::Journey`.
  *
@@ -67,12 +68,12 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
   });
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Memory</div>
+          <h1 style={surfaceStyles.title}>Memory</h1>
           <div style={surfaceStyles.subtitle}>
-            Curated memories and their provenance; governed learnings awaiting review.
+            What your agents remember, where it came from and what needs your review.
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -80,7 +81,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
             Memories
           </button>
           <button style={tabStyle(tab === "journey")} onClick={() => setTab("journey")}>
-            Journey
+            Learning review
           </button>
           {onRefresh && (
             <button style={surfaceButton()} onClick={onRefresh}>
@@ -90,7 +91,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
         </div>
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         {notice && (
           <div role="status" style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}>
             {notice}
@@ -129,17 +130,12 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
 
         {tab === "memories" ? (
           <SurfaceBody
+          onRetry={onRefresh}
             status={memories.status}
             detail={memories.detail}
             count={memories.items.length}
-            emptyMessage={
-              "Nothing has been remembered yet. Memory is harvested after each run, and " +
-              "extraction needs a model that can act as a chat client — an ACP entry cannot, " +
-              "being a full-agent executor. If every model in models.toml is ACP, add one " +
-              "chat-capable model (a local Ollama or any OpenAI-compatible endpoint will do) " +
-              "or set `memory_extraction_model` in routing.toml, and the next run will start " +
-              "filling this."
-            }
+            emptyTitle="A workspace that learns with you"
+            emptyMessage="Useful context from your runs appears here, ready for you to review. Memory extraction needs a chat-capable model."
           >
             {memories.items.map((memory) => (
               <div key={memory.id} style={surfaceStyles.card}>
@@ -246,9 +242,11 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
           </SurfaceBody>
         ) : (
           <SurfaceBody
+          onRetry={onRefresh}
             status={learnings.status}
             detail={learnings.detail}
             count={learnings.items.length}
+            emptyTitle="Learning review is clear"
             emptyMessage="No proposed or active learnings for this repository."
           >
             {learnings.items.map((learning) => (
@@ -369,6 +367,6 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
           </SurfaceBody>
         )}
       </div>
-    </div>
+    </PageShell>
   );
 };

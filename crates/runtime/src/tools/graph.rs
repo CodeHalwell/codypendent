@@ -120,6 +120,7 @@ fn parse_depth(args: &Value) -> usize {
 #[must_use]
 pub fn summarize_graph_question(question: &GraphQuestion) -> String {
     match question {
+        GraphQuestion::Traverse(request) => request.summary(),
         GraphQuestion::CallersOf { symbol } => format!("callers of {symbol}"),
         GraphQuestion::BlastRadius { symbol, depth } => {
             format!("blast radius of {symbol} (depth {depth})")
@@ -128,6 +129,29 @@ pub fn summarize_graph_question(question: &GraphQuestion) -> String {
             format!("tests covering {path} (depth {depth})")
         }
     }
+}
+
+/// A row bound is not a text bound when paths or qualified names are very long.
+/// Keep the model observation small even if a graph backend returns oversized metadata.
+#[must_use]
+pub fn render_graph_answer(answer: &codypendent_knowledge::GraphAnswer) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let rendered = answer.render();
+    let Some((end, _)) = rendered.char_indices().nth(MAX_CHARS) else {
+        return rendered;
+    };
+    let prefix = rendered[..end]
+        .rsplit_once('\n')
+        .map_or(&rendered[..end], |(head, _)| head);
+    let mut output = format!(
+        "{prefix}\n[Graph output truncated. Narrow the symbol/path or request a smaller limit.]"
+    );
+    if let Some(page) = &answer.traversal {
+        if let Some(next) = page.next_offset {
+            output.push_str(&format!("\nnext_offset: {next}"));
+        }
+    }
+    output
 }
 
 // --------------------------------------------------------------------------

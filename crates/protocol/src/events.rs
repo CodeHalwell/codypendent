@@ -23,6 +23,22 @@ use crate::run::{
     ProposedAction, Risk, RunDisposition, RunState, ToolOutcome,
 };
 
+/// Completeness of the measured subtotal. Requests count calls to the model
+/// driver, including failed/cancelled calls; each measured dimension counts
+/// the calls that reported it. Retries without their own usage leave the
+/// subtotal partial even when the final attempt reports a measurement.
+/// Absent metadata on older events means coverage is unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct UsageCoverage {
+    pub requests: u64,
+    pub prompt_requests: u64,
+    pub completion_requests: u64,
+    pub cost_requests: u64,
+    #[serde(default)]
+    pub unmeasured_retries: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SessionEvent {
@@ -171,6 +187,17 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Refines the display details of an existing call without starting another
+    /// tool execution. ACP agents commonly publish the command or path after
+    /// their initial generic tool title. `tool` retains the call's identity.
+    /// Older clients fold this additive variant to `Unknown` and retain the
+    /// initial label and eventual completion.
+    ToolUpdated {
+        run_id: RunId,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     ToolCompleted {
         run_id: RunId,
         tool: String,
@@ -264,6 +291,8 @@ pub enum EventBody {
         completion_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_micros: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coverage: Option<UsageCoverage>,
     },
     /// A content-free projection of newly curated learning after a successful
     /// run. Facts, provenance, and confidence stay in the governed learning
@@ -521,6 +550,7 @@ mod tests {
             prompt_tokens: Some(1002),
             completion_tokens: Some(60),
             cost_micros: None,
+            coverage: None,
         });
         round_trip(EventBody::LearningsCaptured {
             run_id: RunId::new(),
@@ -606,6 +636,7 @@ mod tests {
             prompt_tokens: Some(1002),
             completion_tokens: Some(60),
             cost_micros: None,
+            coverage: None,
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(json.contains("prompt_tokens"));
@@ -623,6 +654,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             cost_micros: None,
+            coverage: None,
         }))
         .expect("serialize");
         let parsed: SessionEvent = serde_json::from_str(&json).expect("deserialize");
@@ -633,6 +665,7 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: None,
                 cost_micros: None,
+                coverage: None,
             }
         );
     }
