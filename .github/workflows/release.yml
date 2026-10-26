@@ -226,7 +226,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: |
             sdk/protocol/package-lock.json
@@ -454,7 +454,7 @@ jobs:
       # by path, so this needs the full checkout, not just apps/desktop.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: |
             sdk/protocol/package-lock.json
