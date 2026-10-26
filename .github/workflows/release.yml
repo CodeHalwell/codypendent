@@ -367,19 +367,19 @@ jobs:
           cp "target/${{ matrix.target }}/release/codypendentd" "$dist/" 2>/dev/null || true
           # Remote UI executes only on a pinned, self-contained runtime tree.
           # Release binaries deliberately do not fall back to PATH/system Node.
-          node_version="22.13.1"
+          node_version="22.23.4"
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-gnu)
               node_platform="linux-x64"
-              node_sha256="666148b9fe0c7e1301cc1b029e33a45e9e4a893f68d2d2bb1cc88a931a88a004"
+              node_sha256="b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406"
               ;;
             x86_64-apple-darwin)
               node_platform="darwin-x64"
-              node_sha256="6fdcc8412d434664238b0651ebd5ad55d15a08598ff42dcb6d9cf1d434a6c4be"
+              node_sha256="efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819"
               ;;
             aarch64-apple-darwin)
               node_platform="darwin-arm64"
-              node_sha256="97483ff4361d239a56d038c6335767a56a291e78c10f07446f463f05d9d19b89"
+              node_sha256="c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428"
               ;;
           esac
           node_archive="node-v${node_version}-${node_platform}.tar.gz"
