@@ -18,6 +18,8 @@ The Linux validation pass on 2026-10-26 observed 4,055 Rust workspace tests pass
 
 `npm --prefix apps/desktop run test:native` is a real-window test using WebKitGTK WebDriver, an actual Rust daemon and a deterministic loopback model. It starts a run through the SDK, observes it in Tauri, closes the desktop while the daemon continues, reopens the window, verifies replay, and reads the same curated memory. Build the application with `--features app,tauri/custom-protocol` to embed the frontend. Supply `CODYPENDENT_TEST_BINARY`, `CODYPENDENT_DESKTOP_BINARY` and optionally `CODYPENDENT_SMOKE_OUTPUT`; run under `xvfb-run -a` on headless Linux. CI and release quality gates include this test.
 
+Pull-request CI checks and builds the complete native Tauri application on Linux and macOS, and runs the transport format, lint and test checks on both. The real-window WebDriver test runs on Linux; macOS GUI automation and signing remain separate release evidence.
+
 Anton also tests the actual Rust TUI in a PTY with the bundled runtime, alongside its editor/controller and browser checks. These checks use temporary data, no live provider credentials, and no paid model calls. They do not establish macOS notarization, Windows shared-runtime support or stable installer readiness; those require platform-native release evidence.
 
 ## Dependency policy

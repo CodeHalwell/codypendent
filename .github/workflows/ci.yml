@@ -224,11 +224,14 @@ jobs:
   # single line of it. Until this job existed, nothing in the repository
   # compiled it at all: a broken bridge would have shipped green.
   #
-  # It runs on Linux because that is the fragile half (macOS's WKWebView needs
-  # no system packages), so this job is also the standing proof that the Linux
-  # half of release.yml's `desktop-bundle` can still build.
+  # Build the complete application on both supported platforms. Linux also
+  # exercises a real WebKitGTK window through its native WebDriver.
   desktop-tauri:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -237,6 +240,7 @@ jobs:
       # 2.0 (→ webkit2gtk-4.1), soup3, javascriptcore-rs 1.1, libappindicator
       # 0.9. Their build scripts fail at pkg-config time without these.
       - name: Install the Tauri Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -248,7 +252,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: desktop-tauri
+          key: desktop-tauri-${{ matrix.os }}
           workspaces: apps/desktop/src-tauri
       # Compile the complete shell as well as the headless transport. The app
       # feature embeds frontendDist, so build the frontend before checking it.
@@ -273,6 +277,7 @@ jobs:
           cargo build --locked -p codypendent-cli --bin codypendent -p codypendent-ui-worker-launcher --bin codypendent-ui-worker-launcher
           cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --features app,tauri/custom-protocol --bin codypendent-desktop
       - name: Native desktop disconnect and replay
+        if: runner.os == 'Linux'
         timeout-minutes: 5
         env:
           CODYPENDENT_TEST_BINARY: ${{ github.workspace }}/target/debug/codypendent
