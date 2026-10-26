@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 import type { EventBody, SessionStoreSnapshot } from './index.js';
 
-export interface TranscriptRow { id: string; kind: 'user' | 'assistant' | 'status' | 'patch'; text: string; timestamp?: string; runId?: string }
+export interface TranscriptRow { id: string; kind: 'user' | 'assistant' | 'status' | 'patch'; text: string; timestamp?: string; runId?: string; modelId?: string }
 export interface ApprovalCard { id: string; action: string; risk: string }
 export interface QuestionCard { id: string; questions: Extract<EventBody, { type: 'QuestionAsked' }>['questions'] }
 export interface SessionRunView {
@@ -52,10 +52,13 @@ export function projectSession(snapshot: SessionStoreSnapshot, previous?: Sessio
 			case 'RunStarted': activeRuns.add(body.run_id); runs.set(body.run_id, { id: body.run_id, state: 'Running', objective: body.objective }); append(id, 'user', body.objective); break;
 			case 'ModelStreamDelta':
 				if (!body.thought) {
+					const modelId = event.actor.type === 'Agent' && event.actor.run_id === body.run_id && event.actor.model.trim()
+						? event.actor.model : undefined;
 					const last = [...rows.values()].at(-1);
-					const key = last?.kind === 'assistant' && (last.runId === body.run_id || last.id === `${body.run_id}:reply`)
+					const key = last?.kind === 'assistant' && last.modelId === modelId && (last.runId === body.run_id || last.id === `${body.run_id}:reply`)
 						? last.id : rows.has(`${body.run_id}:reply`) ? `${body.run_id}:reply:${id}` : `${body.run_id}:reply`;
 					append(key, 'assistant', body.text); rows.get(key)!.runId = body.run_id;
+					if (modelId !== undefined) { rows.get(key)!.modelId = modelId; }
 				}
 				break;
 			case 'NoteAppended': append(id, 'status', body.text); break;

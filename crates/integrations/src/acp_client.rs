@@ -804,6 +804,13 @@ struct AcpDiscovery {
 }
 
 impl AcpDiscovery {
+    fn current_model(&self) -> Option<String> {
+        self.models
+            .iter()
+            .find(|model| model.current)
+            .map(|model| model.id.clone())
+    }
+
     fn apply_initialize(&mut self, response: &InitializeResponse) {
         self.auth_methods = response
             .auth_methods
@@ -969,6 +976,8 @@ fn authentication_required(message: &str) -> bool {
 /// implement it to record events and auto-answer.
 #[async_trait]
 pub trait AcpEventSink: Send {
+    async fn on_model(&mut self, _: Option<&str>) {}
+
     /// A Codypendent event mapped from a streamed `session/update`.
     async fn on_event(&mut self, event: EventBody);
 
@@ -1275,7 +1284,7 @@ impl AcpClient {
         let mut assistant_text = String::new();
         while let Some(message) = incoming.recv().await {
             match message {
-                PromptOut::Event(event) => {
+                PromptOut::Event { event, model } => {
                     if let EventBody::ModelStreamDelta {
                         text,
                         thought: false,
@@ -1289,6 +1298,7 @@ impl AcpClient {
                             .unwrap_or(0);
                         assistant_text.push_str(&text[..end]);
                     }
+                    sink.on_model(model.as_deref()).await;
                     sink.on_event(event).await;
                 }
                 PromptOut::Permission {
@@ -1417,7 +1427,10 @@ enum PromptCommand {
 /// One item streamed from the connection driver back to an in-flight `prompt`.
 enum PromptOut {
     /// A Codypendent event mapped from a `session/update`.
-    Event(EventBody),
+    Event {
+        event: EventBody,
+        model: Option<String>,
+    },
     /// A permission request awaiting the sink's choice.
     Permission {
         tool_call: Value,
@@ -1428,6 +1441,19 @@ enum PromptOut {
     Done(AcpStopReason),
     /// The turn failed; carries a human-readable reason.
     Failed(String),
+}
+
+async fn ordered_response<T: Send + 'static>(
+    request: agent_client_protocol::SentRequest<T>,
+) -> Result<T, agent_client_protocol::Error> {
+    let (reply, response) = oneshot::channel();
+    request.on_receiving_result(async move |result| {
+        let _ = reply.send(result);
+        Ok(())
+    })?;
+    response
+        .await
+        .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))?
 }
 
 /// Drive one ACP connection: run the builder's `connect_with`, complete the
@@ -1458,23 +1484,31 @@ where
                 let active = Arc::clone(&active);
                 let discovery = Arc::clone(&discovery);
                 async move |notification: SessionNotification, _cx| {
-                    match &notification.update {
-                        SessionUpdate::ConfigOptionUpdate(update) => {
-                            lock_recovering(&discovery)
-                                .apply_config_options(&update.config_options);
+                    let model = {
+                        let mut state = lock_recovering(&discovery);
+                        match &notification.update {
+                            SessionUpdate::ConfigOptionUpdate(update) => {
+                                state.apply_config_options(&update.config_options);
+                            }
+                            SessionUpdate::CurrentModeUpdate(update) => {
+                                state.apply_current_mode(&update.current_mode_id.to_string());
+                            }
+                            _ => {}
                         }
-                        SessionUpdate::CurrentModeUpdate(update) => {
-                            lock_recovering(&discovery)
-                                .apply_current_mode(&update.current_mode_id.to_string());
-                        }
-                        _ => {}
-                    }
+                        state.current_model()
+                    };
                     let current = lock_recovering(&active).clone();
                     if let Some(prompt) = current {
                         let events = lock_recovering(&prompt.tools)
                             .events(&notification.update, prompt.run_id);
                         for event in events {
-                            let _ = prompt.events.send(PromptOut::Event(event)).await;
+                            let _ = prompt
+                                .events
+                                .send(PromptOut::Event {
+                                    event,
+                                    model: model.clone(),
+                                })
+                                .await;
                         }
                     }
                     Ok(())
@@ -1549,23 +1583,21 @@ where
                 "session/new",
                 NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
             )?;
-            let session_id = match cx.send_request(request).block_task().await {
-                Ok(response) => {
-                    let parsed: NewSessionResponse = match serde_json::from_value(response.clone())
-                    {
-                        Ok(parsed) => parsed,
-                        Err(error) => {
-                            let _ = ready.send(Err(AcpClientError::Handshake(format!(
-                                "invalid session/new response: {error}"
-                            ))));
-                            return Err(error.into());
-                        }
-                    };
-                    let mut slot = lock_recovering(&discovery);
-                    slot.apply_session(&parsed);
-                    slot.apply_legacy_models(&response);
-                    parsed.session_id
-                }
+            let session_discovery = Arc::clone(&discovery);
+            let session = cx.send_request(request).map(move |response| {
+                let parsed: NewSessionResponse =
+                    serde_json::from_value(response.clone()).map_err(|error| {
+                        agent_client_protocol::util::internal_error(format!(
+                            "invalid session/new response: {error}"
+                        ))
+                    })?;
+                let mut slot = lock_recovering(&session_discovery);
+                slot.apply_session(&parsed);
+                slot.apply_legacy_models(&response);
+                Ok(parsed.session_id)
+            });
+            let session_id = match ordered_response(session).await {
+                Ok(session_id) => session_id,
                 Err(error) => {
                     // An auth-gated agent fails exactly here; name its
                     // advertised remedies instead of an opaque failure.
@@ -1661,35 +1693,37 @@ where
                                 "session/set_model",
                                 serde_json::json!({"sessionId":session_id,"modelId":value}),
                             )?;
-                            let outcome = match cx.send_request(request).block_task().await {
-                                Ok(_) => {
-                                    for model in &mut lock_recovering(&discovery).models {
-                                        model.current = model.id == value;
-                                    }
-                                    Ok(())
+                            let model_discovery = Arc::clone(&discovery);
+                            let request = cx.send_request(request).map(move |_| {
+                                for model in &mut lock_recovering(&model_discovery).models {
+                                    model.current = model.id == value;
                                 }
+                                Ok(())
+                            });
+                            let outcome = match ordered_response(request).await {
+                                Ok(()) => Ok(()),
                                 Err(error) => Err(format!("session/set_model failed: {error}")),
                             };
                             let _ = reply.send(outcome);
                             continue;
                         };
-                        let result = cx
+                        let model_discovery = Arc::clone(&discovery);
+                        let request = cx
                             .send_request(SetSessionConfigOptionRequest::new(
                                 session_id.clone(),
                                 SessionConfigId::new(config_id),
                                 SessionConfigOptionValue::value_id(value),
                             ))
-                            .block_task()
-                            .await;
-                        let outcome = match result {
-                            Ok(response) => {
+                            .map(move |response| {
                                 // The response carries the full refreshed set;
                                 // fold it so `discovered_models()` reports the
                                 // new current selection.
-                                lock_recovering(&discovery)
+                                lock_recovering(&model_discovery)
                                     .apply_config_options(&response.config_options);
                                 Ok(())
-                            }
+                            });
+                        let outcome = match ordered_response(request).await {
+                            Ok(()) => Ok(()),
                             Err(error) => Err(format!("session/set_config_option failed: {error}")),
                         };
                         let _ = reply.send(outcome);
@@ -2708,6 +2742,29 @@ mod client_tests {
         }
     }
 
+    #[derive(Default)]
+    struct ModelRecordingSink {
+        model: Option<String>,
+        chunks: Vec<(String, Option<String>)>,
+    }
+
+    #[async_trait]
+    impl AcpEventSink for ModelRecordingSink {
+        async fn on_model(&mut self, model: Option<&str>) {
+            self.model = model.map(str::to_string);
+        }
+
+        async fn on_event(&mut self, event: EventBody) {
+            if let EventBody::ModelStreamDelta { text, .. } = event {
+                self.chunks.push((text, self.model.clone()));
+            }
+        }
+
+        async fn on_permission(&mut self, _: Value, _: Vec<PermissionOption>) -> Option<String> {
+            None
+        }
+    }
+
     /// How the scripted agent answers the handshake and one `session/prompt`.
     /// Defaults to the pre-discovery agent: no auth methods, no config options,
     /// no permission ask, stream a text chunk + a tool call, end the turn.
@@ -2720,8 +2777,10 @@ mod client_tests {
         /// Extra keys merged into the `session/new` result (`configOptions`,
         /// `modes`).
         session_new_extra: serde_json::Map<String, Value>,
+        session_new_updates: Vec<Value>,
         /// Answer `session/set_config_option` with this full refreshed set.
         set_config_options: Option<Value>,
+        set_config_updates: Vec<Value>,
         /// Ask for tool permission before streaming (and record the answer).
         permission: bool,
         /// `session/update` payloads streamed before the turn resolves.
@@ -2768,6 +2827,25 @@ mod client_tests {
         line.push('\n');
         writer.write_all(line.as_bytes()).await.expect("write");
         writer.flush().await.expect("flush");
+    }
+
+    async fn write_reply_with_updates<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        reply: &Value,
+        updates: &[Value],
+    ) {
+        let mut messages = serde_json::to_string(reply).unwrap();
+        messages.push('\n');
+        for update in updates {
+            let notification = json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": { "sessionId": "s-1", "update": update }
+            });
+            messages.push_str(&serde_json::to_string(&notification).unwrap());
+            messages.push('\n');
+        }
+        writer.write_all(messages.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
     }
 
     async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R, sent: &Sent) -> Option<Value> {
@@ -2840,7 +2918,8 @@ mod client_tests {
                             json!({ "jsonrpc": "2.0", "id": id, "result": script.session_new_result() })
                         }
                     };
-                    write_message(&mut writer, &reply).await;
+                    write_reply_with_updates(&mut writer, &reply, &script.session_new_updates)
+                        .await;
                 }
                 "authenticate" => {
                     write_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
@@ -2856,10 +2935,15 @@ mod client_tests {
                             "error": { "code": -32602, "message": "unknown config option" }
                         }),
                     };
-                    write_message(&mut writer, &reply).await;
+                    write_reply_with_updates(&mut writer, &reply, &script.set_config_updates).await;
                 }
                 "session/set_model" => {
-                    write_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
+                    write_reply_with_updates(
+                        &mut writer,
+                        &json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        &script.set_config_updates,
+                    )
+                    .await;
                 }
                 "session/prompt" => {
                     if script.permission {
@@ -2924,7 +3008,7 @@ mod client_tests {
                                     if message.get("method").and_then(Value::as_str)
                                         == Some("session/cancel") =>
                                 {
-                                    break
+                                    break;
                                 }
                                 Some(_) => continue,
                                 None => return,
@@ -3305,6 +3389,130 @@ mod client_tests {
         assert!(client.discovered_models().is_empty());
         assert!(client.discovered_modes().is_empty());
         assert!(client.auth_methods().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_chunks_preserve_the_reported_model_at_notification_time() {
+        let models = [("model-first", "First"), ("model-second", "Second")];
+        let extra = json!({
+            "configOptions": [wire_model_selector("model-first", &models)]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (mut client, _) = connect_to_scripted_agent(Script {
+            session_new_extra: extra,
+            updates: vec![
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "first" }
+                }),
+                json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [wire_model_selector("model-second", &models)]
+                }),
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "second" }
+                }),
+                json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": []
+                }),
+            ],
+            final_text: Some("unreported".into()),
+            ..Script::default()
+        })
+        .await;
+        let mut sink = ModelRecordingSink::default();
+
+        client
+            .prompt("do the thing", RunId::new(), &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.chunks,
+            vec![
+                ("first".into(), Some("model-first".into())),
+                ("second".into(), Some("model-second".into())),
+                ("unreported".into(), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_chunks_use_the_model_returned_by_selection() {
+        let models = [("requested", "Requested"), ("reported", "Reported")];
+        let extra = json!({
+            "configOptions": [wire_model_selector("requested", &models)]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (mut client, _) = connect_to_scripted_agent(Script {
+            session_new_extra: extra,
+            set_config_options: Some(json!([wire_model_selector("reported", &models)])),
+            ..Script::default()
+        })
+        .await;
+        client.set_model("requested").await.unwrap();
+        let mut sink = ModelRecordingSink::default();
+
+        client
+            .prompt("do the thing", RunId::new(), &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.chunks,
+            vec![("hi from agent".into(), Some("reported".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_chunks_keep_model_updates_received_immediately_after_responses() {
+        let models = [("old", "Old"), ("new", "New")];
+        let update = json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [wire_model_selector("new", &models)]
+        });
+        for (select, legacy) in [(false, false), (true, false), (true, true)] {
+            let extra = if legacy {
+                json!({"models": {
+                    "currentModelId": "old",
+                    "availableModels": [
+                        {"modelId": "old", "name": "Old"},
+                        {"modelId": "new", "name": "New"}
+                    ]
+                }})
+            } else {
+                json!({"configOptions": [wire_model_selector("old", &models)]})
+            };
+            let (mut client, _) = connect_to_scripted_agent(Script {
+                session_new_extra: extra.as_object().unwrap().clone(),
+                session_new_updates: if select { vec![] } else { vec![update.clone()] },
+                set_config_options: Some(json!([wire_model_selector("old", &models)])),
+                set_config_updates: vec![update.clone()],
+                ..Script::default()
+            })
+            .await;
+            if select {
+                client.set_model("old").await.unwrap();
+            }
+            let mut sink = ModelRecordingSink::default();
+
+            client
+                .prompt("do the thing", RunId::new(), &mut sink)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sink.chunks,
+                vec![("hi from agent".into(), Some("new".into()))],
+                "select={select}, legacy={legacy}"
+            );
+        }
     }
 
     #[tokio::test]

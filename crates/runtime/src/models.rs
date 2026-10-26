@@ -1613,6 +1613,25 @@ enum NativeProtocol {
 }
 
 #[cfg(feature = "provider-openai")]
+impl NativeProtocol {
+    fn response_model(self, value: &serde_json::Value) -> Option<String> {
+        let field = match self {
+            Self::Anthropic => "model",
+            Self::Gemini => "modelVersion",
+        };
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|model| {
+                !model.trim().is_empty()
+                    && model.len() <= 512
+                    && !model.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+    }
+}
+
+#[cfg(feature = "provider-openai")]
 fn gemini_synthetic_call_id() -> String {
     format!("gemini-synthetic-{}", uuid::Uuid::now_v7())
 }
@@ -2301,6 +2320,7 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
             .map_err(|e| Error::service(format!("invalid native response json: {e}")))?;
         let contents = self.normalize(&value)?;
         Ok(agent_framework_core::types::ChatResponse {
+            model: self.protocol.response_model(&value),
             messages: vec![agent_framework_core::types::Message::with_contents(
                 agent_framework_core::types::Role::assistant(),
                 contents,
@@ -2648,7 +2668,11 @@ impl StreamNormalizer {
         {
             return Err(Error::service("native provider error event"));
         }
-        let update = match self.protocol {
+        let model = self.protocol.response_model(match self.protocol {
+            NativeProtocol::Anthropic => value.get("message").unwrap_or(&value),
+            NativeProtocol::Gemini => &value,
+        });
+        let mut update = match self.protocol {
             NativeProtocol::Anthropic => match value.get("type").and_then(|v| v.as_str()) {
                 Some("content_block_delta") => {
                     let delta = value
@@ -2837,6 +2861,7 @@ impl StreamNormalizer {
                 })
             }
         }?;
+        update.model = model;
         Ok(Some(update))
     }
 }
@@ -5545,6 +5570,99 @@ prefix = "Key "
         assert!(stream_request.starts_with(
             "POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse&region=north+west&token=a%26b "
         ));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_complete_responses_preserve_reported_models_without_request_fallbacks() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+        use serde_json::json;
+
+        for (protocol, provider, field, payload) in [
+            (
+                NativeProtocol::Anthropic,
+                "anthropic",
+                "model",
+                json!({"content": [{"type": "text", "text": "hello"}]}),
+            ),
+            (
+                NativeProtocol::Gemini,
+                "gemini",
+                "modelVersion",
+                json!({"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}),
+            ),
+        ] {
+            for reported in [Some("provider-reported-model"), None] {
+                let mut payload = payload.clone();
+                if let Some(model) = reported {
+                    payload[field] = json!(model);
+                }
+                let (base_url, server) =
+                    native_capture_server("200 OK", "application/json", payload.to_string()).await;
+                let client = NativeChatClient::new(
+                    &ModelConfig {
+                        id: model_id("configured-profile"),
+                        provider: "openai-compatible".into(),
+                        base_url,
+                        model: "configured-model-alias".into(),
+                        api_key_env: String::new(),
+                        provider_id: Some(provider.into()),
+                        context_tokens: None,
+                    },
+                    protocol,
+                    "",
+                )
+                .unwrap();
+                let response = client
+                    .get_response(vec![Message::user("ping")], ChatOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(response.model.as_deref(), reported);
+                assert_eq!(response.text(), "hello");
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn native_streams_preserve_only_the_provider_reported_model_field() {
+        use serde_json::json;
+
+        for (protocol, envelope, expected) in [
+            (
+                NativeProtocol::Anthropic,
+                json!({"type": "message_start", "message": {"model": "claude-reported"}}),
+                Some("claude-reported"),
+            ),
+            (
+                NativeProtocol::Anthropic,
+                json!({"type": "message_start", "message": {"modelVersion": "wrong-field"}}),
+                None,
+            ),
+            (
+                NativeProtocol::Anthropic,
+                json!({"type": "message_delta", "model": "claude-usage-metadata", "usage": {"output_tokens": 5}}),
+                Some("claude-usage-metadata"),
+            ),
+            (
+                NativeProtocol::Gemini,
+                json!({"modelVersion": "gemini-reported", "candidates": [{"content": {"parts": [{"text": "hello"}]}}]}),
+                Some("gemini-reported"),
+            ),
+            (
+                NativeProtocol::Gemini,
+                json!({"model": "wrong-field", "candidates": [{"content": {"parts": [{"text": "hello"}]}}]}),
+                None,
+            ),
+        ] {
+            let update = StreamNormalizer::new(protocol)
+                .normalize(envelope.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.model.as_deref(), expected);
+        }
     }
 
     #[cfg(feature = "provider-openai")]

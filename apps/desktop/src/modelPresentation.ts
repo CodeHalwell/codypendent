@@ -62,6 +62,15 @@ export function modelLabel(id: string): string {
   return modelVersionLabel(id);
 }
 
+/** Message attribution is the recorded identity, never the current selection. */
+export function messageModelLabel(id?: string): string {
+  if (!id) return "Model not recorded";
+  if (id.startsWith("acp/") && (!id.includes("#") || /#(?:default|auto)$/i.test(id))) {
+    return `${providerLabel(id)} · Model not reported`;
+  }
+  return modelLabel(id);
+}
+
 export function modelProviderLabel(id: string, providerId?: string | null, provider?: string): string {
   if (providerId) return providerLabel(providerId);
   if (id.startsWith("acp/")) {

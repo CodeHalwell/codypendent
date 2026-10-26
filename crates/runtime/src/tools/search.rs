@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::time::Instant;
 
-use super::{CapabilityKind, MAX_CAPTURE_BYTES, ToolError, salient::clamp_search_line};
+use super::{salient::clamp_search_line, CapabilityKind, ToolError, MAX_CAPTURE_BYTES};
 
 /// Maximum matches returned; beyond this the search stops and flags truncation.
 const MATCH_CAP: usize = 200;
@@ -340,7 +340,7 @@ mod process_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        MATCH_CAP, MAX_MATCH_LINE_BYTES, MAX_STREAM_BYTES, SEARCH_TIMEOUT_SECS, Search, SearchInput,
+        Search, SearchInput, MATCH_CAP, MAX_MATCH_LINE_BYTES, MAX_STREAM_BYTES, SEARCH_TIMEOUT_SECS,
     };
     use crate::tools::ABSOLUTE_MAX_TIMEOUT;
     use codypendent_daemon::policy::PathScope;

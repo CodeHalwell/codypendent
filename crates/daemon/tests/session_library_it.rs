@@ -82,16 +82,12 @@ async fn reasoning_streams_commit_and_rebuild_without_losing_transcript_sources(
     ).fetch_all(&pool)
     };
     let before = load().await.unwrap();
-    assert!(
-        before
-            .iter()
-            .any(|(kind, _, seq)| kind == "reasoning" && *seq == Some(1))
-    );
-    assert!(
-        before
-            .iter()
-            .any(|(kind, _, seq)| kind == "transcript" && *seq == Some(2))
-    );
+    assert!(before
+        .iter()
+        .any(|(kind, _, seq)| kind == "reasoning" && *seq == Some(1)));
+    assert!(before
+        .iter()
+        .any(|(kind, _, seq)| kind == "transcript" && *seq == Some(2)));
     session_library::rebuild_search_sources(&pool)
         .await
         .unwrap();

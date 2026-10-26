@@ -134,8 +134,8 @@ passes its tests, and has no production caller.
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
 > `-D warnings`, `cargo test --workspace`). The current checkout declares
-> **4240 test attributes as of 2026-10-26**
-<!-- doc-count:test sources="crates" expect=4240 label="workspace total" -->
+> **4249 test attributes as of 2026-10-26**
+<!-- doc-count:test sources="crates" expect=4249 label="workspace total" -->
 > (a static `#[test]`/`#[tokio::test]` count over `crates/**/*.rs`, not a new full-suite result —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with

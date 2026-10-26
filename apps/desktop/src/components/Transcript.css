@@ -7,6 +7,8 @@
 }
 .transcript-user { white-space: pre-wrap; overflow-wrap: anywhere; }
 .transcript-assistant > :last-child { margin-bottom: 0 !important; }
+.transcript-model { display: flex; align-items: baseline; gap: 9px; margin-bottom: 6px; color: var(--cody-text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.transcript-model-source { color: var(--cody-text-faint); font-size: 10px; }
 .transcript-thought { line-height: 1.6; overflow-wrap: anywhere; font-weight: 400; }
 .transcript-thought strong { font-weight: inherit; }
 .transcript-thought > div { margin-top: 2px !important; margin-bottom: 2px !important; }

@@ -827,6 +827,9 @@ function applyEvent(state: DaemonState, event: SessionEvent, replay = false): Da
         return state;
       }
       const runId = asText(body.run_id);
+      const modelId = event.actor?.type === "Agent" && event.actor.run_id === runId
+        ? asText(event.actor.model).trim() || undefined
+        : undefined;
       // Keep provider progress separate from the answer.
       const kind = body.thought === true ? "thought" : "assistant";
       const prefix = `${kind}-${runId}-`;
@@ -834,7 +837,7 @@ function applyEvent(state: DaemonState, event: SessionEvent, replay = false): Da
         ? state.activity
         : { kind: "streaming" };
       const last = state.transcript[state.transcript.length - 1];
-      if (last && last.type === kind && last.id.startsWith(prefix)) {
+      if (last && last.type === kind && last.id.startsWith(prefix) && last.modelId === modelId) {
         const merged: TranscriptItem = { ...last, text: last.text + text };
         return { ...state, activity, transcript: replaceTranscriptItem(state.transcript, state.transcript.length - 1, merged, replay) };
       }
@@ -842,7 +845,7 @@ function applyEvent(state: DaemonState, event: SessionEvent, replay = false): Da
         ...state,
         activity,
         transcript: appendTranscript(state.transcript,
-          { id: `${prefix}${key}`, type: kind, text, runId, timestamp: at }, replay),
+          { id: `${prefix}${key}`, type: kind, text, runId, modelId, timestamp: at }, replay),
       };
     }
 

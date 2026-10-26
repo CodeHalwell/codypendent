@@ -40,6 +40,8 @@ export interface TranscriptItem {
   id: string;
   /** Owning native run, for correlating streamed content with its terminal state. */
   runId?: string;
+  /** Exact model identity carried by this message's same-run daemon actor. */
+  modelId?: string;
   type:
     | "user"
     | "assistant"

@@ -21,6 +21,7 @@ import { sanitizeFailureText } from "../failure.js";
 import { activityEntries } from "./activityEntries.js";
 import { WorkActivity } from "./WorkActivity.js";
 import { progressText } from "./progressText.js";
+import { messageModelLabel } from "../modelPresentation.js";
 
 interface TranscriptProps {
   recoveredRuns?: ReadonlySet<string>;
@@ -437,6 +438,13 @@ function PatchCard({ item, onReadArtifact, onSaveArtifact, onOpenFile }: RowProp
  * `onApprove`/`onReject` must be referentially stable at the call site or the
  * memo never hits and this is decoration.
  */
+function ResponseModel({ modelId }: { modelId?: string }) {
+  return <div className="transcript-model" aria-label={`Response model: ${messageModelLabel(modelId)}`}
+    data-model-id={modelId} title={modelId ? `Recorded by daemon: ${modelId}` : "The daemon did not record a model identity for this message."}>
+    <span>{messageModelLabel(modelId)}</span><span className="transcript-model-source">Daemon</span>
+  </div>;
+}
+
 const TranscriptRow = React.memo(function TranscriptRow({
   item,
   failedRun,
@@ -492,11 +500,13 @@ const TranscriptRow = React.memo(function TranscriptRow({
       // as literal characters. Rendered to React elements only — never HTML —
       // so model output cannot inject into the webview.
       return <div style={ROW_ASSISTANT} className="transcript-assistant">
+        <ResponseModel modelId={item.modelId} />
         {renderMarkdown(item.text, { onOpenSource: onOpenFile ? (file, line) => onOpenFile(file, line, item.runId) : undefined })}
       </div>;
 
     case "thought":
       return item.text.trim() ? <div style={ROW_THOUGHT} className="transcript-thought" aria-label="Agent progress">
+        <ResponseModel modelId={item.modelId} />
         {renderMarkdown(progressText(item.text), { onOpenSource: onOpenFile ? (file, line) => onOpenFile(file, line, item.runId) : undefined })}
       </div> : null;
 

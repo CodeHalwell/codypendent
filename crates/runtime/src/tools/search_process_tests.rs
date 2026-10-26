@@ -1,4 +1,4 @@
-use super::{MATCH_CAP, MAX_ERROR_BYTES, Search, SearchInput, SearchResults};
+use super::{Search, SearchInput, SearchResults, MATCH_CAP, MAX_ERROR_BYTES};
 use crate::tools::ToolError;
 use codypendent_daemon::policy::PathScope;
 use std::os::unix::fs::PermissionsExt;

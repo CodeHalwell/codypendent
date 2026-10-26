@@ -2758,6 +2758,18 @@ impl AcpRunSink {
 
 #[async_trait]
 impl AcpEventSink for AcpRunSink {
+    async fn on_model(&mut self, reported: Option<&str>) {
+        if let Actor::Agent { model, .. } = &mut self.actor {
+            let agent = codypendent_integrations::acp_registry::agent_id_from_coordinate(
+                &self.registry_agent_id,
+            );
+            *model = ModelId(match reported {
+                Some(id) if !id.is_empty() => format!("acp/{agent}#{id}"),
+                _ => format!("acp/{agent}"),
+            });
+        }
+    }
+
     async fn on_event(&mut self, event: EventBody) {
         match &event {
             EventBody::ModelStreamDelta {
@@ -4192,6 +4204,66 @@ fn acp_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn acp_stream_actors_use_reported_models_with_the_effective_agent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (pool, _artifacts) = test_pool(temporary.path()).await;
+        let (session_id, run_id) = seed_run_in_state(&pool, "Running").await;
+        let agent_id = AgentId::new();
+        let mut sink = AcpRunSink {
+            pool: pool.clone(),
+            subscriptions: SubscriptionHub::new(),
+            approvals: ApprovalBroker::new(),
+            session_id,
+            run_id,
+            actor: Actor::Agent {
+                agent_id,
+                run_id,
+                model: ModelId("acp/gemini#requested".into()),
+            },
+            registry_agent_id: "antigravity-acp#requested".into(),
+            cancellation: CancellationToken::never(),
+            assistant_text: String::new(),
+            tools: Vec::new(),
+            failure: None,
+        };
+        for reported in [Some("gemini-first"), Some("gemini-second"), None] {
+            sink.on_model(reported).await;
+            sink.on_event(EventBody::ModelStreamDelta {
+                run_id,
+                text: "Response".into(),
+                thought: false,
+            })
+            .await;
+        }
+
+        assert!(sink.failure.is_none());
+        let events = ledger::load_events(&pool, session_id).await.unwrap();
+        let models = events
+            .iter()
+            .filter_map(|event| match &event.actor {
+                Actor::Agent {
+                    agent_id: actual_agent,
+                    run_id: actual_run,
+                    model,
+                } => {
+                    assert_eq!(*actual_agent, agent_id);
+                    assert_eq!(*actual_run, run_id);
+                    Some(model.0.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            models,
+            vec![
+                "acp/antigravity-acp#gemini-first",
+                "acp/antigravity-acp#gemini-second",
+                "acp/antigravity-acp",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn acp_summary_excludes_thoughts_but_preserves_their_flagged_events() {

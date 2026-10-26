@@ -854,6 +854,7 @@ pub struct RetryNotice {
 pub trait DeltaSink: Send {
     /// Handle one chunk of streamed text.
     fn on_text(&mut self, chunk: &str);
+    fn on_model(&mut self, _model: Option<&str>) {}
     /// Default no-op so `NullDeltaSink` and every test sink compile unchanged.
     fn on_retry(&mut self, _notice: &RetryNotice) {}
 }
@@ -867,6 +868,7 @@ impl DeltaSink for NullDeltaSink {
 }
 
 enum SinkEvent {
+    Model(Option<ModelId>),
     Text(String),
     Retry(RetryNotice),
 }
@@ -886,9 +888,36 @@ impl DeltaSink for ChannelSink {
         let _ = self.tx.send(SinkEvent::Text(chunk.to_string()));
     }
 
+    fn on_model(&mut self, model: Option<&str>) {
+        let model = match model {
+            None => None,
+            Some(value) => match reported_model(Some(value)) {
+                Some(model) => Some(model),
+                None => return,
+            },
+        };
+        let _ = self.tx.send(SinkEvent::Model(model));
+    }
+
     fn on_retry(&mut self, notice: &RetryNotice) {
         let _ = self.tx.send(SinkEvent::Retry(notice.clone()));
     }
+}
+
+fn reported_model(model: Option<&str>) -> Option<ModelId> {
+    model
+        .filter(|value| {
+            !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+        })
+        .map(|value| ModelId(value.to_owned()))
+}
+
+fn response_actor(run_actor: &Actor, reported: Option<ModelId>) -> Actor {
+    let mut actor = run_actor.clone();
+    if let Actor::Agent { model, .. } = &mut actor {
+        *model = reported.unwrap_or_else(|| ModelId(String::new()));
+    }
+    actor
 }
 
 /// Produces the next [`ModelStep`] from the conversation so far. The loop is
@@ -896,8 +925,8 @@ impl DeltaSink for ChannelSink {
 /// driver (tests) or a live framework client.
 #[async_trait]
 pub trait ModelDriver: Send + Sync {
-    /// The model id this driver represents, recorded in run attribution and
-    /// per-request trace metadata.
+    /// Configured model identity for routing and per-request trace metadata.
+    /// Response attribution comes from [`DeltaSink::on_model`].
     fn model_id(&self) -> ModelId;
 
     /// Given the conversation so far, produce the next step and the MEASURED
@@ -2916,6 +2945,7 @@ impl FrameworkAgentRuntime {
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
         let mut model_requests: u64 = 0;
+        let mut message_actor = response_actor(&run_actor, None);
         // The run's AGGREGATED measured usage (Phase 7): starts `None` and stays
         // `None` unless a request actually reports usage. An unmeasured run keeps
         // it `None`, so the cost budget charges nothing — the honesty invariant.
@@ -3098,6 +3128,7 @@ impl FrameworkAgentRuntime {
             }
 
             coverage.requests = coverage.requests.saturating_add(1);
+            message_actor = response_actor(&run_actor, None);
             let started = Instant::now();
             // Live streaming with COALESCED journaling. The driver pushes each
             // text chunk through the `ChannelSink` AS the model produces it;
@@ -3149,14 +3180,14 @@ impl FrameworkAgentRuntime {
                         // property precisely on the abnormal paths where the
                         // record matters most.
                         _ = cancel.cancelled() => {
-                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                            self.flush_deltas(&run, &message_actor, &mut pending).await?;
                             break 'agent Terminal::Cancelled;
                         }
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
                             run_started + Duration::from_secs(MAX_WALL_CLOCK_SECS)
                                 + paused_total
                         )) => {
-                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                            self.flush_deltas(&run, &message_actor, &mut pending).await?;
                             break 'agent Terminal::Failed {
                                 reason: "wall-clock budget exhausted".to_string(),
                                 error: Some(budget_exhausted(
@@ -3168,6 +3199,13 @@ impl FrameworkAgentRuntime {
                         res = &mut step_fut => break res,
                         Some(event) = rx.recv() => {
                             match event {
+                                SinkEvent::Model(model) => {
+                                    let next_actor = response_actor(&run_actor, model);
+                                    if next_actor != message_actor {
+                                        self.flush_deltas(&run, &message_actor, &mut pending).await?;
+                                        message_actor = next_actor;
+                                    }
+                                }
                                 SinkEvent::Text(chunk) => {
                                     streamed_this_step = true;
                                     let flush_now = chunk.contains('\n');
@@ -3176,7 +3214,7 @@ impl FrameworkAgentRuntime {
                                         // A newline is a natural reader boundary —
                                         // journal the buffered line(s) immediately.
                                         flush_deadline = None;
-                                        self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                                        self.flush_deltas(&run, &message_actor, &mut pending).await?;
                                     } else if flush_deadline.is_none() {
                                         flush_deadline = Some(
                                             tokio::time::Instant::now() + DELTA_COALESCE_WINDOW,
@@ -3185,7 +3223,7 @@ impl FrameworkAgentRuntime {
                                 }
                                 SinkEvent::Retry(notice) => {
                                     coverage.unmeasured_retries = coverage.unmeasured_retries.saturating_add(1);
-                                    self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                                    self.flush_deltas(&run, &message_actor, &mut pending).await?;
                                     self.emit(
                                         run.session_id,
                                         run_actor.clone(),
@@ -3210,7 +3248,7 @@ impl FrameworkAgentRuntime {
                             flush_deadline.unwrap_or_else(tokio::time::Instant::now)
                         ), if flush_deadline.is_some() => {
                             flush_deadline = None;
-                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                            self.flush_deltas(&run, &message_actor, &mut pending).await?;
                         }
                     }
                 }
@@ -3224,13 +3262,22 @@ impl FrameworkAgentRuntime {
             // chunks streamed before a mid-stream error are never lost.
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    SinkEvent::Model(model) => {
+                        let next_actor = response_actor(&run_actor, model);
+                        if next_actor != message_actor {
+                            self.flush_deltas(&run, &message_actor, &mut pending)
+                                .await?;
+                            message_actor = next_actor;
+                        }
+                    }
                     SinkEvent::Text(chunk) => {
                         streamed_this_step = true;
                         pending.push_str(&chunk);
                     }
                     SinkEvent::Retry(notice) => {
                         coverage.unmeasured_retries = coverage.unmeasured_retries.saturating_add(1);
-                        self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                        self.flush_deltas(&run, &message_actor, &mut pending)
+                            .await?;
                         self.emit(
                             run.session_id,
                             run_actor.clone(),
@@ -3246,7 +3293,8 @@ impl FrameworkAgentRuntime {
                     }
                 }
             }
-            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+            self.flush_deltas(&run, &message_actor, &mut pending)
+                .await?;
             let StepOutcome {
                 step,
                 usage: step_usage,
@@ -3325,7 +3373,7 @@ impl FrameworkAgentRuntime {
                         if !streamed_this_step {
                             self.emit(
                                 run.session_id,
-                                run_actor.clone(),
+                                message_actor.clone(),
                                 EventBody::ModelStreamDelta {
                                     run_id: run.run_id,
                                     text: text.clone(),
@@ -3551,7 +3599,7 @@ impl FrameworkAgentRuntime {
             .journal
             .complete(
                 run.session_id,
-                run_actor,
+                message_actor,
                 run.run_id,
                 state,
                 EventBody::RunCompleted {
@@ -9091,6 +9139,7 @@ impl FrameworkModelDriver {
         use agent_framework_core::types::{ChatOptions, ChatResponse};
         use futures::StreamExt;
 
+        sink.on_model(None);
         let mut options = ChatOptions::new();
         // The loop already projected the exact definition set for this run
         // (FIX 1) — advertise it verbatim, MCP definitions included.
@@ -9140,6 +9189,9 @@ impl FrameworkModelDriver {
                     "model stream exceeded the {}-byte safety limit",
                     MAX_MODEL_STREAM_BYTES
                 );
+            }
+            if let Some(model) = reported_model(update.model.as_deref()) {
+                sink.on_model(Some(&model.0));
             }
             if let Some(text) = update_text_delta(&update) {
                 *streamed = true;
@@ -14702,6 +14754,8 @@ context_tokens = 1000000
     struct ParallelCallDriver {
         calls: Vec<ToolCallRequest>,
         served: Mutex<bool>,
+        response_model: Option<String>,
+        preface: Option<String>,
     }
 
     impl ParallelCallDriver {
@@ -14715,6 +14769,8 @@ context_tokens = 1000000
                     })
                     .collect(),
                 served: Mutex::new(false),
+                response_model: None,
+                preface: None,
             }
         }
     }
@@ -14729,7 +14785,7 @@ context_tokens = 1000000
             &self,
             _transcript: &[TurnItem],
             _tools: &[ToolDefinition],
-            _sink: &mut dyn DeltaSink,
+            sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let mut served = self.served.lock().expect("parallel driver mutex");
             if *served {
@@ -14741,6 +14797,7 @@ context_tokens = 1000000
                 ));
             }
             *served = true;
+            sink.on_model(self.response_model.as_deref());
             let mut calls = self.calls.clone();
             let first = calls.remove(0);
             Ok(StepOutcome::new(
@@ -14750,7 +14807,8 @@ context_tokens = 1000000
                 },
                 None,
             )
-            .with_extra_calls(calls))
+            .with_extra_calls(calls)
+            .with_preface(self.preface.clone()))
         }
     }
 
@@ -14763,6 +14821,44 @@ context_tokens = 1000000
             std::fs::write(repo.path().join(name), body).expect("write fixture");
         }
         repo
+    }
+
+    #[tokio::test]
+    async fn response_model_attributes_prefaces_without_leaking_into_an_unreported_finish() {
+        let repo = repo_with_files(&[("a.txt", "alpha")]);
+        let mut driver =
+            ParallelCallDriver::new(vec![("workspace.read_file", json!({"path":"a.txt"}))]);
+        driver.response_model = Some("provider/actual-preface-model".into());
+        driver.preface = Some("Reading the file.".into());
+        let (runtime, mut events, session_id) = test_runtime();
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read the file",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, run, CancellationToken::never())
+            .await
+            .unwrap();
+        let mut preface = None;
+        let mut completed = None;
+        while let Ok(event) = events.try_recv() {
+            match event.body {
+                EventBody::ModelStreamDelta { text, .. } if text == "Reading the file." => {
+                    preface = Some(event.actor);
+                }
+                EventBody::RunCompleted { .. } => completed = Some(event.actor),
+                _ => {}
+            }
+        }
+        assert!(
+            matches!(preface, Some(Actor::Agent { model, .. }) if model.0 == "provider/actual-preface-model")
+        );
+        assert!(matches!(completed, Some(Actor::Agent { model, .. }) if model.0.is_empty()));
+        assert_eq!(driver.model_id().0, "parallel");
     }
 
     #[tokio::test]
@@ -15088,6 +15184,8 @@ context_tokens = 1000000
         chunks: Vec<String>,
         /// Deliver the failure as the last stream item instead, after `chunks`.
         fail_mid_stream: bool,
+        response_model: Option<String>,
+        metadata_failure: Option<String>,
         requests: std::sync::Arc<AtomicUsize>,
     }
 
@@ -15102,6 +15200,8 @@ context_tokens = 1000000
                     message: message.to_string(),
                     chunks: vec!["recovered".to_string()],
                     fail_mid_stream: false,
+                    response_model: None,
+                    metadata_failure: None,
                     requests: requests.clone(),
                 },
                 requests,
@@ -15121,6 +15221,8 @@ context_tokens = 1000000
                     message: message.to_string(),
                     chunks: chunks.iter().map(|c| c.to_string()).collect(),
                     fail_mid_stream: true,
+                    response_model: None,
+                    metadata_failure: None,
                     requests: requests.clone(),
                 },
                 requests,
@@ -15145,7 +15247,21 @@ context_tokens = 1000000
             _messages: Vec<agent_framework_core::types::Message>,
             _options: agent_framework_core::types::ChatOptions,
         ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
-            self.requests.fetch_add(1, Ordering::SeqCst);
+            let request = self.requests.fetch_add(1, Ordering::SeqCst);
+            if request == 0 {
+                if let Some(model) = &self.metadata_failure {
+                    let update = agent_framework_core::types::ChatResponseUpdate {
+                        model: Some(model.clone()),
+                        ..Default::default()
+                    };
+                    return Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(update),
+                        Err(agent_framework_core::error::Error::Service(
+                            self.message.clone(),
+                        )),
+                    ])));
+                }
+            }
             {
                 let mut remaining = self.remaining_failures.lock().expect("flaky client mutex");
                 if *remaining > 0 {
@@ -15159,7 +15275,14 @@ context_tokens = 1000000
             let mut items: Vec<agent_framework_core::error::Result<_>> = self
                 .chunks
                 .iter()
-                .map(|c| Ok(agent_framework_core::types::ChatResponseUpdate::text(c)))
+                .enumerate()
+                .map(|(index, text)| {
+                    let mut update = agent_framework_core::types::ChatResponseUpdate::text(text);
+                    if index == 0 {
+                        update.model = self.response_model.clone();
+                    }
+                    Ok(update)
+                })
                 .collect();
             if self.fail_mid_stream {
                 items.push(Err(agent_framework_core::error::Error::Service(
@@ -15168,6 +15291,78 @@ context_tokens = 1000000
             }
             Ok(Box::pin(futures::stream::iter(items)))
         }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn native_response_models(client: FlakyChatClient) -> Vec<String> {
+        let driver =
+            FrameworkModelDriver::new(Arc::new(client), ModelId("configured-alias".into()));
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().unwrap();
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "answer",
+            AgentMode::Ask,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, run, CancellationToken::never())
+            .await
+            .unwrap();
+        assert_eq!(driver.model_id().0, "configured-alias");
+        let mut models = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event.body,
+                EventBody::ModelStreamDelta { .. } | EventBody::RunCompleted { .. }
+            ) {
+                let Actor::Agent { model, .. } = event.actor else {
+                    panic!("response must retain its agent actor")
+                };
+                models.push(model.0);
+            }
+        }
+        assert!(
+            models.len() >= 2,
+            "streamed response and final summary must be attributed"
+        );
+        models
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_response_model_survives_later_chunks_without_model_metadata() {
+        let (mut client, _) = FlakyChatClient::new(0, "");
+        client.response_model = Some("provider/actual-snapshot".into());
+        client.chunks = vec!["First".into(), " second".into()];
+        assert!(native_response_models(client)
+            .await
+            .iter()
+            .all(|model| model == "provider/actual-snapshot"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_response_model_is_unreported_when_the_provider_omits_it() {
+        let (client, _) = FlakyChatClient::new(0, "");
+        assert!(native_response_models(client)
+            .await
+            .iter()
+            .all(String::is_empty));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn native_response_model_does_not_leak_from_a_failed_metadata_only_retry() {
+        let (mut client, requests) = FlakyChatClient::new(0, "503 Service Unavailable");
+        client.metadata_failure = Some("failed-request-model".into());
+        assert!(native_response_models(client)
+            .await
+            .iter()
+            .all(String::is_empty));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     /// Collect every chunk a driver pushes through its sink.
