@@ -388,6 +388,8 @@ jobs:
           echo "$node_sha256  $node_archive" | shasum -a 256 -c -
           mkdir -p "$dist/node-runtime"
           tar -xzf "$node_archive" --strip-components=1 -C "$dist/node-runtime"
+          mkdir -p "$dist/node-runtime/share/doc/codypendent"
+          cp third_party/tantivy-sstable/LICENSE "$dist/node-runtime/share/doc/codypendent/TANTIVY_SSTABLE_LICENSE"
           python3 - "$dist/node-runtime" <<'PY'
           import hashlib, json, os, pathlib, sys
           root = pathlib.Path(sys.argv[1])

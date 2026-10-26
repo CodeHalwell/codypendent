@@ -124,3 +124,7 @@ debug = "line-tables-only"
 debug = 0
 [profile.test.build-override]
 debug = 0
+
+# Keep the native shell on the same patched compression backend as the daemon.
+[patch.crates-io]
+tantivy-sstable = { path = "../../../third_party/tantivy-sstable" }
