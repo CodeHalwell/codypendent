@@ -1096,6 +1096,12 @@ async fn run_fixture_tests(repository: &Path) -> anyhow::Result<bool> {
     let output = tokio::process::Command::new("cargo")
         .arg("test")
         .arg("--quiet")
+        // Concurrent fixture checkouts can use the same package name and
+        // version. An inherited shared target directory can then execute a
+        // different checkout's test binary and turn a known failure into a
+        // false pass. Keep compilation artifacts scoped to this checkout.
+        .arg("--target-dir")
+        .arg(repository.join("target"))
         .current_dir(repository)
         .output()
         .await

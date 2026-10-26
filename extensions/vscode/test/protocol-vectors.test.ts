@@ -1556,6 +1556,8 @@ describe("protocol-vectors/ file inventory", () => {
     "history.json",
     "inbox.json",
     "memory.json",
+    // This editor does not browse knowledge cards; the SDK conformance suite covers their full wire shapes.
+    "knowledge.json",
     "promotion_evidence.json",
     "voice.json",
     "session.json",

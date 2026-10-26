@@ -3,7 +3,8 @@ name = "codypendent-desktop"
 description = "Tauri shell for the Codypendent desktop client: owns the codypendentd socket connection and bridges it to the webview."
 version = "0.14.0"
 edition = "2021"
-rust-version = "1.88"
+# The native notification backend (notify-rust 4.18) requires Rust 1.89.
+rust-version = "1.89"
 repository = "https://github.com/CodeHalwell/codypendent"
 license = "MIT"
 publish = false
@@ -35,7 +36,7 @@ required-features = ["app"]
 
 [features]
 default = []
-app = []
+app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-notification"]
 
 [dependencies]
 codypendent-protocol = { path = "../../../crates/protocol" }
@@ -65,13 +66,9 @@ codypendent-council = { path = "../../../crates/council" }
 #   daemon runs them.
 codypendent-providers = { path = "../../../crates/providers" }
 codypendent-runtime = { path = "../../../crates/runtime", default-features = false, features = ["provider-openai"] }
-# The knowledge surfaces (Skills, Memory, Docs) read the daemon's SQLite
-# database directly, exactly as the TUI harness does — there is no wire
-# command that lists registry items, memories, learnings or documents. This
-# crate is already in the build transitively (through `codypendent-runtime`);
-# naming it makes the stores and the shared card mapping importable
-# (`knowledge.rs`). `sqlx` is named only for the `SqlitePool` type the
-# stores take; the version and features unify with the workspace's.
+# Knowledge browsing uses authenticated ReadKnowledge commands. These local
+# stores remain for the existing learning mutation/document replica paths;
+# they do not supply the shipped Skills/Memory/Journey/Docs list views.
 codypendent-knowledge = { path = "../../../crates/knowledge" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 anyhow = "1.0"
@@ -89,7 +86,7 @@ hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = [], optional = true }
 toml = "0.8"
 toml_edit = "0.22"
 # NATIVE FOLDER PICKER for repository selection. Called from Rust
@@ -98,17 +95,36 @@ toml_edit = "0.22"
 # so it can neither enumerate the filesystem nor name a directory the shell did
 # not gate. `capabilities/default.json` therefore grants no `dialog:*`
 # permission at all.
-tauri-plugin-dialog = "2"
+tauri-plugin-dialog = { version = "2", optional = true }
 # OS notifications for work that BLOCKS A HUMAN (approvals, questions). The
 # webview calls it through `@tauri-apps/plugin-notification`; the permission is
 # declared in `capabilities/default.json`. Nothing else in the app notifies.
-tauri-plugin-notification = "2"
+tauri-plugin-notification = { version = "2", optional = true }
 # `time`: the daemon launcher polls the socket after spawning (`launcher.rs`).
 tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dev-dependencies]
 chrono = "0.4"
 tempfile = "3"
+
+# Match the daemon workspace's development profiles. Transport tests do not
+# benefit from full dependency debug symbols, and can share its build cache.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = 0
+[profile.dev.build-override]
+debug = 0
+[profile.test]
+debug = "line-tables-only"
+[profile.test.package."*"]
+debug = 0
+[profile.test.build-override]
+debug = 0
+
+# Keep the native shell on the same patched compression backend as the daemon.
+[patch.crates-io]
+tantivy-sstable = { path = "../../../third_party/tantivy-sstable" }

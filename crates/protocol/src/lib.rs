@@ -31,6 +31,7 @@ pub mod ide;
 pub mod ids;
 pub mod inbox;
 pub mod input;
+pub mod knowledge;
 pub mod marketplace;
 pub mod memory;
 pub mod model;

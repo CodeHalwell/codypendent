@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   computeBackoff,
   computeSha256,
@@ -131,6 +131,97 @@ function catchupPayload(from = 1, through = 0, events: SessionEvent[] = []): Pay
 }
 
 const SESSION_ID = "44444444-4444-4444-4444-444444444444";
+
+describe("connection ownership and recovery", () => {
+  const clients: DaemonClient[] = [];
+  afterEach(() => { for (const client of clients.splice(0)) client.stop(); vi.useRealTimers(); });
+  function setup(options: Partial<ConstructorParameters<typeof DaemonClient>[0]> = {}) {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({ sessionId: SESSION_ID,
+      createConnection: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, ...options });
+    clients.push(client);
+    client.start();
+    const socket = sockets[0];
+    socket.emit("connect"); socket.deliver(serverHelloPayload());
+    return { client, socket, sockets };
+  }
+
+  it("does not resume past an event gap or expose that event to a consumer", () => {
+    const { client, socket } = setup();
+    socket.deliver(catchupPayload(1, 0));
+    const events: number[] = []; client.on("event", event => events.push(event.sequence));
+    socket.deliver(eventPayload(2));
+    expect(client.sequenceCursor).toBe(0);
+    expect(events).toEqual([]);
+    expect(socket.destroyed).toBe(true);
+  });
+
+  it("rejects an invalid catch-up before announcing attachment or flushing queued commands", () => {
+    const { client, socket } = setup();
+    client.submitUserInput("queued work");
+    socket.deliver(catchupPayload(1, 2, []));
+    expect(client.connectionStatus).not.toBe("attached");
+    expect(client.sequenceCursor).toBeUndefined();
+    expect(socket.sent().some(frame => frame.payload.type === "Command" && frame.payload.body.type === "SubmitUserInput")).toBe(false);
+  });
+
+  it("resets cursor, pending requests and queued approvals when switching sessions", async () => {
+    const { client, socket, sockets } = setup();
+    socket.deliver(catchupPayload(1, 1, [{ sequence: 1, occurred_at: "", actor: { type: "System" }, body: { type: "SessionClosed" } }]));
+    const pending = client.request({ type: "ListInbox" });
+    client.attachSession("55555555-5555-5555-5555-555555555555");
+    await expect(pending).rejects.toThrow("connection closed");
+    expect(client.sequenceCursor).toBeUndefined();
+    expect(client.store.getSnapshot().events).toEqual([]);
+    expect(socket.destroyed).toBe(true);
+    const next = sockets[1]; next.emit("connect"); next.deliver(serverHelloPayload());
+    const attach = next.sent().find(frame => frame.payload.type === "Command");
+    expect(attach?.payload).toMatchObject({ body: { type: "AttachSession", session_id: "55555555-5555-5555-5555-555555555555" } });
+    expect(attach && "body" in attach.payload && "last_seen_sequence" in attach.payload.body).toBe(false);
+  });
+
+  it("emits pre-catch-up activity only after validation and in sequence order", () => {
+    const { client, socket } = setup(); const seen: number[] = [];
+    client.on("event", event => seen.push(event.sequence));
+    socket.deliver(eventPayload(2)); socket.deliver(eventPayload(1)); socket.deliver(eventPayload(2));
+    expect(seen).toEqual([]);
+    socket.deliver(catchupPayload(1, 0));
+    expect(seen).toEqual([1, 2]);
+    expect(client.sequenceCursor).toBe(2);
+  });
+
+  it("rejects a daemon's incompatible negotiated version before attaching", () => {
+    const socket = new FakeSocket();
+    const client = new DaemonClient({ sessionId: SESSION_ID, createConnection: () => socket }); clients.push(client);
+    const errors: string[] = []; client.on("protocolError", error => errors.push(error.code));
+    client.start(); socket.emit("connect");
+    socket.deliver({ ...serverHelloPayload(), selected_protocol: { major: 99, minor: 0 } } as Payload);
+    expect(errors).toEqual(["protocol.incompatible-version"]);
+    expect(client.connectionStatus).toBe("closed");
+    expect(socket.sent().some(frame => frame.payload.type === "Command")).toBe(false);
+  });
+
+  it("bounds a silent connection and stop cancels the reconnect timer", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeSocket();
+    const client = new DaemonClient({ createConnection: () => socket, connectionTimeoutMs: 50 }); clients.push(client);
+    client.start();
+    await vi.advanceTimersByTimeAsync(51);
+    expect(socket.destroyed).toBe(true);
+    client.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never lets a previous reconnect loop create a second socket after stop/start", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({ createConnection: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } }); clients.push(client);
+    client.start(); sockets[0].destroy(); await vi.advanceTimersByTimeAsync(1);
+    client.stop(); client.start();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sockets).toHaveLength(2);
+  });
+});
 
 describe("Milestone 2 Task 2.3 Acceptance Tests", () => {
   it("fragmented_frames_reassemble_in_order", async () => {

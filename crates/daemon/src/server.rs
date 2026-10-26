@@ -3754,6 +3754,37 @@ async fn handle_request(
                 // Observer included) may issue it — so it carries no role gate, only the
                 // transport check (Phase 5 STEP 5.2 / T9). It is the catch-up baseline a
                 // client folds a `Subscription::Workflow` live stream on top of.
+                CommandBody::ReadKnowledge {
+                    session_id,
+                    section,
+                    offset,
+                    limit,
+                } => {
+                    let payload = if let Some(gateway) = state.memory.as_ref() {
+                        match gateway
+                            .read_knowledge(crate::memory::ReadKnowledgeRequest {
+                                session_id: *session_id,
+                                section: *section,
+                                offset: *offset,
+                                limit: *limit,
+                            })
+                            .await
+                        {
+                            Ok(page) => Payload::KnowledgePage {
+                                command_id: command.command_id,
+                                page: Box::new(page),
+                            },
+                            Err(error) => Payload::CommandRejected(error),
+                        }
+                    } else {
+                        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                            "knowledge.transport-unavailable",
+                            "Knowledge browsing is not enabled on this daemon",
+                            false,
+                        ))
+                    };
+                    send(writer, &Envelope::reply_to(&request, payload)).await?;
+                }
                 CommandBody::ReadWorkflowRun { workflow_run_id } => {
                     let Some(reader) = state.workflow_reader.as_ref() else {
                         let reply = Envelope::reply_to(

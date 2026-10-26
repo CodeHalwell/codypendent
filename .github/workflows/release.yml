@@ -171,7 +171,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev \
             libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev \
-            libssl-dev libxdo-dev build-essential patchelf file
+            libssl-dev libxdo-dev build-essential patchelf file xvfb webkit2gtk-driver
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
@@ -179,6 +179,37 @@ jobs:
         with:
           key: release-desktop-tauri
           workspaces: apps/desktop/src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.4"
+      - name: Build frontend for the native shell check
+        run: |
+          npm --prefix sdk/protocol ci
+          npm --prefix sdk/protocol run build
+          npm --prefix sdk/ui ci
+          npm --prefix sdk/ui run build
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run build
+      - name: Check the complete Tauri bridge and application
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --features app --all-targets --locked
+      - name: Build native clients for desktop handoff
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          cargo build --locked -p codypendent-cli --bin codypendent -p codypendent-ui-worker-launcher --bin codypendent-ui-worker-launcher
+          cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --features app,tauri/custom-protocol --bin codypendent-desktop
+      - name: Native desktop disconnect and replay
+        timeout-minutes: 5
+        env:
+          CODYPENDENT_TEST_BINARY: ${{ github.workspace }}/target/debug/codypendent
+          CODYPENDENT_DESKTOP_BINARY: ${{ github.workspace }}/apps/desktop/src-tauri/target/debug/codypendent-desktop
+          CODYPENDENT_SMOKE_OUTPUT: ${{ github.workspace }}/work/desktop-smoke
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          # Only the disposable WebKit fixture; daemon execution policy is unchanged.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: '1'
+        run: xvfb-run -a npm --prefix apps/desktop run test:native
+
       - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
       - run: >-
@@ -195,7 +226,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: |
             sdk/protocol/package-lock.json
@@ -336,19 +367,19 @@ jobs:
           cp "target/${{ matrix.target }}/release/codypendentd" "$dist/" 2>/dev/null || true
           # Remote UI executes only on a pinned, self-contained runtime tree.
           # Release binaries deliberately do not fall back to PATH/system Node.
-          node_version="22.13.1"
+          node_version="22.23.4"
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-gnu)
               node_platform="linux-x64"
-              node_sha256="666148b9fe0c7e1301cc1b029e33a45e9e4a893f68d2d2bb1cc88a931a88a004"
+              node_sha256="b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406"
               ;;
             x86_64-apple-darwin)
               node_platform="darwin-x64"
-              node_sha256="6fdcc8412d434664238b0651ebd5ad55d15a08598ff42dcb6d9cf1d434a6c4be"
+              node_sha256="efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819"
               ;;
             aarch64-apple-darwin)
               node_platform="darwin-arm64"
-              node_sha256="97483ff4361d239a56d038c6335767a56a291e78c10f07446f463f05d9d19b89"
+              node_sha256="c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428"
               ;;
           esac
           node_archive="node-v${node_version}-${node_platform}.tar.gz"
@@ -357,6 +388,8 @@ jobs:
           echo "$node_sha256  $node_archive" | shasum -a 256 -c -
           mkdir -p "$dist/node-runtime"
           tar -xzf "$node_archive" --strip-components=1 -C "$dist/node-runtime"
+          mkdir -p "$dist/node-runtime/share/doc/codypendent"
+          cp third_party/tantivy-sstable/LICENSE "$dist/node-runtime/share/doc/codypendent/TANTIVY_SSTABLE_LICENSE"
           python3 - "$dist/node-runtime" <<'PY'
           import hashlib, json, os, pathlib, sys
           root = pathlib.Path(sys.argv[1])
@@ -423,7 +456,7 @@ jobs:
       # by path, so this needs the full checkout, not just apps/desktop.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "22.13.1"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: |
             sdk/protocol/package-lock.json

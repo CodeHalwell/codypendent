@@ -1394,6 +1394,7 @@ mod tests {
             Err(RunnerError::ObjectStore("unused in test".to_string()))
         }
 
+        #[allow(deprecated, reason = "fetch_update supports the Rust 1.88 MSRV")]
         async fn upload_artifact(&self, _key: &str, _data: &[u8]) -> Result<(), RunnerError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if self

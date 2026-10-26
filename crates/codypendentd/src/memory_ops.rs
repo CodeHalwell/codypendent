@@ -326,6 +326,24 @@ fn evidence_label(evidence: &EvidenceRef) -> String {
 }
 
 impl MemoryGateway for MemoryStoreGateway {
+    fn read_knowledge(
+        &self,
+        request: codypendent_daemon::memory::ReadKnowledgeRequest,
+    ) -> codypendent_daemon::memory::KnowledgePageFuture<'_> {
+        Box::pin(async move {
+            codypendent_knowledge::client_views::read_page(
+                &self.pool,
+                request.session_id,
+                request.section,
+                request.offset,
+                request.limit,
+            )
+            .await
+            .map_err(|error| {
+                CodypendentError::new("knowledge.read-failed", error.to_string(), false)
+            })
+        })
+    }
     fn inspect(&self, request: InspectMemoryRequest) -> MemoryViewFuture<'_> {
         let host = self.clone();
         Box::pin(async move {

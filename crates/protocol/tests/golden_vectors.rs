@@ -3193,6 +3193,49 @@ fn model_vectors() -> Vec<Vector> {
     ]
 }
 
+fn knowledge_vectors() -> Vec<Vector> {
+    use codypendent_protocol::knowledge::{KnowledgePage, KnowledgeSection, MemoryCard};
+    vec![
+        vec_of(
+            "CommandBody_ReadKnowledge",
+            CommandBody::ReadKnowledge {
+                session_id: session_id(),
+                section: KnowledgeSection::Memories,
+                offset: 0,
+                limit: 50,
+            },
+        ),
+        vec_of(
+            "Payload_KnowledgePage",
+            Payload::KnowledgePage {
+                command_id: command_id(),
+                page: Box::new(KnowledgePage {
+                    section: KnowledgeSection::Memories,
+                    skills: vec![],
+                    learnings: vec![],
+                    documents: vec![],
+                    warnings: vec![],
+                    next_offset: Some(50),
+                    memories: vec![MemoryCard {
+                        id: "60000000-0000-0000-0000-000000000001".into(),
+                        statement: "Build artifacts belong to an isolated checkout.".into(),
+                        class: "semantic".into(),
+                        scope: "repository 70000000".into(),
+                        revision: "seq:1".into(),
+                        observed: "2026-07-17".into(),
+                        confidence: 0.8,
+                        source: "events 1..3 of the session".into(),
+                    }],
+                }),
+            },
+        ),
+        vec_of("KnowledgeSection_Skills", KnowledgeSection::Skills),
+        vec_of("KnowledgeSection_Learnings", KnowledgeSection::Learnings),
+        vec_of("KnowledgeSection_Documents", KnowledgeSection::Documents),
+        vec_of("KnowledgeSection_Unknown", KnowledgeSection::Unknown),
+    ]
+}
+
 fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
     vec![
         ("command.json", command_vectors()),
@@ -3236,6 +3279,7 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("automation.json", automation_vectors()),
         ("bundle.json", bundle_vectors()),
         ("model.json", model_vectors()),
+        ("knowledge.json", knowledge_vectors()),
     ]
 }
 

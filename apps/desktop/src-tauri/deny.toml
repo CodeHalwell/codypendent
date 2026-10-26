@@ -18,6 +18,12 @@ ignore = [
     { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained — transitive via loro/im; no safe upgrade available" },
     { id = "RUSTSEC-2026-0248", reason = "im unmaintained — transitive via loro; no safe upgrade available" },
     { id = "RUSTSEC-2026-0251", reason = "sized-chunks unmaintained — transitive via loro/im; no safe upgrade available" },
+    { id = "RUSTSEC-2024-0449", reason = "Reviewed 2026-10-26: unsafe-libyaml is unmaintained, not a reported vulnerability; transitive via serde_yaml, whose compatible serde_yaml_ng replacement still uses it. No safe compatible upgrade exists; revisit with a separately validated YAML parser migration." },
+    # notify-rust's current compatible releases require zbus 5. These standalone
+    # crates are being folded into zbus; remove when notify-rust supports it.
+    { id = "RUSTSEC-2026-0371", reason = "Reviewed 2026-10-26: zbus_names unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
+    { id = "RUSTSEC-2026-0370", reason = "Reviewed 2026-10-26: zvariant unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
+    { id = "RUSTSEC-2026-0372", reason = "Reviewed 2026-10-26: zvariant_derive unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
     # gtk-rs GTK3 bindings, pulled by Tauri's Linux webkit2gtk backend.
     { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
     { id = "RUSTSEC-2024-0412", reason = "gdk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },

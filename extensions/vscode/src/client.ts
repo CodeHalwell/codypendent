@@ -11,13 +11,10 @@
  * `@codypendent/protocol` and provides the default Node.js Unix socket connection
  * factory (`net.createConnection`).
  */
-import * as net from "node:net";
-
 import {
-  DaemonClient as BaseDaemonClient,
   type DaemonClientOptions as BaseDaemonClientOptions,
-  type SocketLike,
 } from "@codypendent/protocol";
+import { NodeDaemonClient } from "@codypendent/protocol/node";
 
 export {
   computeBackoff,
@@ -49,14 +46,11 @@ export interface DaemonClientOptions extends BaseDaemonClientOptions {
   socketPath: string;
 }
 
-export class DaemonClient extends BaseDaemonClient {
+export class DaemonClient extends NodeDaemonClient {
   constructor(options: DaemonClientOptions) {
     super({
       clientName: "codypendent-vscode",
       ...options,
-      createConnection:
-        options.createConnection ??
-        ((socketPath: string) => net.createConnection({ path: socketPath }) as unknown as SocketLike),
     });
   }
 }

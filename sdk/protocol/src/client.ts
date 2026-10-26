@@ -95,6 +95,10 @@ export function computeBackoff(attempt: number, config: BackoffConfig = DEFAULT_
  */
 export const MAX_QUEUED_COMMANDS = 256;
 
+function catchupWatermark(catchup: Catchup): number {
+  return catchup.type === "Unknown" ? 0 : catchup.through;
+}
+
 export type ConnectionStatus =
   | "connecting"
   | "handshaking"
@@ -134,6 +138,16 @@ export interface DaemonClientOptions {
   wait?: (ms: number) => Promise<void>;
   /** Optional SessionStore instance for state tracking. */
   store?: SessionStore;
+  /** Deadline for correlated requests; requests are never replayed after reconnect. */
+  requestTimeoutMs?: number;
+  /** Maximum wait for a handshake/attach; also bounds silent connections. */
+  connectionTimeoutMs?: number;
+}
+
+export interface RequestOptions {
+  /** Stable caller-owned identity for a mutation that may need reconciliation. */
+  idempotencyKey?: string;
+  timeoutMs?: number;
 }
 
 type EventListener<T = any> = (...args: T[]) => void;
@@ -286,14 +300,21 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
   private socket: SocketLike | undefined;
   private stopped = false;
   private running = false;
+  private generation = 0;
   private status: ConnectionStatus = "closed";
   private attached = false;
+  private handshaken = false;
+  private negotiatedProtocol?: ProtocolVersion;
+  private readonly requestTimeoutMs: number;
+  private readonly connectionTimeoutMs: number;
+  private cancelReconnectWait?: () => void;
   private readonly pendingRequests = new Map<
     Uuid,
     {
       socket: SocketLike;
-      resolve: (payload: Payload) => void;
+      resolve: (envelope: Envelope) => void;
       reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
     }
   >();
 
@@ -319,8 +340,19 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       ((_p: string) => {
         throw new Error("No connection factory provided for DaemonClient");
       });
-    this.wait = options.wait ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.wait = options.wait ?? ((ms: number) => new Promise((resolve) => {
+      const timer = setTimeout(() => { this.cancelReconnectWait = undefined; resolve(); }, ms);
+      this.cancelReconnectWait = () => { clearTimeout(timer); resolve(); };
+    }));
     this.sessionStore = options.store ?? new SessionStore();
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    this.connectionTimeoutMs = options.connectionTimeoutMs ?? 15_000;
+    if (!Number.isFinite(this.requestTimeoutMs) || this.requestTimeoutMs <= 0 || this.requestTimeoutMs > 2_147_483_647) {
+      throw new Error("requestTimeoutMs must be a positive finite number");
+    }
+    if (!Number.isFinite(this.connectionTimeoutMs) || this.connectionTimeoutMs <= 0 || this.connectionTimeoutMs > 2_147_483_647) {
+      throw new Error("connectionTimeoutMs must be a positive finite number");
+    }
   }
 
   /** The highest ledger sequence observed so far (the resume cursor). */
@@ -343,24 +375,31 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     }
     this.running = true;
     this.stopped = false;
-    void this.runLoop();
+    void this.runLoop(++this.generation);
   }
 
   /** Stop for good: close the socket and do not reconnect. */
   stop(): void {
     this.stopped = true;
+    this.generation += 1;
     this.running = false;
+    this.cancelReconnectWait?.();
+    this.cancelReconnectWait = undefined;
     this.teardownSocket();
+    this.rejectQueuedCommands();
     this.setStatus("closed");
   }
 
   /** Attach to a specific session. */
   attachSession(sessionId: Uuid): void {
+    if (this.sessionId === sessionId) return;
+    const restart = this.running;
+    if (restart) this.stop();
+    this.rejectQueuedCommands();
+    this.lastSeenSequence = undefined;
+    this.sessionStore.reset();
     this.sessionId = sessionId;
-    if (this.status === "handshaking" || this.status === "attaching" || this.status === "attached") {
-      this.setStatus("attaching");
-      this.sendAttach();
-    }
+    if (restart) this.start();
   }
 
   // --- command helpers ------------------------------------------------------
@@ -561,9 +600,9 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
 
   // --- connection loop ------------------------------------------------------
 
-  private async runLoop(): Promise<void> {
+  private async runLoop(generation: number): Promise<void> {
     let attempt = 0;
-    while (!this.stopped) {
+    while (!this.stopped && generation === this.generation) {
       try {
         await this.connectOnce(() => {
           attempt = 0;
@@ -571,7 +610,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       } catch (err) {
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
-      if (this.stopped) {
+      if (this.stopped || generation !== this.generation) {
         break;
       }
       const delay = computeBackoff(attempt, this.backoff);
@@ -579,21 +618,35 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       this.setStatus("reconnecting");
       await this.wait(delay);
     }
-    this.running = false;
+    if (generation === this.generation) this.running = false;
   }
 
   private connectOnce(onAttached: () => void): Promise<void> {
     return new Promise<void>((resolve) => {
       const decoder = new FrameDecoder();
+      this.bufferedEvents.length = 0;
+      this.sessionStore.beginCatchup();
       this.attached = false;
+      this.handshaken = false;
       this.setStatus("connecting");
 
       let settled = false;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let livenessMs = this.connectionTimeoutMs;
+      const armDeadline = (): void => {
+        clearTimeout(deadline);
+        deadline = setTimeout(() => {
+          if (this.socket !== socket) return;
+          this.emit("error", new Error("daemon connection timed out"));
+          socket.destroy();
+        }, livenessMs);
+      };
       const settle = (): void => {
         if (settled) {
           return;
         }
         settled = true;
+        clearTimeout(deadline);
         resolve();
       };
 
@@ -606,8 +659,10 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
         return;
       }
       this.socket = socket;
+      armDeadline();
 
       socket.on("connect", () => {
+        if (this.socket !== socket) return;
         this.setStatus("handshaking");
         this.sendClientHello();
       });
@@ -623,18 +678,37 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
           return;
         }
         for (const envelope of envelopes) {
+          if (this.socket !== socket) break;
+          if (envelope.payload.type === "ServerHello") {
+            const selected = envelope.payload.selected_protocol;
+            if (!selected || !Number.isSafeInteger(selected.major) || !Number.isSafeInteger(selected.minor)
+                || selected.major !== PROTOCOL_V1.major || selected.minor < 0 || selected.minor > PROTOCOL_V1.minor) {
+              this.emit("protocolError", { code: "protocol.incompatible-version", message: "The daemon selected an unsupported protocol version.", retryable: false });
+              this.stop();
+              break;
+            }
+            const interval = envelope.payload.heartbeat_interval_ms;
+            this.negotiatedProtocol = selected;
+            livenessMs = Number.isFinite(interval) && interval > 0
+              ? Math.min(360_000, Math.max(this.connectionTimeoutMs, interval * 3)) : this.connectionTimeoutMs;
+          }
+          armDeadline();
           const correlationId = envelope.correlation_id;
           const pending = correlationId ? this.pendingRequests.get(correlationId) : undefined;
           if (pending?.socket === socket) {
             this.pendingRequests.delete(correlationId!);
-            pending.resolve(envelope.payload);
+            clearTimeout(pending.timer);
+            pending.resolve(envelope);
           } else {
+            if ((envelope.payload.type === "Event" || envelope.payload.type === "Catchup")
+                && envelope.session_id && envelope.session_id !== this.sessionId) continue;
             this.handlePayload(envelope.payload, onAttached);
           }
         }
       });
 
       socket.on("error", (err: Error) => {
+        if (this.socket !== socket) return;
         this.emit("error", err);
       });
 
@@ -643,6 +717,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
         if (this.socket === socket) {
           this.socket = undefined;
           this.attached = false;
+          this.handshaken = false;
         }
         settle();
       });
@@ -653,6 +728,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     switch (payload.type) {
       case "ServerHello": {
         const hello = payload as { type: "ServerHello" } & ServerHello;
+        this.handshaken = true;
         if (typeof hello.resume_token === "string" && hello.resume_token.length > 0) {
           this.resumeToken = hello.resume_token;
         }
@@ -676,16 +752,23 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       }
       case "Catchup": {
         const catchup = (payload as { type: "Catchup"; catchup: Catchup }).catchup;
-        this.setStatus("attached");
         this.attached = true;
-        onAttached();
-        this.applyCatchup(catchup);
         try {
           this.sessionStore.applyCatchup(catchup);
         } catch (err) {
           this.emit("error", err instanceof Error ? err : new Error(String(err)));
+          this.attached = false;
+          this.socket?.destroy();
+          break;
         }
+        this.advanceCursor(this.sessionStore.getSnapshot().cursor);
+        this.setStatus("attached");
+        onAttached();
         this.emit("catchup", catchup);
+        const pending = new Map(this.bufferedEvents.splice(0).map((event) => [event.sequence, event]));
+        for (const event of [...pending.values()].sort((left, right) => left.sequence - right.sequence)) {
+          if (event.sequence > catchupWatermark(catchup)) this.emit("event", event);
+        }
         this.flushOfflineQueue();
         break;
       }
@@ -702,12 +785,21 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
         if (this.lastSeenSequence !== undefined && sessionEvent.sequence <= this.lastSeenSequence) {
           break;
         }
-        this.advanceCursor(sessionEvent.sequence);
         try {
           this.sessionStore.applyEvent(sessionEvent);
         } catch (err) {
           this.emit("error", err instanceof Error ? err : new Error(String(err)));
+          this.socket?.destroy();
+          break;
         }
+        if (!this.attached) {
+          if (this.bufferedEvents.length >= 2_000) {
+            this.emit("error", new Error("too much activity before session catch-up"));
+            this.socket?.destroy();
+          } else this.bufferedEvents.push(sessionEvent);
+          break;
+        }
+        this.advanceCursor(sessionEvent.sequence);
         this.emit("event", sessionEvent);
         break;
       }
@@ -739,17 +831,6 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       }
       default:
         break;
-    }
-  }
-
-  private applyCatchup(catchup: Catchup): void {
-    if (catchup.type === "Events") {
-      this.advanceCursor(catchup.through);
-      for (const event of catchup.events) {
-        this.advanceCursor(event.sequence);
-      }
-    } else if (catchup.type === "Snapshot") {
-      this.advanceCursor(catchup.through);
     }
   }
 
@@ -812,15 +893,51 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     this.sendEnvelope(this.buildEnvelope(payload, { withSession: true }));
   }
 
-  request(body: CommandBody): Promise<Payload> {
+  request(body: CommandBody, options?: RequestOptions): Promise<Payload> {
+    return this.requestEnvelope(body, true, options).then((reply) => reply.payload);
+  }
+
+  /**
+   * Discover or create sessions after ServerHello, before attaching to one.
+   * CreateSession returns its new id in the envelope's session_id, not payload.
+   * No command is queued or retried: an interrupted mutation has an uncertain
+   * outcome and must be reconciled by the caller rather than silently repeated.
+   */
+  requestGlobal(
+    body: Extract<CommandBody, { type: "CreateSession" | "ListSessions" | "SearchSessions" | "ProbeModel" | "ReadCodeGraphStatus" | "ReadCodeGraph" | "BuildCodeGraph" | "ReadBlackboard" | "ReadKnowledge" | "PostBlackboardItem" | "UpdateBlackboardItem" }>,
+    options?: RequestOptions,
+  ): Promise<Envelope> {
+    return this.requestEnvelope(body, false, options);
+  }
+
+  private requestEnvelope(body: CommandBody, withSession: boolean, options: RequestOptions = {}): Promise<Envelope> {
     const socket = this.socket;
-    if (!socket || !this.attached) return Promise.reject(new Error("daemon is not attached"));
+    if (!socket || !this.handshaken || (withSession && !this.attached)) {
+      return Promise.reject(new Error("daemon is not attached"));
+    }
+    if (body.type === "ProbeModel" && (this.negotiatedProtocol?.minor ?? 0) < 9) {
+      return Promise.reject(new Error("Model readiness requires Codypendent protocol 1.9 or newer. Update and restart the daemon."));
+    }
+    if (body.type === "ReadKnowledge" && (this.negotiatedProtocol?.minor ?? 0) < 10) {
+      return Promise.reject(new Error("Knowledge browsing requires Codypendent protocol 1.10 or newer. Update and restart the daemon."));
+    }
+    const timeout = options.timeoutMs ?? this.requestTimeoutMs;
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 2_147_483_647) {
+      return Promise.reject(new Error("request timeout must be a positive bounded number"));
+    }
+    if (options.idempotencyKey !== undefined && (!options.idempotencyKey || options.idempotencyKey.length > 256)) {
+      return Promise.reject(new Error("idempotency key must be non-empty and at most 256 characters"));
+    }
     const messageId = generateUuid();
-    const command: Command = { command_id: messageId, idempotency_key: generateUuid(), body };
-    const envelope = this.buildEnvelope({ type: "Command", ...command }, { withSession: true });
+    const command: Command = { command_id: messageId, idempotency_key: options.idempotencyKey ?? generateUuid(), body };
+    const envelope = this.buildEnvelope({ type: "Command", ...command }, { withSession });
     envelope.message_id = messageId;
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(messageId, { socket, resolve, reject });
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(messageId);
+        reject(new Error(`daemon request timed out (${body.type}); its outcome may be unknown`));
+      }, timeout);
+      this.pendingRequests.set(messageId, { socket, resolve, reject, timer });
       this.sendEnvelope(envelope);
     });
   }
@@ -900,7 +1017,16 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       this.rejectPendingRequests(socket);
       this.socket = undefined;
       this.attached = false;
+      this.handshaken = false;
       socket.destroy();
+    }
+  }
+
+  private rejectQueuedCommands(): void {
+    for (const command of this.offlineQueue.splice(0)) {
+      if (DaemonClient.isApprovalBody(command.body)) {
+        this.emit("approvalDropped", { approvalId: command.body.approval_id });
+      }
     }
   }
 
@@ -908,6 +1034,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     for (const [messageId, pending] of this.pendingRequests) {
       if (pending.socket === socket) {
         this.pendingRequests.delete(messageId);
+        clearTimeout(pending.timer);
         pending.reject(new Error("daemon connection closed"));
       }
     }

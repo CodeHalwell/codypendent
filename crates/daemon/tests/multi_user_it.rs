@@ -351,6 +351,45 @@ async fn a_stranger_cannot_read_another_principals_session_events() {
     stop_server(task).await;
 }
 
+#[tokio::test]
+async fn knowledge_cannot_enumerate_a_foreign_or_missing_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let foreign_uid = our_uid(&tmp) + 1;
+    let (paths, mut task, pool) = start_server(&tmp).await;
+    let (foreign, _, _) = seed_foreign_session(&pool, foreign_uid).await;
+    let mut stream = connect(&paths, &mut task).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+    let mut replies = Vec::new();
+    for session_id in [foreign, SessionId::new()] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadKnowledge {
+                        session_id,
+                        section: codypendent_protocol::knowledge::KnowledgeSection::Memories,
+                        offset: 0,
+                        limit: 50,
+                    },
+                    &format!("knowledge-{session_id}"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => replies.push(error.code),
+            other => panic!("knowledge disclosure: {other:?}"),
+        }
+    }
+    assert_eq!(
+        replies,
+        vec!["protocol.session-not-found", "protocol.session-not-found"]
+    );
+    stop_server(task).await;
+}
+
 /// F-19-1, the approval-gate bypass, reproduced and now refused. The review
 /// parked a `shell.run ls -la`, resolved it "by a *stranger* client over a raw
 /// socket", and the daemon executed it. The gate in front of arbitrary command

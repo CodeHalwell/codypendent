@@ -12,6 +12,7 @@
 //! - [`repository`] — which checkout the client works in, gated so a folder
 //!   that is not a repository (or is `$HOME`) can never reach the indexer.
 
+#[cfg(feature = "app")]
 pub mod bridge;
 pub mod council;
 pub mod daemon;

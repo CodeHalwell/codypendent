@@ -12,12 +12,11 @@
  *
  * The card shapes below mirror the TUI's own projections one-for-one
  * (`crates/tui/src/state.rs`: `SkillCard`, `MemoryCard`, `LearningCard`,
- * `DocCard`, `DocBlockView`, `DocSuggestionView`); the shell maps the same
- * `RegistryItem` / `MemoryRecord` / `LearningRecord` / document snapshot the
- * CLI harness maps in `crates/cli/src/tui.rs` (`src-tauri/src/knowledge.rs`),
- * so the two clients show the same facts about the same database.
+ * `DocCard`, `DocBlockView`, `DocSuggestionView`); the daemon maps store records once and sends these schema-generated
+ * projections to both clients. Scope keys are derived from the selected
+ * session and cannot be supplied by a webview.
  */
-import type { PublishTarget, UiPluginLifecycleStatus } from "@codypendent/protocol";
+import type { PublishTarget, UiPluginLifecycleStatus, SkillCard as ProtocolSkillCard, MemoryCard as ProtocolMemoryCard, LearningCard as ProtocolLearningCard, DocCard as ProtocolDocCard, DocBlockView as ProtocolDocBlockView, DocSuggestionView as ProtocolDocSuggestionView } from "@codypendent/protocol";
 
 /**
  * Whether a surface's data reflects a real answer.
@@ -40,17 +39,7 @@ export function unloaded<T>(): Loaded<T> {
 }
 
 /** `crates/tui/src/state.rs` `SkillCard`. `permissions` are verbatim strings. */
-export interface SkillCard {
-  name: string;
-  kind: string;
-  scope: string;
-  trust: string;
-  status: string;
-  risk: string;
-  description: string;
-  /** Requested capabilities, one verbatim string each ("command: cargo"). */
-  permissions: string[];
-}
+export type SkillCard = ProtocolSkillCard;
 
 /**
  * `crates/tui/src/state.rs` `MemoryCard`, plus the memory's id.
@@ -58,32 +47,10 @@ export interface SkillCard {
  * The TUI's card has no id because its browser only reads; the desktop offers
  * `CorrectMemory`/`ForgetMemory`, which are keyed by `{ id, repository }`.
  */
-export interface MemoryCard {
-  id: string;
-  statement: string;
-  /** `semantic` / `procedural` / `preference` / … */
-  class: string;
-  scope: string;
-  revision: string;
-  /** A date string, exactly as the store rendered it. */
-  observed: string;
-  confidence: number;
-  /** The human-readable evidence source; "(no evidence)" when there is none. */
-  source: string;
-}
+export type MemoryCard = ProtocolMemoryCard;
 
 /** `crates/tui/src/state.rs` `LearningCard`. */
-export interface LearningCard {
-  id: string;
-  statement: string;
-  kind: string;
-  state: string;
-  scope: string;
-  provenance: string;
-  confidence: number;
-  pinned: boolean;
-  revision: number;
-}
+export type LearningCard = ProtocolLearningCard;
 
 /** `crates/tui/src/action.rs` `LearningMutation`. */
 export type LearningMutation =
@@ -94,45 +61,13 @@ export type LearningMutation =
   | { type: "Delete" };
 
 /** `crates/tui/src/state.rs` `DocBlockView`. */
-export interface DocBlockView {
-  id: string;
-  kind: string;
-  /** A one-line, lossy display rendering. */
-  text: string;
-  /**
-   * The block's primary text VERBATIM, or `null` for a structured block with
-   * no single editable container. This is what an edit prefills and what its
-   * full replace deletes.
-   */
-  editable: string | null;
-}
+export type DocBlockView = ProtocolDocBlockView;
 
 /** `crates/tui/src/state.rs` `DocSuggestionView`. */
-export interface DocSuggestionView {
-  id: string;
-  block_id: string;
-  source_revision: number;
-  status: string;
-  author: string;
-  range: string;
-  original: string;
-  replacement: string;
-  rationale: string | null;
-}
+export type DocSuggestionView = ProtocolDocSuggestionView;
 
 /** `crates/tui/src/state.rs` `DocCard`. */
-export interface DocCard {
-  document_id: string;
-  title: string;
-  scope: string;
-  status: string;
-  /** `ask` / `suggest` / `edit` / `co_author` / `review` / `maintain`. */
-  mode: string;
-  /** Pre-rendered, e.g. `"r7"`. */
-  revision: string;
-  blocks: DocBlockView[];
-  suggestions: DocSuggestionView[];
-}
+export type DocCard = ProtocolDocCard;
 
 export type { UiPluginLifecycleStatus };
 

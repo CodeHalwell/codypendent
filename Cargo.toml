@@ -31,7 +31,8 @@ members = [
 # workspace so Automerge/Yrs — pulled in only for the comparison — never enter
 # the product's dependency graph. Excluded here so a root `cargo` command never
 # tries to fold it into this workspace.
-exclude = ["benches/crdt-bench"]
+# The SSTable backport is a third-party dependency, not a workspace member.
+exclude = ["benches/crdt-bench", "third_party/tantivy-sstable"]
 
 [workspace.package]
 version = "0.14.0"
@@ -88,7 +89,7 @@ hex = "0.4"
 flate2 = "1"
 bzip2 = "0.5"
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
 # publisher signature over the canonical `codypendent-plugin-signature-v1` digest
@@ -303,3 +304,7 @@ debug = "line-tables-only"
 
 [profile.test.build-override]
 debug = 0
+
+# Preserve the existing Tantivy index format while patching its compression backend.
+[patch.crates-io]
+tantivy-sstable = { path = "third_party/tantivy-sstable" }

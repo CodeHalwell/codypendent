@@ -1,13 +1,14 @@
 {
   "name": "Codypendent Documentation Suite",
   "version": "0.5.1",
-  "date": "2026-09-02",
+  "date": "2026-10-26",
   "files": [
     "CONTRIBUTING.md",
     "PROJECT_REVIEW_2026-07-17.md",
     "PROJECT_SCAFFOLD.md",
     "README.md",
     "SECURITY.md",
+    "SHARED_RUNTIME.md",
     "TIMELINE.md",
     "architecture/backend-daemon.md",
     "architecture/model-provider-selection.md",

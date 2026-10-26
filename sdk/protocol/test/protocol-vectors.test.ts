@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { foldUnknownCommandBody, foldUnknownEventBody, foldUnknownPayload } from "../src/tags.js";
+import type { KnowledgeSection, KnowledgePage } from "../src/knowledge.js";
 import type {
   Actor,
   ArtifactRef,
@@ -2006,6 +2007,9 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         model: optStr(r, "model"),
         network: r.network === undefined ? false : bool(r, "network"),
       };
+    case "ReadKnowledge":
+      return { type: "ReadKnowledge", session_id: str(r, "session_id"), section: reconstructKnowledgeSection(rec(r, "section")),
+        offset: num(r, "offset"), limit: num(r, "limit") };
     case "ReadCodeGraphStatus":
       return { type: "ReadCodeGraphStatus", repository: str(r, "repository") };
     case "ReadCodeGraph":
@@ -2086,6 +2090,41 @@ function reconstructDaemonStatus(r: Record<string, unknown>): DaemonStatus {
     build_id: str(r, "build_id"),
     active_run_count: num(r, "active_run_count"),
     integration_issues: optStrArr(r, "integration_issues"),
+  };
+}
+
+function reconstructKnowledgeSection(r: Record<string, unknown>): KnowledgeSection {
+  switch (str(r, "type")) {
+    case "Skills": return { type: "Skills" };
+    case "Memories": return { type: "Memories" };
+    case "Learnings": return { type: "Learnings" };
+    case "Documents": return { type: "Documents" };
+    case "Unknown": return { type: "Unknown" };
+    default: return unknownTag("KnowledgeSection", str(r, "type"));
+  }
+}
+
+function reconstructKnowledgePage(r: Record<string, unknown>): KnowledgePage {
+  return {
+    section: reconstructKnowledgeSection(rec(r, "section")),
+    next_offset: optNum(r, "next_offset"), warnings: optStrArr(r, "warnings"),
+    skills: optRecArr(r, "skills")?.map(item => ({ name: str(item, "name"), kind: str(item, "kind"),
+      scope: str(item, "scope"), trust: str(item, "trust"), status: str(item, "status"), risk: str(item, "risk"),
+      description: str(item, "description"), permissions: strArr(item, "permissions") })),
+    memories: optRecArr(r, "memories")?.map(item => ({ id: str(item, "id"), statement: str(item, "statement"),
+      class: str(item, "class"), scope: str(item, "scope"), revision: str(item, "revision"), observed: str(item, "observed"),
+      confidence: num(item, "confidence"), source: str(item, "source") })),
+    learnings: optRecArr(r, "learnings")?.map(item => ({ id: str(item, "id"), statement: str(item, "statement"),
+      kind: str(item, "kind"), state: str(item, "state"), scope: str(item, "scope"), provenance: str(item, "provenance"),
+      confidence: num(item, "confidence"), pinned: bool(item, "pinned"), revision: num(item, "revision") })),
+    documents: optRecArr(r, "documents")?.map(item => ({ document_id: str(item, "document_id"), title: str(item, "title"),
+      scope: str(item, "scope"), status: str(item, "status"), mode: str(item, "mode"), revision: str(item, "revision"),
+      blocks: recArr(item, "blocks").map(block => ({ id: str(block, "id"), kind: str(block, "kind"), text: str(block, "text"),
+        editable: strOrNull(block, "editable") })),
+      suggestions: recArr(item, "suggestions").map(value => ({ id: str(value, "id"), block_id: str(value, "block_id"),
+        source_revision: num(value, "source_revision"), status: str(value, "status"), author: str(value, "author"),
+        range: str(value, "range"), original: str(value, "original"), replacement: str(value, "replacement"),
+        rationale: strOrNull(value, "rationale") })) })),
   };
 }
 
@@ -2252,6 +2291,8 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         command_id: str(r, "command_id"),
         report: reconstructCodeGraphScanReport(rec(r, "report")),
       };
+    case "KnowledgePage":
+      return { type: "KnowledgePage", command_id: str(r, "command_id"), page: reconstructKnowledgePage(rec(r, "page")) };
     case "ModelProbes":
       return {
         type: "ModelProbes",
@@ -2876,6 +2917,8 @@ function reconstructFederationPayload(tag: string, r: Record<string, unknown>): 
 type Reconstructor = (r: Record<string, unknown>) => unknown;
 
 const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
+  KnowledgeSection: reconstructKnowledgeSection,
+  KnowledgePage: reconstructKnowledgePage,
   // artifact.rs
   ArtifactRef: reconstructArtifactRef,
   DataClassification: reconstructDataClassification,

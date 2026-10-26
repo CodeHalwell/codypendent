@@ -75,6 +75,7 @@ function retainTail(events: readonly SessionEvent[]): {
 export class SessionStore {
   private snapshot: SessionStoreSnapshot = EMPTY_SNAPSHOT;
   private buffered = new Map<number, SessionEvent>();
+  private catchingUp = false;
   private readonly listeners = new Set<SessionStoreListener>();
 
   getSnapshot = (): SessionStoreSnapshot => this.snapshot;
@@ -84,8 +85,20 @@ export class SessionStore {
     return () => this.listeners.delete(listener);
   };
 
+  /** Hold new wire events until the next catch-up validates the resume baseline. */
+  beginCatchup(): void {
+    this.catchingUp = true;
+    this.buffered.clear();
+  }
+
   applyEvent(event: SessionEvent): void {
-    if (!this.snapshot.ready) {
+    if (!Number.isSafeInteger(event.sequence) || event.sequence < 1) {
+      throw new Error("invalid session event sequence");
+    }
+    if (!this.snapshot.ready || this.catchingUp) {
+      if (!this.buffered.has(event.sequence) && this.buffered.size >= MAX_RETAINED_EVENTS) {
+        throw new Error("session catch-up buffer is full");
+      }
       this.buffered.set(event.sequence, event);
       return;
     }
@@ -147,6 +160,7 @@ export class SessionStore {
     }
 
     this.buffered.clear();
+    this.catchingUp = false;
     const { kept, dropped } = retainTail(events);
     // A Snapshot catch-up restarts the history from a projection, so its
     // dropped count restarts with it; an Events catch-up extends what is
@@ -164,6 +178,7 @@ export class SessionStore {
 
   reset(): void {
     this.buffered.clear();
+    this.catchingUp = false;
     this.snapshot = EMPTY_SNAPSHOT;
     this.emit();
   }

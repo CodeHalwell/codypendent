@@ -35,13 +35,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use codypendent_integrations::unsloth::HfCatalogApi;
+use codypendent_knowledge::client_views::{block_view, evidence_source, suggestion_view};
 use codypendent_knowledge::{
-    db as knowledge_db, ActivationOutcome, BlockContent, CapabilityRequest, CollaborationMode,
-    DocumentAuthor, DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument,
-    LearningContent, LearningMutationOutcome, LearningPatch, LearningProvenance, LearningQuery,
-    LearningRecord, LearningScope, LearningState, LearningStore, MemoryClass, MemoryRecord,
-    MemoryStore, Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope,
-    Suggestion, SuggestionStatus, SuggestionStore, TrustTier, Verification,
+    db as knowledge_db, ActivationOutcome, DocumentReplica, DocumentStore, EvidenceRef,
+    LearningContent, LearningMutationOutcome, LearningPatch, LearningStore, Scope, SuggestionStore,
+    Verification,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -57,11 +55,11 @@ use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
     AddModelRow, AppState, BlackboardItemCard, ColorDepth, CouncilMemberSummary,
-    CouncilProgressPhase, CouncilRoundSummary, CouncilRunSummary, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, LearningCard,
-    LearningMutation, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness,
-    ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme, UnslothQuantCard,
-    UnslothRepoCard, VoiceKeyRow, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    CouncilProgressPhase, CouncilRoundSummary, CouncilRunSummary, DocCard, GraphEdgeCard, Intent,
+    KanbanCard, KeyStatus, KeyTarget, LearningCard, LearningMutation, MemoryCard, ModelCard,
+    ModelListOrigin, ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard, SkillCard,
+    TerminalGuard, Theme, UnslothQuantCard, UnslothRepoCard, VoiceKeyRow, WorkflowNodeCard,
+    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1183,7 +1181,7 @@ async fn boot_phase(
     // notice) and continues with empty lists; it never fails the TUI.
     let _ = stage_tx.send(SplashStage::LoadingWorkspace);
     let mut loader_warnings = Vec::new();
-    let projections = load_knowledge(paths, workspace_id, repo, &mut loader_warnings).await;
+    let projections = load_knowledge(paths, session_id, repo, &mut loader_warnings).await;
     state.skills = projections.skills;
     state.memories = projections.memories;
     state.docs = projections.docs;
@@ -3270,6 +3268,7 @@ async fn event_loop<P: Presentation>(
                 tokio::spawn(async move {
                     let active_subagents =
                         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    #[allow(deprecated, reason = "fetch_update supports the Rust 1.88 MSRV")]
                     let progress = move |progress: crate::council::CouncilProgress| {
                         use std::sync::atomic::Ordering;
                         let active = match &progress.event {
@@ -3451,11 +3450,20 @@ async fn event_loop<P: Presentation>(
                 ];
                 let repository = PathBuf::from(repository);
                 let user_workflows = paths.data_dir.join("workflows");
+                let socket = paths.socket_path.clone();
                 let kind = *kind;
                 let tx = live.query_tx.clone();
                 tokio::spawn(async move {
-                    let projection =
-                        load_projection(kind, pool, scopes, repository, user_workflows).await;
+                    let projection = load_projection(
+                        kind,
+                        pool,
+                        scopes,
+                        repository,
+                        user_workflows,
+                        socket,
+                        session_id,
+                    )
+                    .await;
                     let _ = tx
                         .send(ReaderSignal::ProjectionLoaded {
                             generation,
@@ -3484,7 +3492,14 @@ async fn event_loop<P: Presentation>(
                 match result {
                     Ok(message) => {
                         let selected = state.focused_learning().map(|card| card.id.clone());
-                        match load_journey(pool, Path::new(repository)).await {
+                        match load_wire_knowledge(
+                            &paths.socket_path,
+                            session_id,
+                            codypendent_protocol::knowledge::KnowledgeSection::Learnings,
+                        )
+                        .await
+                        .map(|page| page.learnings)
+                        {
                             Ok(cards) => {
                                 state.learnings = cards;
                                 state.selected_learning = selected
@@ -3985,34 +4000,43 @@ enum ProjectionLoad {
 async fn load_projection(
     kind: ProjectionKind,
     pool: sqlx::SqlitePool,
-    scopes: Vec<Scope>,
+    _scopes: Vec<Scope>,
     repository: PathBuf,
     user_workflows: PathBuf,
+    socket: PathBuf,
+    session: SessionId,
 ) -> ProjectionLoad {
+    use codypendent_protocol::knowledge::KnowledgeSection;
     match kind {
         ProjectionKind::Skills => ProjectionLoad::Skills(
-            Registry::new()
-                .list(&pool)
+            load_wire_knowledge(&socket, session, KnowledgeSection::Skills)
                 .await
-                .map(|items| items.iter().map(skill_card).collect())
+                .map(|page| page.skills)
                 .map_err(|error| error.to_string()),
         ),
         ProjectionKind::Memory => ProjectionLoad::Memory(
-            MemoryStore::new()
-                .query(&pool, &scopes, None)
+            load_wire_knowledge(&socket, session, KnowledgeSection::Memories)
                 .await
-                .map(|records| records.iter().map(memory_card).collect())
+                .map(|page| page.memories.into_iter().map(wire_memory_card).collect())
                 .map_err(|error| error.to_string()),
         ),
         ProjectionKind::Journey => ProjectionLoad::Journey(
-            load_journey(&pool, &repository)
+            load_wire_knowledge(&socket, session, KnowledgeSection::Learnings)
                 .await
+                .map(|page| page.learnings)
                 .map_err(|error| error.to_string()),
         ),
         ProjectionKind::Docs => {
-            let mut warnings = Vec::new();
-            let cards = load_docs(&pool, &scopes, &mut warnings).await;
-            ProjectionLoad::Docs { cards, warnings }
+            match load_wire_knowledge(&socket, session, KnowledgeSection::Documents).await {
+                Ok(page) => ProjectionLoad::Docs {
+                    cards: page.documents,
+                    warnings: page.warnings,
+                },
+                Err(error) => ProjectionLoad::Docs {
+                    cards: vec![],
+                    warnings: vec![error.to_string()],
+                },
+            }
         }
         ProjectionKind::Workflow => {
             let mut warnings = Vec::new();
@@ -7493,76 +7517,131 @@ struct KnowledgeProjections {
 /// to start.
 async fn load_knowledge(
     paths: &RuntimePaths,
-    workspace_id: WorkspaceId,
+    session: SessionId,
     repo: &Path,
     warnings: &mut Vec<String>,
 ) -> KnowledgeProjections {
-    let empty = || KnowledgeProjections {
-        skills: Vec::new(),
-        memories: Vec::new(),
-        docs: Vec::new(),
-        edges: Vec::new(),
+    use codypendent_protocol::knowledge::KnowledgeSection;
+    let mut result = KnowledgeProjections {
+        skills: vec![],
+        memories: vec![],
+        docs: vec![],
+        edges: vec![],
         edge_total: 0,
-        blackboard: Vec::new(),
+        blackboard: vec![],
     };
-
-    let database_path = paths.data_dir.join("codypendent.db");
-    let pool = match knowledge_db::open(&database_path).await {
-        Ok(pool) => pool,
-        Err(error) => {
-            warnings.push(format!(
-                "knowledge views unavailable (opening {}: {error})",
-                database_path.display()
-            ));
-            return empty();
+    for section in [
+        KnowledgeSection::Skills,
+        KnowledgeSection::Memories,
+        KnowledgeSection::Documents,
+    ] {
+        match load_wire_knowledge(&paths.socket_path, session, section).await {
+            Ok(page) => {
+                result.skills.extend(page.skills);
+                result
+                    .memories
+                    .extend(page.memories.into_iter().map(wire_memory_card));
+                result.docs.extend(page.documents);
+            }
+            Err(error) => warnings.push(format!("knowledge view unavailable: {error}")),
         }
-    };
-
-    let skills = match Registry::new().list(&pool).await {
-        Ok(items) => items.iter().map(skill_card).collect(),
-        Err(error) => {
-            warnings.push(format!("could not list registry items: {error}"));
-            Vec::new()
-        }
-    };
-
-    // Visible scopes: the System tier, this session's workspace, and THIS
-    // repository — where a run's harvested memories and documents live. The
-    // identity must come from `anchor_repository_id`, which resolves the Git
-    // toplevel first, exactly as `codypendentd::scan::repository_id_for` does:
-    // hashing the opened directory instead made every one of these lists empty
-    // whenever the TUI was started from a subdirectory. The stores enforce
-    // cross-scope isolation in SQL; an empty result is fine.
-    let repository = crate::repo_anchor::anchor_repository_id(repo);
-    let scopes = vec![
-        Scope::System,
-        Scope::Workspace(workspace_id),
-        Scope::Repository(repository),
-    ];
-    let memories = match MemoryStore::new().query(&pool, &scopes, None).await {
-        Ok(records) => records.iter().map(memory_card).collect(),
-        Err(error) => {
-            warnings.push(format!("could not query memories: {error}"));
-            Vec::new()
-        }
-    };
-
-    let docs = load_docs(&pool, &scopes, warnings).await;
-    let (edges, edge_total, _) = load_edge_page(&pool, repository, "", 0, warnings).await;
-    // Phase 5 STEP 5.3: the blackboard artifacts on the active workflow runs. The
-    // workflow tables share this database (the migrations are workspace-wide), so
-    // the same pool serves them; empty until a run posts artifacts.
-    let blackboard = load_blackboard(&pool, warnings).await;
-
-    pool.close().await;
-    KnowledgeProjections {
-        skills,
-        memories,
-        docs,
-        edges,
-        edge_total,
-        blackboard,
     }
+    // Graph/workflow projections remain separate services; the knowledge cards
+    // above never open SQLite or decide their own visible scopes.
+    match knowledge_db::open_read_only(&paths.data_dir.join("codypendent.db")).await {
+        Ok(pool) => {
+            let repository = crate::repo_anchor::anchor_repository_id(repo);
+            let (edges, total, _) = load_edge_page(&pool, repository, "", 0, warnings).await;
+            result.edges = edges;
+            result.edge_total = total;
+            result.blackboard = load_blackboard(&pool, warnings).await;
+            pool.close().await;
+        }
+        Err(error) => warnings.push(format!("graph/workflow views unavailable: {error}")),
+    }
+    result
+}
+
+fn wire_memory_card(card: codypendent_protocol::knowledge::MemoryCard) -> MemoryCard {
+    MemoryCard {
+        statement: card.statement,
+        class: card.class,
+        scope: card.scope,
+        revision: card.revision,
+        observed: card.observed,
+        confidence: card.confidence,
+        source: card.source,
+    }
+}
+
+async fn read_wire_knowledge(
+    conn: &mut Connection,
+    session: SessionId,
+    section: codypendent_protocol::knowledge::KnowledgeSection,
+) -> anyhow::Result<codypendent_protocol::knowledge::KnowledgePage> {
+    use codypendent_protocol::knowledge::KnowledgePage;
+    let mut result = KnowledgePage {
+        section,
+        skills: vec![],
+        memories: vec![],
+        learnings: vec![],
+        documents: vec![],
+        next_offset: None,
+        warnings: vec![],
+    };
+    let mut offset = 0;
+    loop {
+        let reply = conn
+            .send_command(CommandBody::ReadKnowledge {
+                session_id: session,
+                section,
+                offset,
+                limit: 100,
+            })
+            .await?;
+        let page = match reply.payload {
+            Payload::KnowledgePage { page, .. } if page.section == section => page,
+            Payload::CommandRejected(error) => {
+                return Err(anyhow!("{} ({})", error.message, error.code))
+            }
+            _ => {
+                return Err(anyhow!(
+                    "unexpected knowledge reply; update the daemon and reconnect"
+                ))
+            }
+        };
+        result.skills.extend(page.skills);
+        result.memories.extend(page.memories);
+        result.learnings.extend(page.learnings);
+        result.documents.extend(page.documents);
+        result.warnings.extend(page.warnings);
+        let Some(next) = page.next_offset else {
+            return Ok(result);
+        };
+        if next <= offset || next >= 10_000 {
+            return Err(anyhow!(
+                "knowledge view reached its 10,000-item limit or made no progress"
+            ));
+        }
+        offset = next;
+    }
+}
+
+async fn load_wire_knowledge(
+    socket: &Path,
+    session: SessionId,
+    section: codypendent_protocol::knowledge::KnowledgeSection,
+) -> anyhow::Result<codypendent_protocol::knowledge::KnowledgePage> {
+    let mut conn = Connection::connect(socket).await?;
+    let hello = conn
+        .handshake("codypendent-tui-knowledge", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    if hello.selected_protocol.minor < 10 {
+        return Err(anyhow!(
+            "knowledge browsing requires protocol 1.10; restart the updated daemon"
+        ));
+    }
+    read_wire_knowledge(&mut conn, session, section).await
 }
 
 /// Seed the model-picker projection (MP1): every model configured in
@@ -8285,50 +8364,6 @@ fn protocol_label(protocol: codypendent_providers::Protocol) -> &'static str {
     }
 }
 
-/// Project each visible-scope document (snapshot + pending suggestions) into a
-/// [`DocCard`]. A per-document read failure collects a diagnostic and skips
-/// that document; the browser degrades to what it could load rather than
-/// failing.
-async fn load_docs(
-    pool: &sqlx::SqlitePool,
-    scopes: &[Scope],
-    warnings: &mut Vec<String>,
-) -> Vec<DocCard> {
-    let doc_store = DocumentStore::new();
-    let suggestion_store = SuggestionStore::new();
-    let summaries = match doc_store.list(pool, scopes).await {
-        Ok(summaries) => summaries,
-        Err(error) => {
-            warnings.push(format!("could not list documents: {error}"));
-            return Vec::new();
-        }
-    };
-
-    let mut docs = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        let document = match doc_store.snapshot_document(pool, summary.id).await {
-            Ok(Some(document)) => document,
-            Ok(None) => continue,
-            Err(error) => {
-                warnings.push(format!("could not load document {}: {error}", summary.id));
-                continue;
-            }
-        };
-        let suggestions = suggestion_store
-            .pending(pool, summary.id)
-            .await
-            .unwrap_or_else(|error| {
-                warnings.push(format!(
-                    "could not load suggestions for {}: {error}",
-                    summary.id
-                ));
-                Vec::new()
-            });
-        docs.push(doc_card(&document, &suggestions));
-    }
-    docs
-}
-
 /// Read one filtered graph page with endpoint names joined in SQLite. This never
 /// materializes the repository's full node/edge sets: a 50k-edge checkout costs
 /// one `COUNT` plus at most [`EDGE_PAGE_SIZE`] joined rows.
@@ -8433,113 +8468,6 @@ async fn load_edge_page(
     (cards, total, page)
 }
 
-/// Map a governed [`RegistryItem`] into the TUI's [`SkillCard`] projection,
-/// rendering each requested capability **verbatim** (STEP 2.6 "skill permissions
-/// are visible").
-fn skill_card(item: &RegistryItem) -> SkillCard {
-    SkillCard {
-        name: item.name.clone(),
-        kind: registry_kind_label(item.kind).to_owned(),
-        scope: scope_label(&item.scope),
-        trust: trust_label(item.trust.tier).to_owned(),
-        status: status_label(item.status).to_owned(),
-        risk: risk_label(item.risk).to_owned(),
-        description: item.description.clone(),
-        permissions: item.permissions.iter().map(capability_verbatim).collect(),
-    }
-}
-
-/// Map a [`MemoryRecord`] into the TUI's [`MemoryCard`] projection. `source` is a
-/// human rendering of the record's evidence refs (joined when there are several),
-/// which the memory browser's "open source" affordance surfaces in full.
-fn memory_card(record: &MemoryRecord) -> MemoryCard {
-    let source = if record.provenance.is_empty() {
-        "(no evidence)".to_owned()
-    } else {
-        record
-            .provenance
-            .iter()
-            .map(evidence_source)
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    MemoryCard {
-        statement: record.statement.clone(),
-        class: memory_class_label(record.class).to_owned(),
-        scope: scope_label(&record.scope),
-        revision: record.valid_from.0.clone(),
-        observed: record.observed_at.date_naive().to_string(),
-        confidence: record.confidence,
-        source,
-    }
-}
-
-async fn load_journey(
-    pool: &sqlx::SqlitePool,
-    repository: &Path,
-) -> Result<Vec<LearningCard>, codypendent_knowledge::LearningError> {
-    let records = LearningStore::new()
-        .query(
-            pool,
-            &LearningQuery {
-                scopes: vec![
-                    LearningScope::User(UserId("local".to_owned())),
-                    LearningScope::Repository(crate::repo_anchor::anchor_repository_id(repository)),
-                ],
-                states: vec![LearningState::Proposed, LearningState::Active],
-                ..LearningQuery::default()
-            },
-        )
-        .await?;
-    Ok(records.iter().map(learning_card).collect())
-}
-
-fn learning_card(record: &LearningRecord) -> LearningCard {
-    let scope = match &record.scope {
-        LearningScope::User(_) => "user".to_owned(),
-        LearningScope::Repository(id) => format!(
-            "repository {}",
-            id.to_string().chars().take(8).collect::<String>()
-        ),
-        LearningScope::Provider(_) => "provider".to_owned(),
-        LearningScope::Council(_) => "council".to_owned(),
-    };
-    let mut provenance = record
-        .provenance
-        .iter()
-        .map(|source| match source {
-            LearningProvenance::UserStatement { .. } => "user-confirmed",
-            LearningProvenance::SuccessfulCommand { .. } => "locally verified",
-            LearningProvenance::RepositoryObservation { .. } => "repository observation",
-            LearningProvenance::AgentInference { .. } => "agent proposal",
-            LearningProvenance::ToolOutput { .. } => "untrusted tool proposal",
-            LearningProvenance::ExternalContent { .. } => "external proposal",
-            LearningProvenance::CouncilResult { .. } => "council proposal",
-        })
-        .collect::<Vec<_>>();
-    provenance.sort_unstable();
-    provenance.dedup();
-    LearningCard {
-        id: record.id.to_string(),
-        statement: record.content.summary().to_owned(),
-        kind: match record.content.kind() {
-            codypendent_knowledge::LearningKind::Fact => "fact".to_owned(),
-            codypendent_knowledge::LearningKind::Procedure => "procedure".to_owned(),
-        },
-        state: match record.state {
-            LearningState::Proposed => "proposed",
-            LearningState::Active => "active",
-            LearningState::Rejected => "rejected",
-        }
-        .to_owned(),
-        scope,
-        provenance: provenance.join(" + "),
-        confidence: record.confidence,
-        pinned: record.pinned,
-        revision: record.revision,
-    }
-}
-
 async fn mutate_learning(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -8621,182 +8549,6 @@ async fn mutate_learning(
                 bail!("learning was already deleted")
             }
         }
-    }
-}
-
-/// Render one requested capability exactly as declared, e.g.
-/// `"filesystem_read: $REPOSITORY"` or `"command: cargo"` — the verbatim form the
-/// Skill Studio shows.
-fn capability_verbatim(capability: &CapabilityRequest) -> String {
-    match capability {
-        CapabilityRequest::FilesystemRead(value) => format!("filesystem_read: {value}"),
-        CapabilityRequest::FilesystemWrite(value) => format!("filesystem_write: {value}"),
-        CapabilityRequest::Command(value) => format!("command: {value}"),
-        CapabilityRequest::Network(value) => format!("network: {value}"),
-        CapabilityRequest::Secret(value) => format!("secret: {value}"),
-    }
-}
-
-/// A human rendering of a memory's evidence ref (what "open source" reveals).
-fn evidence_source(evidence: &EvidenceRef) -> String {
-    match evidence {
-        EvidenceRef::EventRange {
-            session_id,
-            from_sequence,
-            to_sequence,
-        } => format!("events {from_sequence}..{to_sequence} of session {session_id}"),
-        EvidenceRef::Artifact {
-            artifact,
-            source_path,
-        } => match source_path {
-            Some(path) => format!("artifact {} ({path})", artifact.id),
-            None => format!("artifact {}", artifact.id),
-        },
-        // An agent's claim: the rationale IS the evidence, so it travels here
-        // rather than being reduced to "run <uuid>". A reviewer needs to read
-        // what was asserted, not be told that something was.
-        EvidenceRef::AgentAssertion {
-            session_id,
-            run_id,
-            rationale,
-        } => format!("asserted by run {run_id} (session {session_id}): {rationale}"),
-    }
-}
-
-/// A compact human label for a memory/registry [`Scope`]: the tier, plus a short
-/// prefix of its key for the id-bearing tiers (the full UUID is noise in a card).
-fn scope_label(scope: &Scope) -> String {
-    match scope.key() {
-        Some(key) => format!(
-            "{} {}",
-            scope.tier(),
-            key.chars().take(8).collect::<String>()
-        ),
-        None => scope.tier().to_owned(),
-    }
-}
-
-fn registry_kind_label(kind: RegistryItemKind) -> &'static str {
-    match kind {
-        RegistryItemKind::Tool => "tool",
-        RegistryItemKind::Skill => "skill",
-        RegistryItemKind::Plugin => "plugin",
-        RegistryItemKind::Hook => "hook",
-        RegistryItemKind::Command => "command",
-    }
-}
-
-fn trust_label(tier: TrustTier) -> &'static str {
-    match tier {
-        TrustTier::Untrusted => "untrusted",
-        TrustTier::Community => "community",
-        TrustTier::Verified => "verified",
-        TrustTier::FirstParty => "first-party",
-    }
-}
-
-fn status_label(status: RegistryStatus) -> &'static str {
-    match status {
-        RegistryStatus::Draft => "draft",
-        RegistryStatus::Active => "active",
-        RegistryStatus::Modified => "modified",
-        RegistryStatus::Deprecated => "deprecated",
-    }
-}
-
-fn risk_label(risk: RiskClass) -> &'static str {
-    match risk {
-        RiskClass::Safe => "safe",
-        RiskClass::Low => "low",
-        RiskClass::Medium => "medium",
-        RiskClass::High => "high",
-    }
-}
-
-fn memory_class_label(class: MemoryClass) -> &'static str {
-    match class {
-        MemoryClass::Working => "working",
-        MemoryClass::Episodic => "episodic",
-        MemoryClass::Semantic => "semantic",
-        MemoryClass::Procedural => "procedural",
-        MemoryClass::Preference => "preference",
-        MemoryClass::Failure => "failure",
-        MemoryClass::Artifact => "artifact",
-        MemoryClass::Code => "code",
-    }
-}
-
-/// Map a [`KnowledgeDocument`] (plus its pending suggestions) into the TUI's
-/// [`DocCard`] projection. `mode` is the collaboration mode the document's scope
-/// defaults to — org-scope docs read `suggest`, the suggest-by-default the
-/// engine enforces (STEP 4.3).
-fn doc_card(document: &KnowledgeDocument, suggestions: &[Suggestion]) -> DocCard {
-    DocCard {
-        document_id: document.id,
-        title: document.title.clone(),
-        scope: scope_label(&document.scope),
-        status: document.status.as_str().to_owned(),
-        mode: collab_mode_label(CollaborationMode::default_for_scope(&document.scope)).to_owned(),
-        revision: format!("r{}", document.revision),
-        blocks: document.blocks.iter().map(block_view).collect(),
-        suggestions: suggestions.iter().map(suggestion_view).collect(),
-    }
-}
-
-/// Render one [`DocumentBlock`] into the editor rail's [`DocBlockView`]: a kind
-/// label and a single-line human rendering of its content (never the raw
-/// serialized block). Structured/embed blocks get a compact stand-in.
-fn block_view(block: &DocumentBlock) -> DocBlockView {
-    let (kind, text) = match &block.content {
-        BlockContent::Heading { level, text } => (format!("heading h{level}"), text.clone()),
-        BlockContent::Paragraph { text } => ("paragraph".to_owned(), text.clone()),
-        BlockContent::Code { language, text } => (
-            match language {
-                Some(language) => format!("code {language}"),
-                None => "code".to_owned(),
-            },
-            text.clone(),
-        ),
-        BlockContent::Diagram { format, .. } => {
-            (format!("diagram {format}"), "(diagram)".to_owned())
-        }
-        BlockContent::Table { rows } => ("table".to_owned(), format!("({} rows)", rows.len())),
-        BlockContent::Callout { kind, text } => (format!("callout {kind}"), text.clone()),
-        BlockContent::Checklist { items } => {
-            ("checklist".to_owned(), format!("({} items)", items.len()))
-        }
-        BlockContent::Query { query } => ("query".to_owned(), query.clone()),
-        BlockContent::EmbeddedFile { path } => ("embed-file".to_owned(), path.clone()),
-        BlockContent::EmbeddedSymbol { symbol } => ("embed-symbol".to_owned(), symbol.clone()),
-        BlockContent::EmbeddedWorkflow { workflow } => {
-            ("embed-workflow".to_owned(), workflow.clone())
-        }
-        BlockContent::EmbeddedSkill { skill } => ("embed-skill".to_owned(), skill.clone()),
-    };
-    // Collapse to one line — the editor rail renders a block per row. The raw
-    // primary text rides alongside it so `e` can prefill the edit prompt with
-    // exactly what the block holds (and replace exactly that many characters);
-    // a structured/embed block has none, and the rail says so instead.
-    DocBlockView {
-        id: block.id.clone(),
-        kind,
-        text: text.replace('\n', " "),
-        editable: block.primary_text().map(str::to_owned),
-    }
-}
-
-/// Map a [`Suggestion`] into the review rail's [`DocSuggestionView`].
-fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
-    DocSuggestionView {
-        id: suggestion.id.clone(),
-        block_id: suggestion.block_id.clone(),
-        source_revision: suggestion.source_revision,
-        original: suggestion.original.clone(),
-        status: suggestion_status_label(suggestion.status).to_owned(),
-        author: document_author_label(&suggestion.author),
-        range: format!("{}..{}", suggestion.range_start, suggestion.range_end),
-        replacement: suggestion.replacement.clone(),
-        rationale: suggestion.rationale.clone(),
     }
 }
 
@@ -9322,35 +9074,6 @@ fn truncate_chars(text: &str, max: usize) -> String {
     } else {
         let kept: String = text.chars().take(max.saturating_sub(1)).collect();
         format!("{kept}\u{2026}")
-    }
-}
-
-fn collab_mode_label(mode: CollaborationMode) -> &'static str {
-    match mode {
-        CollaborationMode::Ask => "ask",
-        CollaborationMode::Suggest => "suggest",
-        CollaborationMode::Edit => "edit",
-        CollaborationMode::CoAuthor => "co-author",
-        CollaborationMode::Review => "review",
-        CollaborationMode::Maintain => "maintain",
-    }
-}
-
-fn suggestion_status_label(status: SuggestionStatus) -> &'static str {
-    match status {
-        SuggestionStatus::Pending => "pending",
-        SuggestionStatus::Accepted => "accepted",
-        SuggestionStatus::Rejected => "rejected",
-    }
-}
-
-/// A compact label for who authored a document mutation — an agent sentence
-/// names its serving model (the traceability triple's public face).
-fn document_author_label(author: &DocumentAuthor) -> String {
-    match author {
-        DocumentAuthor::Human { .. } => "human".to_owned(),
-        DocumentAuthor::Agent { model, .. } => format!("agent ({model})"),
-        DocumentAuthor::Integration { integration } => format!("integration ({integration})"),
     }
 }
 

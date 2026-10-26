@@ -61,6 +61,8 @@ Consolidated documentation:
 
 The backend owns intelligence and session state; all frontends are clients.
 
+Son of Anton uses this runtime for its primary Unix editor chat, participants, inline assistance, repository board and graph. Its versioned SDK and runtime build inputs are vendored with provenance, so normal IDE builds need no sibling checkout. Both native clients and the IDE can observe the same durable sessions without cancelling work when a client closes. See [shared runtime integration](docs/SHARED_RUNTIME.md) for the ownership boundary, compatibility and verification.
+
 ## Skills Studio
 
 Skills are first-class editable objects with metadata, tests, history, traces, and version promotion/deprecation.

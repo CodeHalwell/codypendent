@@ -655,6 +655,58 @@ impl DaemonClient {
 
     /// Cancel a run. This is a real `CancelRun` command — the UI never clears
     /// its own transcript and calls that a cancellation.
+    /// Read authenticated knowledge for the selected durable session. A
+    /// changed selection invalidates the result instead of displaying another
+    /// repository's page under the new heading.
+    pub async fn read_knowledge(
+        &self,
+        section: codypendent_protocol::knowledge::KnowledgeSection,
+    ) -> anyhow::Result<codypendent_protocol::knowledge::KnowledgePage> {
+        use codypendent_protocol::knowledge::KnowledgePage;
+        let session_id = (*self.attached.lock().await)
+            .context("Open a session before browsing its knowledge")?;
+        let mut offset = 0;
+        let mut result = KnowledgePage {
+            section,
+            skills: vec![],
+            memories: vec![],
+            learnings: vec![],
+            documents: vec![],
+            next_offset: None,
+            warnings: vec![],
+        };
+        loop {
+            let reply = self
+                .send_command(CommandBody::ReadKnowledge {
+                    session_id,
+                    section,
+                    offset,
+                    limit: 100,
+                })
+                .await?;
+            let page = match reply.payload {
+                Payload::KnowledgePage { page, .. } if page.section == section => page,
+                Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+                _ => bail!("Unexpected knowledge response; update the daemon and reconnect"),
+            };
+            if *self.attached.lock().await != Some(session_id) {
+                bail!("The selected session changed; refresh knowledge");
+            }
+            result.skills.extend(page.skills);
+            result.memories.extend(page.memories);
+            result.learnings.extend(page.learnings);
+            result.documents.extend(page.documents);
+            result.warnings.extend(page.warnings);
+            let Some(next) = page.next_offset else {
+                return Ok(result);
+            };
+            if next <= offset || next >= 10_000 {
+                bail!("Knowledge browsing reached its 10,000-item limit or made no progress; narrow the repository scope");
+            }
+            offset = next;
+        }
+    }
+
     pub async fn cancel_run(&self, run_id: RunId) -> anyhow::Result<()> {
         let reply = self.send_command(CommandBody::CancelRun { run_id }).await?;
         match reply.payload {
@@ -2549,6 +2601,100 @@ mod tests {
 
     fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("daemon.sock")
+    }
+
+    #[tokio::test]
+    async fn knowledge_reads_the_selected_session_and_collects_every_page() {
+        use codypendent_protocol::knowledge::{KnowledgePage, KnowledgeSection, SkillCard};
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).unwrap();
+        let session_id = SessionId::new();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello = read_envelope(&mut stream).await.unwrap().unwrap();
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(&hello, Payload::ServerHello(server_hello())),
+            )
+            .await
+            .unwrap();
+            for offset in [0, 1] {
+                let request = read_envelope(&mut stream).await.unwrap().unwrap();
+                let Payload::Command(command) = request.payload.clone() else {
+                    panic!("expected knowledge request");
+                };
+                assert!(
+                    matches!(command.body, CommandBody::ReadKnowledge { session_id: selected, section: KnowledgeSection::Skills, offset: requested, limit: 100 } if selected == session_id && requested == offset)
+                );
+                let page = KnowledgePage {
+                    section: KnowledgeSection::Skills,
+                    next_offset: (offset == 0).then_some(1),
+                    warnings: vec![],
+                    memories: vec![],
+                    learnings: vec![],
+                    documents: vec![],
+                    skills: vec![SkillCard {
+                        name: format!("skill-{offset}"),
+                        kind: "skill".into(),
+                        scope: "system".into(),
+                        trust: "first-party".into(),
+                        status: "active".into(),
+                        risk: "safe".into(),
+                        description: "shared projection".into(),
+                        permissions: vec![],
+                    }],
+                };
+                write_envelope(
+                    &mut stream,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::KnowledgePage {
+                            command_id: command.command_id,
+                            page: Box::new(page),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (client, _) = DaemonClient::connect(&path, None, Arc::new(Collector::default()))
+            .await
+            .unwrap();
+        *client.attached.lock().await = Some(session_id);
+        let page = client
+            .read_knowledge(KnowledgeSection::Skills)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.skills
+                .iter()
+                .map(|card| card.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill-0", "skill-1"]
+        );
+        server.await.unwrap();
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn knowledge_without_a_selected_session_fails_before_sending_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).unwrap();
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+        let (client, _) = DaemonClient::connect(&path, None, Arc::new(Collector::default()))
+            .await
+            .unwrap();
+        let error = client
+            .read_knowledge(codypendent_protocol::knowledge::KnowledgeSection::Memories)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Open a session"));
+        assert!(observed.commands.lock().unwrap().is_empty());
+        client.shutdown().await;
     }
 
     #[tokio::test]

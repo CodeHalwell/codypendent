@@ -1378,25 +1378,7 @@ impl RunView {
 /// `"filesystem_read: $REPOSITORY"`, `"command: cargo"`) — the exact strings the
 /// package declared, never a paraphrase — so the "skill permissions are visible"
 /// exit criterion holds at a glance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillCard {
-    /// The item's name (its registry identity within a scope).
-    pub name: String,
-    /// The kind label (`tool` / `skill` / `plugin` / `hook` / `command`).
-    pub kind: String,
-    /// The scope the item is installed at (e.g. `system`, `workspace …`).
-    pub scope: String,
-    /// The provenance trust tier (`untrusted` … `first-party`).
-    pub trust: String,
-    /// The lifecycle status (`draft` / `active` / `modified` / `deprecated`).
-    pub status: String,
-    /// The coarse risk class (`safe` / `low` / `medium` / `high`).
-    pub risk: String,
-    /// The item's description (untrusted content; shown, never trusted).
-    pub description: String,
-    /// The requested capabilities, one verbatim string per capability.
-    pub permissions: Vec<String>,
-}
+pub use codypendent_protocol::knowledge::SkillCard;
 
 /// A council browser row (rubric 6 TUI wiring): one persisted council
 /// definition projected for the `/council` browser. Self-contained — the CLI
@@ -1528,18 +1510,7 @@ pub struct MemoryCard {
 /// Safe projection of one governed learning. Provenance is reduced to a
 /// categorical label by the CLI; raw tool output, commands, paths, and URIs are
 /// intentionally absent from this presentation type.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LearningCard {
-    pub id: String,
-    pub statement: String,
-    pub kind: String,
-    pub state: String,
-    pub scope: String,
-    pub provenance: String,
-    pub confidence: f32,
-    pub pinned: bool,
-    pub revision: u64,
-}
+pub use codypendent_protocol::knowledge::LearningCard;
 
 /// A Docs Studio card (STEP 4.x client wiring): one [`KnowledgeDocument`]
 /// projected for the Docs browser's tree/editor/review rails. Self-contained —
@@ -1548,75 +1519,16 @@ pub struct LearningCard {
 /// pre-rendered human string so the renderer stays a pure projection.
 ///
 /// [`KnowledgeDocument`]: (mapped by the CLI from `codypendent-knowledge`)
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocCard {
-    /// The document's stable id — the key that correlates an incoming
-    /// [`DocumentSync`](codypendent_protocol::DocumentSync) (merged into the
-    /// client replica by the CLI harness) back to this card, and the target of an
-    /// edit's `MutateDocument`/`AcquireDocumentLease`.
-    pub document_id: DocumentId,
-    /// The document title (its heading in the tree).
-    pub title: String,
-    /// The scope the document lives in (e.g. `system`, `workspace …`).
-    pub scope: String,
-    /// The lifecycle status (`draft` / `in_review` / `published` / `archived`).
-    pub status: String,
-    /// The collaboration mode governing agent edits (`ask` / `suggest` / `edit`
-    /// / `co_author` / `review` / `maintain`) — org docs default to `suggest`.
-    pub mode: String,
-    /// The document's monotonic revision, pre-rendered (e.g. `"r7"`).
-    pub revision: String,
-    /// The rendered blocks (the editor rail), in document order.
-    pub blocks: Vec<DocBlockView>,
-    /// The pending suggestions on the document (the review rail).
-    pub suggestions: Vec<DocSuggestionView>,
-}
+pub use codypendent_protocol::knowledge::DocCard;
 
 /// One rendered document block (the editor rail). `text` is the block's primary
 /// text or a structured-block label — never the raw serialized content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocBlockView {
-    /// The block's stable id — the target an edit action leases and mutates (never
-    /// rendered; carried so the reducer can name the block without a second lookup).
-    pub id: String,
-    /// The block kind label (`heading` / `paragraph` / `code` / …).
-    pub kind: String,
-    /// A one-line human rendering of the block's content.
-    pub text: String,
-    /// The block's primary text VERBATIM (newlines included), or `None` for a
-    /// structured/embed block that has no single editable text container. This
-    /// is what the `e` prompt prefills and what its full-replace deletes — the
-    /// one-line `text` above is display-only and lossy.
-    pub editable: Option<String>,
-}
+pub use codypendent_protocol::knowledge::DocBlockView;
 
 /// One pending suggestion on a document (the review rail): a proposed
 /// replacement over a character range, with its author and rationale. Rendered
 /// read-only — accept/reject is a later live-transport concern.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocSuggestionView {
-    /// The suggestion's stable id — the target of an accept/reject
-    /// `MutateDocument` (never rendered; carried so the reducer can resolve the
-    /// focused suggestion without a second lookup).
-    pub id: String,
-    /// Stable block the proposal targets.
-    pub block_id: String,
-    /// Document revision the proposer reviewed. Accepting a stale proposal is
-    /// refused by the daemon; surfacing it here lets review UI explain why.
-    pub source_revision: u64,
-    /// The suggestion status (`pending` for the review rail).
-    pub status: String,
-    /// Who proposed it, pre-rendered (e.g. `"agent"` / `"human"`).
-    pub author: String,
-    /// The character range it targets, pre-rendered (e.g. `"12..40"`).
-    pub range: String,
-    /// The exact source text the proposer intends to replace.
-    pub original: String,
-    /// The proposed replacement text.
-    pub replacement: String,
-    /// The proposer's rationale, when given.
-    pub rationale: Option<String>,
-}
+pub use codypendent_protocol::knowledge::DocSuggestionView;
 
 /// Which rail of the Docs Studio overlay the keyboard drives (Phase 4 client
 /// wiring). Defaults to [`DocFocus::Tree`] so the overlay opens on the document

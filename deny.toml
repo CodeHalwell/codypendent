@@ -25,6 +25,7 @@ ignore = [
     { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained — transitive via loro/im; no safe upgrade available" },
     { id = "RUSTSEC-2026-0248", reason = "im unmaintained — transitive via loro; no safe upgrade available" },
     { id = "RUSTSEC-2026-0251", reason = "sized-chunks unmaintained — transitive via loro/im; no safe upgrade available" },
+    { id = "RUSTSEC-2024-0449", reason = "Reviewed 2026-10-26: unsafe-libyaml is unmaintained, not a reported vulnerability; transitive via serde_yaml, whose compatible serde_yaml_ng replacement still uses it. No safe compatible upgrade exists; revisit with a separately validated YAML parser migration." },
 ]
 
 [licenses]

@@ -37,6 +37,10 @@
     ],
     "shortDescription": "Codypendent desktop client",
     "longDescription": "Desktop client for the Codypendent daemon. Connects to a local codypendentd over its Unix domain socket; it never executes tools itself.",
+    "resources": {
+      "../../../LICENSE": "licenses/CODYPENDENT_LICENSE",
+      "../../../third_party/tantivy-sstable/LICENSE": "licenses/TANTIVY_SSTABLE_LICENSE"
+    },
     "linux": {
       "deb": {
         "depends": [

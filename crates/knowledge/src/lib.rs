@@ -14,6 +14,7 @@
 
 pub mod adapter;
 pub mod builtin;
+pub mod client_views;
 pub mod codegraph;
 pub mod context;
 pub mod db;

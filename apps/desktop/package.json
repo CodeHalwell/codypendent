@@ -12,7 +12,8 @@
     "tauri:build": "tauri build -f app",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "perf": "vitest run --config vitest.perf.config.ts"
+    "perf": "vitest run --config vitest.perf.config.ts",
+    "test:native": "node test/native-smoke.mjs"
   },
   "dependencies": {
     "@codypendent/protocol": "file:../../sdk/protocol",

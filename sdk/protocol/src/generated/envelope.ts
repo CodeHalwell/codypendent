@@ -5,6 +5,11 @@
 
 type Payload =
   | {
+      command_id: string;
+      page: KnowledgePage;
+      type: "KnowledgePage";
+    }
+  | {
       type: "Ping";
     }
   | {
@@ -546,10 +551,33 @@ type Payload =
   | {
       type: "Unknown";
     };
+type KnowledgeSection =
+  | {
+      type: "Skills";
+    }
+  | {
+      type: "Memories";
+    }
+  | {
+      type: "Learnings";
+    }
+  | {
+      type: "Documents";
+    }
+  | {
+      type: "Unknown";
+    };
 /**
  * The specific change a command requests. A wire enum: internally tagged with an [`CommandBody::Unknown`] fallback so a command from a newer client deserializes and is rejected structurally rather than crashing the peer.
  */
 type CommandBody =
+  | {
+      limit?: number;
+      offset?: number;
+      section: KnowledgeSection;
+      session_id: string;
+      type: "ReadKnowledge";
+    }
   | {
       allow_unsigned?: boolean;
       artifact_base64: string;
@@ -3194,6 +3222,106 @@ export interface Envelope {
   sequence?: number | null;
   session_id?: string | null;
   workspace_id?: string | null;
+}
+interface KnowledgePage {
+  documents?: DocCard[];
+  learnings?: LearningCard[];
+  memories?: MemoryCard[];
+  next_offset?: number | null;
+  section: KnowledgeSection;
+  skills?: SkillCard[];
+  warnings?: string[];
+}
+/**
+ * `crates/tui/src/state.rs` `DocCard`.
+ */
+interface DocCard {
+  blocks: DocBlockView[];
+  document_id: string;
+  mode: string;
+  /**
+   * Pre-rendered, e.g. `"r7"`.
+   */
+  revision: string;
+  scope: string;
+  status: string;
+  suggestions: DocSuggestionView[];
+  title: string;
+}
+/**
+ * `crates/tui/src/state.rs` `DocBlockView`.
+ */
+interface DocBlockView {
+  /**
+   * The block's primary text verbatim, or `None` for a structured block with no single editable container.
+   */
+  editable?: string | null;
+  id: string;
+  kind: string;
+  /**
+   * A one-line, lossy display rendering.
+   */
+  text: string;
+}
+/**
+ * `crates/tui/src/state.rs` `DocSuggestionView`.
+ */
+interface DocSuggestionView {
+  author: string;
+  block_id: string;
+  id: string;
+  original: string;
+  range: string;
+  rationale?: string | null;
+  replacement: string;
+  source_revision: number;
+  status: string;
+}
+/**
+ * `crates/tui/src/state.rs` `LearningCard`.
+ */
+interface LearningCard {
+  confidence: number;
+  id: string;
+  kind: string;
+  pinned: boolean;
+  provenance: string;
+  revision: number;
+  scope: string;
+  state: string;
+  statement: string;
+}
+/**
+ * `crates/tui/src/state.rs` `MemoryCard`, plus the memory's id so the desktop can address `CorrectMemory`/`ForgetMemory` at it.
+ */
+interface MemoryCard {
+  class: string;
+  confidence: number;
+  id: string;
+  /**
+   * A date string, exactly as the store rendered it.
+   */
+  observed: string;
+  revision: string;
+  scope: string;
+  /**
+   * The human-readable evidence source; "(no evidence)" when there is none.
+   */
+  source: string;
+  statement: string;
+}
+/**
+ * `crates/tui/src/state.rs` `SkillCard`. `permissions` are verbatim strings.
+ */
+interface SkillCard {
+  description: string;
+  kind: string;
+  name: string;
+  permissions: string[];
+  risk: string;
+  scope: string;
+  status: string;
+  trust: string;
 }
 interface ProtocolVersion {
   major: number;

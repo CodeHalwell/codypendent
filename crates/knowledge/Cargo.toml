@@ -48,6 +48,7 @@ tokio = { workspace = true }
 url = "2.5"
 
 [dev-dependencies]
+tantivy-sstable = "0.3"
 tempfile = { workspace = true }
 criterion = { workspace = true }
 # Assembles the WebAssembly text fixture the end-to-end skill-module test runs.
