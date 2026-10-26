@@ -13,9 +13,21 @@
 //!   that is not a repository (or is `$HOME`) can never reach the indexer.
 
 #[cfg(feature = "app")]
+mod artifacts;
+#[cfg(feature = "app")]
 pub mod bridge;
 pub mod council;
 pub mod daemon;
+#[cfg(feature = "app")]
+pub mod desktop_tools;
+#[cfg(feature = "app")]
+pub mod environment;
+#[cfg(feature = "app")]
+mod native_menu;
+#[cfg(feature = "app")]
+pub mod python_sandbox;
+#[cfg(feature = "app")]
+mod sandbox;
 // Starting `codypendentd` when nothing is listening: the CLI's `ensure_daemon`
 // for a shell whose own binary is not `codypendent`.
 pub mod knowledge;

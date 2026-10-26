@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * Remote UI plugins — the TUI's `Overlay::UiPlugins` and its four confirms.
  *
@@ -104,12 +105,12 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
   };
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Remote UI plugins</div>
+          <h1 style={surfaceStyles.title}>Extensions</h1>
           <div style={surfaceStyles.subtitle}>
-            Host-owned trust controls. A plugin never draws its own.
+            Add capabilities to Codypendent and review what each extension can access.
           </div>
         </div>
         {onRefresh && (
@@ -119,7 +120,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
         )}
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         {notice && (
           <div role="status" style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}>
             {notice}
@@ -186,6 +187,8 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
         )}
 
         <SurfaceBody
+          emptyTitle="Make Codypendent your own"
+          onRetry={onRefresh}
           status={plugins.status}
           detail={plugins.detail}
           count={plugins.items.length}
@@ -305,6 +308,6 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
           })}
         </SurfaceBody>
       </div>
-    </div>
+    </PageShell>
   );
 };

@@ -1909,8 +1909,16 @@
     "CodeGraphQuery": {
       "description": "The filter `graph show` applies. Every field narrows; absent fields do not.\n\n**Scoping is not one of these fields.** The repository is carried by the command, resolved by the daemon from a filesystem path with its own single source of truth, and applied to every branch of this query — including [`node_id`](Self::node_id). There is no way to spell \"some other checkout\" here.",
       "properties": {
+        "connected_view": {
+          "description": "An unfiltered visual overview follows one recorded connected neighbourhood, including endpoint metadata.",
+          "type": "boolean"
+        },
         "include_edges": {
           "description": "Include the edges incident to the selected nodes — **every** node the filter selects, not only the ones this page of nodes happens to show. The two row kinds are paged independently (see [`limit`](Self::limit)), so an edge between two nodes that both fall past the node page is still returned and still counted.",
+          "type": "boolean"
+        },
+        "include_neighbors": {
+          "description": "Return metadata for endpoints of the returned edges in `related_nodes`, separately from the matching node page and its total. At most twice the edge limit can be returned; other query filters still select the main page.",
           "type": "boolean"
         },
         "include_nodes": {

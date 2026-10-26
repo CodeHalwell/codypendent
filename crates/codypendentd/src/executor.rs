@@ -42,7 +42,8 @@ use codypendent_daemon::worktrees::{ReleaseOutcome, WorktreeError, WorktreeManag
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::acp::PermissionOption;
 use codypendent_integrations::acp_client::{
-    forwardable_mcp_servers, AcpClient, AcpEventSink, AcpSessionOptions, AcpStopReason,
+    forwardable_mcp_servers, AcpClient, AcpEventSink, AcpMcpServer, AcpSessionOptions,
+    AcpStopReason,
 };
 use codypendent_integrations::acp_registry::{agent_model_from_coordinate, AcpRegistryStore};
 use codypendent_integrations::github::{GitHubApi, RepoId};
@@ -80,6 +81,8 @@ use crate::routing::{
     derive_run_classification, estimate_input_tokens, RoutingConfig, RoutingCoordinator,
 };
 use crate::scan;
+#[path = "executor_graph.rs"]
+mod graph_readiness;
 use crate::session_history::{context_turn, continuation_prior, CONTEXT_PSEUDO_TOOL};
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
 use crate::workflows::{AssemblyWorkflowQuery, WorkflowConductorHost, WorkflowRunReader};
@@ -646,9 +649,7 @@ impl RuntimeExecutor {
         self
     }
 
-    /// Warm `repository`'s code graph when this daemon has no fold of its
-    /// CURRENT revision, so [`emit_context`](Self::emit_context) opens with the
-    /// right repository map.
+    /// Warm the current revision in the background for graph traversal tools.
     ///
     /// The gate is the checkout's `HEAD`, not a once-per-boot flag: a daemon
     /// lives for days across branch switches and pulls, and a bare flag pinned
@@ -1093,15 +1094,18 @@ impl RuntimeExecutor {
         runtime = runtime
             .with_mcp_top_k(self.retrieval.mcp_top_k)
             .with_builtin_top_k(self.retrieval.builtin_top_k)
-            .with_registry_search(Arc::new(PoolRegistrySearch::new(
+            .with_semantic_embedder(self.embedder.clone())
+            .with_registry_search(Arc::new(
+                PoolRegistrySearch::new(self.pool.clone(), self.embedder.clone()).with_mcp_catalog(
+                    self.mcp
+                        .clone()
+                        .filter(|_| mode_overlay(launch.mode).command_allowed),
+                ),
+            ))
+            .with_code_graph(Arc::new(graph_readiness::ReadyCodeGraph::new(
                 self.pool.clone(),
-                self.embedder.clone(),
+                self.scanned.clone(),
             )))
-            // Outcome 5: the `graph.*` tools. A pure read of the derived graph
-            // this daemon's own scan wrote, so it is wired unconditionally like
-            // the registry search above; a repository with no folded graph
-            // simply answers "no results".
-            .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())))
             // The agent lever on the same graph (`graph.assert_edge`): a run can
             // record a relation the parser cannot see. Wired beside the read
             // seam and over the same pool, so an assertion lands under the id
@@ -1382,6 +1386,7 @@ impl RuntimeExecutor {
             if let Some(agent_id) = registry.acp_agent_id(id) {
                 match acp.launch_spec(agent_id) {
                     Ok(_) => return Ok(id.clone()),
+                    Err(_) if acp.can_prepare_launch(agent_id) => return Ok(id.clone()),
                     // An external agent's refusal is not a `ModelsError`, so it
                     // contributes a reason and no classification.
                     Err(error) => {
@@ -1419,9 +1424,18 @@ impl RuntimeExecutor {
         token: CancellationToken,
     ) -> Result<(), String> {
         let store = AcpRegistryStore::new(&self.paths.data_dir);
-        let launch_spec = store
-            .launch_spec(registry_agent_id)
-            .map_err(|error| format!("ACP agent `{registry_agent_id}` is unavailable: {error}"))?;
+        let mut launch_spec = tokio::select! {
+            result = store.prepare_launch(registry_agent_id) => result
+                .map_err(|error| format!("ACP agent `{registry_agent_id}` is unavailable: {error}"))?,
+            _ = token.cancelled() => {
+                self.finish_acp_run(launch, model_id, None, AcpRunCompletion {
+                    state: RunState::Cancelled,
+                    disposition: RunDisposition::Cancelled { reason: Some("run cancelled while preparing the agent".into()) },
+                    summary: None, changed_files: Vec::new(),
+                }).await?;
+                return Ok(());
+            }
+        };
 
         let manager = WorktreeManager::new();
         let binding = bind_run_worktree(
@@ -1461,7 +1475,7 @@ impl RuntimeExecutor {
             self.finish_acp_run(
                 launch,
                 model_id,
-                &launch_spec,
+                Some(&launch_spec),
                 AcpRunCompletion {
                     state: RunState::Cancelled,
                     disposition: RunDisposition::Cancelled {
@@ -1478,22 +1492,135 @@ impl RuntimeExecutor {
         self.transition_acp(launch.session_id, launch.run_id, RunState::Preparing)
             .await?;
 
-        let command = launch_spec.command.to_string_lossy().into_owned();
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: launch.run_id,
+            model: model_id.clone(),
+        };
+        let desktop = codypendent_runtime::desktop_tools::DesktopTools::resolve()?;
+        let mut mcp_servers = forwardable_mcp_servers(&self.paths.global_mcp_path());
+        let desktop_mcp = {
+            let runtime = FrameworkAgentRuntime::new(
+                ModelRegistry::new(Vec::new()),
+                self.load_run_policy(&launch.repository)?,
+                self.approvals.clone(),
+                self.subscriptions.clone(),
+                self.journal(),
+                self.sink(self.artifacts()),
+            )
+            .with_desktop_tools(desktop.clone())
+            .with_registry_search(Arc::new(PoolRegistrySearch::new(
+                self.pool.clone(),
+                self.embedder.clone(),
+            )))
+            .with_code_graph(Arc::new(graph_readiness::ReadyCodeGraph::new(
+                self.pool.clone(),
+                self.scanned.clone(),
+            )))
+            .with_code_graph_assertions(Arc::new(
+                crate::graph_assertions::PoolCodeGraphAssertions::new(self.pool.clone()),
+            ))
+            .with_docs(Arc::new(crate::docs_channel::AssemblyDocsChannel::new(
+                self.pool.clone(),
+                self.startup_repository_root.clone(),
+            )))
+            .with_workflow_query(Arc::new(AssemblyWorkflowQuery::new(self.pool.clone())))
+            .with_workflow_control(Arc::new(self.workflow_host.clone()))
+            .with_task_board(Arc::new(AssemblyTaskBoardChannel::new(
+                self.pool.clone(),
+                self.blackboards.clone(),
+            )))
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())))
+            .with_questions(Arc::new(PoolQuestionChannel {
+                pool: self.pool.clone(),
+                broker: self.questions.clone(),
+            }))
+            .with_plan_bridge(Arc::new(PoolPlanBridge::new(
+                self.pool.clone(),
+                self.subscriptions.clone(),
+            )));
+            let context = RunContext::new(
+                launch.session_id,
+                launch.run_id,
+                launch.objective.clone(),
+                launch.mode,
+                &operating_tree,
+                &operating_tree,
+            )
+            .with_repository_identity(launch.repository.to_string_lossy().into_owned());
+            let server = codypendent_runtime::desktop_mcp::DesktopMcpServer::start(
+                runtime,
+                desktop.clone(),
+                context,
+                run_actor.clone(),
+                token.clone(),
+            )?;
+            let current = std::env::current_exe().map_err(|error| error.to_string())?;
+            let program =
+                if current.file_stem().and_then(|name| name.to_str()) == Some("codypendent") {
+                    current
+                } else {
+                    current
+                        .parent()
+                        .ok_or("desktop.mcp_cli_unavailable")?
+                        .join("codypendent")
+                };
+            if !program.is_file() {
+                return Err(
+                    "desktop.mcp_cli_unavailable: matching CLI must be beside the daemon".into(),
+                );
+            }
+            mcp_servers.push(AcpMcpServer {
+                name: "codypendent-desktop".into(),
+                command: program.to_string_lossy().into_owned(),
+                args: vec![
+                    "__desktop_tools_mcp".into(),
+                    "--socket".into(),
+                    server.socket().to_string_lossy().into_owned(),
+                ],
+            });
+            Some(server)
+        };
         // The external agent inherits the same operator-declared MCP servers a
         // native run is offered, so delegating a run does not silently shrink
         // the tool surface. Launch specs only — never the operator's `env`
         // pairs (see `forwardable_mcp_servers`).
-        let mut client = AcpClient::spawn_with(
-            &command,
-            &launch_spec.args,
-            &launch_spec.env,
-            operating_tree.to_string_lossy().as_ref(),
-            AcpSessionOptions {
-                mcp_servers: forwardable_mcp_servers(&self.paths.global_mcp_path()),
-            },
-        )
-        .await
-        .map_err(|error| format!("could not start ACP agent `{registry_agent_id}`: {error}"))?;
+        let cwd = operating_tree.to_string_lossy().into_owned();
+        let mut session_options = AcpSessionOptions::for_agent(&launch_spec);
+        session_options.mcp_servers = mcp_servers;
+        let connection = tokio::select! {
+            result = AcpClient::spawn_with_google_recovery(
+                &launch_spec,
+                registry_agent_id,
+                &self.paths.data_dir,
+                &cwd,
+                session_options,
+            ) => result.map_err(|error| format!("could not start ACP agent `{registry_agent_id}`: {error}"))?,
+            _ = token.cancelled() => {
+                self.finish_acp_run(
+                    launch,
+                    model_id,
+                    Some(&launch_spec),
+                    AcpRunCompletion {
+                        state: RunState::Cancelled,
+                        disposition: RunDisposition::Cancelled {
+                            reason: Some("run cancelled while connecting to the agent".to_string()),
+                        },
+                        summary: None,
+                        changed_files: Vec::new(),
+                    },
+                ).await?;
+                guard.release().await;
+                return Ok(());
+            }
+        };
+        let mut client = connection.client;
+        let recovered_model = connection.selected_model;
+        launch_spec = connection.spec;
+        let effective_coordinate = recovered_model
+            .as_ref()
+            .map(|model| format!("{}#{model}", launch_spec.registry_id));
+        let registry_agent_id = effective_coordinate.as_deref().unwrap_or(registry_agent_id);
         // A profile pinned to one of the agent's own models (`…#model`) selects
         // it for this session BEFORE the turn starts. A failure here is fatal:
         // silently running the agent's default model would attribute the run to
@@ -1503,23 +1630,37 @@ impl RuntimeExecutor {
                 format!("ACP agent `{registry_agent_id}` could not select model `{model}`: {error}")
             })?;
         }
+        if let Some(model) = recovered_model {
+            let name = client
+                .discovered_models()
+                .into_iter()
+                .find(|listed| listed.id == model)
+                .map_or(model, |listed| listed.name);
+            self.emit_note(
+                launch.session_id,
+                launch.run_id,
+                format!("Google moved this Gemini sign-in to Antigravity. Using {name}."),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
         self.transition_acp(launch.session_id, launch.run_id, RunState::Running)
             .await?;
 
         let mut prior = convert_launch_prior(&launch.prior);
         prior.extend(reconstructed_prior);
-        let objective = render_acp_prompt(&prior, &launch.objective);
+        let mut objective = render_acp_prompt(&prior, &launch.objective);
+        if let Some(server) = &desktop_mcp {
+            objective.push_str("\n\nCodypendent application instructions:\n");
+            objective.push_str(server.instructions());
+        }
         let mut sink = AcpRunSink {
             pool: self.pool.clone(),
             subscriptions: self.subscriptions.clone(),
             approvals: self.approvals.clone(),
             session_id: launch.session_id,
             run_id: launch.run_id,
-            actor: Actor::Agent {
-                agent_id: AgentId::new(),
-                run_id: launch.run_id,
-                model: model_id.clone(),
-            },
+            actor: run_actor,
             registry_agent_id: registry_agent_id.to_string(),
             cancellation: token.clone(),
             assistant_text: String::new(),
@@ -1622,7 +1763,7 @@ impl RuntimeExecutor {
         self.finish_acp_run(
             launch,
             model_id,
-            &launch_spec,
+            Some(&launch_spec),
             AcpRunCompletion {
                 state,
                 disposition,
@@ -1659,16 +1800,16 @@ impl RuntimeExecutor {
         &self,
         launch: &RunLaunch,
         model_id: &ModelId,
-        agent: &codypendent_integrations::acp_registry::AcpLaunchSpec,
+        agent: Option<&codypendent_integrations::acp_registry::AcpLaunchSpec>,
         completion: AcpRunCompletion,
     ) -> Result<(), String> {
         let chronicle = serde_json::json!({
             "objective": launch.objective,
             "runtime": {
                 "protocol": "acp",
-                "agent": agent.registry_id,
-                "agentName": agent.name,
-                "agentVersion": agent.version,
+                "agent": agent.map(|agent| &agent.registry_id),
+                "agentName": agent.map(|agent| &agent.name),
+                "agentVersion": agent.map(|agent| &agent.version),
                 "profile": model_id,
             },
             "summary": completion.summary,
@@ -2619,7 +2760,11 @@ impl AcpRunSink {
 impl AcpEventSink for AcpRunSink {
     async fn on_event(&mut self, event: EventBody) {
         match &event {
-            EventBody::ModelStreamDelta { text, .. } => {
+            EventBody::ModelStreamDelta {
+                text,
+                thought: false,
+                ..
+            } => {
                 if self.assistant_text.len() < 2 * 1024 * 1024 {
                     let remaining = 2 * 1024 * 1024 - self.assistant_text.len();
                     self.assistant_text.push_str(&bounded_text(text, remaining));
@@ -2966,15 +3111,7 @@ impl RuntimeExecutor {
             // daemon attributes its context map and curated memories correctly.
             let repository = scan::repository_id_for(&launch.repository);
 
-            // Register a cancellation handle BEFORE the loop starts, so a
-            // `CancelRun` accepted at any point after this run was launched can
-            // stop it. The token drives `execute`; the handle stays in the shared
-            // registry for `cancel_run` to fire.
-            // Warm this repository's code graph the first time the daemon serves a
-            // run for it, so the context below opens with the right repository map.
-            executor
-                .ensure_scanned(repository, &launch.repository)
-                .await;
+            executor.ensure_repository_scanned(launch.repository.clone());
 
             // Build the run's seed transcript ONCE (continuous-session plan,
             // Task 3 + 2026-08-11 review item 1): it reconstructs the
@@ -3295,11 +3432,6 @@ impl RunExecutor for RuntimeExecutor {
     }
 
     fn ensure_repository_scanned(&self, root: PathBuf) {
-        // Fire-and-forget, exactly like `spawn_run`: the server must never await
-        // this. Reuses `Self::ensure_scanned` — the SAME guarded warm-up
-        // `spawn_run` calls before a run's context opens — so a repository
-        // opened here and later run against is scanned at most once either way,
-        // and a repository already warmed by a run is not re-scanned on open.
         let executor = self.clone();
         tokio::spawn(async move {
             let repository = scan::repository_id_for(&root);
@@ -4061,6 +4193,61 @@ fn acp_failure(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn acp_summary_excludes_thoughts_but_preserves_their_flagged_events() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (pool, _artifacts) = test_pool(temporary.path()).await;
+        let (session_id, run_id) = seed_run_in_state(&pool, "Running").await;
+        let mut sink = AcpRunSink {
+            pool: pool.clone(),
+            subscriptions: SubscriptionHub::new(),
+            approvals: ApprovalBroker::new(),
+            session_id,
+            run_id,
+            actor: Actor::System,
+            registry_agent_id: "opencode".to_string(),
+            cancellation: CancellationToken::never(),
+            assistant_text: String::new(),
+            tools: Vec::new(),
+            failure: None,
+        };
+        sink.on_event(EventBody::ModelStreamDelta {
+            run_id,
+            text: "Internal planning text.".to_string(),
+            thought: true,
+        })
+        .await;
+        assert!(sink.assistant_text.is_empty());
+        sink.on_event(EventBody::ModelStreamDelta {
+            run_id,
+            text: "The interactive card is ready.".to_string(),
+            thought: false,
+        })
+        .await;
+        sink.on_event(EventBody::ModelStreamDelta {
+            run_id,
+            text: "Internal follow-up text.".to_string(),
+            thought: true,
+        })
+        .await;
+        assert!(sink.failure.is_none());
+        assert_eq!(
+            last_nonempty_line(&sink.assistant_text),
+            Some("The interactive card is ready.".to_string())
+        );
+        let events = ledger::load_events(&pool, session_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.body,
+                    EventBody::ModelStreamDelta { thought: true, .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
     /// Seed a session + a `runs` row in the given state (PascalCase, as the
     /// projections store it), returning the run id.
     async fn seed_run_in_state(pool: &SqlitePool, state: &str) -> (SessionId, RunId) {
@@ -4712,6 +4899,67 @@ mod tests {
         assert!(!control.starting.contains(&run_id));
         assert!(control.live.contains_key(&run_id));
         assert!(control.pending_pauses.contains(&run_id));
+    }
+
+    #[tokio::test]
+    async fn ask_run_does_not_wait_for_repository_indexing() {
+        use codypendent_knowledge::codegraph::{CodeGraphQueries, GraphQuestion};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().join("data"));
+        paths.ensure_directories().unwrap();
+        let (pool, _) = test_pool(&paths.data_dir).await;
+        let repo = init_git_repo(dir.path());
+        std::fs::write(
+            repo.join("calls.rs"),
+            "fn target() {}\nfn caller() { target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(paths.data_dir.join("models.toml"), "invalid = [").unwrap();
+        let repository = scan::repository_id_for(&repo);
+        let executor = RuntimeExecutor::new(pool.clone(), paths, repository, repo.clone());
+        let graph = graph_readiness::ReadyCodeGraph::new(pool.clone(), executor.scanned.clone());
+        let question = GraphQuestion::CallersOf {
+            symbol: "target".to_string(),
+        };
+        let guard = scan::lock_repository(repository).await;
+        let reason = graph.ask(&repo, question.clone()).await.unwrap_err();
+        assert!(reason.contains("not finished indexing") && reason.contains("workspace.search"));
+
+        let (session_id, run_id) = seed_run_in_state(&pool, "Queued").await;
+        executor.spawn_run(RunLaunch {
+            session_id,
+            run_id,
+            objective: "Find a skill for this task".to_string(),
+            mode: AgentMode::Ask,
+            repository: repo.clone(),
+            model: None,
+            prior: Vec::new(),
+        });
+        wait_for_failed_run_cleanup(&executor, run_id).await;
+        assert!(!executor.scanned.lock().unwrap().contains_key(&repository));
+
+        drop(guard);
+        executor.ensure_scanned(repository, &repo).await;
+        let answer = graph.ask(&repo, question).await.unwrap();
+        assert!(answer
+            .hits
+            .iter()
+            .any(|hit| hit.qualified_name.ends_with("caller")));
+        executor
+            .scanned
+            .lock()
+            .unwrap()
+            .insert(repository, GitRevision("outdated".to_string()));
+        assert!(graph
+            .ask(
+                &repo,
+                GraphQuestion::CallersOf {
+                    symbol: "target".to_string()
+                }
+            )
+            .await
+            .is_err());
     }
 
     /// 2026-08-11 review, "graph staleness": `ensure_scanned` gated on a bare
@@ -6943,7 +7191,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
     /// `NoteAppended` trace event only and this transcript carried nothing but
     /// the objective.
     #[tokio::test]
-    async fn first_run_seed_reaches_the_model_driver_with_repo_map_and_skill_card() {
+    async fn first_run_seed_reaches_the_model_driver_with_graph_tools_and_skill_card() {
         use codypendent_knowledge::{codegraph, register_builtins, GitRevision, Registry};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6958,9 +7206,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         let executor =
             RuntimeExecutor::new(pool.clone(), paths, repository, repo.path().to_path_buf());
 
-        // Seed all three manifest surfaces: builtins (tool cards), a real code
-        // graph (repository map), and an ACTIVE repository-scoped skill
-        // (skill card) registered through the real package path.
+        // Seed graph data to prove context carries traversal guidance without symbols.
         register_builtins(&pool).await.expect("register builtins");
         codegraph::upsert_file_graph(
             &pool,
@@ -7020,8 +7266,8 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             Some(TurnItem::ToolResult { tool, output, .. }) => {
                 assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
                 assert!(
-                    output.contains("=== REPOSITORY MAP ===") && output.contains("Engine"),
-                    "the seed turn must carry the repository map: {output}"
+                    output.contains("graph.find_symbols") && !output.contains("Engine"),
+                    "the seed must disclose graph traversal without graph contents: {output}"
                 );
                 assert!(
                     output.contains("test.fix-flaky-ci"),
@@ -7070,11 +7316,11 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
                 first.first(),
                 Some(TurnItem::ToolResult { tool, output, .. })
                     if tool == CONTEXT_PSEUDO_TOOL
-                        && output.contains("=== REPOSITORY MAP ===")
-                        && output.contains("Engine")
+                        && output.contains("graph.find_symbols")
+                        && !output.contains("Engine")
                         && output.contains("test.fix-flaky-ci")
             ),
-            "the DRIVER must receive the repo map + skill card in its transcript, got head: {:?}",
+            "the DRIVER must receive graph tool guidance + skill card, got head: {:?}",
             first.first()
         );
         assert!(
@@ -7156,7 +7402,9 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             Some(TurnItem::ToolResult { tool, output, .. }) => {
                 assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
                 assert!(
-                    output.contains("pkg engine") && output.contains("test.fix-flaky-ci"),
+                    !output.contains("pkg engine")
+                        && output.contains("graph.find_symbols")
+                        && output.contains("test.fix-flaky-ci"),
                     "the stored manifest content must re-enter the seed: {output}"
                 );
             }

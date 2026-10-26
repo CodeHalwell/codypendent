@@ -1,303 +1,99 @@
-import React, { useState } from "react";
+import { PageShell } from "./PageShell.js";
+import React, { useRef, useState } from "react";
+import { ArrowLeft, Crown, Plus, UsersRound, X } from "lucide-react";
+import { modelLabel } from "../modelPresentation.js";
+import { newCouncilDraft } from "../useCouncilRun.js";
+import { CouncilParticipants, councilKey, councilTitle } from "./CouncilParticipants.js";
 import type { CouncilCard, CouncilDraft, CouncilMemberRow } from "../localConfig.js";
+import "./Councils.css";
 
-/**
- * Building a new council.
- *
- * Deliberately collects exactly what the TUI's wizard collects — name,
- * description, chair, rounds, members — and nothing more. The TUI has no quorum
- * step and no evidence step, and passes `quorum: None, evidence: false`; adding
- * either here would invent a control the rest of the product does not have.
- *
- * **Validation is not duplicated here.** The council crate owns it: the name
- * charset (it becomes a directory under `<data>/councils/`), the 2..=N member
- * bound, unique member models, and — the one that catches people — every member
- * model AND the chair having to already exist in `models.toml`. Those refusals
- * are shown verbatim, so the desktop cannot accept a council the TUI would
- * reject, or reject one it would accept. The only checks made locally are the
- * ones needed to keep the form from submitting something obviously incomplete.
- */
 export interface CouncilBuilderProps {
   onCreate: (draft: CouncilDraft) => Promise<CouncilCard>;
   onCancel?: () => void;
-  /** Called once a council was actually persisted. */
   onCreated?: (council: CouncilCard) => void;
-  /**
-   * Model ids that are configured, when the caller knows them, so the form can
-   * offer them as suggestions. Absent means we do not know — the field stays
-   * free text and the crate's refusal is the authority either way.
-   */
   configuredModels?: string[];
+  onOpenModels?: () => void;
+  draft?: CouncilDraft;
+  onDraftChange?: (draft: CouncilDraft) => void;
 }
-
-export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
-  onCreate,
-  onCancel,
-  onCreated,
-  configuredModels,
-}) => {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [chair, setChair] = useState("");
-  const [rounds, setRounds] = useState(1);
-  const [members, setMembers] = useState<CouncilMemberRow[]>([
-    { model: "", role: "member" },
-    { model: "", role: "member" },
-  ]);
+export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({ onCreate, onCancel, onCreated, configuredModels, onOpenModels, draft, onDraftChange }) => {
+  const [localDraft, setLocalDraft] = useState(newCouncilDraft);
+  const { name, description, chair, rounds, members } = draft ?? localDraft;
+  const updateDraft = (patch: Partial<CouncilDraft>) => {
+    const next = { ...(draft ?? localDraft), ...patch };
+    if (onDraftChange) onDraftChange(next);
+    else setLocalDraft(next);
+  };
   const [refusal, setRefusal] = useState<string | null>(null);
   const [created, setCreated] = useState<CouncilCard | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const updateMember = (index: number, patch: Partial<CouncilMemberRow>) => {
-    setMembers((current) =>
-      current.map((member, position) => (position === index ? { ...member, ...patch } : member)),
-    );
-  };
-
-  const filled = members.filter((member) => member.model.trim().length > 0);
-  // Only the checks that stop an obviously incomplete submission. Everything
-  // else — including whether these models exist — is the crate's to answer.
-  const submittable =
-    name.trim().length > 0 && chair.trim().length > 0 && filled.length >= 2 && !busy;
-  // The FIRST unmet condition, so a disabled Create button explains itself
-  // instead of leaving the operator to diff the form against the rules.
-  const blockedBecause = busy
-    ? null
-    : name.trim().length === 0
-      ? "a name is required"
-      : filled.length < 2
-        ? `at least two members need a model (${filled.length} of 2 so far)`
-        : chair.trim().length === 0
-          ? "a chair model is required"
-          : null;
-
+  const busyRef = useRef(false);
+  const updateMember = (index: number, patch: Partial<CouncilMemberRow>) => updateDraft({ members: members.map((member, position) => position === index ? { ...member, ...patch } : member) });
+  const filled = members.filter((member) => member.model.trim());
+  const key = councilKey(name);
+  const duplicate = new Set(filled.map((member) => member.model.trim())).size !== filled.length;
+  const blockedBecause = !key ? "Give your council a name." : filled.length < 2 ? "Choose at least two models to contribute."
+    : duplicate ? "Choose a different model for each perspective." : !chair.trim() ? "Choose a chair to bring the answers together." : null;
+  const submittable = !blockedBecause && !busy && !created;
   const submit = async () => {
-    setRefusal(null);
-    setCreated(null);
-    setBusy(true);
+    if (!submittable || busyRef.current) return;
+    busyRef.current = true; setBusy(true); setRefusal(null);
     try {
-      const council = await onCreate({
-        name: name.trim(),
-        description: description.trim(),
-        chair: chair.trim(),
-        rounds,
-        members: filled.map((member) => ({
-          model: member.model.trim(),
-          role: member.role.trim() || "member",
-        })),
-      });
-      setCreated(council);
-      onCreated?.(council);
-    } catch (error) {
-      setRefusal(describe(error));
-    } finally {
-      setBusy(false);
-    }
+      const result = await onCreate({ name: key, description: description.trim(), chair: chair.trim(), rounds,
+        members: filled.map((member) => ({ model: member.model.trim(), role: member.role.trim() || "member" })) });
+      setCreated(result); onCreated?.(result);
+    } catch (error) { setRefusal(error instanceof Error ? error.message : String(error)); }
+    finally { busyRef.current = false; setBusy(false); }
   };
-
-  return (
-    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)", maxWidth: 760 }}>
-      <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>New council</h2>
-      <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)" }}>
-        Two or more members deliberate; the chair synthesizes. Every model named here must
-        already be configured in <code>models.toml</code> — the council is refused otherwise
-        rather than created and then failing at run time.
-      </p>
-
-      <Labelled label="Name" hint="Becomes a directory under the council report store, so letters, digits, dot, underscore and dash only.">
-        <input
-          data-testid="council-name"
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          style={inputStyle}
-        />
-      </Labelled>
-
-      <Labelled label="Description" hint="Optional.">
-        <input
-          data-testid="council-description"
-          value={description}
-          onChange={(event) => setDescription(event.target.value)}
-          style={inputStyle}
-        />
-      </Labelled>
-
-      <Labelled label="Chair" hint="The model that synthesizes. May also sit as a member, but it then weighs its own report.">
-        <input
-          data-testid="council-chair"
-          value={chair}
-          onChange={(event) => setChair(event.target.value)}
-          list={configuredModels ? "council-model-choices" : undefined}
-          style={inputStyle}
-        />
-      </Labelled>
-
-      <Labelled label="Rounds" hint="Each round re-runs every member with the previous round's dossier.">
-        <input
-          data-testid="council-rounds"
-          type="number"
-          min={1}
-          value={rounds}
-          onChange={(event) => setRounds(Math.max(1, Number(event.target.value) || 1))}
-          style={{ ...inputStyle, width: 100 }}
-        />
-      </Labelled>
-
-      {configuredModels && (
-        <datalist id="council-model-choices">
-          {configuredModels.map((model) => (
-            <option key={model} value={model} />
-          ))}
-        </datalist>
-      )}
-
-      <div style={{ marginTop: 20 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Members</div>
-        <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 8 }}>
-          At least two, and no model may appear twice.
-        </div>
-        {members.map((member, index) => (
-          <div key={index} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <input
-              data-testid={`council-member-model-${index}`}
-              value={member.model}
-              onChange={(event) => updateMember(index, { model: event.target.value })}
-              placeholder="model id"
-              list={configuredModels ? "council-model-choices" : undefined}
-              style={{ ...inputStyle, flex: 2 }}
-            />
-            <input
-              data-testid={`council-member-role-${index}`}
-              value={member.role}
-              onChange={(event) => updateMember(index, { role: event.target.value })}
-              placeholder="role"
-              style={{ ...inputStyle, flex: 1 }}
-            />
-            <button
-              onClick={() => setMembers((current) => current.filter((_, position) => position !== index))}
-              disabled={members.length <= 2}
-              style={buttonStyle}
-              data-testid={`council-member-remove-${index}`}
-              aria-label={`Remove member ${index + 1}`}
-            >
-              Remove
-            </button>
-          </div>
-        ))}
-        <button
-          onClick={() => setMembers((current) => [...current, { model: "", role: "member" }])}
-          style={buttonStyle}
-          data-testid="council-member-add"
-        >
-          Add member
-        </button>
-      </div>
-
-      {refusal && (
-        /* The council crate's own words. Rewriting them would let the desktop
-           and the TUI disagree about why something was refused. */
-        <div role="alert" data-testid="council-builder-refusal" style={refusalStyle}>
-          {refusal}
-        </div>
-      )}
-
-      {created && (
-        <div role="status" data-testid="council-builder-created" style={createdStyle}>
-          Created “{created.name}” — {created.members.length} members, chair{" "}
-          <code>{created.chair}</code>, {created.rounds} round(s), quorum{" "}
-          {created.requiredQuorum}.
-          {created.chairIsMember && (
-            <div style={{ marginTop: 6, color: "var(--cody-warning)" }}>
-              The chair is also a member, so its synthesis will weigh its own report.
-            </div>
-          )}
-        </div>
-      )}
-
-      <div style={{ display: "flex", gap: 8, marginTop: 20, alignItems: "center" }}>
-        <button onClick={() => void submit()} disabled={!submittable} style={primaryButtonStyle} data-testid="council-builder-submit">
-          Create council
-        </button>
-        {blockedBecause && (
-          <span style={{ fontSize: 12, color: "var(--cody-text-muted)" }} data-testid="council-builder-blocked">
-            {blockedBecause}
-          </span>
-        )}
-        {onCancel && (
-          <button onClick={onCancel} disabled={busy} style={buttonStyle} data-testid="council-builder-cancel">
-            Cancel
-          </button>
-        )}
-      </div>
+  return <PageShell className="councils-page"><div className="councils-content">
+    {onCancel && <button type="button" className="council-button quiet" onClick={onCancel} disabled={busy} data-testid="council-builder-cancel"><ArrowLeft size={14} aria-hidden="true" /> Back to councils</button>}
+    <header className="councils-header" style={{ marginTop: 16 }}><div><div className="councils-eyebrow"><UsersRound size={14} aria-hidden="true" /> Build your team</div>
+      <h1>New council</h1><p>Choose a few models with different strengths. A chair will turn their findings into one answer.</p></div></header>
+    <div className="council-form-layout">
+      <form className="council-form" onSubmit={(event) => { event.preventDefault(); void submit(); }} aria-label="Create a council">
+        <section className="council-form-section"><h2>Give it a purpose</h2>
+          <label className="council-label"><span>Council name</span><input className="council-input" data-testid="council-name" value={name} maxLength={64} placeholder="For example, Code review" disabled={busy} onChange={(event) => { updateDraft({ name: event.target.value }); setCreated(null); }} /></label>
+          <label className="council-label"><span>What is this team good at? <small>Optional</small></span><textarea className="council-input" data-testid="council-description" rows={2} value={description} placeholder="A second opinion on architecture, security and code quality." disabled={busy} onChange={(event) => updateDraft({ description: event.target.value })} /></label>
+        </section>
+        <section className="council-form-section"><h2>Choose the perspectives</h2><p>Each model considers the question and contributes its own findings.</p>
+          {configuredModels?.length === 0 && <div className="council-notice"><p>Add or discover models before choosing your team.</p>{onOpenModels && <button type="button" className="council-button" onClick={onOpenModels}>Find models</button>}</div>}
+          {members.map((member, index) => <div className="council-member-row" key={index}>
+            <span className="council-member-number" aria-hidden="true">{index + 1}</span>
+            <ModelChoice data-testid={`council-member-model-${index}`} aria-label={`Member ${index + 1} model`} value={member.model} onChange={(model) => updateMember(index, { model })}
+              options={configuredModels} excluded={members.filter((_, position) => position !== index).map((value) => value.model)} disabled={busy} />
+            <button type="button" className="council-button quiet icon-only" disabled={busy || members.length <= 2} onClick={() => updateDraft({ members: members.filter((_, position) => position !== index) })} data-testid={`council-member-remove-${index}`} aria-label={`Remove member ${index + 1}`}><X size={15} aria-hidden="true" /></button>
+          </div>)}
+          <button type="button" className="council-button quiet" disabled={busy} onClick={() => updateDraft({ members: [...members, { model: "", role: "member" }] })} data-testid="council-member-add"><Plus size={14} aria-hidden="true" /> Add another perspective</button>
+          <label className="council-label" style={{ marginTop: 24 }}><span><Crown size={13} aria-hidden="true" /> Chair</span>
+            <ModelChoice data-testid="council-chair" value={chair} onChange={(chair) => updateDraft({ chair })} options={configuredModels} disabled={busy} />
+          </label><p className="council-note">The chair reads the findings, weighs differences and brings the answer together.</p>
+          {chair && filled.some((member) => member.model === chair) && <p className="council-note">This model will also contribute its own perspective.</p>}
+        </section>
+        <details className="council-advanced"><summary>Roles and discussion settings</summary>
+          <p className="council-note">Give members a focus, or add another round so they can respond to one another.</p>
+          {members.map((member, index) => <label key={index} className="council-role-row"><span>{member.model ? modelLabel(member.model) : `Perspective ${index + 1}`} · role</span><input className="council-input" data-testid={`council-member-role-${index}`} aria-label={`Member ${index + 1} role`} value={member.role} disabled={busy} onChange={(event) => updateMember(index, { role: event.target.value })} placeholder="For example, security reviewer" /></label>)}
+          <label className="council-label"><span>Discussion rounds</span><input className="council-input" style={{ width: 100 }} data-testid="council-rounds" type="number" min={1} value={rounds} disabled={busy} onChange={(event) => updateDraft({ rounds: Math.max(1, Number(event.target.value) || 1) })} /></label>
+          <p className="council-note">Each extra round runs every member again and can use more time and tokens.</p>
+          <dl className="council-details"><dt>Council ID</dt><dd>{key || "Generated from the name"}</dd></dl>
+        </details>
+        {refusal && <div className="council-notice error" role="alert" data-testid="council-builder-refusal">{refusal}</div>}
+        {created && <div className="council-notice success" role="status" data-testid="council-builder-created">{councilTitle(created.name)} is ready. {created.members.length} members, chaired by {modelLabel(created.chair)}.</div>}
+        <div className="council-form-footer"><button type="submit" className="council-button primary" disabled={!submittable} data-testid="council-builder-submit">{busy ? "Creating council…" : "Create council"}</button>
+          {blockedBecause && !busy && <p className="council-note" data-testid="council-builder-blocked">{blockedBecause}</p>}</div>
+      </form>
+      <aside className="council-form-preview" aria-label="Your council preview"><h2>{name.trim() ? councilTitle(name.trim()) : "Your council"}</h2>
+        {filled.length || chair ? <CouncilParticipants members={filled} chair={chair || undefined} /> : <p className="council-note">Your team will take shape here as you choose its models.</p>}
+      </aside>
     </div>
-  );
+  </div></PageShell>;
 };
-
-const Labelled: React.FC<{ label: string; hint?: string; children: React.ReactNode }> = ({
-  label,
-  hint,
-  children,
-}) => (
-  <label style={{ display: "block", marginTop: 16 }}>
-    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{label}</div>
-    {hint && <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>{hint}</div>}
-    {children}
-  </label>
-);
-
-const inputStyle: React.CSSProperties = {
-  width: "100%",
-  padding: "6px 10px",
-  borderRadius: 6,
-  border: "1px solid var(--cody-border-strong)",
-  background: "var(--cody-canvas)",
-  color: "var(--cody-text)",
-  fontSize: 13,
-};
-
-const buttonStyle: React.CSSProperties = {
-  padding: "6px 12px",
-  borderRadius: 6,
-  border: "1px solid var(--cody-border-strong)",
-  background: "var(--cody-inset)",
-  color: "var(--cody-text)",
-  fontSize: 13,
-  cursor: "pointer",
-};
-
-const primaryButtonStyle: React.CSSProperties = {
-  ...buttonStyle,
-  background: "var(--cody-success-strong)",
-  borderColor: "var(--cody-success)",
-};
-
-const refusalStyle: React.CSSProperties = {
-  marginTop: 16,
-  padding: 12,
-  borderRadius: 8,
-  border: "1px solid var(--cody-danger)",
-  background: "var(--cody-danger-bg)",
-  color: "var(--cody-danger-text)",
-  fontSize: 13,
-  whiteSpace: "pre-wrap",
-};
-
-const createdStyle: React.CSSProperties = {
-  marginTop: 16,
-  padding: 12,
-  borderRadius: 8,
-  border: "1px solid var(--cody-success)",
-  background: "var(--cody-success-bg)",
-  color: "var(--cody-success-text)",
-  fontSize: 13,
-};
-
-function describe(error: unknown): string {
-  if (typeof error === "string") {
-    return error;
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
+function ModelChoice({ value, options, excluded = [], onChange, ...props }: {
+  value: string; options?: string[]; excluded?: string[]; onChange: (value: string) => void;
+  disabled?: boolean; "data-testid"?: string; "aria-label"?: string;
+}) {
+  if (!options) return <input {...props} className="council-input" value={value} placeholder="Choose a model" onChange={(event) => onChange(event.target.value)} />;
+  return <select {...props} className="council-input" value={value} onChange={(event) => onChange(event.target.value)}>
+    <option value="">Choose a model</option>{value && !options.includes(value) && <option value={value}>{modelLabel(value)}</option>}
+    {options.map((model) => <option key={model} value={model} disabled={model !== value && excluded.includes(model)}>{modelLabel(model)}</option>)}
+  </select>;
 }

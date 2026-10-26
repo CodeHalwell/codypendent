@@ -64,7 +64,7 @@ function client(readiness: ModelReadinessRow[], probe: (id: string) => ModelRead
 }
 
 describe("model readiness", () => {
-  it("badges every row from the shell's verdict, without asking hosted providers", async () => {
+  it("shows real readiness problems without default unverified badges or hosted probes", async () => {
     const api = client(
       [
         {
@@ -85,7 +85,8 @@ describe("model readiness", () => {
     render(<ModelPicker client={api} />);
     await act(async () => undefined);
     await act(async () => undefined);
-    expect(screen.getByTestId("model-readiness-openai/gpt-5").textContent).toContain("unverified");
+    expect(screen.queryByTestId("model-readiness-openai/gpt-5")).toBeNull();
+    expect(screen.getByText("Not tested").closest("details")?.open).toBe(false);
     expect(screen.getByTestId("model-readiness-ollama/qwen3").textContent).toContain("unavailable");
     // An unavailable model says why, in the row itself.
     expect(screen.getByText(/connection refused/)).toBeTruthy();
@@ -119,7 +120,7 @@ describe("model readiness", () => {
     });
     expect(probes).toEqual(["openai/gpt-5"]);
     expect(screen.getByTestId("model-readiness-openai/gpt-5").textContent).toContain("ready");
-    expect(screen.getByRole("status").textContent).toContain("openai/gpt-5: ready");
+    expect(screen.getByRole("status").textContent).toContain("GPT-5: ready");
   });
 
   it("keeps a Test verdict when the slower bulk read lands after it", async () => {

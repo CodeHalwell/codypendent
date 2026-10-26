@@ -6,15 +6,16 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codypendent_integrations::acp::PermissionOption;
-use codypendent_integrations::acp_client::{AcpClient, AcpClientError, AcpEventSink};
+use codypendent_integrations::acp_client::{
+    AcpClient, AcpClientError, AcpEventSink, AcpSessionOptions,
+};
 use codypendent_integrations::acp_registry::{
     agent_coordinate, agent_coordinate_with_model, agent_id_from_coordinate,
-    agent_model_from_coordinate, community_acp_agent, local_acp_agent_specs, AcpRegistry,
-    AcpRegistryStore,
+    agent_model_from_coordinate, community_acp_agent, AcpRegistry, AcpRegistryStore,
 };
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{EventBody, ModelId, RunId};
-use codypendent_runtime::models::{load_models, ModelConfig};
+use codypendent_protocol::{EventBody, RunId};
+use codypendent_runtime::models::load_models;
 
 pub async fn refresh(paths: &RuntimePaths) -> anyhow::Result<()> {
     let registry = AcpRegistryStore::new(&paths.data_dir).refresh().await?;
@@ -49,7 +50,7 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
                 })
             })
             .collect::<Vec<_>>();
-        for spec in local_acp_agent_specs() {
+        for spec in store.installed_agent_specs() {
             if rows
                 .iter()
                 .any(|row| row["id"].as_str() == Some(spec.registry_id.as_str()))
@@ -70,9 +71,9 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
         }
         if !rows
             .iter()
-            .any(|row| row["id"].as_str() == Some("antigravity-acp"))
+            .any(|row| row["id"].as_str() == Some("antigravity-community"))
         {
-            let agent = community_acp_agent("antigravity-acp")
+            let agent = community_acp_agent("antigravity-community")
                 .expect("built-in Antigravity community descriptor");
             let status = agent_status(&store, &agent);
             let connected_profiles = connected
@@ -118,7 +119,7 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
             agent.id, agent.name, agent.version, state
         );
     }
-    for spec in local_acp_agent_specs() {
+    for spec in store.installed_agent_specs() {
         if registry.get(&spec.registry_id).is_some() {
             continue;
         }
@@ -141,10 +142,11 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
             spec.registry_id, spec.name, spec.version, state
         );
     }
-    if registry.get("antigravity-acp").is_none()
-        && codypendent_integrations::acp_registry::local_acp_agent_spec("antigravity-acp").is_none()
+    if registry.get("antigravity-community").is_none()
+        && codypendent_integrations::acp_registry::local_acp_agent_spec("antigravity-community")
+            .is_none()
     {
-        let agent = community_acp_agent("antigravity-acp")
+        let agent = community_acp_agent("antigravity-community")
             .expect("built-in Antigravity community descriptor");
         println!(
             "{:<24} {:<28} {:<12} {} · --accept-community-risk required",
@@ -162,7 +164,7 @@ fn local_adapter_description(id: &str) -> &'static str {
         "kimi-code" => "Locally installed Kimi Code native ACP server",
         "junie" => "Locally installed JetBrains Junie native ACP server",
         "cursor" => "Locally installed Cursor CLI native ACP server",
-        "antigravity-acp" => {
+        "antigravity-community" => {
             "Opt-in community ACP bridge for Google Antigravity; review Google's third-party access terms before use"
         }
         _ => "Locally installed ACP server",
@@ -174,7 +176,7 @@ fn local_adapter_repository(id: &str) -> &'static str {
         "kimi-code" => "https://github.com/MoonshotAI/kimi-code",
         "junie" => "https://www.jetbrains.com/junie/",
         "cursor" => "https://cursor.com/cli",
-        "antigravity-acp" => "https://github.com/shubzkothekar/antigravity-acp",
+        "antigravity-community" => "https://github.com/shubzkothekar/antigravity-acp",
         _ => "",
     }
 }
@@ -216,11 +218,12 @@ pub async fn connect(
     // Handshake before changing models.toml: a missing launcher, incompatible
     // adapter, or failed session/new leaves no broken selectable profile.
     let command = spec.command.to_string_lossy();
-    let client = AcpClient::spawn(
+    let client = AcpClient::spawn_with(
         &command,
         &spec.args,
         &spec.env,
         repository.to_string_lossy().as_ref(),
+        AcpSessionOptions::for_agent(&spec),
     )
     .await
     .map_err(|error| handshake_failure(agent, &error))?;
@@ -312,14 +315,16 @@ pub async fn probe(
     ensure_agent_catalog(&store, agent, refresh).await?;
     let spec = store.install(agent, allow_unverified).await?;
     let command = spec.command.to_string_lossy();
-    let mut client = AcpClient::spawn(
+    let mut client = AcpClient::spawn_with(
         &command,
         &spec.args,
         &spec.env,
         repository.to_string_lossy().as_ref(),
+        AcpSessionOptions::for_agent(&spec),
     )
     .await
     .map_err(|error| handshake_failure(agent, &error))?;
+    select_probe_model(&mut client, agent).await?;
     let discovered = client.discovered_models();
     let mut sink = ProbeSink::default();
     let stop = tokio::time::timeout(
@@ -366,8 +371,28 @@ pub async fn probe(
     Ok(())
 }
 
+async fn select_probe_model(client: &mut AcpClient, agent: &str) -> anyhow::Result<()> {
+    let Some(requested) = agent_model_from_coordinate(agent) else {
+        return Ok(());
+    };
+    let models = client.discovered_models();
+    if !models.iter().any(|model| model.id == requested) {
+        let advertised = models
+            .iter()
+            .take(64)
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("ACP agent `{agent}` did not advertise the exact requested model `{requested}`; advertised models: {advertised}");
+    }
+    client
+        .set_model(requested)
+        .await
+        .with_context(|| format!("ACP agent `{agent}` refused requested model `{requested}`"))
+}
+
 fn require_community_risk_acceptance(agent: &str, accepted: bool) -> anyhow::Result<()> {
-    if agent_id_from_coordinate(agent) == "antigravity-acp" && !accepted {
+    if agent_id_from_coordinate(agent) == "antigravity-community" && !accepted {
         bail!(
             "Antigravity's ACP bridge is third-party software, not provided or endorsed by Google. Its maintainer warns that third-party Antigravity OAuth use may violate Google's Terms and risk account suspension. Review the bridge and re-run with `--accept-community-risk` to continue"
         );
@@ -507,48 +532,7 @@ fn replace_profile_family(
     base: &str,
     profiles: &[(String, String)],
 ) -> anyhow::Result<()> {
-    if base.is_empty() || base.len() > 256 || base.contains(['\0', '\n', '\r']) {
-        bail!("invalid ACP profile id");
-    }
-    let family_prefix = format!("{base}#");
-    for (profile, _) in profiles {
-        if profile.is_empty()
-            || profile.len() > 256
-            || profile.contains(['\0', '\n', '\r'])
-            || (profile != base && !profile.starts_with(&family_prefix))
-        {
-            bail!("invalid ACP profile id");
-        }
-    }
-    std::fs::create_dir_all(&paths.data_dir)?;
-    let path = paths.data_dir.join("models.toml");
-    crate::models_file::update_model_entries(&path, |configs| {
-        if let Some(conflict) = configs.iter().find(|config| {
-            config.provider != "acp" && profiles.iter().any(|(profile, _)| config.id.0 == *profile)
-        }) {
-            bail!(
-                "ACP profile `{}` conflicts with an existing {} model",
-                conflict.id.0,
-                conflict.provider
-            );
-        }
-        configs.retain(|config| {
-            !(config.provider == "acp"
-                && (config.id.0 == base || config.id.0.starts_with(&family_prefix)))
-        });
-        configs.extend(profiles.iter().map(|(profile, agent)| ModelConfig {
-            id: ModelId(profile.clone()),
-            provider: "acp".to_string(),
-            base_url: String::new(),
-            model: agent.clone(),
-            api_key_env: String::new(),
-            context_tokens: None,
-            // An ACP agent is launched, not addressed over HTTP, so it has no
-            // catalog provider whose auth header would need resolving.
-            provider_id: None,
-        }));
-        Ok(())
-    })
+    codypendent_runtime::acp_setup::replace_profile_family(&paths.data_dir, base, profiles)
 }
 
 fn distribution_label(
@@ -587,6 +571,88 @@ fn agent_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_selector_is_exact_and_refusal_never_uses_the_default() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_reads, agent_writes) = tokio::io::duplex(8192);
+        let (agent_reads, client_writes) = tokio::io::duplex(8192);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&sent);
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(agent_reads).lines();
+            let mut writer = agent_writes;
+            while let Some(line) = reader.next_line().await.unwrap() {
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                recorded.lock().unwrap().push(message.clone());
+                let id = &message["id"];
+                let config = |current: &str| {
+                    serde_json::json!([{
+                        "id":"model", "name":"Model", "category":"model", "type":"select",
+                        "currentValue":current, "options":[
+                            {"value":"haiku","name":"Haiku"}, {"value":"opus","name":"Opus"},
+                            {"value":"refused","name":"Refused model"}
+                        ]
+                    }])
+                };
+                let result = match message["method"].as_str() {
+                    Some("initialize") => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}})
+                    }
+                    Some("session/new") => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"probe","configOptions":config("haiku")}})
+                    }
+                    Some("session/set_config_option")
+                        if message["params"]["value"] == "refused" =>
+                    {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"model refused"}})
+                    }
+                    Some("session/set_config_option") => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"configOptions":config(message["params"]["value"].as_str().unwrap())}})
+                    }
+                    _ => continue,
+                };
+                writer
+                    .write_all(format!("{result}\n").as_bytes())
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+        });
+        let mut client = AcpClient::connect(client_reads, client_writes, ".")
+            .await
+            .unwrap();
+        select_probe_model(&mut client, "claude-acp#opus")
+            .await
+            .unwrap();
+        assert!(client
+            .discovered_models()
+            .iter()
+            .any(|model| model.id == "opus" && model.current));
+        let before = sent.lock().unwrap().len();
+        let error = select_probe_model(&mut client, "claude-acp#opus[1m]")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exact requested model"));
+        assert_eq!(sent.lock().unwrap().len(), before);
+        let error = select_probe_model(&mut client, "claude-acp#refused")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refused requested model"));
+        assert!(client
+            .discovered_models()
+            .iter()
+            .any(|model| model.id == "opus" && model.current));
+        assert!(!sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == "session/prompt"));
+        drop(client);
+        peer.abort();
+    }
 
     /// The single-profile shorthand the tests below drive `replace_profile_family`
     /// with (`connect` always writes a whole set at once).
@@ -836,15 +902,17 @@ api_key_env = ""
 
     #[test]
     fn antigravity_cli_requires_warning_specific_acknowledgement() {
-        let error = require_community_risk_acceptance("antigravity", false)
+        let error = require_community_risk_acceptance("antigravity-community", false)
             .expect_err("community bridge must fail closed");
         let message = error.to_string();
         assert!(message.contains("not provided or endorsed by Google"));
         assert!(message.contains("--accept-community-risk"));
-        require_community_risk_acceptance("antigravity-acp", true)
+        require_community_risk_acceptance("antigravity-community", true)
             .expect("explicit acknowledgement");
         require_community_risk_acceptance("codex", false)
             .expect("official agents do not use the community warning");
+        require_community_risk_acceptance("antigravity", false)
+            .expect("Google's official server does not use the community warning");
     }
 
     #[tokio::test]

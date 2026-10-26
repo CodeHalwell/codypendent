@@ -1152,6 +1152,7 @@ pub async fn import(
                         | EventBody::ToolProposed { run_id, .. }
                         | EventBody::ToolDenied { run_id, .. }
                         | EventBody::ToolStarted { run_id, .. }
+                        | EventBody::ToolUpdated { run_id, .. }
                         | EventBody::ToolCompleted { run_id, .. }
                         | EventBody::PatchProposed { run_id, .. }
                         | EventBody::SteeringQueued { run_id, .. }

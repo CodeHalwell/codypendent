@@ -506,8 +506,8 @@ pub struct CouncilProgress {
     pub event: CouncilEvent,
 }
 
-/// Aggregated MEASURED usage across every run a council performed (all rounds'
-/// members plus the chair). `tokens`/`cost_micros` sum only over runs that
+/// Aggregated MEASURED usage across attributed member, chair and review runs.
+/// `tokens`/`cost_micros` sum only over runs that
 /// measured that dimension; `measured_runs`/`total_runs` keep the sum honest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2527,7 +2527,7 @@ fn build_report(
         evidence: seed.evidence,
         definition: seed.definition.clone(),
         warnings: seed.warnings.clone(),
-        costs: aggregate_costs(rounds, chair),
+        costs: aggregate_costs(rounds, chair, review),
         rounds: rounds.to_vec(),
         chair: chair.cloned(),
         review: review.cloned(),
@@ -2535,15 +2535,20 @@ fn build_report(
     }
 }
 
-/// Sum MEASURED usage across every run (all rounds' members plus the chair).
+/// Sum MEASURED usage across all attributed member, chair and review runs.
 /// A dimension sums only over runs that measured it; a run counts as measured
 /// when it reported either dimension.
-fn aggregate_costs(rounds: &[CouncilRoundReport], chair: Option<&MemberOutcome>) -> CouncilCosts {
+fn aggregate_costs(
+    rounds: &[CouncilRoundReport],
+    chair: Option<&MemberOutcome>,
+    review: Option<&MemberOutcome>,
+) -> CouncilCosts {
     let mut costs = CouncilCosts::default();
     let all = rounds
         .iter()
         .flat_map(|round| round.members.iter())
-        .chain(chair);
+        .chain(chair)
+        .chain(review);
     for outcome in all {
         costs.total_runs += 1;
         if outcome.tokens.is_some() || outcome.cost_micros.is_some() {
@@ -2741,10 +2746,17 @@ fn load_result_path(json_path: &Path) -> anyhow::Result<StoredCouncilResult> {
             MAX_REPORT_BYTES / (1024 * 1024)
         );
     }
-    let report: CouncilReport = serde_json::from_slice(
+    let mut report: CouncilReport = serde_json::from_slice(
         &std::fs::read(json_path).with_context(|| format!("reading {}", json_path.display()))?,
     )
     .with_context(|| format!("parsing {}", json_path.display()))?;
+    // Older reports omitted review usage from the cached aggregate. Derive
+    // display totals from the attributed runs without rewriting the record.
+    report.costs = aggregate_costs(
+        &report.rounds,
+        report.chair.as_ref(),
+        report.review.as_ref(),
+    );
     let handle = CouncilReportHandle {
         result_id: report.result_id,
         council: report.council.clone(),
@@ -2836,6 +2848,10 @@ fn render_report_markdown(report: &CouncilReport) -> String {
     }
     if let Some(chair) = &report.chair {
         md.push_str(&format!("- {}\n", participant_line(chair)));
+        any = true;
+    }
+    if let Some(review) = &report.review {
+        md.push_str(&format!("- {}\n", participant_line(review)));
         any = true;
     }
     if !any {
@@ -4082,7 +4098,7 @@ model = "gpt-4"
             failures: vec![],
             ruling: None,
         }];
-        let costs = aggregate_costs(&rounds, None);
+        let costs = aggregate_costs(&rounds, None, None);
         assert_eq!(costs.tokens, Some(1500));
         assert_eq!(costs.cost_micros, Some(2500));
         assert_eq!(costs.measured_runs, 2);
@@ -4091,6 +4107,12 @@ model = "gpt-4"
         assert!(line.contains("1500 tokens"));
         assert!(line.contains("$0.0025"));
         assert!(line.contains("2/3 runs"));
+        let unmeasured_review = outcome("independent reviewer", "d", "verdict");
+        let with_review = aggregate_costs(&rounds, None, Some(&unmeasured_review));
+        assert_eq!(with_review.tokens, Some(1500));
+        assert_eq!(with_review.cost_micros, Some(2500));
+        assert_eq!(with_review.measured_runs, 2);
+        assert_eq!(with_review.total_runs, 4);
         assert_eq!(
             cost_line(&CouncilCosts {
                 total_runs: 4,
@@ -4098,6 +4120,80 @@ model = "gpt-4"
             }),
             "cost: not measured across 4 runs",
             "no measurement must never fabricate a number"
+        );
+    }
+
+    #[test]
+    fn review_usage_is_included_in_new_and_restored_report_totals() {
+        let (_directory, paths) = paths();
+        let definition = CouncilDefinition {
+            name: "review-costs".to_owned(),
+            description: String::new(),
+            chair: "chair".to_owned(),
+            rounds: 1,
+            quorum: None,
+            evidence: false,
+            review: true,
+            reviewer: Some("codex".to_owned()),
+            members: vec![
+                parse_member("claude=architect").expect("member"),
+                parse_member("codex=critic").expect("member"),
+            ],
+        };
+        let seed = ReportSeed {
+            result_id: CouncilResultId::new(),
+            definition: &definition,
+            objective: "Account for the independent review",
+            evidence: false,
+            started_at: "2026-10-19T13:00:00Z",
+            warnings: Vec::new(),
+            repository: "/workspace/review",
+            origin_session_id: None,
+        };
+        let mut architect = outcome("architect", "claude", "Member finding");
+        architect.tokens = Some(5933);
+        let mut critic = outcome("critic", "codex", "Second finding");
+        critic.tokens = Some(5443);
+        let rounds = vec![round(1, vec![architect, critic])];
+        let mut chair = outcome("chair", "chair", "Synthesis");
+        chair.tokens = Some(6366);
+        let mut review = outcome("independent reviewer", "codex", "Review verdict");
+        review.tokens = Some(9246);
+        let report = build_report(
+            &seed,
+            "completed",
+            &rounds,
+            Some(&chair),
+            Some(&review),
+            None,
+        );
+        assert_eq!(report.costs.tokens, Some(26988));
+        assert_eq!(report.costs.cost_micros, None);
+        assert_eq!(report.costs.measured_runs, 4);
+        assert_eq!(report.costs.total_runs, 4);
+        let handle = persist_report(&paths, &report).expect("persist reviewed report");
+        let markdown = std::fs::read_to_string(&handle.markdown_path).expect("markdown");
+        assert!(markdown.contains("26988 tokens measured across 4/4 runs"));
+        assert!(markdown.contains(&participant_line(&review)));
+
+        // Retain the historical file while correcting its display aggregate.
+        let mut historical = serde_json::to_value(&report).expect("report JSON");
+        historical["costs"] = serde_json::json!({
+            "tokens": 17742,
+            "measuredRuns": 3,
+            "totalRuns": 3
+        });
+        let historical_bytes = serde_json::to_vec(&historical).expect("historical JSON");
+        std::fs::write(&handle.json_path, &historical_bytes).expect("historical report");
+        let restored = load_result_path(&handle.json_path).expect("load historical report");
+        assert_eq!(restored.report.costs.tokens, Some(26988));
+        assert_eq!(restored.report.costs.cost_micros, None);
+        assert_eq!(restored.report.costs.measured_runs, 4);
+        assert_eq!(restored.report.costs.total_runs, 4);
+        assert_eq!(restored.report.review.unwrap().run_id, review.run_id);
+        assert_eq!(
+            std::fs::read(&handle.json_path).expect("unchanged historical report"),
+            historical_bytes
         );
     }
 

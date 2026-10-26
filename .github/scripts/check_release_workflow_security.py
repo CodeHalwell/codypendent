@@ -74,6 +74,9 @@ def main() -> int:
 
     try:
         publish = section(lines, "publish:", 2)
+        publish_condition = " ".join(section(publish, "if: >-", 4))
+        if "github.event_name == 'push' &&" not in publish_condition:
+            failures.append("publish must require a push event; manual dispatch must only build artifacts")
         publish_permissions = section(publish, "permissions:", 4)
         if "      contents: write" not in publish_permissions:
             failures.append("publish job must explicitly set contents: write")
@@ -93,6 +96,18 @@ def main() -> int:
             failures.append("permissions: write-all is forbidden")
     except ValueError as error:
         failures.append(str(error))
+
+    for job, signer in (("build:", "sign-apple-runtime.sh"), ("desktop-bundle:", "sign-apple-release.sh")):
+        try:
+            body = section(lines, job, 2)
+            signing = next(step for step in action_steps(body) if any(signer in line for line in step))
+            required = input_value(signing, "REQUIRE_APPLE_SIGNING") or ""
+            if "startsWith(github.ref, 'refs/tags/')" not in required:
+                failures.append(f"{job[:-1]} must require Apple signing for every tag")
+            if not any('elif [ "$REQUIRE_APPLE_SIGNING" = "true" ]' in line for line in signing) or not any(line.strip() == "exit 1" for line in signing):
+                failures.append(f"{job[:-1]} must fail when required Apple credentials are absent")
+        except (ValueError, StopIteration):
+            failures.append(f"{job[:-1]} is missing its Apple distribution signing gate")
 
     for workflow_name, workflow_lines in (("release", lines), ("CI", ci_lines)):
         for step in action_steps(workflow_lines):

@@ -1,0 +1,27 @@
+.function-connections { min-width: 0; margin-top: 18px; }
+.function-section { padding: 15px 0 0; margin-top: 15px; border-top: 1px solid var(--code-map-line, var(--cody-border)); }
+.function-section:first-child { margin-top: 0; }
+.function-connections .function-section h4 { display: flex; align-items: center; gap: 7px; margin: 0 0 10px; padding: 0; border: 0; color: var(--cody-text-secondary); font-size: 11px; font-weight: 550; letter-spacing: 0; }
+.function-section h4 > svg { color: var(--cody-text-faint); flex-shrink: 0; }
+.function-count { margin-left: auto; padding: 1px 6px; border-radius: 5px; background: var(--cody-canvas); color: var(--cody-text-faint); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.function-connections .function-note { margin: 7px 0 0; color: var(--cody-text-muted); font-size: 11px; line-height: 1.6; }
+.function-connections .function-source-path { margin: 0; color: var(--cody-text-secondary); font-family: var(--cody-mono); font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
+.function-connections .function-source-link { display: flex; justify-content: space-between; align-items: flex-start; width: 100%; gap: 7px; min-height: 28px; padding: 5px 7px; border: 1px solid var(--code-map-line, var(--cody-border)); border-radius: 6px; background: var(--cody-canvas); color: var(--cody-text-secondary); font-family: var(--cody-mono); font-size: 10px; line-height: 1.6; text-align: left; cursor: pointer; }
+.function-source-link span { min-width: 0; overflow-wrap: anywhere; }
+.function-source-link > svg { margin-top: 3px; color: var(--cody-text-faint); flex-shrink: 0; }
+.function-connections .function-source-link:hover { border-color: var(--cody-border-strong); color: var(--cody-text); }
+.function-call-list, .function-location-list { list-style: none; margin: 0; padding: 0; }
+.function-call-list > li { padding: 12px 0; border-top: 1px solid var(--code-map-line, var(--cody-border)); }
+.function-call-list > li:first-child { padding-top: 0; border-top: 0; }
+.function-connections .function-target { display: flex; width: 100%; justify-content: space-between; align-items: flex-start; gap: 8px; min-height: 27px; padding: 3px 0; border: 0; border-radius: 4px; background: transparent; color: var(--cody-text-secondary); font-size: 12px; font-weight: 500; text-align: left; cursor: pointer; }
+.function-target span { overflow-wrap: anywhere; }
+.function-target > svg { flex-shrink: 0; margin-top: 3px; color: var(--cody-text-faint); }
+.function-connections .function-target:hover { background: transparent; color: var(--cody-accent); }
+.function-connections .function-reference-note { margin: 0 0 7px; color: var(--cody-text-faint); font-size: 10px; line-height: 1.6; }
+.function-connections .function-location-label { margin: 5px 0 6px; color: var(--cody-text-faint); font-size: 9px; line-height: 1.5; }
+.function-location-list { display: grid; gap: 5px; }
+.function-load-error { margin: 12px 0; padding: 10px; border: 1px solid color-mix(in srgb, var(--cody-warning-border) 40%, transparent); border-radius: 7px; background: var(--cody-warning-bg); color: var(--cody-warning-text); font-size: 11px; line-height: 1.6; }
+.function-load-error p { margin: 0; color: inherit; font-size: inherit; }
+.function-load-error details { margin-top: 7px; font-size: 10px; }
+.function-load-error summary { cursor: pointer; }
+.function-load-error details p { margin-top: 7px; overflow-wrap: anywhere; }

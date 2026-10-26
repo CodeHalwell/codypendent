@@ -2050,9 +2050,17 @@ interface BlackboardItemDraft {
  */
 interface CodeGraphQuery {
   /**
+   * An unfiltered visual overview follows one recorded connected neighbourhood, including endpoint metadata.
+   */
+  connected_view?: boolean;
+  /**
    * Include the edges incident to the selected nodes — **every** node the filter selects, not only the ones this page of nodes happens to show. The two row kinds are paged independently (see [`limit`](Self::limit)), so an edge between two nodes that both fall past the node page is still returned and still counted.
    */
   include_edges?: boolean;
+  /**
+   * Return metadata for endpoints of the returned edges in `related_nodes`, separately from the matching node page and its total. At most twice the edge limit can be returned; other query filters still select the main page.
+   */
+  include_neighbors?: boolean;
   /**
    * Include the nodes themselves. Both false is treated as both true — a query that selects nothing is a client bug, not a legal request. Both flags default to `false`, so this is exactly what the default `{}` query asks for: everything.
    */

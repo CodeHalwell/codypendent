@@ -5,6 +5,26 @@
 
 fn main() {
     codypendent_desktop::bridge::register(tauri::Builder::default())
-        .run(tauri::generate_context!())
-        .expect("running the Codypendent desktop shell");
+        .build(tauri::generate_context!())
+        .expect("building the Codypendent desktop shell")
+        .run(|_, _event| {
+            #[cfg(target_os = "macos")]
+            if matches!(_event, tauri::RunEvent::Ready) {
+                set_dock_icon();
+            }
+        });
+}
+
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let main_thread = MainThreadMarker::new().expect("Dock icon must be set on the main thread");
+    let data = NSData::with_bytes(include_bytes!("../icons/icon.png"));
+    let image =
+        NSImage::initWithData(NSImage::alloc(), &data).expect("loading the Codypendent icon");
+    // Use this build's icon even when LaunchServices has cached an older app with the same ID.
+    unsafe { NSApplication::sharedApplication(main_thread).setApplicationIconImage(Some(&image)) };
 }

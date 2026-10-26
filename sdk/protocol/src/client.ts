@@ -99,6 +99,12 @@ function catchupWatermark(catchup: Catchup): number {
   return catchup.type === "Unknown" ? 0 : catchup.through;
 }
 
+const RUN_TRACE_EVENTS = new Set<SessionEvent["body"]["type"]>([
+  "RunStarted", "RunStateChanged", "ModelStreamDelta", "ToolProposed", "ToolDenied",
+  "ToolStarted", "ToolUpdated", "ToolCompleted", "PatchProposed", "SteeringQueued", "SteeringApplied",
+  "BudgetWarning", "RunCompleted", "RunUsage", "ContextUsage", "LearningsCaptured",
+]);
+
 export type ConnectionStatus =
   | "connecting"
   | "handshaking"
@@ -285,6 +291,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
   private readonly clientVersion: string;
   private readonly capabilities: ClientCapabilities;
   private readonly subscriptions: Subscription[];
+  private readonly allEventsRequested: boolean;
   private readonly role: ClientRole;
   private readonly backoff: BackoffConfig;
   private readonly connect: ConnectionFactory;
@@ -333,6 +340,9 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
       { type: "SessionSummary" },
       { type: "AgentActivity" },
     ];
+    this.allEventsRequested = this.subscriptions.length === 0 || this.subscriptions.some(
+      subscription => subscription.type === "SessionSummary" || subscription.type === "AgentActivity",
+    );
     this.role = options.role ?? { type: "Approver" };
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.connect =
@@ -767,7 +777,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
         this.emit("catchup", catchup);
         const pending = new Map(this.bufferedEvents.splice(0).map((event) => [event.sequence, event]));
         for (const event of [...pending.values()].sort((left, right) => left.sequence - right.sequence)) {
-          if (event.sequence > catchupWatermark(catchup)) this.emit("event", event);
+          if (event.sequence > catchupWatermark(catchup)) this.emitSubscribedEvent(event);
         }
         this.flushOfflineQueue();
         break;
@@ -800,7 +810,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
           break;
         }
         this.advanceCursor(sessionEvent.sequence);
-        this.emit("event", sessionEvent);
+        this.emitSubscribedEvent(sessionEvent);
         break;
       }
       case "RemoteUi": {
@@ -843,6 +853,14 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     }
   }
 
+  private emitSubscribedEvent(event: SessionEvent): void {
+    const body = event.body;
+    if (this.allEventsRequested || (RUN_TRACE_EVENTS.has(body.type) && "run_id" in body &&
+        this.subscriptions.some(subscription => subscription.type === "RunTrace" && subscription.run_id === body.run_id))) {
+      this.emit("event", event);
+    }
+  }
+
   // --- outbound framing -----------------------------------------------------
 
   private sendClientHello(): void {
@@ -864,7 +882,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     const body: CommandBody = {
       type: "AttachSession",
       session_id: this.sessionId,
-      subscriptions: this.subscriptions,
+      subscriptions: this.allEventsRequested ? this.subscriptions : [...this.subscriptions, { type: "SessionSummary" }],
       requested_role: this.role,
     };
     if (this.lastSeenSequence !== undefined) {

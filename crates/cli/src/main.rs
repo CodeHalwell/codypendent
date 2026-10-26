@@ -11,7 +11,7 @@
 //! STEP 1.13 adds the headless JSONL client:
 //!
 //! ```text
-//! codypendent run --objective "..." [--mode build] [--repo PATH] --jsonl
+//! codypendent run --objective "..." [--mode build] [--repo PATH] [--jsonl]
 //! codypendent attach <SESSION_ID> [--from-sequence N] --events jsonl
 //! ```
 //!
@@ -55,6 +55,16 @@ use codypendent_protocol::{AgentMode, DocumentId, SessionId};
         codypendent daemon status                    is the daemon up, and which build?"
 )]
 struct Cli {
+    /// Start in this directory, as if launched there. Useful for IDE tasks,
+    /// terminal launchers, and opening a repository from another directory.
+    /// Relative command arguments are resolved from this directory.
+    #[arg(
+        short = 'C',
+        long = "working-directory",
+        global = true,
+        value_name = "PATH"
+    )]
+    launch_directory: Option<PathBuf>,
     /// Force a theme for the interactive TUI, overriding automatic terminal
     /// detection (`NO_COLOR`/`COLORTERM`/`TERM`) and any `CODYPENDENT_THEME`
     /// env var — a manual override always wins. Accepts a
@@ -84,6 +94,11 @@ enum TopCommand {
     /// Hidden from `--help`; behaves exactly like the standalone `codypendentd`.
     #[command(name = "__daemon", hide = true)]
     InternalDaemon,
+    #[command(name = "__desktop_tools_mcp", hide = true)]
+    InternalDesktopToolsMcp {
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Manage the codypendentd daemon.
     Daemon {
         #[command(subcommand)]
@@ -121,10 +136,9 @@ enum TopCommand {
         #[arg(long)]
         model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
-        /// terminates. `--json` is accepted as an alias. Required today —
-        /// JSONL streaming is the only headless output mode, and clap says so
-        /// at parse time (with a usage line) rather than after connecting.
-        #[arg(long, visible_alias = "json", required = true)]
+        /// terminates. `--json` is accepted as an alias. Without this flag,
+        /// stdout streams the assistant's answer as text; progress goes to stderr.
+        #[arg(long, visible_alias = "json")]
         jsonl: bool,
     },
     /// Attach to an existing session and stream its events as JSONL.
@@ -1031,6 +1045,9 @@ enum GraphCommand {
         /// Also list the edges incident to the selected nodes.
         #[arg(long)]
         edges: bool,
+        /// Follow one recorded connected neighbourhood instead of separate pages.
+        #[arg(long)]
+        connected: bool,
         /// Maximum rows of each kind (server-clamped).
         #[arg(long, default_value_t = 50)]
         limit: u32,
@@ -1875,6 +1892,16 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if let Some(TopCommand::InternalDesktopToolsMcp { socket }) = &cli.command {
+        return codypendent_runtime::desktop_mcp::proxy_stdio(socket).await;
+    }
+
+    if let Some(directory) = &cli.launch_directory {
+        std::env::set_current_dir(directory).map_err(|error| {
+            anyhow::anyhow!("cannot open directory {}: {error}", directory.display())
+        })?;
+    }
+
     // `codypendent __daemon` *is* the daemon (the hidden self-spawn target of
     // `ensure_daemon`). Dispatch it before any TUI/theme setup so it behaves
     // exactly like the standalone `codypendentd` binary: init the daemon's
@@ -1928,6 +1955,9 @@ async fn run() -> anyhow::Result<()> {
         // Dispatched before the match (see the early return in `main`); a
         // parsed `InternalDaemon` never reaches here.
         TopCommand::InternalDaemon => unreachable!("__daemon is dispatched before the match"),
+        TopCommand::InternalDesktopToolsMcp { .. } => {
+            unreachable!("desktop MCP proxy is dispatched before the match")
+        }
         TopCommand::Daemon { command } => match command {
             DaemonCommand::Start => commands::start(&paths).await,
             DaemonCommand::Stop => commands::stop(&paths).await,
@@ -1987,6 +2017,7 @@ async fn run() -> anyhow::Result<()> {
                 name,
                 node_id,
                 edges,
+                connected,
                 limit,
                 json,
             } => {
@@ -1996,7 +2027,9 @@ async fn run() -> anyhow::Result<()> {
                     kind,
                     name,
                     node_id,
-                    include_edges: edges,
+                    connected_view: connected,
+                    include_neighbors: false,
+                    include_edges: edges || connected,
                     include_nodes: true,
                     limit,
                 };
@@ -2788,6 +2821,49 @@ async fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_can_be_selected_by_a_launcher_or_after_a_subcommand() {
+        let cli = Cli::try_parse_from(["codypendent", "-C", "/tmp/My Project"]).unwrap();
+        assert_eq!(cli.launch_directory, Some(PathBuf::from("/tmp/My Project")));
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from([
+            "codypendent",
+            "workflow",
+            "validate",
+            "workflow.yaml",
+            "--working-directory",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert_eq!(cli.launch_directory, Some(PathBuf::from("/tmp/project")));
+        let skill = Cli::try_parse_from(["codypendent", "skill", "add", "package"]).unwrap();
+        assert!(skill.launch_directory.is_none());
+        assert!(matches!(skill.command, Some(TopCommand::Skill {
+            command: SkillCommand::Add { directory }
+        }) if directory == PathBuf::from("package")));
+        let skill = Cli::try_parse_from([
+            "codypendent",
+            "-C",
+            "/tmp/project",
+            "skill",
+            "new",
+            "example",
+            "--name",
+            "Example",
+            "--description",
+            "Example package",
+            "--procedure",
+            "body.md",
+            "--directory",
+            "output",
+        ])
+        .unwrap();
+        assert_eq!(skill.launch_directory, Some(PathBuf::from("/tmp/project")));
+        assert!(matches!(skill.command, Some(TopCommand::Skill {
+            command: SkillCommand::New { directory: Some(directory), .. }
+        }) if directory == PathBuf::from("output")));
+    }
     use clap::CommandFactory;
 
     #[test]
@@ -2915,12 +2991,9 @@ mod tests {
         ));
     }
 
-    /// The two parse-time requirements `run` gained: an objective source, and
-    /// `--jsonl` (the only headless output mode today). Both used to be
-    /// runtime errors, printed after paths resolved (and, for the objective,
-    /// after the process was already exiting 2 with no usage line).
+    /// A prompt remains required; humans no longer need to opt into JSONL.
     #[test]
-    fn run_requires_an_objective_and_jsonl_at_parse_time() {
+    fn run_requires_an_objective_and_defaults_to_text() {
         let Err(no_objective) = Cli::try_parse_from(["codypendent", "run", "--jsonl"]) else {
             panic!("an objective-less run must be refused at parse time");
         };
@@ -2929,13 +3002,12 @@ mod tests {
             clap::error::ErrorKind::MissingRequiredArgument
         );
 
-        let Err(no_jsonl) = Cli::try_parse_from(["codypendent", "run", "fix the tests"]) else {
-            panic!("a --jsonl-less run must be refused at parse time");
-        };
-        assert_eq!(
-            no_jsonl.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        let cli = Cli::try_parse_from(["codypendent", "run", "fix the tests"])
+            .expect("plain runs must parse");
+        assert!(matches!(
+            cli.command,
+            Some(TopCommand::Run { jsonl: false, .. })
+        ));
     }
 
     #[test]

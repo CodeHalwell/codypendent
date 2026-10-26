@@ -1,5 +1,23 @@
+import type { ArtifactRef, Risk } from "@codypendent/protocol";
+import type { ApprovalAction } from "./approval.js";
 export type SessionId = string;
 export type RunId = string;
+
+export interface WorkspaceTarget {
+  id: string;
+  label: string;
+  kind: "editor" | "terminal" | "files";
+}
+
+export interface WorkspaceOpenRequest {
+  target: string;
+  expectedRepository: string;
+  expectedSession?: string | null;
+  expectedRun?: string | null;
+  file?: string;
+  /** One-based source line. */
+  line?: number;
+}
 
 /**
  * `connected` means the shell's handshake with `codypendentd` succeeded and
@@ -20,6 +38,8 @@ export interface SessionSummary {
 
 export interface TranscriptItem {
   id: string;
+  /** Owning native run, for correlating streamed content with its terminal state. */
+  runId?: string;
   type:
     | "user"
     | "assistant"
@@ -61,13 +81,23 @@ export interface TranscriptItem {
   /** `failure` only: one sentence naming the next step, when the text gives one. */
   hint?: string;
   toolName?: string;
+  /** Tool invocation's owning run; matching never crosses concurrent runs. */
+  toolRunId?: string;
+  /** Human type and action; ACP machine names carry the stable call identity. */
+  toolKind?: string;
+  toolLabel?: string;
   toolArgs?: Record<string, unknown>;
   toolResult?: unknown;
-  status?: "pending" | "running" | "success" | "error";
+  status?: "pending" | "running" | "success" | "error" | "finished";
   duration_ms?: number;
   approvalId?: string;
+  approvalAction?: ApprovalAction;
+  approvalRisk?: Risk;
+  approvalPattern?: string;
   /** `question` only: the daemon's question id, for `ResolveQuestion`. */
   questionId?: string;
+  /** Durable issue sequence distinguishes a reissue with identical prompts. */
+  decisionRevision?: number;
   /**
    * The run that ASKED, so a resolution can be attributed. `QuestionResolved`
    * carries only the question id, and a session runs several runs at once —
@@ -78,6 +108,7 @@ export interface TranscriptItem {
   /** `question` only: every prompt in the batch, normalised for the card. */
   questionPrompts?: QuestionPromptView[];
   artifactId?: string;
+  artifact?: ArtifactRef;
   /**
    * `PatchProposed` only: the wire's bounded unified-diff preview, rendered
    * as a fold. The full patch remains the artifact.
@@ -85,6 +116,8 @@ export interface TranscriptItem {
   diffPreview?: string;
   /** `PatchProposed` only: repository-relative paths the change set touches. */
   patchFiles?: string[];
+  /** Owning run selects the durable worktree when opening a reviewed file. */
+  patchRunId?: string;
   /** `PatchProposed` only: `+added −removed` line counts from the wire. */
   patchAdditions?: number;
   patchDeletions?: number;
@@ -145,4 +178,5 @@ export interface RunUsage {
   completionTokens: number | null;
   /** USD millionths. */
   costMicros: number | null;
+  coverage?: import("@codypendent/protocol").UsageCoverage | null;
 }

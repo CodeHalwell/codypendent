@@ -46,7 +46,7 @@
 //! yours" and "not there" alike. A gate enforced only where a list is built is
 //! not a gate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -63,6 +63,9 @@ use codypendent_protocol::{
     CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally, CodypendentError, RepositoryId,
 };
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+
+#[path = "codegraph_locations.rs"]
+pub(crate) mod locations;
 use tracing::{info, warn};
 
 use crate::scan;
@@ -272,7 +275,7 @@ impl CodeGraphGateway for CodeGraphOps {
     fn read(&self, request: CodeGraphReadRequest) -> CodeGraphReadFuture<'_> {
         let host = self.clone();
         Box::pin(async move {
-            let (_root, repository) = Self::anchor(&request.repository)?;
+            let (root, repository) = Self::anchor(&request.repository)?;
             let query = request.query;
             let limit = if query.limit == 0 {
                 MAX_GRAPH_PAGE
@@ -290,6 +293,37 @@ impl CodeGraphGateway for CodeGraphOps {
                 pair => pair,
             };
 
+            if query.connected_view
+                && want_nodes
+                && want_edges
+                && query.node_id.is_none()
+                && query.path.is_none()
+                && query.language.is_none()
+                && query.kind.is_none()
+                && query.name.is_none()
+            {
+                let total_nodes = count_nodes(&host.pool, repository, &query).await?;
+                let total_edges = count_edges(&host.pool, repository, &query).await?;
+                let (nodes, edges) = if total_edges == 0 {
+                    (
+                        select_nodes(&host.pool, repository, &query, limit).await?,
+                        Vec::new(),
+                    )
+                } else {
+                    select_connected_page(&host.pool, repository, limit).await?
+                };
+                let mut page = CodeGraphPage {
+                    nodes,
+                    edges,
+                    related_nodes: Vec::new(),
+                    total_nodes,
+                    total_edges,
+                    limit,
+                };
+                locations::attach(&host.pool, repository, &root, &mut page).await?;
+                return Ok(page);
+            }
+
             // The node page is read even when only edges were asked for: this is
             // where the by-id gate lives, so `--node <id>` naming another
             // checkout is refused on that path too rather than quietly answered
@@ -302,13 +336,19 @@ impl CodeGraphGateway for CodeGraphOps {
                 (Vec::new(), 0)
             };
 
-            Ok(CodeGraphPage {
+            let mut page = CodeGraphPage {
                 nodes: if want_nodes { nodes } else { Vec::new() },
                 edges,
+                related_nodes: Vec::new(),
                 total_nodes,
                 total_edges,
                 limit,
-            })
+            };
+            if query.include_neighbors {
+                page.related_nodes = select_related_nodes(&host.pool, repository, &page).await?;
+            }
+            locations::attach(&host.pool, repository, &root, &mut page).await?;
+            Ok(page)
         })
     }
 }
@@ -609,12 +649,55 @@ async fn select_nodes(
             qualified_name: row.get::<String, _>("qualified_name"),
             kind: row.get::<String, _>("kind"),
             revision: row.get::<String, _>("revision"),
+            location: None,
         })
         .collect();
     if query.node_id.is_some() && nodes.is_empty() {
         return Err(node_not_found());
     }
     Ok(nodes)
+}
+
+async fn select_related_nodes(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    page: &CodeGraphPage,
+) -> Result<Vec<CodeGraphNodeView>, CodypendentError> {
+    let known: HashSet<&str> = page.nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut ids: Vec<&str> = page
+        .edges
+        .iter()
+        .flat_map(|edge| [edge.from_id.as_str(), edge.to_id.as_str()])
+        .filter(|id| !known.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut builder = QueryBuilder::new("SELECT id, language, package, source_path, qualified_name, kind, revision FROM code_nodes WHERE repository = ");
+    builder
+        .push_bind(repository.to_string())
+        .push(" AND id IN (");
+    let mut values = builder.separated(",");
+    for id in ids {
+        values.push_bind(id);
+    }
+    values.push_unseparated(") ORDER BY source_path, qualified_name, id");
+    let rows = builder.build().fetch_all(pool).await.map_err(store_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| CodeGraphNodeView {
+            id: row.get("id"),
+            language: row.get("language"),
+            package: row.get("package"),
+            source_path: row.get("source_path"),
+            qualified_name: row.get("qualified_name"),
+            kind: row.get("kind"),
+            revision: row.get("revision"),
+            location: None,
+        })
+        .collect())
 }
 
 /// How many nodes match `query` before the limit, so a client can say "showing
@@ -629,6 +712,156 @@ async fn count_nodes(
     push_node_filters(&mut builder, repository, query);
     let row = builder.build().fetch_one(pool).await.map_err(store_error)?;
     Ok(row.get::<i64, _>(0).max(0) as u64)
+}
+
+/// An opt-in overview is one real connected neighborhood, including endpoint metadata.
+async fn select_connected_page(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    limit: u32,
+) -> Result<(Vec<CodeGraphNodeView>, Vec<CodeGraphEdgeView>), CodypendentError> {
+    let repo = repository.to_string();
+    let callable: Option<String> = sqlx::query_scalar(
+        "SELECT n.id FROM code_nodes n WHERE n.repository = ? \
+         AND n.kind IN ('function', 'method', 'test') AND n.source_path IS NOT NULL AND (\
+           EXISTS (SELECT 1 FROM code_edges e JOIN code_nodes t ON t.id = e.to_node \
+                   WHERE e.from_node = n.id AND t.repository = ? AND e.relation = 'calls') OR \
+           EXISTS (SELECT 1 FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+                   WHERE e.to_node = n.id AND f.repository = ? AND e.relation = 'calls')) \
+         ORDER BY CASE WHEN n.source_path LIKE 'src/%' THEN 0 ELSE 1 END, \
+           ((SELECT COUNT(*) FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+             WHERE e.to_node = n.id AND f.repository = ? AND e.relation = 'calls') * 4 + \
+            (SELECT COUNT(*) FROM code_edges e JOIN code_nodes t ON t.id = e.to_node \
+             WHERE e.from_node = n.id AND t.repository = ? AND e.relation = 'calls')) DESC, \
+           n.source_path, n.qualified_name, n.id LIMIT 1",
+    )
+    .bind(&repo)
+    .bind(&repo)
+    .bind(&repo)
+    .bind(&repo)
+    .bind(&repo)
+    .fetch_optional(pool)
+    .await
+    .map_err(store_error)?;
+    let seed = if callable.is_some() {
+        callable
+    } else {
+        let seed: Option<String> = sqlx::query_scalar(
+            "SELECT n.id FROM code_nodes n WHERE n.repository = ? AND (\
+           EXISTS (SELECT 1 FROM code_edges e JOIN code_nodes t ON t.id = e.to_node \
+                   WHERE e.from_node = n.id AND t.repository = ?) OR \
+           EXISTS (SELECT 1 FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+                   WHERE e.to_node = n.id AND f.repository = ?)) \
+         ORDER BY CASE \
+           WHEN n.kind IN ('file', 'module') AND n.source_path LIKE 'src/%' THEN 0 \
+           WHEN n.kind IN ('file', 'module') AND n.source_path IS NOT NULL \
+             AND n.source_path NOT LIKE '.%' AND n.source_path NOT LIKE 'vendor/%' \
+             AND n.source_path NOT LIKE 'node_modules/%' AND n.source_path NOT LIKE 'target/%' \
+             AND n.source_path NOT LIKE 'tests/%' THEN 1 ELSE 2 END, \
+           ((SELECT COUNT(*) FROM code_edges e JOIN code_nodes t ON t.id = e.to_node \
+             WHERE e.from_node = n.id AND t.repository = ?) + \
+            (SELECT COUNT(*) FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+             WHERE e.to_node = n.id AND f.repository = ?)) DESC, \
+           n.source_path ASC, n.qualified_name ASC, n.id ASC LIMIT 1",
+        )
+        .bind(&repo)
+        .bind(&repo)
+        .bind(&repo)
+        .bind(&repo)
+        .bind(&repo)
+        .fetch_optional(pool)
+        .await
+        .map_err(store_error)?;
+        seed
+    };
+    let Some(seed) = seed else {
+        return Ok((
+            select_nodes(pool, repository, &CodeGraphQuery::default(), limit).await?,
+            Vec::new(),
+        ));
+    };
+    let mut nodes = select_nodes(
+        pool,
+        repository,
+        &CodeGraphQuery {
+            node_id: Some(seed.clone()),
+            ..Default::default()
+        },
+        1,
+    )
+    .await?;
+    let mut known = HashSet::from([seed.clone()]);
+    let mut frontier = VecDeque::from([seed]);
+    let mut seen_edges = HashSet::new();
+    let mut edges = Vec::new();
+    while let Some(id) = frontier.pop_front() {
+        if edges.len() >= limit as usize {
+            break;
+        }
+        let rows = sqlx::query(
+            "SELECT e.id AS edge_id, e.from_node, f.qualified_name AS from_name, \
+                    e.to_node, t.qualified_name AS to_name, e.relation, e.confidence, \
+                    e.evidence_kind, e.evidence_artifact, e.revision, \
+                    f.language AS from_language, f.package AS from_package, \
+                    f.source_path AS from_path, f.kind AS from_kind, f.revision AS from_revision, \
+                    t.language AS to_language, t.package AS to_package, \
+                    t.source_path AS to_path, t.kind AS to_kind, t.revision AS to_revision \
+             FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+             JOIN code_nodes t ON t.id = e.to_node \
+             WHERE f.repository = ? AND t.repository = ? AND (e.from_node = ? OR e.to_node = ?) \
+             ORDER BY CASE e.relation WHEN 'calls' THEN 0 WHEN 'contains' THEN 1 WHEN 'defines' THEN 2 ELSE 3 END, \
+               CASE WHEN e.from_node = ? THEN 0 ELSE 1 END, \
+               f.source_path, t.source_path, f.qualified_name, e.relation, t.qualified_name, e.id \
+             LIMIT ?",
+        )
+        .bind(&repo)
+        .bind(&repo)
+        .bind(&id)
+        .bind(&id)
+        .bind(&id)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?;
+        for row in rows {
+            let edge_id: String = row.get("edge_id");
+            if seen_edges.contains(&edge_id) {
+                continue;
+            }
+            let from = incident_node(&row, "from");
+            let to = incident_node(&row, "to");
+            let missing = usize::from(!known.contains(&from.id))
+                + usize::from(from.id != to.id && !known.contains(&to.id));
+            if nodes.len() + missing > limit as usize {
+                continue;
+            }
+            for node in [from, to] {
+                if known.insert(node.id.clone()) {
+                    frontier.push_back(node.id.clone());
+                    nodes.push(node);
+                }
+            }
+            seen_edges.insert(edge_id);
+            edges.push(edge_view(&row));
+            if edges.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+    Ok((nodes, edges))
+}
+
+fn incident_node(row: &sqlx::sqlite::SqliteRow, prefix: &str) -> CodeGraphNodeView {
+    CodeGraphNodeView {
+        id: row.get(format!("{prefix}_node").as_str()),
+        qualified_name: row.get(format!("{prefix}_name").as_str()),
+        language: row.get(format!("{prefix}_language").as_str()),
+        package: row.get(format!("{prefix}_package").as_str()),
+        source_path: row.get(format!("{prefix}_path").as_str()),
+        kind: row.get(format!("{prefix}_kind").as_str()),
+        revision: row.get(format!("{prefix}_revision").as_str()),
+        location: None,
+    }
 }
 
 /// The edges incident to the nodes matching `query`, with both endpoints named,
@@ -654,24 +887,7 @@ async fn select_edges(
     query: &CodeGraphQuery,
     limit: u32,
 ) -> Result<(Vec<CodeGraphEdgeView>, u64), CodypendentError> {
-    // The count runs first, over the SAME predicate builder as the page and
-    // without its `LIMIT`, so `total_edges` is the real total rather than
-    // "however many the limit let through". Reporting a clamped page size as the
-    // total is the same class of confidently-wrong number as the bare zero this
-    // whole command family exists to replace.
-    let mut counter = QueryBuilder::new(
-        "SELECT COUNT(*) FROM code_edges e \
-         JOIN code_nodes f ON e.from_node = f.id \
-         JOIN code_nodes t ON e.to_node = t.id",
-    );
-    push_edge_filters(&mut counter, repository, query);
-    let total = counter
-        .build()
-        .fetch_one(pool)
-        .await
-        .map_err(store_error)?
-        .get::<i64, _>(0)
-        .max(0) as u64;
+    let total = count_edges(pool, repository, query).await?;
 
     // `evidence_artifact` joins the page because `evidence_kind` alone says only
     // THAT an edge was asserted by an agent, never by whom or why — and
@@ -692,23 +908,49 @@ async fn select_edges(
         .push_bind(i64::from(limit));
 
     let rows = builder.build().fetch_all(pool).await.map_err(store_error)?;
-    let edges: Vec<CodeGraphEdgeView> = rows
-        .into_iter()
-        .map(|row| CodeGraphEdgeView {
-            from_id: row.get::<String, _>("from_node"),
-            from_name: row.get::<String, _>("from_name"),
-            to_id: row.get::<String, _>("to_node"),
-            to_name: row.get::<String, _>("to_name"),
-            relation: row.get::<String, _>("relation"),
-            confidence: row.get::<f64, _>("confidence") as f32,
-            evidence_kind: row.get::<String, _>("evidence_kind"),
-            revision: row.get::<String, _>("revision"),
-            asserted_by: agent_assertion(
-                row.get::<Option<String>, _>("evidence_artifact").as_deref(),
-            ),
-        })
-        .collect();
-    Ok((edges, total))
+    Ok((rows.iter().map(edge_view).collect(), total))
+}
+
+async fn count_edges(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    query: &CodeGraphQuery,
+) -> Result<u64, CodypendentError> {
+    // The count runs first, over the SAME predicate builder as the page and
+    // without its `LIMIT`, so `total_edges` is the real total rather than
+    // "however many the limit let through". Reporting a clamped page size as the
+    // total is the same class of confidently-wrong number as the bare zero this
+    // whole command family exists to replace.
+    let mut counter = QueryBuilder::new(
+        "SELECT COUNT(*) FROM code_edges e \
+         JOIN code_nodes f ON e.from_node = f.id \
+         JOIN code_nodes t ON e.to_node = t.id",
+    );
+    push_edge_filters(&mut counter, repository, query);
+    let total = counter
+        .build()
+        .fetch_one(pool)
+        .await
+        .map_err(store_error)?
+        .get::<i64, _>(0)
+        .max(0) as u64;
+
+    Ok(total)
+}
+
+fn edge_view(row: &sqlx::sqlite::SqliteRow) -> CodeGraphEdgeView {
+    CodeGraphEdgeView {
+        from_id: row.get::<String, _>("from_node"),
+        from_name: row.get::<String, _>("from_name"),
+        to_id: row.get::<String, _>("to_node"),
+        to_name: row.get::<String, _>("to_name"),
+        relation: row.get::<String, _>("relation"),
+        confidence: row.get::<f64, _>("confidence") as f32,
+        evidence_kind: row.get::<String, _>("evidence_kind"),
+        revision: row.get::<String, _>("revision"),
+        call_site: None,
+        asserted_by: agent_assertion(row.get::<Option<String>, _>("evidence_artifact").as_deref()),
+    }
 }
 
 /// The agent-assertion provenance stored in one edge's `evidence_artifact`, if
@@ -805,6 +1047,272 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
+    }
+
+    #[tokio::test]
+    async fn connected_view_returns_one_real_application_neighborhood_with_full_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repository = scan::repository_id_for(repo.path());
+        let revision = GitRevision("r1".into());
+        for index in 0..20 {
+            codegraph::upsert_file_graph(
+                &pool,
+                repository,
+                &revision,
+                &format!("aaa/pad{index}.rs"),
+                "// only a file node\n",
+            )
+            .await
+            .unwrap();
+        }
+        for (path, source) in [
+            (
+                "src/main.rs",
+                "pub fn entry() { work(); }\npub fn work() {}\n",
+            ),
+            (
+                "vendor/large.rs",
+                "pub fn a() {}\npub fn b() {}\npub fn c() {}\npub fn d() {}\n",
+            ),
+            (
+                "tools/other.rs",
+                "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+            ),
+        ] {
+            codegraph::upsert_file_graph(&pool, repository, &revision, path, source)
+                .await
+                .unwrap();
+        }
+        let ops = ops(pool.clone());
+        let request = || CodeGraphReadRequest {
+            repository: repo.path().display().to_string(),
+            query: CodeGraphQuery {
+                connected_view: true,
+                include_nodes: true,
+                include_edges: true,
+                limit: 100,
+                ..Default::default()
+            },
+        };
+        let page = ops.read(request()).await.unwrap();
+        assert_eq!(
+            page.nodes[0].qualified_name, "work",
+            "The called source function should anchor the overview"
+        );
+        assert_eq!(page.nodes.len(), 3, "{page:?}");
+        assert_eq!(page.edges.len(), 5, "{page:?}");
+        assert!(page
+            .nodes
+            .iter()
+            .all(|node| node.source_path.as_deref() == Some("src/main.rs")
+                && node.language == "rust"
+                && !node.kind.is_empty()));
+        let ids: HashSet<_> = page.nodes.iter().map(|node| node.id.as_str()).collect();
+        assert!(page
+            .edges
+            .iter()
+            .all(|edge| ids.contains(edge.from_id.as_str()) && ids.contains(edge.to_id.as_str())));
+        let totals = totals(&pool, repository).await.unwrap();
+        assert_eq!((page.total_nodes, page.total_edges), totals);
+        assert!(page.total_nodes > page.nodes.len() as u64);
+        assert_eq!(ops.read(request()).await.unwrap(), page);
+    }
+
+    #[tokio::test]
+    async fn connected_view_respects_both_budgets_and_keeps_explicit_filters_independent() {
+        let data = tempfile::tempdir().unwrap();
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repository = scan::repository_id_for(repo.path());
+        let revision = GitRevision("r1".into());
+        let source: String = (0..60)
+            .map(|index| format!("pub fn f{index:02}() {{}}\n"))
+            .collect();
+        codegraph::upsert_file_graph(&pool, repository, &revision, "src/main.rs", &source)
+            .await
+            .unwrap();
+        let ops = ops(pool.clone());
+        for limit in [1, 7, 100] {
+            let page = ops
+                .read(CodeGraphReadRequest {
+                    repository: repo.path().display().to_string(),
+                    query: CodeGraphQuery {
+                        connected_view: true,
+                        include_nodes: true,
+                        include_edges: true,
+                        limit,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(
+                page.nodes.len() <= limit as usize && page.edges.len() <= limit as usize,
+                "{page:?}"
+            );
+            let ids: HashSet<_> = page.nodes.iter().map(|node| node.id.as_str()).collect();
+            assert!(page.edges.iter().all(
+                |edge| ids.contains(edge.from_id.as_str()) && ids.contains(edge.to_id.as_str())
+            ));
+            assert_eq!(page.total_nodes, 61);
+            assert_eq!(page.total_edges, 120);
+        }
+        let filtered = |connected_view| CodeGraphReadRequest {
+            repository: repo.path().display().to_string(),
+            query: CodeGraphQuery {
+                connected_view,
+                name: Some("f01".into()),
+                include_nodes: true,
+                include_edges: true,
+                limit: 7,
+                ..Default::default()
+            },
+        };
+        let legacy = ops.read(filtered(false)).await.unwrap();
+        assert_eq!(ops.read(filtered(true)).await.unwrap(), legacy);
+        assert_eq!(legacy.nodes.len(), 1);
+        assert!(!legacy.edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connected_view_falls_back_to_real_nodes_when_no_relationships_exist() {
+        let data = tempfile::tempdir().unwrap();
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repository = scan::repository_id_for(repo.path());
+        codegraph::upsert_file_graph(
+            &pool,
+            repository,
+            &GitRevision("r1".into()),
+            "src/empty.rs",
+            "// no relationships\n",
+        )
+        .await
+        .unwrap();
+        let page = ops(pool)
+            .read(CodeGraphReadRequest {
+                repository: repo.path().display().to_string(),
+                query: CodeGraphQuery {
+                    connected_view: true,
+                    include_nodes: true,
+                    include_edges: true,
+                    limit: 100,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.total_nodes, 1);
+        assert!(page.edges.is_empty());
+        assert_eq!(page.total_edges, 0);
+    }
+
+    #[tokio::test]
+    async fn graph_locations_include_verified_definitions_call_sites_and_related_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let source = "// π heading\npub fn target() {}\n\npub fn caller() {\n    let _ = \"é\"; target();\n    target();\n}\n";
+        std::fs::write(repo.path().join("src/main.rs"), source).unwrap();
+        let repository = scan::repository_id_for(repo.path());
+        codegraph::upsert_file_graph(
+            &pool,
+            repository,
+            &GitRevision("r1".into()),
+            "src/main.rs",
+            source,
+        )
+        .await
+        .unwrap();
+        let target: String = sqlx::query_scalar(
+            "SELECT id FROM code_nodes WHERE repository = ? AND qualified_name = 'target'",
+        )
+        .bind(repository.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ops = ops(pool);
+        let request = || CodeGraphReadRequest {
+            repository: repo.path().display().to_string(),
+            query: CodeGraphQuery {
+                node_id: Some(target.clone()),
+                include_nodes: true,
+                include_edges: true,
+                include_neighbors: true,
+                limit: 100,
+                ..Default::default()
+            },
+        };
+        let page = ops.read(request()).await.unwrap();
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(
+            page.total_nodes, 1,
+            "Endpoint metadata must not inflate filter matches"
+        );
+        assert_eq!(
+            page.nodes[0]
+                .location
+                .as_ref()
+                .map(|site| (site.line, site.column)),
+            Some((2, 1))
+        );
+        let caller = page
+            .related_nodes
+            .iter()
+            .find(|node| node.qualified_name == "caller")
+            .unwrap();
+        assert_eq!(
+            caller
+                .location
+                .as_ref()
+                .map(|site| (site.line, site.column)),
+            Some((4, 1))
+        );
+        let calls: Vec<_> = page
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == "calls")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "The durable triple retains one recorded call occurrence"
+        );
+        let site = calls[0].call_site.as_ref().unwrap();
+        assert_eq!(
+            (site.source_path.as_str(), site.line, site.column),
+            ("src/main.rs", 5, 18)
+        );
+        let ids: HashSet<_> = page
+            .nodes
+            .iter()
+            .chain(&page.related_nodes)
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(page
+            .edges
+            .iter()
+            .all(|edge| ids.contains(edge.from_id.as_str()) && ids.contains(edge.to_id.as_str())));
+        std::fs::write(
+            repo.path().join("src/main.rs"),
+            format!("// changed\n{source}"),
+        )
+        .unwrap();
+        let stale = ops.read(request()).await.unwrap();
+        assert!(stale
+            .nodes
+            .iter()
+            .chain(&stale.related_nodes)
+            .all(|node| node.location.is_none()));
+        assert!(stale.edges.iter().all(|edge| edge.call_site.is_none()));
     }
 
     /// An extension histogram is ranked most-files-first with a total order, so
@@ -1262,24 +1770,32 @@ mod tests {
         .await
         .expect("insert a cross-repository edge");
 
-        let page = ops(pool)
-            .read(CodeGraphReadRequest {
-                repository: mine.path().display().to_string(),
-                query: CodeGraphQuery {
-                    include_edges: true,
-                    include_nodes: true,
-                    ..CodeGraphQuery::default()
-                },
-            })
-            .await
-            .expect("read");
-        assert!(
-            !page
-                .edges
+        let ops = ops(pool);
+        for connected_view in [false, true] {
+            let page = ops
+                .read(CodeGraphReadRequest {
+                    repository: mine.path().display().to_string(),
+                    query: CodeGraphQuery {
+                        connected_view,
+                        include_edges: true,
+                        include_nodes: true,
+                        ..CodeGraphQuery::default()
+                    },
+                })
+                .await
+                .expect("read");
+            assert!(
+                !page.edges.iter().any(
+                    |edge| edge.to_name.contains("hidden") || edge.from_name.contains("hidden")
+                ),
+                "an edge must never name a node outside this repository: {page:?}"
+            );
+            assert!(!page
+                .nodes
                 .iter()
-                .any(|edge| edge.to_name.contains("hidden") || edge.from_name.contains("hidden")),
-            "an edge must never name a node outside this repository: {page:?}"
-        );
+                .any(|node| node.qualified_name == "hidden"));
+            assert_eq!(page.total_edges, 2);
+        }
     }
 
     /// A build on a checkout holding nothing the extractor can parse must still

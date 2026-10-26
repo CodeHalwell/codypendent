@@ -4,7 +4,7 @@
 //! want the same bounded, failure-tolerant walk, so it lives here rather than in
 //! the server or executor.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -864,6 +864,95 @@ pub const WATCH_FULL_RESCAN_COOLDOWN: Duration = Duration::from_secs(30);
 /// dropped and recorded, and the batch it belongs to degrades to a full rescan.
 const WATCH_CHANNEL_CAP: usize = 4096;
 
+#[derive(Default)]
+struct ImporterQueue {
+    paths: VecDeque<String>,
+    queued: HashSet<String>,
+}
+
+impl ImporterQueue {
+    fn extend(&mut self, paths: impl IntoIterator<Item = String>) {
+        for path in paths {
+            if self.queued.insert(path.clone()) {
+                self.paths.push_back(path);
+            }
+        }
+    }
+
+    fn take_batch(&mut self) -> Vec<String> {
+        let mut paths = Vec::with_capacity(WATCH_BATCH_CAP);
+        while paths.len() < WATCH_BATCH_CAP {
+            let Some(path) = self.paths.pop_front() else {
+                break;
+            };
+            self.queued.remove(&path);
+            paths.push(path);
+        }
+        paths
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.paths.clear();
+        self.queued.clear();
+    }
+}
+
+async fn queue_affected_importers(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    changed_paths: &[String],
+    importers: &mut ImporterQueue,
+) -> Result<(), codegraph::CodeGraphError> {
+    let mut after = None;
+    while !changed_paths.is_empty() {
+        let page = codegraph::affected_importers_page(
+            pool,
+            repository,
+            changed_paths,
+            after.as_deref(),
+            WATCH_BATCH_CAP,
+        )
+        .await?;
+        after = page.paths.last().cloned();
+        importers.extend(page.paths);
+        if !page.truncated || after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn indexed_source_matches(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    path: &str,
+    digest: &[u8; 32],
+) -> Result<bool, codegraph::CodeGraphError> {
+    let evidence: Option<String> = sqlx::query_scalar(
+        "SELECT e.evidence_artifact FROM code_edges e JOIN code_nodes n ON n.id = e.from_node \
+         WHERE n.repository = ? AND n.source_path = ? AND e.evidence_kind = 'syntax_inferred' \
+         AND e.evidence_artifact IS NOT NULL LIMIT 1",
+    )
+    .bind(repository.to_string())
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(evidence
+        .map(|raw| serde_json::from_str::<codypendent_knowledge::EvidenceRef>(&raw))
+        .transpose()?
+        .is_some_and(|evidence| {
+            matches!(
+                evidence,
+                codypendent_knowledge::EvidenceRef::Artifact { artifact, .. }
+                    if artifact.sha256 == hex::encode(digest)
+            )
+        }))
+}
+
 /// A live per-repository code-graph watcher. Dropping it stops the background
 /// task and, with it, the underlying `notify` watcher and its thread.
 pub struct RepositoryWatcher {
@@ -1145,23 +1234,41 @@ async fn watch_loop(
     // file costs a hash instead of a parse and a transaction. Belt and braces
     // over the event-kind filter: any future event storm degrades to a read.
     let mut folded: HashMap<String, [u8; 32]> = HashMap::new();
-    while let Some(first) = rx.recv().await {
+    let mut importers = ImporterQueue::default();
+    let mut retry_paths = HashSet::new();
+    loop {
+        let first = if importers.is_empty() && retry_paths.is_empty() {
+            rx.recv().await
+        } else {
+            tokio::time::timeout(WATCH_DEBOUNCE, rx.recv())
+                .await
+                .unwrap_or(None)
+        };
+        if first.is_none() && importers.is_empty() && retry_paths.is_empty() {
+            break;
+        }
         let mut pending: HashSet<PathBuf> = HashSet::new();
-        pending.insert(first);
+        pending.extend(first);
+        pending.extend(retry_paths.drain());
         // Collect until the tree goes quiet for WATCH_DEBOUNCE, or the window
         // ceiling is reached — whichever comes first.
         let window_ends = Instant::now() + WATCH_MAX_WINDOW;
-        let closed = loop {
-            let quiet = WATCH_DEBOUNCE.min(window_ends.saturating_duration_since(Instant::now()));
-            if quiet.is_zero() {
-                break false;
-            }
-            match tokio::time::timeout(quiet, rx.recv()).await {
-                Ok(Some(path)) => {
-                    pending.insert(path);
+        let closed = if pending.is_empty() {
+            rx.is_closed()
+        } else {
+            loop {
+                let quiet =
+                    WATCH_DEBOUNCE.min(window_ends.saturating_duration_since(Instant::now()));
+                if quiet.is_zero() {
+                    break false;
                 }
-                Ok(None) => break true,
-                Err(_elapsed) => break false,
+                match tokio::time::timeout(quiet, rx.recv()).await {
+                    Ok(Some(path)) => {
+                        pending.insert(path);
+                    }
+                    Ok(None) => break true,
+                    Err(_elapsed) => break false,
+                }
             }
         };
 
@@ -1206,6 +1313,8 @@ async fn watch_loop(
             match scan_repository(&pool, repository, &root).await {
                 Ok(_summary) => {
                     last_full_rescan = Instant::now();
+                    importers.clear();
+                    folded.clear();
                     true
                 }
                 Err(error) => {
@@ -1231,7 +1340,18 @@ async fn watch_loop(
                     "code-graph watcher: rebuild deferred by the cooldown; folding this batch incrementally"
                 );
             }
-            apply_batch(&pool, repository, &root, pending, &mut folded).await;
+            if !apply_batch(
+                &pool,
+                repository,
+                &root,
+                &pending,
+                &mut folded,
+                &mut importers,
+            )
+            .await
+            {
+                retry_paths.extend(pending);
+            }
         }
         drop(guard);
 
@@ -1253,6 +1373,8 @@ async fn watch_loop(
             match scan_repository(&pool, repository, &root).await {
                 Ok(_summary) => {
                     last_full_rescan = Instant::now();
+                    importers.clear();
+                    folded.clear();
                     info!(%repository, "code-graph watcher: completed deferred rebuild");
                 }
                 Err(error) => {
@@ -1266,7 +1388,7 @@ async fn watch_loop(
             drop(guard);
         }
 
-        if closed {
+        if closed && importers.is_empty() && retry_paths.is_empty() {
             break;
         }
     }
@@ -1285,17 +1407,18 @@ async fn apply_batch(
     pool: &SqlitePool,
     repository: RepositoryId,
     root: &Path,
-    pending: HashSet<PathBuf>,
+    pending: &HashSet<PathBuf>,
     folded: &mut HashMap<String, [u8; 32]>,
-) {
+    importers: &mut ImporterQueue,
+) -> bool {
     let mut relative: Vec<String> = pending
         .iter()
         .filter(|path| codegraph::language_for(path).is_some())
         .filter_map(|path| repo_relative(root, path))
         .collect();
     relative.sort();
-    if relative.is_empty() {
-        return;
+    if relative.is_empty() && importers.is_empty() {
+        return true;
     }
     // `.gitignore` is asked once per batch, not once per file — and the batch's
     // revision stamp with it, in the same hop off the runtime. Both shell out to
@@ -1320,8 +1443,7 @@ async fn apply_batch(
     // A panicked blocking task leaves nothing ignored and the placeholder
     // revision — the same conservative answers `ignored_paths` degrades to.
     .unwrap_or_else(|_| (HashSet::new(), GitRevision("workdir".to_string())));
-    let mut reparsed = 0usize;
-    let mut retired = 0usize;
+    let mut changes = Vec::new();
     for path in relative {
         if ignored.contains(&path) {
             continue;
@@ -1333,6 +1455,30 @@ async fn apply_batch(
                 if folded.get(&path) == Some(&digest) {
                     continue;
                 }
+                changes.push((path, Some((source, digest))));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                changes.push((path, None));
+            }
+            Err(error) => debug!(%repository, path, %error, "unreadable changed file; skipped"),
+        }
+    }
+
+    let changed_paths: Vec<String> = changes.iter().map(|(path, _)| path.clone()).collect();
+    // Retiring a callee also removes its inbound edges. Capture dependents
+    // first, including imports whose target has not been defined yet.
+    if let Err(error) = queue_affected_importers(pool, repository, &changed_paths, importers).await
+    {
+        warn!(%repository, %error, "code-graph importer lookup failed; retrying the unchanged batch");
+        return false;
+    }
+
+    let mut succeeded = true;
+    let mut reparsed = 0usize;
+    let mut retired = 0usize;
+    for (path, source) in changes {
+        match source {
+            Some((source, digest)) => {
                 match codegraph::upsert_file_graph(pool, repository, &revision, &path, &source)
                     .await
                 {
@@ -1344,32 +1490,128 @@ async fn apply_batch(
                         }
                         folded.insert(path.clone(), digest);
                         reparsed += 1;
+                        if changed_paths.len() > 1 {
+                            importers.extend([path]);
+                        }
                     }
-                    Err(error) => warn!(%repository, path, %error, "code-graph reparse failed"),
+                    Err(error) => {
+                        succeeded &= !matches!(error, codegraph::CodeGraphError::Sqlx(_));
+                        warn!(%repository, path, %error, "code-graph reparse failed");
+                    }
                 }
             }
-            // Gone (deleted or renamed away): retire what it defined, which a
-            // reparse can never do because nothing reparses a missing file.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            None => {
                 folded.remove(&path);
                 match codegraph::remove_file_graph(pool, repository, &path).await {
                     Ok(removed) if removed > 0 => retired += 1,
                     Ok(_) => {}
-                    Err(error) => warn!(%repository, path, %error, "code-graph retire failed"),
+                    Err(error) => {
+                        succeeded = false;
+                        warn!(%repository, path, %error, "code-graph retire failed");
+                    }
                 }
             }
-            Err(error) => debug!(%repository, path, %error, "unreadable changed file; skipped"),
         }
     }
-    if reparsed > 0 || retired > 0 {
+
+    let paths = importers.take_batch();
+    let ignore_root = root.to_path_buf();
+    let probe = paths.clone();
+    let ignored = tokio::task::spawn_blocking(move || ignored_paths(&ignore_root, &probe))
+        .await
+        .unwrap_or_default();
+    let mut reconciled = 0usize;
+    for path in paths {
+        let absolute = root.join(&path);
+        if ignored.contains(&path) || !is_candidate_path(root, &absolute) {
+            continue;
+        }
+        let source = match absolute.canonicalize() {
+            Ok(canonical) if canonical.starts_with(root) => std::fs::read_to_string(canonical),
+            Ok(_) => continue,
+            Err(error) => Err(error),
+        };
+        match source {
+            Ok(source) => {
+                let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+                let unchanged = match folded.get(&path) {
+                    Some(previous) => Ok(previous == &digest),
+                    None => indexed_source_matches(pool, repository, &path, &digest).await,
+                };
+                // A queued importer may itself have been edited before its
+                // notify event arrived. Capture its callers before replacing it.
+                let capture = match unchanged {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        queue_affected_importers(
+                            pool,
+                            repository,
+                            std::slice::from_ref(&path),
+                            importers,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = capture {
+                    importers.extend([path.clone()]);
+                    warn!(%repository, path, %error, "code-graph queued source lookup failed; retrying");
+                    continue;
+                }
+                match codegraph::reconcile_imports_for_file(
+                    pool, repository, &revision, &path, &source,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        if folded.len() >= SCAN_FILE_CAP {
+                            folded.clear();
+                        }
+                        folded.insert(path, digest);
+                        reconciled += 1;
+                    }
+                    Err(error) => {
+                        if matches!(error, codegraph::CodeGraphError::Sqlx(_)) {
+                            importers.extend([path.clone()]);
+                        }
+                        warn!(%repository, path, %error, "code-graph importer refresh failed");
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = queue_affected_importers(
+                    pool,
+                    repository,
+                    std::slice::from_ref(&path),
+                    importers,
+                )
+                .await
+                {
+                    importers.extend([path.clone()]);
+                    warn!(%repository, path, %error, "code-graph queued deletion lookup failed; retrying");
+                    continue;
+                }
+                folded.remove(&path);
+                if let Err(error) = codegraph::remove_file_graph(pool, repository, &path).await {
+                    importers.extend([path.clone()]);
+                    warn!(%repository, path, %error, "code-graph missing importer retire failed");
+                }
+            }
+            Err(error) => debug!(%repository, path, %error, "unreadable importer; skipped"),
+        }
+    }
+    if reparsed > 0 || retired > 0 || reconciled > 0 {
         info!(
             %repository,
             revision = %revision.0,
             reparsed,
             retired,
+            reconciled,
+            pending_importers = importers.paths.len(),
             "code-graph updated from the working tree"
         );
     }
+    succeeded
 }
 
 /// The revision a fold of the **working tree** is stamped with: `<HEAD>+workdir`
@@ -1461,9 +1703,28 @@ impl codegraph::CodeGraphQueries for PoolCodeGraph {
         question: codegraph::GraphQuestion,
     ) -> Result<codegraph::GraphAnswer, String> {
         let repository = repository_id_for(repository_root);
-        codegraph::answer(&self.pool, repository, &question)
+        let mut answer = codegraph::answer(&self.pool, repository, &question)
             .await
-            .map_err(|error| format!("code-graph query failed: {error}"))
+            .map_err(|error| format!("code-graph query failed: {error}"))?;
+        let ids: Vec<String> = answer
+            .hits
+            .iter()
+            .take(codegraph::GRAPH_ANSWER_LIMIT)
+            .map(|hit| hit.id.to_string())
+            .collect();
+        if let Ok(locations) = crate::codegraph_ops::locations::for_node_ids(
+            &self.pool,
+            repository,
+            repository_root,
+            &ids,
+        )
+        .await
+        {
+            for hit in &mut answer.hits {
+                hit.location = locations.get(&hit.id.to_string()).cloned();
+            }
+        }
+        Ok(answer)
     }
 }
 
@@ -1480,6 +1741,22 @@ pub fn repository_id_for(root: &Path) -> RepositoryId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn importer_refreshes_are_coalesced_and_drained_in_bounded_fifo_batches() {
+        let paths: Vec<String> = (0..WATCH_BATCH_CAP + 7)
+            .map(|index| format!("src/caller_{index}.py"))
+            .collect();
+        let mut queue = ImporterQueue::default();
+        queue.extend(paths.clone());
+        queue.extend(paths.clone());
+        assert_eq!(queue.take_batch(), paths[..WATCH_BATCH_CAP]);
+        queue.extend([paths[WATCH_BATCH_CAP].clone(), paths[0].clone()]);
+        let mut remainder = paths[WATCH_BATCH_CAP..].to_vec();
+        remainder.push(paths[0].clone());
+        assert_eq!(queue.take_batch(), remainder);
+        assert!(queue.is_empty());
+    }
 
     fn init_repo(path: &Path) {
         let status = Command::new("git")
@@ -1608,6 +1885,230 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watcher_refreshes_unchanged_importers_when_definitions_change() {
+        async fn wait_for_call(
+            pool: &SqlitePool,
+            repository: RepositoryId,
+            target_path: &str,
+            target_kind: &str,
+            previous: Option<&str>,
+        ) -> String {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let target: Option<String> = sqlx::query_scalar(
+                    "SELECT t.id FROM code_edges e \
+                     JOIN code_nodes f ON f.id = e.from_node \
+                     JOIN code_nodes t ON t.id = e.to_node \
+                     WHERE f.repository = ? AND t.repository = ? \
+                     AND f.source_path = 'src/main.py' AND f.qualified_name = 'caller' \
+                     AND e.relation = 'calls' AND t.qualified_name = 'target' \
+                     AND t.source_path = ? AND t.kind = ?",
+                )
+                .bind(repository.to_string())
+                .bind(repository.to_string())
+                .bind(target_path)
+                .bind(target_kind)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                if let Some(target) = target.filter(|target| previous != Some(target.as_str())) {
+                    return target;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the unchanged caller never refreshed its {target_kind} target in {target_path}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let caller = root.join("src/main.py");
+        let caller_source = "from service import target\n\ndef caller():\n    return target(1)\n";
+        std::fs::write(&caller, caller_source).unwrap();
+        let modified = std::fs::metadata(&caller).unwrap().modified().unwrap();
+        let callee = root.join("src/service.py");
+        std::fs::write(&callee, "def placeholder():\n    return 1\n").unwrap();
+        init_repo(&root);
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        scan_repository(&pool, repository, &root).await.unwrap();
+        wait_for_call(
+            &pool,
+            repository,
+            "src/main.py",
+            "external_dependency",
+            None,
+        )
+        .await;
+        let _watcher = arm_watcher(pool.clone(), repository, &root).unwrap();
+
+        std::fs::write(&callee, "def target(value):\n    return value\n").unwrap();
+        let first = wait_for_call(&pool, repository, "src/service.py", "function", None).await;
+
+        std::fs::write(
+            &callee,
+            "def target(value, extra=2):\n    return value + extra\n",
+        )
+        .unwrap();
+        wait_for_call(
+            &pool,
+            repository,
+            "src/service.py",
+            "function",
+            Some(&first),
+        )
+        .await;
+
+        std::fs::remove_file(&callee).unwrap();
+        wait_for_call(
+            &pool,
+            repository,
+            "src/main.py",
+            "external_dependency",
+            None,
+        )
+        .await;
+
+        std::fs::write(&callee, "def target(value):\n    return value\n").unwrap();
+        wait_for_call(&pool, repository, "src/service.py", "function", None).await;
+        assert_eq!(std::fs::read_to_string(&caller).unwrap(), caller_source);
+        assert_eq!(
+            std::fs::metadata(caller).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watcher_finishes_importer_fanout_without_further_events() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let callers = WATCH_BATCH_CAP + 3;
+        for index in 0..callers {
+            std::fs::write(
+                root.join(format!("src/caller_{index:03}.py")),
+                "from service import target\n\ndef caller():\n    return target()\n",
+            )
+            .unwrap();
+        }
+        let callee = root.join("src/service.py");
+        std::fs::write(&callee, "def placeholder():\n    return 1\n").unwrap();
+        init_repo(&root);
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        scan_repository(&pool, repository, &root).await.unwrap();
+        let _watcher = arm_watcher(pool.clone(), repository, &root).unwrap();
+        std::fs::write(callee, "def target():\n    return 1\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let refreshed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT f.source_path) FROM code_edges e \
+                 JOIN code_nodes f ON f.id = e.from_node \
+                 JOIN code_nodes t ON t.id = e.to_node \
+                 WHERE f.repository = ? AND t.repository = ? AND e.relation = 'calls' \
+                 AND f.qualified_name = 'caller' AND t.source_path = 'src/service.py' \
+                 AND t.qualified_name = 'target' AND t.kind = 'function'",
+            )
+            .bind(repository.to_string())
+            .bind(repository.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if refreshed == callers as i64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {refreshed}/{callers} queued importers refreshed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watcher_captures_dependents_of_a_queued_importer_edited_before_its_event() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/service.py"), "def target():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("src/middle.py"),
+            "from service import target\n\ndef middle(value):\n    return target()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/outer.py"),
+            "from middle import middle\n\ndef outer():\n    return middle(1)\n",
+        )
+        .unwrap();
+        init_repo(&root);
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        scan_repository(&pool, repository, &root).await.unwrap();
+        let mut importers = ImporterQueue::default();
+        importers.extend(["src/middle.py".to_owned()]);
+        std::fs::write(
+            root.join("src/middle.py"),
+            "from service import target\n\ndef middle(value, extra=2):\n    return target()\n",
+        )
+        .unwrap();
+        let mut folded = HashMap::new();
+        let pending = HashSet::new();
+        assert!(
+            apply_batch(
+                &pool,
+                repository,
+                &root,
+                &pending,
+                &mut folded,
+                &mut importers
+            )
+            .await
+        );
+        assert!(
+            !importers.is_empty(),
+            "the queued edit must capture its caller"
+        );
+        assert!(
+            apply_batch(
+                &pool,
+                repository,
+                &root,
+                &pending,
+                &mut folded,
+                &mut importers
+            )
+            .await
+        );
+        assert!(importers.is_empty());
+        let calls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM code_edges e JOIN code_nodes f ON f.id = e.from_node \
+             JOIN code_nodes t ON t.id = e.to_node WHERE f.repository = ? AND t.repository = ? \
+             AND f.source_path = 'src/outer.py' AND f.qualified_name = 'outer' \
+             AND t.source_path = 'src/middle.py' AND t.qualified_name = 'middle' \
+             AND t.kind = 'function' AND e.relation = 'calls'",
+        )
+        .bind(repository.to_string())
+        .bind(repository.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
     }
 
     #[test]

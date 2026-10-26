@@ -613,7 +613,7 @@ impl ApprovalBroker {
         .bind(approval_id.to_string())
         .fetch_optional(&mut **tx)
         .await?;
-        let (current_state, session_id, action_json, _run_id) =
+        let (current_state, session_id, action_json, run_id) =
             existing.ok_or(ApprovalError::NotFound { approval_id })?;
         if current_state != "pending" {
             return Err(ApprovalError::AlreadyResolved {
@@ -641,16 +641,15 @@ impl ApprovalBroker {
             computed_pattern = Some(pattern.clone());
 
             if scope == ApprovalScope::Repository {
-                let repo_row: Option<(Option<String>,)> = sqlx::query_as(
-                    "SELECT json_extract(body, '$.repository') FROM commands \
-                     WHERE session_id = ? AND status = 'applied' AND body LIKE '%\"type\":\"StartRun\"%' \
-                     ORDER BY received_at DESC LIMIT 1",
+                let provenance = crate::commands::run_launch_provenance_in(
+                    &mut **tx,
+                    parse_run_id(&run_id)?,
+                    session_id,
                 )
-                .bind(session_id.to_string())
-                .fetch_optional(&mut **tx)
-                .await?;
-                let repo = repo_row
-                    .and_then(|(r,)| r)
+                .await
+                .map_err(|error| ApprovalError::Corrupt(format!("run repository: {error}")))?;
+                let repo = provenance
+                    .repository
                     .filter(|r| !r.is_empty())
                     .ok_or(ApprovalError::PatternUnavailable)?;
                 let rule_id = uuid::Uuid::now_v7().to_string();
@@ -1231,15 +1230,17 @@ mod tests {
                 "session_id": session_id,
                 "objective": "diagnose",
                 "repository": repo,
+                "mode": { "type": "Build" },
             });
             sqlx::query(
-                "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, received_at) \
-                 VALUES (?, ?, ?, 'test-client', ?, 'applied', ?)",
+                "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, result_json, received_at) \
+                 VALUES (?, ?, ?, 'test-client', ?, 'applied', ?, ?)",
             )
             .bind(uuid::Uuid::now_v7().to_string())
             .bind(uuid::Uuid::now_v7().to_string())
             .bind(session_id.to_string())
             .bind(body.to_string())
+            .bind(serde_json::json!({ "created_run": run_id }).to_string())
             .bind(chrono::Utc::now().to_rfc3339())
             .execute(pool)
             .await
@@ -1628,6 +1629,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_preserves_only_daemon_learnable_command_patterns() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+        for (program, expected) in [("git", Some("git status *")), ("python3", None)] {
+            let action = ProposedAction::ExecuteCommand {
+                program: program.to_string(),
+                args: vec!["status".to_string()],
+                environment: vec![],
+                cwd: None,
+            };
+            let id = broker
+                .request(
+                    &pool,
+                    session,
+                    run,
+                    None,
+                    action,
+                    sample_risk(),
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            let snapshot = crate::projections::session_projection(&pool, session)
+                .await
+                .unwrap();
+            let approval = snapshot
+                .pending_approvals
+                .iter()
+                .find(|approval| approval.approval_id == id)
+                .unwrap();
+            assert_eq!(approval.pattern.as_deref(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn resolving_a_missing_approval_is_not_found() {
         let dir = tempdir().unwrap();
         let pool = test_pool(dir.path()).await;
@@ -1909,6 +1948,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state_of(&pool, second).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn repository_rule_uses_the_approving_runs_origin_not_later_session_commands() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run_with_repo(&pool, Some("/repository-at-origin")).await;
+        let broker = ApprovalBroker::new();
+        let id = broker
+            .request(
+                &pool,
+                session,
+                run,
+                None,
+                sample_action(),
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, result_json, received_at) \
+             SELECT ?, ?, session_id, client_id, json_set(body, '$.repository', '/later-repository'), 'applied', '{}', ? \
+             FROM commands WHERE session_id = ? LIMIT 1",
+        )
+        .bind(uuid::Uuid::now_v7().to_string()).bind(uuid::Uuid::now_v7().to_string())
+        .bind((Utc::now() + chrono::Duration::seconds(1)).to_rfc3339()).bind(session.to_string())
+        .execute(&pool).await.unwrap();
+        broker
+            .resolve(
+                &pool,
+                id,
+                ApprovalDecision::Approve,
+                ApprovalScope::Repository,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+        let repositories: Vec<(String,)> = sqlx::query_as("SELECT repository FROM approval_rules")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(repositories, vec![("/repository-at-origin".to_string(),)]);
     }
 
     #[tokio::test]

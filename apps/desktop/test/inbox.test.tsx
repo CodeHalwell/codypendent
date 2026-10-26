@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { InboxView } from "../src/components/InboxView.js";
 import type { InboxEntry } from "@codypendent/protocol";
@@ -95,45 +95,28 @@ describe("InboxView component", () => {
 
     // Acknowledge button
     const ackBtn = screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" });
-    fireEvent.click(ackBtn);
+    await act(async () => { fireEvent.click(ackBtn); });
     expect(onAcknowledge).toHaveBeenCalledWith("inbox-1");
 
     // Dismiss button
     const dismissBtn = screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" });
-    fireEvent.click(dismissBtn);
+    await act(async () => { fireEvent.click(dismissBtn); });
     expect(onDismiss).toHaveBeenCalledWith("inbox-1");
 
     // Open/Navigate button
-    const navBtn = screen.getByRole("button", { name: "Open Write patch to fix auth leak" });
-    fireEvent.click(navBtn);
-    expect(onNavigate).toHaveBeenCalledWith({ type: "Approval", approval_id: "app-123" });
+    const navBtn = screen.getByRole("button", { name: "Review Write patch to fix auth leak" });
+    await act(async () => { fireEvent.click(navBtn); });
+    expect(onNavigate).toHaveBeenCalledWith({ type: "Approval", approval_id: "app-123" }, sampleEntries[0]);
   });
 
-  it("handles direct approve and reject actions on approval requests", () => {
-    const onApprove = vi.fn();
-    const onReject = vi.fn();
+  it("requires review of the full request instead of deciding from a summary", async () => {
     const onNavigate = vi.fn();
-    const onAcknowledge = vi.fn();
-    const onDismiss = vi.fn();
-
-    render(
-      <InboxView
-        entries={sampleEntries}
-        onAcknowledge={onAcknowledge}
-        onDismiss={onDismiss}
-        onNavigate={onNavigate}
-        onApprove={onApprove}
-        onReject={onReject}
-      />,
-    );
-
-    const approveBtn = screen.getByRole("button", { name: "Approve Write patch to fix auth leak" });
-    fireEvent.click(approveBtn);
-    expect(onApprove).toHaveBeenCalledWith("app-123");
-
-    const rejectBtn = screen.getByRole("button", { name: "Reject Write patch to fix auth leak" });
-    fireEvent.click(rejectBtn);
-    expect(onReject).toHaveBeenCalledWith("app-123");
+    render(<InboxView entries={sampleEntries} onAcknowledge={vi.fn()} onDismiss={vi.fn()} onNavigate={onNavigate} />);
+    expect(screen.queryByRole("button", { name: /^Approve / })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Reject / })).toBeNull();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Review Write patch to fix auth leak" })); });
+    expect(onNavigate).toHaveBeenCalledWith(sampleEntries[0]!.deep_link, sampleEntries[0]);
+    expect(screen.getByText(/Acknowledge and Dismiss only organize/)).toBeTruthy();
   });
 
   it("an unreadable inbox says so instead of claiming nothing is pending", () => {
@@ -153,6 +136,55 @@ describe("InboxView component", () => {
     const panel = screen.getByTestId("inbox-unavailable");
     expect(panel.textContent).toContain("Inbox unavailable");
     expect(panel.textContent).toContain("no daemon answered ListInbox");
+  });
+
+  it("serializes mutations per entry while allowing different entries to proceed", async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    const acknowledge = vi.fn().mockReturnValue(pending);
+    const dismiss = vi.fn().mockResolvedValue(undefined);
+    render(<InboxView entries={[sampleEntries[0]!, { ...sampleEntries[0]!, id: "other", title: "Another request" }]}
+      onAcknowledge={acknowledge} onDismiss={dismiss} onNavigate={vi.fn()} />);
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" }));
+      fireEvent.click(screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" }));
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" }));
+    });
+    expect(acknowledge).toHaveBeenCalledTimes(1);
+    expect(dismiss).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Dismiss Another request" })));
+    expect(dismiss).toHaveBeenCalledExactlyOnceWith("other");
+    expect((screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => finish());
+    expect((screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("keeps navigation and mutation refusals local and permits retry", async () => {
+    const navigate = vi.fn().mockRejectedValueOnce(new Error("Session is unavailable")).mockResolvedValue(undefined);
+    const acknowledge = vi.fn().mockImplementationOnce(() => { throw new Error("Cannot acknowledge"); }).mockResolvedValue(undefined);
+    render(<InboxView entries={sampleEntries} onAcknowledge={acknowledge} onDismiss={vi.fn()} onNavigate={navigate} />);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Review Write patch to fix auth leak" })));
+    expect(screen.getByRole("alert").textContent).toContain("Session is unavailable");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Review Write patch to fix auth leak" })));
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" }));
+    expect(screen.getByRole("alert").textContent).toContain("Cannot acknowledge");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" })));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("retires a disconnected mutation's error and disables unavailable controls", async () => {
+    let reject!: (error: Error) => void;
+    const pending = new Promise<void>((_, no) => { reject = no; });
+    const props = { entries: sampleEntries, onAcknowledge: vi.fn().mockReturnValue(pending), onDismiss: vi.fn(), onNavigate: vi.fn() };
+    const { rerender } = render(<InboxView {...props} connected />);
+    fireEvent.click(screen.getByRole("button", { name: "Acknowledge Write patch to fix auth leak" }));
+    rerender(<InboxView {...props} connected={false} />);
+    await act(async () => reject(new Error("Old connection")));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect((screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" }) as HTMLButtonElement).disabled).toBe(true);
+    rerender(<InboxView {...props} connected />);
+    expect((screen.getByRole("button", { name: "Dismiss Write patch to fix auth leak" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("an empty inbox that was actually read still shows the empty state", () => {

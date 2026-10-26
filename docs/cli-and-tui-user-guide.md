@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.5.1
+> **Version:** 0.14.0
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -22,10 +22,17 @@
 codypendent
 # When startup is ready, press Enter to open the workspace (Esc quits).
 
+# Open a checkout directly from an IDE task or another terminal directory
+codypendent -C /path/to/repository
+# Long form: codypendent --working-directory /path/to/repository
+
 # Use the cooked, line-oriented accessibility client
 codypendent --accessible # --plain is an equivalent alias
 
-# Run a headless agent run with JSONL event streaming
+# Run an agent with readable streaming output
+codypendent run --objective "Fix failing unit tests in crates/runtime" --mode build
+
+# Use JSONL event streaming for scripts
 codypendent run --objective "Fix failing unit tests in crates/runtime" --mode build --jsonl
 
 # Validate a multi-agent declarative workflow manifest
@@ -44,7 +51,7 @@ codypendent update --check
 
 # Install the newest published release, or pin an exact tag.
 codypendent update
-codypendent update v0.5.1
+codypendent update <release-tag>
 ```
 
 Updating never kills an active run. An idle daemon restarts immediately; a busy
@@ -63,7 +70,7 @@ preserve existing sessions and configuration.
 > |---|---|
 > | `v0.1.0-build.42` | `a29143289fa4` (6661 bytes) |
 > | `v0.1.0-build.43`, `.44`, `.45` | **`a5c81199c24b` (6828 bytes)** |
-> | `v0.1.0-build.46` and every release since, including v0.5.1 | `a29143289fa4` (6661 bytes) |
+> | `v0.1.0-build.46`, `v0.5.1`, and the current 0.14.0 source | `a29143289fa4` (6661 bytes) |
 >
 > (Verified 2026-08-13 by downloading the file at each published tag and hashing
 > it; sqlx's own record is a SHA-384, so these are file identities for
@@ -71,13 +78,14 @@ preserve existing sessions and configuration.
 > clarification — which `sqlx` cannot distinguish from a schema change.) If your
 > database was created by **`v0.1.0-build.43`, `.44` or `.45`**,
 > upgrading to any later release makes the daemon fail to start with a migration
-> checksum error. There is no in-product repair for it yet: the practical
-> options are to re-create the data directory from scratch, or to keep the build
-> that created it. Every other upgrade path is unaffected.
+> checksum error. The current database opener still uses the embedded migration
+> history without an automatic repair. Preserve that database and use its
+> compatible build until a verified migration path is available; deleting the
+> data directory would discard its history.
 >
 > Schema changes otherwise always ship as a *new* numbered migration.
-> `migrations/README.md` records the incident in full; if you maintain this
-> project, treat it as a standing bug, not a documentation nit.
+> `migrations/README.md` explains the immutability requirement; the checksum
+> manifest and CI check protect the current history from further edits.
 
 ---
 
@@ -97,6 +105,12 @@ codypendent daemon stop          # Gracefully shut down the daemon
 ## 3. Interactive TUI Reference (`codypendent`)
 
 Running `codypendent` with no subcommands opens the interactive Ratatui terminal user interface attached to the current directory's repository session. Startup finishes on a welcome screen so you can read any diagnostics and confirm the workspace; press `Enter` to proceed or `Esc` to quit.
+
+The welcome screen pairs a linked-agent emblem with a theme-aware block wordmark.
+Highlights move during startup and settle when ready, without adding a startup
+delay. On smaller terminals, decoration gives way to the current status,
+warnings, and Enter prompt; excess warnings are counted and remain available
+in Issues.
 
 If no saved profile is runnable, Codypendent opens guided setup after the
 splash. Choose a hosted API, local endpoint, or ACP coding agent, then choose a
@@ -139,6 +153,18 @@ money, rather than a `$0.00` that would read as "this run was free". When
 nothing was measured at all the field falls back to the run's cost budget, and
 if there is no budget either it renders `—`. A dash means *not measured*, never
 *free*.
+
+New run records also carry measurement coverage. A `partial` label means one
+or more displayed totals are measured subtotals; some requests or retries have
+no measurement. Older records show `coverage unknown`. Small nonzero costs
+retain six decimals when four would round them down to zero. Measured zero
+remains distinct from missing usage.
+
+Model readiness comes from the running daemon. Passive picker refreshes resolve
+configuration and credentials without calling provider endpoints. Explicit
+`models check` and key verification ask the daemon to probe the configured
+model. ACP validation happens in the agent handshake. An older daemon that
+cannot probe models is reported as a compatibility limitation, not a bad key.
 
 The composer reserves at least three visible text rows at normal terminal
 heights and grows with Unicode-aware wrapping. Tiny terminals use a compact
@@ -187,6 +213,13 @@ Every mouse gesture the TUI recognizes has a keyboard equivalent; the reverse
 is not claimed — some keys (steering, run switching, cursor motion) have no
 mouse gesture at all, and the table below says so with `-`.
 
+In a browsed patch, `Alt-O` opens the selected file or hunk in the originating
+run's checkout and attaches the editor to the same session. It chooses an
+installed VS Code, Cursor or VS Code Insiders; set `CODYPENDENT_EDITOR=cursor`
+(or `code` / `code-insiders`) to choose one explicitly. The editor confirms the
+handoff and honours workspace trust. A deleted file or retired checkout reports
+an error without opening the base repository in its place.
+
 ```mermaid
 graph LR
     InputMode["Input Mode"] --> Normal["Normal Mode (Navigation & Shortcuts)"]
@@ -213,13 +246,18 @@ equivalent and the key is the only way in.
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
 | | `Alt-↑` / `Alt-↓` | Browse transcript folds (tool cards, diffs, long notes) | Click a fold line |
 | | `Alt-Enter` | Expand / collapse the browsed fold, else insert a line break | Click a fold line |
+| | `Alt-N` / `Alt-P` | Next / previous hunk in the browsed patch preview | - |
+| | `Alt-Shift-N` / `Alt-Shift-P` | Next / previous changed file | - |
+| | `Alt-O` | Open the reviewed file or hunk in VS Code / Cursor, with the same session and run checkout | - |
+| | `Shift-Enter` | Insert a line break (terminals with enhanced keyboard reporting) | - |
 | | `Alt-Y` | Copy the focused transcript card's safe projection | Click the focused card's copy chip, or Shift-drag to select terminal text |
 | | `Alt-R` / `Alt-A` | Retry a focused failed run / show re-authentication guidance | Click the corresponding failure-card chip |
 | | `Alt-M` / `Alt-D` | Choose another model / open guarded model disable | Click the corresponding failure-card chip |
 | **Composer** | `←` / `→` / `Home` / `End` | Move the draft cursor (within its own line) | - |
-| | `Ctrl-←` / `Ctrl-→` (or `Alt-←` / `Alt-→`) | Move the draft cursor a word at a time | - |
+| | `Ctrl-←` / `Ctrl-→` (or `Alt-←` / `Alt-→`, `Option-B` / `Option-F`) | Move the draft cursor a word at a time | - |
 | | `Ctrl-A` / `Ctrl-E` | Jump to the start / end of the draft's current line | - |
 | | `Ctrl-W` / `Ctrl-U` / `Ctrl-K` | Delete the word before the cursor / to the line start / to the line end | - |
+| | `Option-Backspace` / `Ctrl-D` | Delete the previous word / the character after the draft cursor | - |
 | | `Delete` | Delete the character under the cursor | - |
 | | `↑` / `↓` | Move between the draft's lines; recall history at its edges | - |
 | | `Ctrl-R` / `Ctrl-G` | Search prompt history (older / newer match) | Click a result row in the history popup |
@@ -237,7 +275,7 @@ equivalent and the key is the only way in.
 | | `p` | Pause current run | Palette row "Pause / resume run" |
 | | `c` | Cancel active run | Palette row "Cancel run" |
 | | `s` | Steer / add prompt to running agent | Palette row "Steer run" |
-| | `q` | Close the open view or overlay (never quits) | Click outside it, or its `Esc close` chip |
+| | `q` | Close a Normal-mode view or browser (never quits); in text filters, including Help, it types `q` | Click outside it, or its `Esc close` chip |
 | | `Ctrl-C` | Detach the TUI (the run continues in the daemon) | Palette row "Detach" |
 | **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |
 | | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
@@ -245,7 +283,7 @@ equivalent and the key is the only way in.
 | | `r` | Reject proposed action | Click the `r reject` footer chip |
 | **Question cards** | `1`-`9` | Pick (or, with multi-select, toggle) the numbered option | Click the option row |
 | | `↑` / `↓`, `Space`, `Enter` | Move the highlight, toggle a multi-select option, confirm | Click an option row / the confirm row |
-| | `r` | Write a custom reply instead (typing into the highlighted custom row also works) | Click the custom-reply row |
+| | `r` | Open rejection feedback; `Enter` submits the rejection | Click the reject control |
 | | `PgUp` / `PgDn` | Page a question body too tall for the modal | Scroll wheel |
 | **Studios & Views** | `/` | Open searchable Command Palette | Click the `/ commands` footer chip |
 | | `Delete` / `Ctrl-D` in `/model` | Remove the highlighted configured model after confirmation; its provider remains available in `/provider` | - |
@@ -282,6 +320,27 @@ surface of the Docs Studio (`D` sends you there) and the whole plugin
 enable/revoke surface were undocumented. Derived from `map_normal_char`
 (`crates/tui/src/input.rs`); the overlay-scoped keys are inert elsewhere,
 which is why they are grouped by the overlay that gives them meaning.
+
+In Help, type to filter by shortcut, description, or mouse action. Every word
+must match, in any order and without case sensitivity. `Backspace` edits the
+filter, `Ctrl-W` removes a word, and `Ctrl-U` clears it. Arrow keys, Page Up/Down,
+and Home/End scroll the matching rows; `Esc`, `?`, or `F1` closes Help. The
+composer draft is preserved. The accessible client supports `type`,
+`backspace`, `clear`, and the same navigation through its line commands.
+
+Approval details show the proposed command and working directory, affected
+paths, or other action-specific evidence, together with the supplied risk
+reasons. GitHub changes include the repository and summary; checkpoint restores
+include the commit and worktree that will be reset. If the client cannot
+interpret the action type, it explains that limitation and offers rejection
+only. Update the client before approving that action.
+
+The front question in the TUI queue owns the answer editor. New questions and
+resolutions in the background preserve its draft and scroll position. A reissued
+front question starts with fresh answers, including when it has the same number
+of prompts or options; previous selections never carry into a new issue. Resolving
+the front question opens the next one at the top. To enter a custom answer, move
+to the custom-reply row and type.
 
 The prefilled prompt editors (session rename, learning edit, doc-block edit)
 share the composer's cursor keys: `←`/`→`, `Home`/`End`, word motion, and the
@@ -342,19 +401,53 @@ they never edit or submit a composer hidden behind the dialog.
 
 ### 4.1 Headless Execution & Event Attaching
 
-Run agents headlessly or stream events directly into JSON pipelines:
+Run agents headlessly with readable answers, or stream events into JSON pipelines:
 
 ```bash
-# Start a headless run
+# Stream the answer to stdout, with progress and diagnostics on stderr
 codypendent run \
   --objective "Add unit tests for workspace.read_file" \
   --mode build \
-  --repo /path/to/repo \
-  --jsonl
+  --repo /path/to/repo
+
+# Preserve the full event-envelope stream for automation
+codypendent run --objective "Explain the test failures" --jsonl > events.jsonl
 
 # Attach to an existing session from a specific event sequence cursor
 codypendent attach <SESSION_ID> --from-sequence 42 --events jsonl
 ```
+
+Readable output contains answer text from the run this command started; private
+thought deltas and concurrent runs in the same session are omitted. If no answer
+was streamed, the completion summary is printed when available. Terminal control
+sequences are stripped from readable output. `--jsonl` (also `--json`) preserves
+the complete subscribed event stream and its existing envelope format.
+
+Both output modes return `0` for completion, `2` for a failed run, and `130` for
+cancellation. `Ctrl-C` detaches the client while the daemon continues the run.
+Measured usage appears on stderr too: `1,200 in · $0.000011 · partial`.
+Missing dimensions are omitted, measured zero remains zero, and older events
+without completeness metadata say `coverage unknown`. Redirecting stdout keeps
+just the answer. A bounded compatibility drain retains usage that older daemons
+send immediately after completion.
+
+In readable mode, the session ID and reattach command appear on stderr. When a run needs an
+approval or answer, open that session in the TUI or desktop to respond.
+
+Session and bundle exports write verified files:
+
+```bash
+codypendent session export <SESSION_ID> --out transcript.md --format markdown
+codypendent bundle export --out support.tar --session <SESSION_ID> --include-transcripts
+```
+
+Downloads stream in bounded chunks to a private temporary file beside the
+destination. The client verifies artifact identity, length, and SHA-256 before
+replacing an existing file. Interrupted, incomplete, or corrupt downloads leave
+the previous export intact. Parent directories are created as needed, and a
+relative filename such as `--out transcript.md` works. The TUI Session Library
+uses the same transfer and verification path. Artifact bodies and internal
+sessions remain opt-in for session exports.
 
 ### 4.2 Declarative Workflows (`codypendent workflow` & `codypendent fix-ci`)
 

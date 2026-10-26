@@ -1,6 +1,9 @@
 import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
 import type { RunActivity, RunUsage } from "../types.js";
 import { describeActivity, usageLabel } from "../runActivity.js";
+import { modelLabel as displayModelName, runDefaultsLabel } from "../modelPresentation.js";
+import { ArrowUp, ChevronDown, Cpu, Layers3, ListOrdered, Pause, Play, Square, Waypoints } from "lucide-react";
+import "./Composer.css";
 
 interface ComposerProps {
   /**
@@ -18,6 +21,8 @@ interface ComposerProps {
    * shell did not report.
    */
   statusLabel?: string | null;
+  onOpenModels?: () => void;
+  onOpenMode?: () => void;
   /**
    * Lifted draft state. The composer unmounts on every trip to another view
    * (`App` conditionally mounts the session surface), so component-local
@@ -26,6 +31,9 @@ interface ComposerProps {
    */
   draft?: string;
   onDraftChange?: (draft: string) => void;
+  /** A lifted draft's owner compares against its current value, even if this
+   * composer unmounts while the daemon is deciding. */
+  onDraftAccepted?: (submittedDraft: string) => void;
   /**
    * Queue the text as a follow-up prompt instead of starting a run
    * (`QueuePrompt`, adoption 06).
@@ -37,7 +45,7 @@ interface ComposerProps {
    * pushes `Intent::QueuePrompt { delivery: Queue }`
    * (`crates/tui/src/reduce.rs`), and this is that behaviour, ported.
    */
-  onQueue?: (text: string) => void;
+  onQueue?: (text: string) => void | boolean | Promise<void | boolean>;
   /**
    * Whether a real `QueuePrompt` can be sent — connected, with a session the
    * shell is attached to and a bridge that offers the command. False keeps the
@@ -106,8 +114,11 @@ interface ComposerProps {
 export const Composer: React.FC<ComposerProps> = ({
   onSend,
   statusLabel,
+  onOpenModels,
+  onOpenMode,
   draft,
   onDraftChange,
+  onDraftAccepted,
   onQueue,
   canQueue,
   queuedCount,
@@ -175,31 +186,22 @@ export const Composer: React.FC<ComposerProps> = ({
 
   /** True while a submission is awaiting the daemon's accept/refuse. */
   const [sending, setSending] = useState(false);
+  const submissionPending = useRef(false);
 
   const submit = () => {
     // The RAW draft as well as the trimmed one: the box holds the raw text, so
     // the pending-edit guard below has to compare like with like.
     const draft = input;
     const text = draft.trim();
-    if (!text || !open || sending) {
+    if (!text || !open || submissionPending.current) {
       return;
     }
-    if (queueing) {
-      onQueue?.(text);
-      // A queue mutation reports its refusal in the queue panel itself; the
-      // text is cleared because the command went out.
-      setInput("");
-      return;
-    }
-    const outcome = onSend(text);
-    if (!(outcome instanceof Promise)) {
-      if (outcome !== false) {
-        setInput("");
-      }
-      return;
-    }
+    // Run starts and queued follow-ups have the same acceptance contract.
+    // Hold synchronously as well as in state, including before React renders.
+    submissionPending.current = true;
     setSending(true);
-    void outcome
+    void Promise.resolve()
+      .then(() => (queueing ? onQueue?.(text) : onSend(text)))
       .then((accepted) => {
         // Cleared only once the daemon accepted the run, AND only while the
         // box still holds what was sent. A refusal keeps the draft exactly as
@@ -209,15 +211,25 @@ export const Composer: React.FC<ComposerProps> = ({
         // somebody had already started writing. Against the RAW draft: a
         // trailing newline or a padded paste differs from what was sent, and
         // comparing with the trimmed text left accepted work in the box.
-        if (accepted !== false && latestInput.current === draft) {
-          setInput("");
+        if (accepted !== false) {
+          if (onDraftAccepted) {
+            onDraftAccepted(draft);
+          } else if (latestInput.current === draft) {
+            setInput("");
+          }
         }
       })
       .catch(() => undefined)
-      .finally(() => setSending(false));
+      .finally(() => {
+        submissionPending.current = false;
+        setSending(false);
+      });
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Enter confirms the current IME candidate before it submits an objective.
+    // Safari can clear isComposing on that final keydown but retains keyCode 229.
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -228,32 +240,28 @@ export const Composer: React.FC<ComposerProps> = ({
   const activityText = activity ? describeActivity(activity) : null;
   const usageText = usageLabel(usage ?? null);
 
+  const defaults = statusLabel?.split(" · ");
+  const separatedDefaults = defaults?.length === 2;
+  const modeLabel = separatedDefaults ? defaults[0] : "Mode";
+  const modelLabel = separatedDefaults ? displayModelName(defaults[1]) : "Choose model";
+  const submitLabel = queueing ? "Queue" : sending ? "Sending…" : "Send";
+
   return (
-    <div
-      style={{
-        padding: "16px 24px 20px",
-        background: "var(--cody-panel)",
-        borderTop: "1px solid var(--cody-border)",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          background: "var(--cody-canvas)",
-          border: "1px solid var(--cody-border-strong)",
-          borderRadius: 8,
-          overflow: "hidden",
-        }}
-      >
+    <div className="workspace-composer">
+      <div className="composer-surface" data-running={isRunning}>
         <textarea
+          aria-label={queueing ? "Follow-up prompt" : "Objective"}
+          autoCorrect="off"
+          autoCapitalize="off"
+          autoComplete="off"
+          spellCheck={false}
           ref={areaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
             disabled
-              ? "Not connected to codypendentd — runs cannot be submitted."
+              ? "Connect your workspace to start a coding task."
               : queueing
                 ? "Queue a follow-up for this session (Enter to queue, Shift+Enter for newline)..."
                 : isRunning
@@ -262,182 +270,65 @@ export const Composer: React.FC<ComposerProps> = ({
           }
           disabled={!open}
           rows={3}
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            background: "transparent",
-            border: "none",
-            outline: "none",
-            color: "var(--cody-text)",
-            padding: "12px 16px",
-            fontSize: 14,
-            resize: "none",
-            fontFamily: "inherit",
-          }}
+          className="composer-input"
         />
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "8px 12px",
-            background: "var(--cody-panel-raised)",
-            borderTop: "1px solid var(--cody-inset)",
-          }}
-        >
-          <span style={{ fontSize: 12, color: "var(--cody-text-muted)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {disabled ? (
-              "Not connected"
-            ) : (
-              <>
-                {/*
-                  The model half of the label stays visible whatever the run is
-                  doing — it used to vanish the moment a run started, so the
-                  model being paid for was named nowhere on screen. While a run
-                  is live the label is the NEXT run's staging, and says so.
-                */}
-                {isRunning ? "next run: " : ""}
-                {statusLabel ?? "Build mode"}
-                {queueing ? " · queueing follow-ups" : ""}
-                {activityText && (
-                  <span data-testid="composer-activity" style={{ color: "var(--cody-warning)" }}>
-                    {" · "}
-                    {activityText}
-                  </span>
-                )}
-                {!isRunning && usageText && (
-                  <span data-testid="composer-usage" title="What the provider measured for the last run">
-                    {" · "}
-                    {usageText}
-                  </span>
-                )}
-              </>
-            )}
-          </span>
-          <div style={{ display: "flex", gap: 8 }}>
-            {/*
-              Pause and resume sit beside Cancel because they answer the same
-              question — "stop this" — without the cost. Which of the two is
-              drawn (if either) is the DAEMON's answer, folded from
-              `RunStateChanged`: `validate_run_transition` admits resume only
-              from `Paused`, so a run that cannot take it is never offered it,
-              and a run whose state this client does not know is offered
-              neither.
-            */}
+        <div className="composer-toolbar">
+          <div className="composer-defaults" aria-label="Run configuration">
+            {onOpenMode ? (
+              <button type="button" className="composer-config" onClick={onOpenMode} title="Choose the mode for your next run">
+                <Layers3 size={14} aria-hidden="true" /><span>{modeLabel}</span><ChevronDown size={12} aria-hidden="true" />
+              </button>
+            ) : separatedDefaults ? <span className="composer-config"><Layers3 size={14} aria-hidden="true" />{modeLabel}</span> : null}
+            {onOpenModels ? (
+              <button type="button" className="composer-config composer-model" onClick={onOpenModels} title="Choose the model for your next run">
+                <Cpu size={14} aria-hidden="true" /><span>{modelLabel}</span><ChevronDown size={12} aria-hidden="true" />
+              </button>
+            ) : separatedDefaults ? <span className="composer-config composer-model"><Cpu size={14} aria-hidden="true" /><span>{modelLabel}</span></span> : null}
+          </div>
+          <div className="composer-controls">
             {lifecycle === "pause" && onPause && (
-              <button
-                onClick={onPause}
-                data-testid="composer-pause"
-                style={{
-                  background: "var(--cody-inset)",
-                  border: "1px solid var(--cody-border-strong)",
-                  color: "var(--cody-text)",
-                  padding: "6px 14px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-              >
-                Pause Run
+              <button type="button" onClick={onPause} data-testid="composer-pause" className="composer-control">
+                <Pause size={13} aria-hidden="true" /><span>Pause Run</span>
               </button>
             )}
             {lifecycle === "resume" && onResume && (
-              <button
-                onClick={onResume}
-                data-testid="composer-resume"
-                style={{
-                  background: "var(--cody-success-strong)",
-                  border: "none",
-                  color: "var(--cody-on-accent)",
-                  padding: "6px 14px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-              >
-                Resume Run
+              <button type="button" onClick={onResume} data-testid="composer-resume" className="composer-control composer-resume">
+                <Play size={13} aria-hidden="true" /><span>Resume Run</span>
               </button>
             )}
             {onToggleQueue && (
-              <button
-                onClick={onToggleQueue}
-                aria-expanded={Boolean(queueOpen)}
-                data-testid="composer-queue"
-                style={{
-                  background: queueOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
-                  border: `1px solid ${queueOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
-                  color: queueOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
-                  padding: "6px 14px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-              >
-                Queue ({queuedCount ?? 0})
+              <button type="button" onClick={onToggleQueue} aria-expanded={Boolean(queueOpen)} data-testid="composer-queue" className="composer-control">
+                <ListOrdered size={14} aria-hidden="true" /><span>Queue ({queuedCount ?? 0})</span>
               </button>
             )}
-            {/*
-              Steering lives here rather than behind a nav entry: it is what an
-              operator reaches for to change a live agent's course, so it
-              belongs next to the box they are already typing in.
-            */}
             {isRunning && canSteer && onToggleSteering && (
-              <button
-                onClick={onToggleSteering}
-                aria-expanded={Boolean(steeringOpen)}
-                data-testid="composer-steer"
-                style={{
-                  background: steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
-                  border: `1px solid ${steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
-                  color: steeringOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
-                  padding: "6px 14px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-              >
-                {steeringOpen ? "Hide steering" : "Steer Run"}
+              <button type="button" onClick={onToggleSteering} aria-expanded={Boolean(steeringOpen)} data-testid="composer-steer" className="composer-control">
+                <Waypoints size={14} aria-hidden="true" /><span>{steeringOpen ? "Hide steering" : "Steer Run"}</span>
               </button>
             )}
             {isRunning && canCancel && onRequestCancel && (
-              <button
-                onClick={onRequestCancel}
-                style={{
-                  background: "var(--cody-danger)",
-                  border: "none",
-                  color: "var(--cody-on-accent)",
-                  padding: "6px 14px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 600,
-                }}
-              >
-                Cancel Run
+              <button type="button" onClick={onRequestCancel} className="composer-control composer-cancel">
+                <Square size={12} aria-hidden="true" /><span>Cancel Run</span>
               </button>
             )}
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || !open || sending}
-              style={{
-                background: input.trim() && open ? "var(--cody-success-strong)" : "var(--cody-inset)",
-                color: input.trim() && open ? "var(--cody-on-accent)" : "var(--cody-text-disabled)",
-                border: "none",
-                padding: "6px 14px",
-                borderRadius: 6,
-                fontSize: 12,
-                cursor: input.trim() && open ? "pointer" : "default",
-                fontWeight: 600,
-              }}
-            >
-              {queueing ? "Queue" : sending ? "Sending…" : "Send"}
+            <button type="button" onClick={handleSend} disabled={!input.trim() || !open || sending} className="composer-submit" aria-label={submitLabel} title={`${submitLabel} · Enter`}>
+              <ArrowUp size={19} strokeWidth={2.2} aria-hidden="true" />
             </button>
           </div>
         </div>
+      </div>
+      <div className="composer-status">
+        <span className="composer-status-copy">
+          {disabled ? "Not connected" : <>
+            {isRunning ? "next run: " : ""}{runDefaultsLabel(statusLabel)}
+            {queueing ? " · queueing follow-ups" : ""}
+          </>}
+        </span>
+        {!disabled && activityText ? (
+          <span data-testid="composer-activity" className="composer-activity">{activityText}</span>
+        ) : !disabled && !isRunning && usageText ? (
+          <span data-testid="composer-usage" className="composer-usage" title="What the provider measured for the last run">{usageText}</span>
+        ) : <span className="composer-shortcut">Enter to send <span aria-hidden="true">·</span> Shift + Enter for a new line</span>}
       </div>
     </div>
   );

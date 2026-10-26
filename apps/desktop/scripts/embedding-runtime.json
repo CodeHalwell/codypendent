@@ -1,0 +1,77 @@
+{
+  "model": {
+    "name": "embeddinggemma-2",
+    "repository": "ggml-org/embeddinggemma-2-GGUF",
+    "revision": "58faf90940886df2d62be555c8765d00dac362c5",
+    "filename": "embeddinggemma-2-Q8_0.gguf",
+    "size": 309855456,
+    "sha256": "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
+    "dimensions": 768,
+    "promptFormat": "eg2-v1",
+    "quantization": "Q8_0",
+    "url": "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/58faf90940886df2d62be555c8765d00dac362c5/embeddinggemma-2-Q8_0.gguf"
+  },
+  "runtime": {
+    "name": "llama.cpp",
+    "version": "0.7.0",
+    "revision": "b11669",
+    "assets": {
+      "aarch64-apple-darwin": {
+        "filename": "llama-b11669-bin-macos-arm64.tar.gz",
+        "size": 12191582,
+        "sha256": "dbed55493d72bc1ba2babc8770d669c2289b5bc4ee9fb2a4dfc158d45b7d13fd",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-macos-arm64.tar.gz"
+      },
+      "x86_64-apple-darwin": {
+        "filename": "llama-b11669-bin-macos-x64.tar.gz",
+        "size": 11677404,
+        "sha256": "cab28238d78158109b48deb27b05d50e0dcef56275d2e76da9ca8281526c7532",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-macos-x64.tar.gz"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "filename": "llama-b11669-bin-ubuntu-arm64.tar.gz",
+        "size": 13900160,
+        "sha256": "9ac6fda2058d35677608a06f751a50122ddfa4ce0ddb7f084466b8e79b6d4a99",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-arm64.tar.gz"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "filename": "llama-b11669-bin-ubuntu-x64.tar.gz",
+        "size": 17851611,
+        "sha256": "cf07c1c112d709bd67e522017471de57ed0ec8bea031d732c5422351c07f65ac",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-x64.tar.gz"
+      },
+      "x86_64-pc-windows-msvc": {
+        "filename": "llama-b11669-bin-win-cpu-x64.zip",
+        "size": 19537886,
+        "sha256": "37b3efcf962847ca869745fd4ccf7f5e7e8dacfeff9fa3523b4ca8cdc66d632b",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-cpu-x64.zip"
+      }
+    }
+  },
+  "licenses": [
+    {
+      "filename": "apache-2.0.txt",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "filename": "embeddinggemma-2-model-card.md",
+      "url": "https://huggingface.co/google/embeddinggemma-2/resolve/914f7f89142e33e77833254d9c9b90c3cef7303b/README.md",
+      "size": 21730,
+      "sha256": "b677a0ee2818c36f091b65fd3d9b4baea9f04d53b02b49cae916c74bf9682037"
+    },
+    {
+      "filename": "embeddinggemma-2-gguf-model-card.md",
+      "url": "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/58faf90940886df2d62be555c8765d00dac362c5/README.md",
+      "size": 449,
+      "sha256": "319bbb434d2abe8f54f8571fa1e90973aa3cde85ab260312b7b7f8e3d9da02f5"
+    },
+    {
+      "filename": "llama.cpp.txt",
+      "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b11669/LICENSE",
+      "size": 1078,
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  ]
+}

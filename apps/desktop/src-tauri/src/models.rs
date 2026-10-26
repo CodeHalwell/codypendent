@@ -12,12 +12,9 @@
 //! **Nothing is reimplemented that already exists.** `ModelConfig`/`load_models`
 //! and `AuthStore` come from `codypendent-runtime`, the provider catalog from
 //! `codypendent-providers` — the same types the TUI, the CLI and the daemon
-//! parse these files with. The two write paths ([`update_model_entries`],
-//! [`remove_model`]) are ports of `crates/cli/src/models_file.rs` and
-//! `crates/cli/src/tui.rs::write_remove_model`, kept structurally identical
-//! (advisory lock, formatting preservation, atomic 0600 install) because
-//! `models.toml` is a document a human owns and four independent writers have
-//! already destroyed parts of it once each.
+//! parse these files with. Model edits and removal use the runtime's shared
+//! `models_file` transaction, including advisory locks, formatting preservation,
+//! atomic installation, and credential cleanup.
 //!
 //! **A secret is never a value that crosses back to the webview.** A key can
 //! travel IN, as [`SecretKey`] (whose `Debug` prints `<redacted>`, mirroring
@@ -26,9 +23,7 @@
 //! There is no function here that returns key material, and
 //! [`KeyTarget`] carries only a non-secret id.
 
-use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
@@ -36,8 +31,15 @@ use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
 use codypendent_providers::{AuthMethod, Catalog, Protocol, Provider};
 use codypendent_runtime::auth::{AuthStore, Save};
-use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig, ModelRegistry};
+use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig};
+use codypendent_runtime::models_file::update_model_entries;
 use serde::{Deserialize, Serialize};
+
+#[path = "model_discovery.rs"]
+mod discovery;
+pub use discovery::{
+    discover_models, reconcile_discovery_default, DetectedProvider, ModelDiscovery,
+};
 
 /// The `<data_dir>` every file in this module hangs off, resolved exactly the
 /// way `socket_path()` resolves the socket.
@@ -338,16 +340,9 @@ pub struct ProvidersView {
     /// The user overlay file, so the view can name where overrides come from.
     pub providers_path: String,
     pub warnings: Vec<String>,
-    /// Why ACP agents are not in this list. The TUI's provider catalog also
-    /// carries live-registry and locally-discovered ACP agents, which come from
-    /// `codypendent-integrations`; this build does not link it, so those rows
-    /// are ABSENT and said to be absent rather than quietly missing.
+    /// Discovery limitations, empty when cached/local agents were loaded.
     pub acp_unavailable: String,
 }
-
-const ACP_UNAVAILABLE: &str = "ACP agents are not listed here: the official ACP registry and \
-local agent discovery live in codypendent-integrations, which this shell does not link. Use the \
-CLI or TUI provider catalog to add an ACP agent.";
 
 /// The catalog, layered with the user's `providers.toml`.
 ///
@@ -416,22 +411,8 @@ pub fn list_providers() -> anyhow::Result<ProvidersView> {
         })
         .collect();
 
-    // The community-bridge gate, carried from `load_provider_cards`. The TUI
-    // FORCE-OVERWRITES any catalog row with this id so that a catalog update —
-    // remote registry or a hand-edited `providers.toml` — can never publish a
-    // row that bypasses the trust confirmation. Same here.
-    //
-    // Unlike the TUI this does not SYNTHESISE the row when the catalog has
-    // none: the TUI's copy is built from a real
-    // `codypendent_integrations::acp_registry::community_acp_agent` descriptor,
-    // and inventing one here from a hardcoded string would be exactly the
-    // fabricated list this client must not show.
-    if let Some(row) = providers
-        .iter_mut()
-        .find(|row| row.id == COMMUNITY_ACP_BRIDGE_ID)
-    {
-        *row = community_bridge_row();
-    }
+    append_acp_rows(&data_dir, &mut providers, &mut warnings);
+    deduplicate_agent_rows(&mut providers);
 
     // Usable first, local endpoints before hosted, then by name — the TUI's
     // ordering, so the same provider is in the same place in both clients.
@@ -446,23 +427,33 @@ pub fn list_providers() -> anyhow::Result<ProvidersView> {
         providers,
         providers_path: overlay.display().to_string(),
         warnings,
-        acp_unavailable: ACP_UNAVAILABLE.to_string(),
+        acp_unavailable: String::new(),
     })
+}
+
+fn deduplicate_agent_rows(providers: &mut Vec<ProviderRow>) {
+    let available: BTreeSet<_> = providers
+        .iter()
+        .filter(|row| row.protocol == "acp" && row.available)
+        .map(|row| row.id.clone())
+        .collect();
+    providers.retain(|row| {
+        let canonical = if row.id == "github-copilot-cli" {
+            "copilot".to_string()
+        } else {
+            codypendent_integrations::acp_registry::canonical_agent_id(&row.id)
+        };
+        row.protocol != "acp" || row.id == canonical || !available.contains(&canonical)
+    });
 }
 
 /// The one provider id whose selection is a trust decision rather than a
 /// configuration choice.
-const COMMUNITY_ACP_BRIDGE_ID: &str = "antigravity-acp";
+const COMMUNITY_ACP_BRIDGE_ID: &str = "antigravity-community";
 
 /// The host-owned row for the community Antigravity bridge.
 ///
-/// Google ships no native Antigravity ACP server; the bridge is a third-party
-/// package with its own terms. The TUI gates it behind
-/// `Overlay::ConfirmCommunityAcpInstall` and this shell keeps that gate — with
-/// an honest terminal state, because installing an ACP agent needs
-/// `codypendent-integrations`, which this build does not link. The row is
-/// therefore shown, marked, and refused, rather than silently dropped (which
-/// would hide that the catalog contains it) or silently accepted.
+/// Its host-owned consent requirement cannot be overwritten by catalog data.
 fn community_bridge_row() -> ProviderRow {
     ProviderRow {
         id: COMMUNITY_ACP_BRIDGE_ID.to_string(),
@@ -476,19 +467,156 @@ fn community_bridge_row() -> ProviderRow {
         catalog_models: 0,
         has_key: false,
         unusable_reason: Some(
-            "installing the community Antigravity bridge is a third-party trust decision, and \
-             this shell cannot install ACP agents — add it from the CLI or TUI, where the \
-             install is verified against a pinned URL and SHA-256."
-                .to_string(),
+            "No verified community bridge distribution is available for this platform.".to_string(),
         ),
         community_consent_required: true,
         community_consent_detail: Some(
-            "Google does not ship a native Antigravity ACP server. This is a community bridge \
-             with third-party ToS risk: it is not published, reviewed or supported by Google, \
+            "This legacy community bridge is not published, reviewed or supported by Google, \
              and using it may breach the terms of the account it drives."
                 .to_string(),
         ),
     }
+}
+
+/// Read cached metadata and local executables only. Refresh is an explicit action.
+fn append_acp_rows(data_dir: &Path, providers: &mut Vec<ProviderRow>, warnings: &mut Vec<String>) {
+    use codypendent_integrations::acp_registry::{self, AcpRegistryStore};
+    let store = AcpRegistryStore::new(data_dir);
+    let registry = store.load_cached();
+    if let Err(error) = &registry {
+        warnings.push(format!(
+            "Refresh the agent catalog to discover official ACP adapters ({error})"
+        ));
+    }
+    let mut agents = registry.map(|registry| registry.agents).unwrap_or_default();
+    if let Some(community) = acp_registry::community_acp_agent(COMMUNITY_ACP_BRIDGE_ID) {
+        agents.retain(|agent| agent.id != COMMUNITY_ACP_BRIDGE_ID);
+        agents.push(community);
+    }
+    for agent in agents {
+        let ready = store.launch_spec(&agent.id).is_ok();
+        let installable = agent
+            .distribution
+            .binary
+            .get(acp_registry::current_platform())
+            .is_some_and(|binary| binary.sha256.is_some());
+        let available = ready || installable || store.can_prepare_launch(&agent.id);
+        let mut row = ProviderRow {
+            id: agent.id.clone(), name: agent.name, protocol: "acp".into(),
+            auth: format!("agent-managed sign-in · {}", agent.version), local: false,
+            requires_key: false, can_list_models: ready, available, catalog_models: 0,
+            has_key: false, unusable_reason: (!available).then(|| "Install this agent's package runner or use a verified distribution for this platform".into()),
+            community_consent_required: false, community_consent_detail: None,
+        };
+        if row.id == COMMUNITY_ACP_BRIDGE_ID {
+            let trusted = community_bridge_row();
+            row.community_consent_required = true;
+            row.community_consent_detail = trusted.community_consent_detail;
+        }
+        providers.retain(|other| other.id != row.id);
+        providers.push(row);
+    }
+    for spec in store.installed_agent_specs() {
+        let mut row = ProviderRow {
+            id: spec.registry_id,
+            name: spec.name,
+            protocol: "acp".into(),
+            auth: format!("local agent · {}", spec.version),
+            local: true,
+            requires_key: false,
+            can_list_models: true,
+            available: true,
+            catalog_models: 0,
+            has_key: false,
+            unusable_reason: None,
+            community_consent_required: false,
+            community_consent_detail: None,
+        };
+        if row.id == COMMUNITY_ACP_BRIDGE_ID {
+            row.community_consent_required = true;
+            row.community_consent_detail = community_bridge_row().community_consent_detail;
+        }
+        providers.retain(|other| other.id != row.id);
+        providers.push(row);
+    }
+    for &(id, name) in acp_registry::supported_agent_names() {
+        if providers
+            .iter()
+            .any(|row| row.id == id && row.protocol == "acp")
+        {
+            continue;
+        }
+        providers.push(ProviderRow {
+            id: id.into(),
+            name: name.into(),
+            protocol: "acp".into(),
+            auth: "agent-managed sign-in".into(),
+            local: true,
+            requires_key: false,
+            can_list_models: false,
+            available: false,
+            catalog_models: 0,
+            has_key: false,
+            unusable_reason: Some(format!(
+                "Install {name} or its ACP adapter; existing sign-ins are reused automatically"
+            )),
+            community_consent_required: false,
+            community_consent_detail: None,
+        });
+    }
+    // A user catalog must not bypass the community gate, even on an unsupported platform.
+    for row in providers
+        .iter_mut()
+        .filter(|row| row.id == COMMUNITY_ACP_BRIDGE_ID)
+    {
+        row.community_consent_required = true;
+        row.community_consent_detail = community_bridge_row().community_consent_detail;
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectedAcp {
+    pub profile_id: String,
+    pub coordinate: String,
+    pub models: Vec<String>,
+}
+
+pub async fn refresh_agents() -> anyhow::Result<ProvidersView> {
+    codypendent_integrations::acp_registry::AcpRegistryStore::new(data_dir()?)
+        .refresh()
+        .await?;
+    list_providers()
+}
+
+pub async fn connect_acp(
+    provider_id: &str,
+    repository: &Path,
+    accept_community_risk: bool,
+) -> anyhow::Result<ConnectedAcp> {
+    let data_dir = data_dir()?;
+    let probe = codypendent_runtime::acp_setup::probe_agent(
+        &data_dir,
+        provider_id,
+        repository,
+        accept_community_risk,
+    )
+    .await?;
+    let profile_id = format!("acp/{}", probe.registry_id);
+    let coordinate = probe.coordinate(None);
+    let mut profiles = vec![(profile_id.clone(), coordinate.clone())];
+    profiles.extend(probe.models.iter().map(|model| {
+        (
+            format!("{profile_id}#{model}"),
+            probe.coordinate(Some(model)),
+        )
+    }));
+    codypendent_runtime::acp_setup::replace_profile_family(&data_dir, &profile_id, &profiles)?;
+    Ok(ConnectedAcp {
+        profile_id,
+        coordinate,
+        models: probe.models,
+    })
 }
 
 /// `crates/cli/src/tui.rs::protocol_label`.
@@ -677,10 +805,8 @@ pub struct KeysView {
     pub unavailable: String,
 }
 
-const KEYS_UNAVAILABLE: &str = "The Tavily search key and the voice (speech-to-text / \
-text-to-speech) keys are not shown here: their auth.json ids are owned by crates this shell does \
-not link, and a wrong id would save a key that reads back as absent. Manage them from the CLI or \
-TUI /keys view.";
+const KEYS_UNAVAILABLE: &str = "Saved keys stay on this computer. Existing agent sign-ins are \
+managed by their apps.";
 
 /// The host part of a `base_url`, for display only — the projection
 /// `crates/cli/src/tui.rs::endpoint_host` makes. A string trim rather than a URL
@@ -706,8 +832,11 @@ fn endpoint_host(base_url: &str) -> &str {
 /// Never returns a key. A corrupt `auth.json` yields [`KeyStatus::Unknown`]
 /// rows rather than a page of confident "Missing".
 pub fn key_statuses() -> anyhow::Result<KeysView> {
-    let data_dir = data_dir()?;
-    let path = models_path(&data_dir);
+    key_statuses_in(&data_dir()?)
+}
+
+fn key_statuses_in(data_dir: &Path) -> anyhow::Result<KeysView> {
+    let path = models_path(data_dir);
     let configs = if path.exists() {
         load_models(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
@@ -715,11 +844,22 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
     };
 
     let mut warnings = Vec::new();
-    let auth = load_auth_for_view(&data_dir, &mut warnings);
-    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
+    let auth = load_auth_for_view(data_dir, &mut warnings);
+    let catalog = load_catalog_for_view(data_dir, &mut warnings);
 
     let mut keys: Vec<KeyRow> = configs
         .iter()
+        .filter(|config| {
+            config.provider != "acp"
+                && (config
+                    .provider_id
+                    .as_deref()
+                    .and_then(|id| catalog.get(id))
+                    .is_none_or(provider_requires_key)
+                    || auth
+                        .as_ref()
+                        .is_ok_and(|auth| auth.get(&config.id.0).is_some()))
+        })
         .map(|config| KeyRow {
             target: KeyTarget::Model {
                 id: config.id.0.clone(),
@@ -738,6 +878,7 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
     let mut provider_ids: Vec<String> = configs
         .iter()
         .filter_map(|config| config.provider_id.clone())
+        .filter(|id| catalog.get(id).is_none_or(provider_requires_key))
         .collect();
     if let Ok(auth) = &auth {
         // From the STORE, not the catalog. A custom provider deleted from
@@ -1006,285 +1147,9 @@ fn add_model_in(
 /// Serialize one read-modify-write of the shared model list under an advisory
 /// lock, preserving every other table.
 ///
-/// A port of `crates/cli/src/models_file.rs::update_model_entries`, which
-/// exists because four independent writers each rebuilt `models.toml` from a
-/// model-only struct and thereby deleted the user's `[embedding]`,
-/// `[retrieval]`, `[transcription]` and `[speech]` configuration. The invariant
-/// it encodes: EDIT THE PARSED DOCUMENT IN PLACE; never serialize the file from
-/// a struct that models only one section. An unknown table is carried through
-/// untouched.
-///
-/// The lock is the same `<data_dir>/.models.toml.lock` the CLI and TUI take, so
-/// a desktop edit and a `codypendent models add` running at the same moment
-/// cannot erase each other.
-fn update_model_entries<R>(
-    path: &Path,
-    edit: impl FnOnce(&mut Vec<ModelConfig>) -> anyhow::Result<R>,
-) -> anyhow::Result<R> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{}: has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let lock_path = parent.join(".models.toml.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing {}", lock_path.display()))?;
-    }
-    fs4::FileExt::lock_exclusive(&lock)
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-
-    let mut configs = if path.exists() {
-        load_models(path).with_context(|| format!("reading {}", path.display()))?
-    } else {
-        Vec::new()
-    };
-    let result = edit(&mut configs)?;
-    write_model_entries_locked(path, &configs)?;
-    let _ = fs4::FileExt::unlock(&lock);
-    Ok(result)
-}
-
-/// Replace only the `model` key of the parsed document and install it
-/// atomically at mode 0600. `crates/cli/src/models_file.rs`.
-///
-/// The document is edited with `toml_edit`, exactly as the remove path does:
-/// comments, key order and formatting everywhere else in the file survive an
-/// add. The `[[model]]` array itself is rendered fresh from `configs` — a
-/// newly added entry has no formatting worth preserving — and grafted onto
-/// the parsed document in place of the old array.
-fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
-    let mut document: toml_edit::DocumentMut = if path.exists() {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        raw.parse()
-            .with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        toml_edit::DocumentMut::new()
-    };
-
-    // `ModelConfig`'s `Serialize` impl is what defines the on-disk field set,
-    // and there is no direct `toml::Value` → `toml_edit::Item` conversion — so
-    // the array is rendered by `toml` under a wrapper key and reparsed as an
-    // editable document item.
-    let mut wrapper = toml::map::Map::new();
-    wrapper.insert(
-        "model".to_string(),
-        toml::Value::try_from(configs).context("serializing models.toml")?,
-    );
-    let rendered_array =
-        toml::to_string_pretty(&toml::Value::Table(wrapper)).context("serializing models.toml")?;
-    let array_document: toml_edit::DocumentMut =
-        rendered_array.parse().context("serializing models.toml")?;
-    document["model"] = array_document["model"].clone();
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{}: has no parent directory", path.display()))?;
-    // Unique per WRITE, not per process: two writes inside one process must not
-    // share a temp path, or one can rename the other's half-written render into
-    // place.
-    static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ticket = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = parent.join(format!(".models-{}-{ticket}.tmp", std::process::id()));
-
-    // Every failure between creating the temp and renaming it into place
-    // removes the temp: an orphaned one next to `models.toml` is the debris a
-    // crashed write leaves behind (the remove path does the same).
-    let install = || -> anyhow::Result<()> {
-        let mut temp_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .with_context(|| format!("creating {}", temp.display()))?;
-        temp_file
-            .write_all(document.to_string().as_bytes())
-            .with_context(|| format!("writing {}", temp.display()))?;
-        temp_file
-            .sync_all()
-            .with_context(|| format!("syncing {}", temp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // An entry names the environment variable holding a key, never the key
-            // itself, but the endpoint list is still the user's business alone.
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing {}", temp.display()))?;
-        }
-        std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
-    };
-    if let Err(error) = install() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
-    #[cfg(unix)]
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("syncing {}", parent.display()))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Writing: models.toml (remove)
-// ---------------------------------------------------------------------------
-
-/// Remove one `[[model]]` entry and its stored key.
-///
-/// A port of `crates/cli/src/tui.rs::write_remove_model`. Like the add path,
-/// removal edits the document with `toml_edit`, which PRESERVES the file's
-/// comments, key order and formatting — a user's `models.toml` is a document
-/// they own, and silently reformatting it while deleting one row is a defect.
-///
-/// The two halves commit in an order that leaves neither behind: the key store
-/// is written first, and either failure path undoes the other half, so a failed
-/// `auth.save` leaves `models.toml` untouched and a failed rename restores the
-/// original key store. Both halves run under the shared `auth.json` hold, so no
-/// other writer can observe or overwrite the pair mid-transaction.
+/// Remove through the same configuration transaction as CLI and TUI.
 pub fn remove_model(model_id: &str) -> anyhow::Result<()> {
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        bail!("model id must not be blank");
-    }
-    let data_dir = data_dir()?;
-    let models_path = models_path(&data_dir);
-
-    // Held across the WHOLE two-file transaction below, load included: this
-    // writes `auth.json` and `models.toml` together and undoes one half when
-    // the other fails, so another writer landing between those steps would see
-    // — or overwrite — a half-committed pair. In particular the rollback below
-    // renames a whole snapshot back, which is only safe while nothing else can
-    // have written in between. The port of this function from the TUI took the
-    // models.toml lock but not this one. Released when this returns.
-    let _auth_hold = codypendent_runtime::auth::hold(&data_dir)
-        .with_context(|| format!("locking {}", data_dir.join("auth.json").display()))?;
-
-    // Validate the key store before touching models.toml. A corrupt auth.json
-    // must never be silently overwritten or leave the operator unsure which
-    // half of the requested cleanup happened.
-    let mut auth = AuthStore::load(&data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    let original_auth = auth.clone();
-    let removed_key = auth.remove(model_id);
-
-    let parent = models_path
-        .parent()
-        .ok_or_else(|| anyhow!("{}: has no parent directory", models_path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let lock_path = parent.join(".models.toml.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing {}", lock_path.display()))?;
-    }
-    fs4::FileExt::lock_exclusive(&lock)
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-
-    let raw = std::fs::read_to_string(&models_path)
-        .with_context(|| format!("reading {}", models_path.display()))?;
-    let mut doc: toml_edit::DocumentMut = raw
-        .parse()
-        .with_context(|| format!("parsing {}", models_path.display()))?;
-
-    // Remove EVERY entry carrying this id, not just the first: a hand-edited
-    // `models.toml` can list the same id twice, and `auth.remove` above is
-    // unconditional — leaving one copy behind would leave a listed model with
-    // no credential.
-    let emptied = {
-        let Some(item) = doc.get_mut("model") else {
-            bail!("model `{model_id}` is not configured");
-        };
-        let Some(array) = item.as_array_of_tables_mut() else {
-            bail!(
-                "`model` entry in {} is not an array of tables",
-                models_path.display()
-            );
-        };
-        let matching: Vec<usize> = array
-            .iter()
-            .enumerate()
-            .filter_map(|(index, table)| {
-                (table.get("id").and_then(toml_edit::Item::as_str) == Some(model_id))
-                    .then_some(index)
-            })
-            .collect();
-        if matching.is_empty() {
-            bail!("model `{model_id}` is not configured");
-        }
-        for index in matching.into_iter().rev() {
-            array.remove(index);
-        }
-        array.is_empty()
-    };
-    if emptied {
-        doc.remove("model");
-    }
-
-    let tmp_path = parent.join(format!(".models-{}.toml.tmp", std::process::id()));
-    let write_tmp = || -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.write_all(doc.to_string().as_bytes())?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&tmp_path, doc.to_string())?;
-        Ok(())
-    };
-    if let Err(error) = write_tmp() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error).with_context(|| format!("writing {}", tmp_path.display()));
-    }
-
-    // Commit the secret cleanup first, then make the already-written model temp
-    // visible. Either half can still fail, so each failure path undoes the
-    // other half: the operation is all-or-nothing in both directions.
-    if removed_key {
-        if let Err(error) = auth.save(&data_dir) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(error)
-                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()));
-        }
-    }
-    if let Err(error) = std::fs::rename(&tmp_path, &models_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        if removed_key {
-            original_auth.save(&data_dir).with_context(|| {
-                format!(
-                    "restoring {} after models.toml replacement failed",
-                    data_dir.join("auth.json").display()
-                )
-            })?;
-        }
-        return Err(error).with_context(|| format!("replacing {}", models_path.display()));
-    }
-    let _ = fs4::FileExt::unlock(&lock);
-
-    Ok(())
+    codypendent_runtime::models_file::remove_model(&data_dir()?, model_id)
 }
 
 /// Whether `model_id` names an entry that is actually in `models.toml`.
@@ -1300,163 +1165,6 @@ pub fn model_is_configured(model_id: &ModelId) -> anyhow::Result<bool> {
     }
     let configs = load_models(&path).with_context(|| format!("reading {}", path.display()))?;
     Ok(configs.iter().any(|config| config.id == *model_id))
-}
-
-// ---------------------------------------------------------------------------
-// Readiness
-//
-// The TUI's model picker computes a readiness badge for every configured
-// model at load (`crates/cli/src/tui.rs::load_model_cards`): a local endpoint
-// is asked for its model list, a hosted model has its credential resolved
-// without touching the network, an ACP profile is left to the daemon. The
-// desktop showed nothing — not because it could not compute this (it links the
-// same `ModelRegistry`), but because nothing asked. So a mistyped key read as
-// "setup complete" until the first run failed. This is the same computation,
-// plus an on-demand probe (`probe = true`) that DOES use the network, because
-// the operator pressed Test and asked for exactly that.
-// ---------------------------------------------------------------------------
-
-/// Truthful readiness of one configured model, as the TUI's `ModelReadiness`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "kebab-case")]
-pub enum ModelReadiness {
-    /// The endpoint answered and lists this model.
-    Ready { detail: String },
-    /// Runnable as far as can be told without the network.
-    Unverified { detail: String },
-    /// Cannot start a run, and why.
-    Unavailable { detail: String },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelReadinessView {
-    pub id: String,
-    pub readiness: ModelReadiness,
-    /// Whether the network was used to reach this verdict.
-    pub probed: bool,
-}
-
-/// The TUI's local-endpoint test: a substring match on the host, not a
-/// reachability test.
-/// Whether this model's endpoint is on this machine.
-///
-/// Delegates to the runtime's host-exact test rather than searching the URL
-/// text: `https://localhost.example.com/v1` is a REMOTE host, and treating it
-/// as local would probe it — sending this model's configured credential to it
-/// — during the pass that is supposed to touch nothing.
-fn local_model_endpoint(url: &str) -> bool {
-    codypendent_runtime::models::is_local_base_url(url)
-}
-
-/// The registry the daemon would build for a run: `models.toml`, `auth.json`
-/// and the provider catalog layered with the user's `providers.toml`.
-fn load_registry(data_dir: &Path) -> anyhow::Result<(ModelRegistry, Vec<ModelConfig>)> {
-    let path = models_path(data_dir);
-    let configs = if path.exists() {
-        load_models(&path).with_context(|| format!("reading {}", path.display()))?
-    } else {
-        Vec::new()
-    };
-    // A CORRUPT `auth.json` is not an empty one. Treating it as empty made
-    // every hosted model read "API key is not configured", sending a person to
-    // replace credentials that are in fact present — while the Models and API
-    // Keys projections correctly said their state was unknown. Propagate it so
-    // readiness reports the real cause.
-    let auth = AuthStore::load(data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
-        .unwrap_or_else(|_| Catalog::builtin());
-    let registry = ModelRegistry::new(configs.clone())
-        .with_auth(auth)
-        .with_catalog(catalog);
-    Ok((registry, configs))
-}
-
-async fn readiness_of(
-    registry: &ModelRegistry,
-    config: &ModelConfig,
-    probe: bool,
-) -> ModelReadinessView {
-    let local = local_model_endpoint(&config.base_url);
-    let (readiness, probed) = if config.provider == "acp" {
-        (
-            ModelReadiness::Unverified {
-                detail: "an ACP agent is checked by the daemon when a run starts (installed, \
-                         launchable, handshake)"
-                    .to_owned(),
-            },
-            false,
-        )
-    } else if config.base_url.trim().is_empty() {
-        (
-            ModelReadiness::Unavailable {
-                detail: "base URL is missing".to_owned(),
-            },
-            false,
-        )
-    } else if local || probe {
-        (
-            match registry.check_model(&config.id).await {
-                Ok(()) => ModelReadiness::Ready {
-                    detail: format!(
-                        "{} answered and lists {}",
-                        endpoint_host(&config.base_url),
-                        config.model
-                    ),
-                },
-                Err(error) => ModelReadiness::Unavailable {
-                    detail: error.to_string(),
-                },
-            },
-            true,
-        )
-    } else {
-        (
-            match registry.credentials_resolvable(&config.id).await {
-                Ok(true) => ModelReadiness::Unverified {
-                    detail: "credential resolves; Test asks the provider".to_owned(),
-                },
-                Ok(false) => ModelReadiness::Unavailable {
-                    detail: "API key is not configured".to_owned(),
-                },
-                Err(error) => ModelReadiness::Unavailable {
-                    detail: error.to_string(),
-                },
-            },
-            false,
-        )
-    };
-    ModelReadinessView {
-        id: config.id.0.clone(),
-        readiness,
-        probed,
-    }
-}
-
-/// Readiness for every configured model, exactly as the TUI computes it at
-/// picker load: local endpoints are asked, hosted credentials are resolved
-/// without the network, ACP is left to the daemon.
-pub async fn list_model_readiness() -> anyhow::Result<Vec<ModelReadinessView>> {
-    let data_dir = data_dir()?;
-    let (registry, configs) = load_registry(&data_dir)?;
-    let mut views = Vec::with_capacity(configs.len());
-    for config in &configs {
-        views.push(readiness_of(&registry, config, false).await);
-    }
-    Ok(views)
-}
-
-/// Readiness for one model. With `probe`, the provider is asked over the
-/// network — the operator pressed Test — so a hosted model can be `Ready`
-/// rather than merely `Unverified`.
-pub async fn model_readiness(model_id: &str, probe: bool) -> anyhow::Result<ModelReadinessView> {
-    let data_dir = data_dir()?;
-    let (registry, configs) = load_registry(&data_dir)?;
-    let config = configs
-        .iter()
-        .find(|config| config.id.0 == model_id)
-        .ok_or_else(|| anyhow!("model `{model_id}` is not configured in models.toml"))?;
-    Ok(readiness_of(&registry, config, probe).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,33 +1221,77 @@ pub fn mode_cards() -> Vec<ModeCard> {
 mod tests {
     use super::*;
 
-    /// A CORRUPT `auth.json` is not an empty one. Treating it as empty made
-    /// every hosted model read "API key is not configured", pointing a person
-    /// at credentials that are in fact present and unreadable — while the
-    /// Models and API Keys projections correctly reported the state unknown.
     #[test]
-    fn a_corrupt_credential_store_fails_readiness_rather_than_reading_as_empty() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn agent_and_keyless_local_profiles_do_not_ask_for_api_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = models_path(directory.path());
         std::fs::write(
-            dir.path().join("models.toml"),
+            &path,
             r#"
 [[model]]
-id = "worker"
+id = "acp/codex"
+provider = "acp"
+model = "codex-acp@1.0.0"
+[[model]]
+id = "local"
 provider = "openai-compatible"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-api_key_env = "OPENAI_API_KEY"
+provider_id = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "coder"
+[[model]]
+id = "hosted"
+provider = "openai-compatible"
+provider_id = "groq"
+base_url = "https://api.groq.com/openai/v1"
+model = "chat"
 "#,
         )
-        .expect("write models");
-        std::fs::write(dir.path().join("auth.json"), "{ this is not json").expect("write auth");
+        .unwrap();
+        let keys = key_statuses_in(directory.path()).unwrap();
+        assert_eq!(keys.keys.len(), 2);
+        assert!(keys
+            .keys
+            .iter()
+            .all(|row| !row.label.contains("codex") && row.label != "local"));
+        assert!(keys
+            .keys
+            .iter()
+            .any(|row| matches!(&row.target, KeyTarget::Model { id } if id == "hosted")));
+    }
 
-        let error = load_registry(dir.path()).expect_err("a corrupt store is not an empty one");
-        let sentence = format!("{error:#}");
-        assert!(
-            sentence.contains("auth.json"),
-            "the failure names the file to repair: {sentence}"
+    #[test]
+    fn installed_agents_replace_legacy_duplicate_provider_rows() {
+        let mut rows: Vec<_> = [
+            "claude-code",
+            "claude-acp",
+            "codex",
+            "codex-acp",
+            "gemini-cli",
+            "gemini",
+            "github-copilot-cli",
+            "copilot",
+            "antigravity-acp",
+        ]
+        .into_iter()
+        .map(|id| {
+            let mut row = community_bridge_row();
+            row.id = id.to_owned();
+            row.available = true;
+            row
+        })
+        .collect();
+        deduplicate_agent_rows(&mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "claude-acp",
+                "codex-acp",
+                "gemini",
+                "copilot",
+                "antigravity-acp"
+            ]
         );
+        assert!(rows.last().unwrap().community_consent_required);
     }
 
     /// A key that cannot be saved must not leave a model behind that looks

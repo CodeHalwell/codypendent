@@ -1,0 +1,12 @@
+.model-picker-row { min-width: 0; }
+.model-connection-details { margin-top: 7px; font-size: 11px; color: var(--cody-text-muted); }
+.model-connection-details > summary { cursor: pointer; width: fit-content; }
+.model-connection-details[open] > summary { margin-bottom: 9px; }
+.model-connection-details dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 5px 12px; margin: 0; }
+.model-connection-details dt { color: var(--cody-text-faint); }
+.model-connection-details dd { margin: 0; overflow-wrap: anywhere; }
+.model-connection-details code { font-size: 10px; }
+@media (max-width: 640px) {
+  .model-picker-row { flex-wrap: wrap; }
+  .model-picker-row > div:first-child { flex-basis: 100% !important; }
+}

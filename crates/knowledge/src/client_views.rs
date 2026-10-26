@@ -13,6 +13,11 @@ use codypendent_protocol::knowledge::*;
 use codypendent_protocol::{SessionId, UserId, WorkspaceId};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
+
+mod identity;
+mod paging;
+pub use identity::session_identity;
+use paging::{slice, MAX_PAGE_BYTES};
 #[derive(Debug, Clone, Default)]
 pub struct KnowledgeIdentity {
     /// The workspace the current daemon connection carries, when connected.
@@ -401,23 +406,15 @@ pub async fn read_page(
     offset: u32,
     limit: u32,
 ) -> anyhow::Result<KnowledgePage> {
-    let (workspace, repository): (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT workspace_id, repository FROM sessions WHERE id = ? AND tombstoned_at IS NULL",
-    )
-    .bind(session.to_string())
-    .fetch_optional(pool)
-    .await?
-    .context("session not found")?;
-    let identity = KnowledgeIdentity {
-        workspace: workspace
-            .map(|id| id.parse())
-            .transpose()
-            .context("invalid session workspace identity")?,
-        repository: repository.map(PathBuf::from),
-    };
+    let identity = session_identity(pool, session).await?;
     let limit = if limit == 0 { 50 } else { limit.min(100) } as usize;
     let mut page = KnowledgePage {
         section,
+        workspace_id: identity.workspace,
+        repository: identity
+            .repository
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         skills: vec![],
         memories: vec![],
         learnings: vec![],
@@ -425,136 +422,53 @@ pub async fn read_page(
         next_offset: None,
         warnings: vec![],
     };
-    fn slice<T>(items: Vec<T>, offset: u32, limit: usize, next: &mut Option<u32>) -> Vec<T> {
-        let mut items: Vec<T> = items
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit + 1)
-            .collect();
-        if items.len() > limit {
-            items.pop();
-            *next = offset.checked_add(limit as u32);
-        }
-        items
-    }
+    let item_budget = MAX_PAGE_BYTES
+        .checked_sub(serde_json::to_vec(&page)?.len() + 64)
+        .context("knowledge page metadata exceeds the 8 MiB page limit")?;
     match section {
         KnowledgeSection::Skills => {
             page.skills = slice(
                 skills_in(pool, &identity).await?,
                 offset,
                 limit,
+                item_budget,
                 &mut page.next_offset,
-            )
+            )?
         }
         KnowledgeSection::Memories => {
             page.memories = slice(
                 memories_in(pool, &identity).await?,
                 offset,
                 limit,
+                item_budget,
                 &mut page.next_offset,
-            )
+            )?
         }
         KnowledgeSection::Learnings => {
             page.learnings = slice(
                 learnings_in(pool, &identity).await?,
                 offset,
                 limit,
+                item_budget,
                 &mut page.next_offset,
-            )
+            )?
         }
         KnowledgeSection::Documents => {
             page.documents = slice(
                 documents_in(pool, &identity).await?,
                 offset,
                 limit,
+                item_budget,
                 &mut page.next_offset,
-            )
+            )?
         }
         _ => bail!("unsupported knowledge section"),
     }
-    if serde_json::to_vec(&page)?.len() > 8 * 1024 * 1024 {
+    if serde_json::to_vec(&page)?.len() > MAX_PAGE_BYTES {
         bail!("knowledge page exceeds 8 MiB; request fewer items");
     }
     Ok(page)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{MemoryClass, MemoryRecord, RetentionPolicy, Revision};
-    use codypendent_protocol::{DataClassification, MemoryId};
-
-    #[tokio::test]
-    async fn knowledge_pages_derive_scopes_from_the_session_and_preserve_provenance() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repo");
-        std::fs::create_dir_all(&repository).unwrap();
-        let pool = crate::db::open(&directory.path().join("store.db"))
-            .await
-            .unwrap();
-        let session = SessionId::new();
-        let now = chrono::Utc::now();
-        sqlx::query("INSERT INTO sessions (id, workspace_id, title, state, created_at, updated_at, repository) VALUES (?, ?, 'knowledge', 'active', ?, ?, ?)")
-            .bind(session.to_string()).bind(WorkspaceId::new().to_string()).bind(now.to_rfc3339()).bind(now.to_rfc3339())
-            .bind(repository.to_string_lossy().to_string()).execute(&pool).await.unwrap();
-        let record = |scope, statement: &str| MemoryRecord {
-            id: MemoryId::new(),
-            class: MemoryClass::Semantic,
-            scope,
-            statement: statement.to_owned(),
-            structured_value: None,
-            provenance: vec![],
-            confidence: 0.7,
-            observed_at: now,
-            valid_from: Revision::sequence(1),
-            valid_until: None,
-            supersedes: vec![],
-            sensitivity: DataClassification::Internal,
-            retention: RetentionPolicy::default(),
-        };
-        let own = record(
-            Scope::Repository(anchor_repository_id(&repository)),
-            "This repository uses an isolated build directory.",
-        );
-        let system = record(
-            Scope::System,
-            "Review proposed changes before promoting a patch.",
-        );
-        let foreign = record(
-            Scope::Repository(codypendent_protocol::RepositoryId::new()),
-            "Another repository uses a separate convention.",
-        );
-        for item in [&own, &system, &foreign] {
-            MemoryStore::new().insert(&pool, item).await.unwrap();
-        }
-        let first = read_page(&pool, session, KnowledgeSection::Memories, 0, 1)
-            .await
-            .unwrap();
-        let second = read_page(
-            &pool,
-            session,
-            KnowledgeSection::Memories,
-            first.next_offset.unwrap(),
-            1,
-        )
-        .await
-        .unwrap();
-        let cards: Vec<_> = first.memories.into_iter().chain(second.memories).collect();
-        assert_eq!(
-            cards
-                .iter()
-                .map(|card| card.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![own.id.to_string(), system.id.to_string()]
-        );
-        assert!(second.next_offset.is_none());
-        assert_eq!(
-            (cards[0].confidence, cards[0].source.as_str()),
-            (0.7, "(no evidence)")
-        );
-        assert!(read_page(&pool, session, KnowledgeSection::Unknown, 0, 1)
-            .await
-            .is_err());
-        pool.close().await;
-    }
-}
+mod tests;

@@ -5,9 +5,9 @@
   "identifier": "com.codypendent.desktop",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "python3 scripts/prepare-monty-runtime.py && python3 scripts/prepare-embedding-runtime.py && npm run dev",
+    "beforeBuildCommand": "python3 scripts/prepare-monty-runtime.py --output ../../target/release && python3 scripts/prepare-embedding-runtime.py --output ../../target/release && npm run build"
   },
   "app": {
     "windows": [
@@ -15,15 +15,26 @@
         "title": "Codypendent",
         "width": 1280,
         "height": 840,
-        "resizable": true
+        "resizable": true,
+        "minWidth": 780,
+        "minHeight": 520
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'self' cody-sandbox: http://cody-sandbox.localhost https://cody-sandbox.localhost data:"
     }
   },
   "bundle": {
     "active": true,
+    "externalBin": [
+      "binaries/monty"
+    ],
+    "resources": {
+      "resources/monty-license.txt": "licenses/monty.txt",
+      "resources/embedding-runtime/": "embedding-runtime/",
+      "../../../LICENSE": "licenses/CODYPENDENT_LICENSE",
+      "../../../third_party/tantivy-sstable/LICENSE": "licenses/TANTIVY_SSTABLE_LICENSE"
+    },
     "targets": [
       "app",
       "deb",
@@ -35,12 +46,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns"
     ],
-    "shortDescription": "Codypendent desktop client",
-    "longDescription": "Desktop client for the Codypendent daemon. Connects to a local codypendentd over its Unix domain socket; it never executes tools itself.",
-    "resources": {
-      "../../../LICENSE": "licenses/CODYPENDENT_LICENSE",
-      "../../../third_party/tantivy-sstable/LICENSE": "licenses/TANTIVY_SSTABLE_LICENSE"
-    },
+    "shortDescription": "Your local-first coding workspace",
+    "longDescription": "A native coding workspace that connects your agents, repository and development tools through a shared local daemon.",
     "linux": {
       "deb": {
         "depends": [
@@ -50,7 +57,9 @@
       }
     },
     "macOS": {
-      "minimumSystemVersion": "10.15"
-    }
+      "minimumSystemVersion": "13.3",
+      "hardenedRuntime": true
+    },
+    "category": "DeveloperTool"
   }
 }

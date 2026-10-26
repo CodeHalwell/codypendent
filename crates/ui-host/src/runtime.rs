@@ -1834,12 +1834,6 @@ impl ProcessSampleSubscription {
         }
         Self { snapshots }
     }
-
-    /// The next sample taken after this call. `None` once the sampler is gone.
-    async fn next(&mut self) -> Option<ProcessSnapshot> {
-        self.snapshots.changed().await.ok()?;
-        self.snapshots.borrow_and_update().clone()
-    }
 }
 
 impl Drop for ProcessSampleSubscription {
@@ -1866,15 +1860,39 @@ async fn watch_process_resources(
     cpu_limit_seconds: u64,
     violation: Arc<Mutex<Option<ResourceViolation>>>,
 ) {
-    let memory_limit_kib = memory_limit_mb.saturating_mul(1_024);
     let mut samples = ProcessSampleSubscription::new();
+    watch_process_resource_samples(
+        process_group,
+        memory_limit_mb,
+        cpu_limit_seconds,
+        violation,
+        &mut samples.snapshots,
+    )
+    .await;
+}
+
+// Keep the subscription alive in the caller while applying the same watchdog
+// decisions to its stream. Tests can supply a failed/closed stream without
+// stopping the shared sampler or interfering with other workers.
+async fn watch_process_resource_samples(
+    process_group: u32,
+    memory_limit_mb: u64,
+    cpu_limit_seconds: u64,
+    violation: Arc<Mutex<Option<ResourceViolation>>>,
+    snapshots: &mut tokio::sync::watch::Receiver<Option<ProcessSnapshot>>,
+) {
+    let memory_limit_kib = memory_limit_mb.saturating_mul(1_024);
     loop {
         // A sample that never arrives is a lost accounting mechanism too — the
         // one shape a shared sampler could add that a private timer could not,
         // so it is bounded rather than waited on forever. Bounded generously:
         // see `PROCESS_SAMPLE_STALL_TIMEOUT` for why a late sample must not be
         // read as a dead one.
-        let sample = timeout(PROCESS_SAMPLE_STALL_TIMEOUT, samples.next()).await;
+        let sample = timeout(PROCESS_SAMPLE_STALL_TIMEOUT, async {
+            snapshots.changed().await.ok()?;
+            snapshots.borrow_and_update().clone()
+        })
+        .await;
         let (rss_kib, cpu_seconds) = match sample {
             Ok(Some(Ok(table))) => match table.get(&process_group) {
                 Some(sample) => *sample,
@@ -3633,6 +3651,120 @@ targets = ["shared"]
             scans <= 4,
             "eight watchdogs over two intervals must not cost eight scans; saw {scans}"
         );
+    }
+
+    #[cfg(unix)]
+    async fn spawn_resident_watchdog_fixture() -> Child {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        // Re-enter only the helper arm of the memory regression in a fresh
+        // executable. No external Node/Python installation or test-process
+        // resource limits are involved, and the child owns a new process group.
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "runtime::tests::watchdog_kills_an_over_budget_process_group",
+                "--nocapture",
+            ])
+            .env("CODY_UI_WATCHDOG_TEST_CHILD", "resident")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn owned watchdog fixture");
+        let mut lines = BufReader::new(child.stdout.take().expect("fixture stdout")).lines();
+        timeout(Duration::from_secs(15), async {
+            while let Some(line) = lines.next_line().await.expect("read fixture readiness") {
+                if line.ends_with("watchdog fixture ready") {
+                    return;
+                }
+            }
+            panic!("watchdog fixture exited before allocating resident memory");
+        })
+        .await
+        .expect("watchdog fixture becomes ready");
+        child
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watchdog_kills_an_over_budget_process_group() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if std::env::var_os("CODY_UI_WATCHDOG_TEST_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("resident"))
+        {
+            // Touch every page and keep it live beyond the watchdog's deadline.
+            let resident = vec![0xabu8; 8 * 1024 * 1024];
+            std::hint::black_box(&resident);
+            println!("watchdog fixture ready");
+            std::io::Write::flush(&mut std::io::stdout()).expect("flush fixture readiness");
+            std::thread::sleep(Duration::from_secs(60));
+            std::hint::black_box(resident);
+            return;
+        }
+
+        let mut child = spawn_resident_watchdog_fixture().await;
+        let group = child.id().expect("live owned process group");
+        let violation = Arc::new(Mutex::new(None));
+        // This uses the real shared process sampler and RSS, not a fabricated
+        // over-budget table. The child has touched 8 MiB against a 1 MiB cap.
+        timeout(
+            Duration::from_secs(15),
+            watch_process_resources(group, 1, u64::MAX, Arc::clone(&violation)),
+        )
+        .await
+        .expect("memory watchdog reaches a verdict");
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("watchdog kills its owned process group")
+            .expect("reap watchdog fixture");
+        assert_eq!(status.signal(), Some(9), "watchdog must issue SIGKILL");
+        assert_eq!(
+            *violation.lock().unwrap(),
+            Some(ResourceViolation::Memory { limit_mb: 1 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watchdog_kills_its_process_group_when_accounting_fails() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        for closed in [false, true] {
+            let mut child = spawn_resident_watchdog_fixture().await;
+            let group = child.id().expect("live owned process group");
+            let violation = Arc::new(Mutex::new(None));
+            let (publisher, mut snapshots) = tokio::sync::watch::channel(None);
+            if closed {
+                drop(publisher);
+            } else {
+                publisher.send(Some(Err(SamplingFailed))).unwrap();
+            }
+            timeout(
+                Duration::from_secs(5),
+                watch_process_resource_samples(
+                    group,
+                    u64::MAX,
+                    u64::MAX,
+                    Arc::clone(&violation),
+                    &mut snapshots,
+                ),
+            )
+            .await
+            .expect("failed or closed accounting fails immediately");
+            let status = timeout(Duration::from_secs(5), child.wait())
+                .await
+                .expect("accounting failure kills its owned process group")
+                .expect("reap watchdog fixture");
+            assert_eq!(status.signal(), Some(9), "watchdog must issue SIGKILL");
+            assert_eq!(
+                *violation.lock().unwrap(),
+                Some(ResourceViolation::AccountingUnavailable)
+            );
+        }
     }
 
     #[test]

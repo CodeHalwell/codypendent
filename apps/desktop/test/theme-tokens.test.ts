@@ -50,7 +50,7 @@ describe("theme tokens", () => {
     // The stylesheet has three palette blocks: the dark `:root`, the light
     // media query, and the explicit `data-theme="light"` override. A token
     // that is missing from one of them falls through to the wrong palette.
-    const blocks = theme.split(/(?=^:root|^@media)/m).filter((block) => /--cody-/.test(block));
+    const blocks = theme.split(/(?=^:root|^@media)/m).filter((block) => /--cody-[\w-]+\s*:/.test(block));
     expect(blocks.length).toBe(3);
     const definedEverywhere = new Set<string>();
     const perBlock = blocks.map((block) => new Set(Array.from(block.matchAll(TOKEN_DEFINITION), (m) => m[1])));

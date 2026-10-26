@@ -60,7 +60,7 @@ pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
 pub use codegraph::{
     CodeGraphEdgeAssertion, CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount,
     CodeGraphNodeView, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport,
-    CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
+    CodeGraphSkippedExtension, CodeGraphSourceLocation, CodeGraphStatusView, CodeGraphTally,
 };
 pub use command::{
     CanaryMetrics, Command, CommandBody, DaemonStore, FileMatchWire, NamedResource,
@@ -72,7 +72,7 @@ pub use document::{
 };
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};
-pub use events::{Actor, EventBody, SessionEvent};
+pub use events::{Actor, EventBody, SessionEvent, UsageCoverage};
 pub use federated_graph::*;
 pub use framing::{read_envelope, write_envelope, FrameError, MAX_FRAME_BYTES};
 pub use handshake::{ClientHello, ClientRole, ResumeToken, ServerHello, Subscription};

@@ -1,4 +1,7 @@
+import { PageShell } from "./PageShell.js";
 import React, { useState } from "react";
+import { useCommandActions, type CommandActions } from "../useCommandActions.js";
+import { CommandFeedbackNote } from "./CommandFeedbackNote.js";
 import { relativeTime } from "../time.js";
 import type { InboxDeepLink, InboxEntry, InboxEntryKind } from "@codypendent/protocol";
 
@@ -6,9 +9,9 @@ export interface InboxViewProps {
   entries: InboxEntry[];
   onAcknowledge: (entryId: string) => void | Promise<void>;
   onDismiss: (entryId: string) => void | Promise<void>;
-  onNavigate: (deepLink: InboxDeepLink) => void;
-  onApprove?: (approvalId: string) => void | Promise<void>;
-  onReject?: (approvalId: string) => void | Promise<void>;
+  onNavigate: (deepLink: InboxDeepLink, entry: InboxEntry) => void | Promise<void>;
+  connected?: boolean;
+  commandActions?: CommandActions;
   onRefresh?: () => void;
   /**
    * Why the inbox could not be read, when it could not be read.
@@ -28,25 +31,15 @@ export const InboxView: React.FC<InboxViewProps> = ({
   onAcknowledge,
   onDismiss,
   onNavigate,
-  onApprove,
-  onReject,
+  connected = true,
+  commandActions,
   onRefresh,
   unavailable,
 }) => {
   const [stateFilter, setStateFilter] = useState<StateFilter>("Unread");
   const [kindFilter, setKindFilter] = useState<string>("All");
-  /**
-   * The `entryId:action` a mutation is in flight for. THAT button disables
-   * (so a slow daemon answer cannot double-fire it) while the row's other
-   * verbs stay live — approving must not lock out rejecting.
-   */
-  const [busyAction, setBusyAction] = useState<string | null>(null);
-  const act = (busyKey: string, run: () => void | Promise<void>) => {
-    setBusyAction(busyKey);
-    void Promise.resolve(run()).finally(() => {
-      setBusyAction((current) => (current === busyKey ? null : current));
-    });
-  };
+  const localActions = useCommandActions(`${connected}`);
+  const actions = commandActions ?? localActions;
 
   const filteredEntries = entries.filter((entry) => {
     const entryState = entry.state?.type ?? "Unread";
@@ -103,14 +96,14 @@ export const InboxView: React.FC<InboxViewProps> = ({
   };
 
   return (
-    <div
+    <PageShell
       role="region"
       aria-label="Inbox"
       style={{
         flex: 1,
         display: "flex",
         flexDirection: "column",
-        height: "100vh",
+        height: "100%",
         background: "var(--cody-canvas)",
         color: "var(--cody-text)",
         overflowY: "auto",
@@ -118,6 +111,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
     >
       {/* Header */}
       <div
+        className="cody-page-header"
         style={{
           padding: "20px 24px 16px",
           borderBottom: "1px solid var(--cody-inset)",
@@ -129,14 +123,15 @@ export const InboxView: React.FC<InboxViewProps> = ({
         }}
       >
         <div>
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Durable Inbox</h1>
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Inbox</h1>
           <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
-            Pending human work, approval requests, and notifications
+            Decisions, questions and updates that need your attention.
           </p>
         </div>
         {onRefresh && (
           <button
             onClick={onRefresh}
+            disabled={!connected}
             style={{
               padding: "6px 12px",
               background: "var(--cody-inset)",
@@ -244,7 +239,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
               fontSize: 14,
             }}
           >
-            No notifications in inbox for filter: {stateFilter}
+            {stateFilter === "All" && kindFilter === "All" ? "You’re all caught up." : "No updates match these filters."}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -252,18 +247,16 @@ export const InboxView: React.FC<InboxViewProps> = ({
               const kindType = entry.kind?.type ?? "Unknown";
               const stateType = entry.state?.type ?? "Unread";
               const kindColors = getKindBadgeColor(kindType);
-              const isApproval = kindType === "ApprovalRequest";
-              const approvalId =
-                entry.deep_link.type === "Approval"
-                  ? entry.deep_link.approval_id
-                  : entry.source?.identity?.type === "Approval"
-                    ? entry.source.identity.approval_id
-                    : undefined;
+              const isDecision = entry.deep_link.type === "Approval" || entry.deep_link.type === "Question";
+              const actionKey = `inbox:${entry.id}`;
+              const result = actions.feedback[actionKey];
+              const busy = result?.phase === "pending";
 
               return (
                 <div
                   key={entry.id}
                   data-testid={`inbox-entry-${entry.id}`}
+                  aria-busy={busy}
                   style={{
                     padding: 16,
                     background: "var(--cody-panel-raised)",
@@ -333,7 +326,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                   >
                     {/* Deep link navigate */}
                     <button
-                      onClick={() => onNavigate(entry.deep_link)}
+                      disabled={busy || !connected}
+                      onClick={() => actions.run(actionKey, () => onNavigate(entry.deep_link, entry))}
                       style={{
                         padding: "4px 10px",
                         background: "var(--cody-success-strong)",
@@ -344,60 +338,16 @@ export const InboxView: React.FC<InboxViewProps> = ({
                         fontWeight: 500,
                         cursor: "pointer",
                       }}
-                      aria-label={`Open ${entry.title}`}
+                      aria-label={`${isDecision ? "Review" : "Open"} ${entry.title}`}
                     >
-                      Open {describeDeepLink(entry.deep_link)}
+                      {isDecision ? "Review" : "Open"} {describeDeepLink(entry.deep_link)}
                     </button>
-
-                    {/* Direct Approval Actions if available */}
-                    {isApproval && approvalId && stateType !== "Resolved" && (
-                      <>
-                        {onApprove && (
-                          <button
-                            disabled={busyAction === `${entry.id}:approve`}
-                            onClick={() => act(`${entry.id}:approve`, () => onApprove(approvalId))}
-                            style={{
-                              padding: "4px 10px",
-                              background: "var(--cody-accent-strong)",
-                              border: "1px solid var(--cody-accent)",
-                              borderRadius: 6,
-                              color: "var(--cody-on-accent)",
-                              fontSize: 12,
-                              fontWeight: 500,
-                              cursor: "pointer",
-                            }}
-                            aria-label={`Approve ${entry.title}`}
-                          >
-                            Approve
-                          </button>
-                        )}
-                        {onReject && (
-                          <button
-                            disabled={busyAction === `${entry.id}:reject`}
-                            onClick={() => act(`${entry.id}:reject`, () => onReject(approvalId))}
-                            style={{
-                              padding: "4px 10px",
-                              background: "var(--cody-danger)",
-                              border: "1px solid var(--cody-danger-soft)",
-                              borderRadius: 6,
-                              color: "var(--cody-on-accent)",
-                              fontSize: 12,
-                              fontWeight: 500,
-                              cursor: "pointer",
-                            }}
-                            aria-label={`Reject ${entry.title}`}
-                          >
-                            Reject
-                          </button>
-                        )}
-                      </>
-                    )}
 
                     {/* Acknowledge */}
                     {stateType === "Unread" && (
                       <button
-                        disabled={busyAction === `${entry.id}:ack`}
-                        onClick={() => act(`${entry.id}:ack`, () => onAcknowledge(entry.id))}
+                        disabled={busy || !connected}
+                        onClick={() => actions.run(actionKey, () => onAcknowledge(entry.id))}
                         style={{
                           padding: "4px 10px",
                           background: "var(--cody-inset)",
@@ -416,8 +366,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                     {/* Dismiss */}
                     {stateType !== "Dismissed" && stateType !== "Resolved" && (
                       <button
-                        disabled={busyAction === `${entry.id}:dismiss`}
-                        onClick={() => act(`${entry.id}:dismiss`, () => onDismiss(entry.id))}
+                        disabled={busy || !connected}
+                        onClick={() => actions.run(actionKey, () => onDismiss(entry.id))}
                         style={{
                           padding: "4px 10px",
                           background: "var(--cody-inset)",
@@ -433,12 +383,16 @@ export const InboxView: React.FC<InboxViewProps> = ({
                       </button>
                     )}
                   </div>
+                  {isDecision && <p style={{ margin: 0, fontSize: 12, color: "var(--cody-text-muted)" }}>
+                    Review the full request before deciding. Acknowledge and Dismiss only organize your inbox.
+                  </p>}
+                  <CommandFeedbackNote feedback={result} />
                 </div>
               );
             })}
           </div>
         )}
       </div>
-    </div>
+    </PageShell>
   );
 };

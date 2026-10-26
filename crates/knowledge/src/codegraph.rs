@@ -40,6 +40,13 @@ use crate::types::{
     GitRevision, LanguageId, SymbolKey, AGENT_ASSERTED_CONFIDENCE, SYNTAX_CALL_CONFIDENCE,
 };
 
+mod import_resolution;
+mod traversal;
+pub use traversal::{
+    GraphDirection, GraphTraversal, GraphTraversalKind, GraphTraversalMetadata,
+    TRAVERSAL_DEFAULT_LIMIT, TRAVERSAL_MAX_LIMIT, TRAVERSAL_MAX_OFFSET,
+};
+
 // --------------------------------------------------------------------------
 // Language dispatch — the single definition of "a file the graph can hold"
 // --------------------------------------------------------------------------
@@ -313,7 +320,8 @@ where
     let mut folded = Vec::with_capacity(files.len());
     let mut scanned: HashSet<&str> = HashSet::with_capacity(files.len());
     for (path, source) in &files {
-        let delta = upsert_file_graph(pool, repository, revision, path, source).await?;
+        let delta =
+            upsert_file_graph_inner(pool, repository, revision, path, source, false).await?;
         folded.push(FoldedFile {
             nodes: delta.nodes.len(),
             edges: delta.edges.len(),
@@ -327,6 +335,9 @@ where
     //    look at those paths and therefore cannot say they are gone.
     let mut retired = RetiredFiles::default();
     if coverage == ScanCoverage::Truncated {
+        for (path, source) in &files {
+            import_resolution::reconcile_file(pool, repository, path, source).await?;
+        }
         let after = non_syntax_edge_count(pool, repository).await?;
         return Ok(RepositoryRebuild {
             folded,
@@ -351,6 +362,11 @@ where
         }
     }
 
+    // Resolve only after all definitions and retirements are visible, so file
+    // ordering cannot hide a target or bind a call to a deleted file.
+    for (path, source) in &files {
+        import_resolution::reconcile_file(pool, repository, path, source).await?;
+    }
     let after = non_syntax_edge_count(pool, repository).await?;
     Ok(RepositoryRebuild {
         folded,
@@ -751,6 +767,60 @@ pub async fn upsert_file_graph(
     path: &str,
     source: &str,
 ) -> Result<GraphDelta, CodeGraphError> {
+    upsert_file_graph_inner(pool, repository, revision, path, source, true).await
+}
+
+/// Importer paths to reparse after changing a source file.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AffectedImporters {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Capture importers before retiring changed definitions. Changed files are
+/// excluded because their own parse already refreshes their outgoing edges.
+pub async fn affected_importers(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    changed_paths: &[String],
+    limit: usize,
+) -> Result<AffectedImporters, CodeGraphError> {
+    affected_importers_page(pool, repository, changed_paths, None, limit).await
+}
+
+/// Read a stable, sorted page of explicit importers. Continue with the last
+/// returned path as `after` while `truncated`; each page holds at most 2000 paths.
+/// The caller holds the repository writer gate across capture and mutation.
+pub async fn affected_importers_page(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    changed_paths: &[String],
+    after: Option<&str>,
+    limit: usize,
+) -> Result<AffectedImporters, CodeGraphError> {
+    import_resolution::affected_importers_page(pool, repository, changed_paths, after, limit).await
+}
+
+/// Reparse one unchanged importer after its dependencies changed. The caller
+/// supplies current, repository-relative source under the repository writer gate.
+pub async fn reconcile_imports_for_file(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    revision: &GitRevision,
+    path: &str,
+    source: &str,
+) -> Result<GraphDelta, CodeGraphError> {
+    upsert_file_graph(pool, repository, revision, path, source).await
+}
+
+async fn upsert_file_graph_inner(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    revision: &GitRevision,
+    path: &str,
+    source: &str,
+    resolve_imports: bool,
+) -> Result<GraphDelta, CodeGraphError> {
     let built = build_file_graph(repository, path, source)?;
     let now = Utc::now();
     let created_at = now.to_rfc3339();
@@ -866,11 +936,30 @@ pub async fn upsert_file_graph(
     //    `graph.callers_of` returned twice. A reparsed syntax edge supersedes a
     //    strictly weaker incumbent and yields to a stronger one, exactly as an
     //    asserted or LSP edge does.
+    let imported = if resolve_imports {
+        import_resolution::resolve(&mut tx, repository, path, source).await?
+    } else {
+        import_resolution::Resolution::default()
+    };
     let mut edge_records = Vec::with_capacity(built.edges.len());
     for edge in &built.edges {
         let record = CodeEdge {
             from: ids[edge.from],
-            to: ids[edge.to],
+            to: if edge.relation == CodeRelation::Calls {
+                imported
+                    .calls
+                    .get(&(edge.site_start, edge.site_end))
+                    .copied()
+                    .unwrap_or(ids[edge.to])
+            } else if edge.relation == CodeRelation::Imports {
+                imported
+                    .imports
+                    .get(&built.nodes[edge.to].key.qualified_name)
+                    .copied()
+                    .unwrap_or(ids[edge.to])
+            } else {
+                ids[edge.to]
+            },
             relation: edge.relation,
             confidence: edge.confidence,
             evidence_kind: edge.evidence_kind,
@@ -884,6 +973,14 @@ pub async fn upsert_file_graph(
             edge_records.push(record);
         }
     }
+
+    edge_records.extend(
+        import_resolution::add_relations(&mut tx, repository, path, source, &imported.relations)
+            .await?,
+    );
+    let pruned = import_resolution::prune_references(&mut tx, repository, path).await?;
+    node_records.retain(|node| !pruned.contains(&node.id));
+    created_node_ids.retain(|id| !pruned.contains(id));
 
     // 4. One SymbolChanged event per durable node, in the SAME transaction.
     for id in &owned_ids {
@@ -1813,6 +1910,8 @@ pub const GRAPH_CANDIDATE_LIMIT: usize = 10;
 /// A question the code graph can answer about a repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphQuestion {
+    /// A bounded, paginated query reached through the existing graph seam.
+    Traverse(GraphTraversal),
     /// Who calls this symbol directly (`graph.callers_of`).
     CallersOf { symbol: String },
     /// Everything that transitively reaches this symbol (`graph.blast_radius`).
@@ -1824,6 +1923,10 @@ pub enum GraphQuestion {
 /// One disclosed symbol in a [`GraphAnswer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphHit {
+    /// Stable identity accepted by the next traversal query.
+    pub id: CodeNodeId,
+    /// Validated by the daemon against the current source, when available.
+    pub location: Option<codypendent_protocol::CodeGraphSourceLocation>,
     pub qualified_name: String,
     pub kind: CodeNodeKind,
     pub source_path: String,
@@ -1836,6 +1939,8 @@ pub struct GraphHit {
 /// the (bounded) symbols found — plus the candidates to try when nothing matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphAnswer {
+    /// Absent for legacy query variants; never an invented pagination state.
+    pub traversal: Option<GraphTraversalMetadata>,
     /// A one-line rendering of the question, so the answer stands alone.
     pub question: String,
     /// The symbols/files the question actually resolved to. Empty means the
@@ -1870,17 +1975,33 @@ impl GraphAnswer {
             out.push_str(&format!("resolved to: {}\n", self.targets.join(", ")));
         }
         if self.hits.is_empty() {
-            out.push_str("no results\n");
+            out.push_str(if self.traversal.is_some() && self.total > 0 {
+                "no results at this offset\n"
+            } else {
+                "no results\n"
+            });
             if !self.candidates.is_empty() {
                 out.push_str(&format!("did you mean: {}\n", self.candidates.join(", ")));
             }
+            self.render_traversal(&mut out);
             return out;
         }
         out.push_str(&format!(
             "{} result{}{}\n",
             self.total,
             if self.total == 1 { "" } else { "s" },
-            if self.truncated() {
+            if let Some(page) = &self.traversal {
+                format!(
+                    " (showing {} at offset {}{})",
+                    self.hits.len(),
+                    page.offset,
+                    if page.total_is_exact {
+                        ""
+                    } else {
+                        "; count is a lower bound"
+                    }
+                )
+            } else if self.truncated() {
                 format!(" (showing the first {})", self.hits.len())
             } else {
                 String::new()
@@ -1894,8 +2015,44 @@ impl GraphAnswer {
                 hit.source_path,
                 hit.revision
             ));
+            if self.traversal.is_some() {
+                out.push_str(&format!("    node_id: {}\n", hit.id));
+                if let Some(location) = &hit.location {
+                    out.push_str(&format!(
+                        "    definition: {}:{}:{}\n",
+                        location.source_path, location.line, location.column
+                    ));
+                }
+            }
         }
+        self.render_traversal(&mut out);
         out
+    }
+
+    fn render_traversal(&self, out: &mut String) {
+        if let Some(page) = &self.traversal {
+            out.push_str(&format!(
+                "page: offset {}, limit {}",
+                page.offset, page.limit
+            ));
+            if let Some(next) = page.next_offset {
+                out.push_str(&format!(", next_offset {next}"));
+            }
+            out.push('\n');
+            if !page.resolved_ids.is_empty() {
+                out.push_str(&format!(
+                    "resolved node IDs: {}\n",
+                    page.resolved_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !page.total_is_exact {
+                out.push_str("Traversal budget reached; result count is a lower bound. Narrow the symbol/path or follow one returned node.\n");
+            }
+        }
     }
 }
 
@@ -1995,6 +2152,7 @@ pub async fn answer(
     question: &GraphQuestion,
 ) -> Result<GraphAnswer, CodeGraphError> {
     match question {
+        GraphQuestion::Traverse(request) => traversal::answer(pool, repository, request).await,
         GraphQuestion::CallersOf { symbol } => {
             let (targets, seeds, candidates) = resolve_seeds(pool, repository, symbol).await?;
             let mut reached = Vec::new();
@@ -2183,6 +2341,8 @@ fn assemble(
         .into_iter()
         .take(GRAPH_ANSWER_LIMIT)
         .map(|node| GraphHit {
+            id: node.id,
+            location: None,
             qualified_name: node.key.qualified_name,
             kind: node.key.kind,
             source_path: node.key.source_path,
@@ -2190,6 +2350,7 @@ fn assemble(
         })
         .collect();
     GraphAnswer {
+        traversal: None,
         question,
         targets,
         candidates,

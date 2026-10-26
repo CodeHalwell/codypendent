@@ -296,6 +296,39 @@ pub fn tool_call_started(tool_call_id: impl Into<String>, title: impl Into<Strin
     ))
 }
 
+/// Refine the human action label of an existing call without starting another.
+#[must_use]
+pub fn tool_call_refined(tool_call_id: impl Into<String>, title: impl Into<String>) -> Value {
+    wire(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        tool_call_id.into(),
+        ToolCallUpdateFields::new().title(title.into()),
+    )))
+}
+
+/// Forward an existing call's terminal outcome to an ACP client.
+#[must_use]
+pub fn tool_call_completed(
+    tool_call_id: impl Into<String>,
+    outcome: &codypendent_protocol::ToolOutcome,
+) -> Value {
+    let mut fields = ToolCallUpdateFields::new();
+    fields = match outcome {
+        codypendent_protocol::ToolOutcome::Succeeded => fields.status(ToolCallStatus::Completed),
+        codypendent_protocol::ToolOutcome::Failed { message } => {
+            fields.status(ToolCallStatus::Failed).content(vec![
+                agent_client_protocol::schema::v1::ToolCallContent::Content(
+                    agent_client_protocol::schema::v1::Content::new(message.clone()),
+                ),
+            ])
+        }
+        _ => fields.status(ToolCallStatus::Failed),
+    };
+    wire(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        tool_call_id.into(),
+        fields,
+    )))
+}
+
 /// A `session/update` announcing a tool call that has been proposed but not yet
 /// authorized.
 #[must_use]
@@ -823,6 +856,24 @@ mod tests {
             serde_json::from_value(permission_tool_call("approval-7", "t")).expect("toolCall");
         assert_eq!(permission.tool_call_id.to_string(), "approval-7");
         assert_eq!(permission.fields.status, Some(ToolCallStatus::Pending));
+        let refined: SessionUpdate =
+            serde_json::from_value(tool_call_refined("tool-1", "git status")).unwrap();
+        let SessionUpdate::ToolCallUpdate(refined) = refined else {
+            panic!("expected refinement")
+        };
+        assert_eq!(refined.tool_call_id.to_string(), "tool-1");
+        assert_eq!(refined.fields.title.as_deref(), Some("git status"));
+        assert_eq!(refined.fields.status, None);
+        let done: SessionUpdate = serde_json::from_value(tool_call_completed(
+            "tool-1",
+            &codypendent_protocol::ToolOutcome::Succeeded,
+        ))
+        .unwrap();
+        let SessionUpdate::ToolCallUpdate(done) = done else {
+            panic!("expected completion")
+        };
+        assert_eq!(done.tool_call_id.to_string(), "tool-1");
+        assert_eq!(done.fields.status, Some(ToolCallStatus::Completed));
     }
 
     #[tokio::test]

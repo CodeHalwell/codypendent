@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * A workflow run's blackboard: the typed artifacts its agents posted, their
  * evidence, and their supersession history.
@@ -172,16 +173,15 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
   );
 
   return (
-    <div
+    <PageShell
       role="region"
       aria-label="Blackboard"
-      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}
+      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}
     >
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
+      <div className="cody-page-header" style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Blackboard</h1>
         <p style={{ margin: "4px 0 12px", fontSize: 13, color: "var(--cody-text-muted)" }}>
-          The typed artifacts a workflow run&rsquo;s agents posted, with their evidence and
-          supersession history
+          Shared findings, evidence and questions from a workflow’s agents.
         </p>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <input
@@ -189,7 +189,7 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
             value={runInput}
             onChange={(event) => setRunInput(event.target.value)}
             onKeyDown={(event) => event.key === "Enter" && void load(runInput)}
-            placeholder="workflow run id"
+            placeholder="Paste a workflow run ID"
             style={{ flex: 1, minWidth: 260, padding: "7px 10px", background: "var(--cody-canvas)", border: "1px solid var(--cody-border-strong)", borderRadius: 6, color: "var(--cody-text)", fontSize: 13 }}
           />
           <button style={button} onClick={() => void load(runInput)}>
@@ -201,8 +201,7 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
       {board.status === "loaded" && (
         <div style={{ padding: "12px 24px", borderBottom: "1px solid var(--cody-inset)", background: "var(--cody-panel-raised)" }}>
           <label htmlFor="blackboard-question" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
-            Post an open question — the only artifact an operator may add, because a question
-            carries no unverified factual claim into the agents&rsquo; evidence channel.
+            Ask the agents a question
           </label>
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
             <input
@@ -263,7 +262,7 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
           </div>
         )}
       </div>
-    </div>
+    </PageShell>
   );
 };
 

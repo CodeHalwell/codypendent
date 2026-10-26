@@ -4,6 +4,7 @@
 //! validated definition store, durable result store, and the daemon-protocol
 //! runner; neither depends on the other to operate a council.
 
+pub mod artifacts;
 pub mod connection;
 mod roles;
 mod service;

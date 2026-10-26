@@ -408,8 +408,6 @@ pub async fn run_with_executor_on_and_health(
     executor: Option<Arc<dyn RunExecutor>>,
     integration_health: IntegrationHealth,
 ) -> anyhow::Result<()> {
-    info!(socket = %paths.socket_path.display(), pid = std::process::id(), "daemon listening");
-
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // One shared fan-out drives both the command processor (publisher) and the
@@ -679,6 +677,7 @@ pub async fn run_with_executor_on_and_health(
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    info!(socket = %paths.socket_path.display(), pid = std::process::id(), "daemon listening");
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -7709,6 +7708,7 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         // single run saw the safe actions and none of the refused ones.
         | ToolDenied { run_id, .. }
         | ToolStarted { run_id, .. }
+        | ToolUpdated { run_id, .. }
         | ToolCompleted { run_id, .. }
         | PatchProposed { run_id, .. }
         | SteeringQueued { run_id }
@@ -8512,6 +8512,7 @@ mod tests {
                 prompt_tokens: Some(1002),
                 completion_tokens: Some(60),
                 cost_micros: None,
+                coverage: None,
             })
         };
 

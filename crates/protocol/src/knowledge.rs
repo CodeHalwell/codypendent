@@ -18,6 +18,10 @@ pub enum KnowledgeSection {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct KnowledgePage {
     pub section: KnowledgeSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<crate::WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillCard>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

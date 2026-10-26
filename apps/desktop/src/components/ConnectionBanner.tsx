@@ -14,6 +14,7 @@ import React, { useEffect, useState } from "react";
 
 import type { ConnectionStatus } from "../types.js";
 import type { DaemonLaunchStatus } from "../transport.js";
+import { useConnectionPresentation } from "../useConnectionPresentation.js";
 
 export interface ConnectionBannerProps {
   status: ConnectionStatus;
@@ -39,15 +40,15 @@ const BANNER: React.CSSProperties = {
 };
 const DISCONNECTED: React.CSSProperties = {
   ...BANNER,
-  background: "var(--cody-danger-bg)",
-  borderBottom: "1px solid var(--cody-danger)",
-  color: "var(--cody-danger-text)",
-};
-const CONNECTING: React.CSSProperties = {
-  ...BANNER,
   background: "var(--cody-warning-bg)",
   borderBottom: "1px solid var(--cody-warning-border)",
   color: "var(--cody-warning-text)",
+};
+const CONNECTING: React.CSSProperties = {
+  ...BANNER,
+  background: "var(--cody-canvas)",
+  borderBottom: "1px solid var(--cody-border)",
+  color: "var(--cody-text-muted)",
 };
 const GUIDANCE: React.CSSProperties = { color: "var(--cody-text)" };
 const RAW: React.CSSProperties = {
@@ -97,11 +98,12 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
   const [launch, setLaunch] = useState<DaemonLaunchStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [outcome, setOutcome] = useState<{ started: boolean; detail: string } | null>(null);
+  const presentation = useConnectionPresentation(status, starting);
 
   // What the shell would launch, read whenever we land in the disconnected
   // state. A failed read leaves the banner with the manual command only.
   useEffect(() => {
-    if (status !== "disconnected" || !launchStatus) {
+    if (presentation !== "disconnected" || !launchStatus) {
       return;
     }
     let cancelled = false;
@@ -115,7 +117,7 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [status, launchStatus]);
+  }, [presentation, launchStatus]);
 
   // A fresh disconnect retires the previous attempt's report.
   useEffect(() => {
@@ -128,10 +130,11 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
     return null;
   }
 
-  if (status === "connecting") {
+  if (presentation === "connecting") {
     return (
       <div data-testid="connection-banner" role="status" style={CONNECTING}>
-        <strong>Connecting to codypendentd…</strong> {detail}
+        <strong>Connecting your workspace…</strong>
+        <details><summary style={{ cursor: "pointer" }}>Connection details</summary><span style={RAW}>{starting ? "Starting the local service. Your workspace will connect when it is ready." : detail}</span></details>
       </div>
     );
   }
@@ -152,12 +155,19 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
     <div data-testid="connection-banner" role="alert" style={DISCONNECTED}>
       <div>
         <strong>
-          {hasTransport ? "Not connected to codypendentd. Reconnecting…" : "Not connected to codypendentd."}
-        </strong>{" "}
-        <span style={RAW}>{detail}</span>
+          {hasTransport ? "Workspace offline · reconnecting" : "Open Codypendent to connect"}
+        </strong>
       </div>
+      <div style={GUIDANCE}>
+        {hasTransport
+          ? "Your sessions are saved. Codypendent is restoring the connection automatically."
+          : "This browser preview has no connection to your local workspace. Use the desktop app to run coding tasks."}
+      </div>
+      <details>
+        <summary style={{ cursor: "pointer", fontSize: 11 }}>Connection details</summary>
+        <div style={{ ...RAW, marginTop: 6 }}>{detail}</div>
       {hasTransport && (
-        <div style={GUIDANCE}>
+        <div style={{ ...GUIDANCE, marginTop: 6 }}>
           {launch && !launch.listening ? (
             found ? (
               <>
@@ -182,6 +192,7 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
           )}
         </div>
       )}
+      </details>
       {hasTransport && (
         <div style={ACTIONS}>
           {canStart && (
@@ -192,7 +203,7 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
               onClick={() => void start()}
               data-testid="start-daemon"
             >
-              {starting ? "Starting daemon…" : "Start daemon"}
+              {starting ? "Connecting…" : "Connect workspace"}
             </button>
           )}
           <button type="button" style={SECONDARY} onClick={onRetry} data-testid="retry-connect">

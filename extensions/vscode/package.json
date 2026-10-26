@@ -23,6 +23,7 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
+    "onUri",
     "onStartupFinished"
   ],
   "contributes": {

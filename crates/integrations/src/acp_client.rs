@@ -26,14 +26,14 @@ use tokio::task::JoinHandle;
 use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
-    SessionConfigSelectOptions, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate,
+    SessionConfigSelectOptions, SessionUpdate, ToolCall, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 // The ACP *client* surface (see the client section below). `ContentBlock` above
 // is shared with the Task 6 mapping; the rest are client-only.
 use agent_client_protocol::schema::v1::{
-    CancelNotification, InitializeRequest, InitializeResponse, McpServer as WireMcpServer,
-    McpServerStdio, NewSessionRequest, NewSessionResponse,
+    AuthenticateRequest, CancelNotification, InitializeRequest, InitializeResponse,
+    McpServer as WireMcpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
     PermissionOption as WirePermissionOption, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigOptionValue, SessionNotification,
@@ -45,6 +45,7 @@ use agent_client_protocol::{
 };
 
 use crate::acp::PermissionOption;
+use crate::acp_tool_failure::AcpToolFailure;
 use crate::poison::lock_recovering;
 use codypendent_protocol::{EventBody, RunId, ToolOutcome};
 
@@ -195,73 +196,206 @@ fn model_stream_delta(chunk: &ContentChunk, run_id: RunId, thought: bool) -> Vec
 /// stays empty: the agent built these arguments, not Codypendent's own tool
 /// executor, so there is no digest comparable to the native path's
 /// `hash_json` (`crates/runtime/src/agent.rs`) to record here — never
-/// fabricate one. `label` stays `None` for the same reason: the native path's
-/// `crate::tools::tool_label` (in `codypendent-runtime`) derives it from
-/// Codypendent's own typed tool arguments, which have no equivalent here — the
-/// external agent's `ToolCall` does carry a `locations`/`raw_input` that could
-/// plausibly seed a label, but `tool_call.title` (already `tool` above) is
-/// already the human-readable summary ACP gives us, so inventing a second,
-/// differently-derived label for this one client is left out of scope rather
-/// than guessed at.
+/// fabricate one. The machine tool name carries the ACP call's stable identity;
+/// its human-readable title is the display label. ACP completion updates can
+/// omit or change their title, and several calls can share the same title, so
+/// matching starts and completions by that title loses their lifecycle.
 fn tool_started(tool_call: &ToolCall, run_id: RunId) -> Vec<EventBody> {
-    vec![EventBody::ToolStarted {
+    let mut events = vec![EventBody::ToolStarted {
         run_id,
-        tool: tool_call.title.clone(),
+        tool: acp_tool_identity(&tool_call.tool_call_id.to_string()),
         args_digest: String::new(),
-        label: None,
-    }]
+        label: Some(acp_tool_display_label(
+            &tool_call.title,
+            Some(tool_call.kind),
+            tool_call.raw_input.as_ref(),
+            &tool_call.locations,
+        )),
+    }];
+    // A ToolCall can arrive already completed (for example during an agent's
+    // own replay); it must not leave a newly-created running card behind.
+    let mut failure = AcpToolFailure::default();
+    failure.capture_call(tool_call);
+    if let Some(outcome) = tool_outcome(tool_call.status, Some(&failure)) {
+        events.push(EventBody::ToolCompleted {
+            run_id,
+            tool: acp_tool_identity(&tool_call.tool_call_id.to_string()),
+            outcome,
+            artifact: None,
+        });
+    }
+    events
 }
 
 /// A tool call update maps to `EventBody::ToolCompleted` only once it reaches
 /// a terminal status. `Pending`/`InProgress` — or an update that does not
-/// touch `status` at all — is not terminal yet and produces no event (ACP
-/// reports progress this way; Codypendent has no "tool progressed" event).
+/// touch `status` at all — is not terminal yet. An input/title refinement is a
+/// new snapshot of the same identified call: clients upsert it rather than
+/// append another card. Claude announces "Terminal" before its command has
+/// streamed; discarding those refinements hid every command and file target.
 fn tool_completed(update: &ToolCallUpdate, run_id: RunId) -> Vec<EventBody> {
-    let outcome = match update.fields.status {
-        Some(ToolCallStatus::Completed) => ToolOutcome::Succeeded,
-        Some(ToolCallStatus::Failed) => ToolOutcome::Failed {
-            message: failure_message(update),
-        },
-        _ => return Vec::new(),
+    let mut events = Vec::new();
+    // Useful details may arrive only in the terminal update. Persist them
+    // before the outcome, but do not let a generic title-only update erase an
+    // already informative command or path.
+    let input = update.fields.raw_input.as_ref();
+    let has_target = [
+        "command",
+        "cmd",
+        "file_path",
+        "filePath",
+        "path",
+        "pattern",
+        "query",
+    ]
+    .iter()
+    .any(|key| {
+        input
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let has_location = update
+        .fields
+        .locations
+        .as_ref()
+        .is_some_and(|locations| !locations.is_empty());
+    let title = update.fields.title.as_deref().unwrap_or("Tool");
+    let generic_title = title.len() <= 64
+        && matches!(
+            title.trim().to_ascii_lowercase().as_str(),
+            "" | "tool"
+                | "terminal"
+                | "shell"
+                | "bash"
+                | "read file"
+                | "read_file"
+                | "write file"
+                | "write_file"
+                | "edit file"
+                | "edit_file"
+                | "file"
+                | "search"
+                | "delete"
+                | "fetch"
+                | "think"
+        );
+    if has_target || has_location || !generic_title {
+        events.push(EventBody::ToolUpdated {
+            run_id,
+            tool: acp_tool_identity(&update.tool_call_id.to_string()),
+            label: Some(acp_tool_display_label(
+                title,
+                update.fields.kind,
+                input,
+                update.fields.locations.as_deref().unwrap_or_default(),
+            )),
+        });
+    }
+    if let Some(outcome) = update.fields.status.and_then(|status| {
+        let mut failure = AcpToolFailure::default();
+        failure.capture_update(update);
+        tool_outcome(status, Some(&failure))
+    }) {
+        events.push(EventBody::ToolCompleted {
+            run_id,
+            tool: acp_tool_identity(&update.tool_call_id.to_string()),
+            outcome,
+            artifact: None,
+        });
+    }
+    events
+}
+
+fn acp_tool_identity(tool_call_id: &str) -> String {
+    format!("acp:{tool_call_id}")
+}
+
+/// Preserve useful action context, never serialize arbitrary arguments or file
+/// contents. ACP labels use "kind · action" so every surface can show the same
+/// human type and target while keeping the machine call identity private.
+fn acp_tool_display_label(
+    title: &str,
+    kind: Option<ToolKind>,
+    input: Option<&Value>,
+    locations: &[ToolCallLocation],
+) -> String {
+    let input_text = |key: &str| {
+        input
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
     };
-    vec![EventBody::ToolCompleted {
-        run_id,
-        tool: tool_label(update),
-        outcome,
-        artifact: None,
-    }]
-}
-
-/// The update's own title, else the tool call id it targets — always
-/// something, since `tool_call_id` is required on every `ToolCallUpdate`.
-fn tool_label(update: &ToolCallUpdate) -> String {
-    update
-        .fields
-        .title
-        .clone()
-        .unwrap_or_else(|| update.tool_call_id.to_string())
-}
-
-/// The first text content block reported alongside a failed tool call, else
-/// a generic message. ACP has no field dedicated to "why did this fail"
-/// distinct from the call's reported content, so this is the closest real
-/// signal to a failure message — never a placeholder when the agent actually
-/// told us something.
-fn failure_message(update: &ToolCallUpdate) -> String {
-    update
-        .fields
-        .content
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find_map(|item| match item {
-            ToolCallContent::Content(content) => match &content.content {
-                ContentBlock::Text(text) => Some(text.text.clone()),
-                _ => None,
-            },
-            _ => None,
+    let command = input_text("command").or_else(|| input_text("cmd"));
+    let path = input_text("file_path")
+        .or_else(|| input_text("filePath"))
+        .or_else(|| input_text("path"));
+    let action = command
+        .or(path)
+        .or_else(|| input_text("pattern"))
+        .or_else(|| input_text("query"))
+        .map(std::borrow::Cow::Borrowed)
+        .or_else(|| {
+            locations
+                .first()
+                .map(|location| location.path.to_string_lossy())
         })
-        .unwrap_or_else(|| "ACP tool call failed".to_string())
+        .unwrap_or(std::borrow::Cow::Borrowed(title));
+    let category = match kind {
+        Some(ToolKind::Execute) => "Terminal",
+        Some(ToolKind::Read) => "Read File",
+        Some(ToolKind::Edit) => "Edit File",
+        Some(ToolKind::Delete) => "Delete",
+        Some(ToolKind::Search) => "Search",
+        Some(ToolKind::Fetch) => "Fetch",
+        Some(ToolKind::Think) => "Think",
+        _ if command.is_some() => "Terminal",
+        _ if path.is_some() => "File",
+        _ => title,
+    };
+    const MAX_LABEL_CHARS: usize = 200;
+    let category = bounded_label_text(category, MAX_LABEL_CHARS);
+    let action = bounded_label_text(&action, MAX_LABEL_CHARS);
+    if action.is_empty() || action == category {
+        category
+    } else {
+        bounded_label_text(&format!("{category} · {action}"), MAX_LABEL_CHARS)
+    }
+}
+
+fn bounded_label_text(text: &str, limit: usize) -> String {
+    let mut chars = Vec::with_capacity(limit);
+    let mut space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            space = !chars.is_empty();
+            continue;
+        }
+        if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+            continue;
+        }
+        if space {
+            chars.push(' ');
+            space = false;
+        }
+        chars.push(ch);
+        if chars.len() > limit {
+            chars.truncate(limit.saturating_sub(1));
+            chars.push('…');
+            break;
+        }
+    }
+    chars.into_iter().collect()
+}
+
+fn tool_outcome(status: ToolCallStatus, failure: Option<&AcpToolFailure>) -> Option<ToolOutcome> {
+    match status {
+        ToolCallStatus::Completed => Some(ToolOutcome::Succeeded),
+        ToolCallStatus::Failed => Some(ToolOutcome::Failed {
+            message: failure.cloned().unwrap_or_default().message(),
+        }),
+        _ => None,
+    }
 }
 
 // ===========================================================================
@@ -287,7 +421,7 @@ const PROMPT_QUEUE_DEPTH: usize = 8;
 /// Bound agent-to-host updates so a noisy external client is backpressured by
 /// durable event/approval processing instead of growing the daemon heap.
 const PROMPT_EVENT_QUEUE_DEPTH: usize = 256;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Why an ACP prompt turn ended. Mirrors [`crate::acp::StopReason`] (the server
 /// role's type) but is owned by the client role so the two directions stay
@@ -316,6 +450,25 @@ pub enum AcpClientError {
     /// Delegating or streaming a prompt turn failed.
     #[error("acp prompt failed: {0}")]
     Prompt(String),
+}
+
+fn streamed_provider_failure(text: &str) -> Option<String> {
+    let content = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("Warning: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: Value = serde_json::from_str(content.trim()).ok()?;
+    if value.get("type")?.as_str()? != "error"
+        || !(400..600).contains(&value.get("status")?.as_u64()?)
+    {
+        return None;
+    }
+    let message = value.pointer("/error/message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(bounded_label_text(message, 4096))
 }
 
 /// One model advertised by a connected ACP agent — a `session/new`
@@ -379,6 +532,204 @@ pub struct AcpMcpServer {
 pub struct AcpSessionOptions {
     /// MCP servers the agent should connect to (`session/new.mcpServers`).
     pub mcp_servers: Vec<AcpMcpServer>,
+    /// Reuse a validated existing vendor session without forwarding its tokens.
+    pub cached_auth: Option<AcpCachedAuth>,
+    /// Original Google home; the process receives an isolated MCP configuration.
+    pub google_home: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpCachedAuth {
+    method_id: String,
+    profile: PathBuf,
+}
+
+pub struct AcpResolvedConnection {
+    pub client: AcpClient,
+    pub spec: crate::acp_registry::AcpLaunchSpec,
+    /// An exact advertised replacement; present only after Google's retirement response.
+    pub selected_model: Option<String>,
+}
+
+impl AcpSessionOptions {
+    /// Only the official Google family requires an explicit cached-sign-in step.
+    #[must_use]
+    pub fn for_agent(spec: &crate::acp_registry::AcpLaunchSpec) -> Self {
+        let google_home = (spec.registry_id == "antigravity-acp")
+            .then(|| {
+                spec.env
+                    .get("GEMINI_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("GEMINI_HOME").map(PathBuf::from))
+                    .or_else(|| {
+                        spec.env
+                            .get("HOME")
+                            .map(PathBuf::from)
+                            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                            .map(|home| home.join(".gemini"))
+                    })
+            })
+            .flatten();
+        let cached_auth = google_home.as_ref().and_then(|home| {
+            [
+                home.join("antigravity-acp/acp_token.json"),
+                home.join("antigravity-cli/antigravity-oauth-token"),
+                home.join("jetski-standalone-oauth-token"),
+            ]
+            .into_iter()
+            .find(|path| cached_google_personal_profile(path))
+            .map(|profile| AcpCachedAuth {
+                method_id: "oauth-personal".into(),
+                profile,
+            })
+        });
+        Self {
+            cached_auth,
+            google_home,
+            ..Self::default()
+        }
+    }
+}
+
+fn bounded_auth_profile(path: &std::path::Path) -> Option<Value> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(65_537)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= 65_536)
+        .then(|| serde_json::from_slice(&bytes).ok())
+        .flatten()
+}
+
+fn cached_google_personal_profile(path: &std::path::Path) -> bool {
+    let Some(profile) = bounded_auth_profile(path) else {
+        return false;
+    };
+    if profile.get("auth_method").and_then(Value::as_str) != Some("consumer") {
+        return false;
+    }
+    let Some(token) = profile.get("token").and_then(Value::as_object) else {
+        return false;
+    };
+    let credential = |name: &str| {
+        token
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value.len() <= 16_384)
+    };
+    let Some(expiry) = token
+        .get("expiry")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return false;
+    };
+    credential("refresh_token") || (credential("access_token") && expiry > chrono::Utc::now())
+}
+
+fn google_subject(profile: &Value) -> Option<String> {
+    use base64::Engine;
+    let token = profile.get("id_token")?.as_str()?;
+    if token.len() > 16_384 {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let _ = parts.next()?;
+    let payload = parts.next()?;
+    let _ = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?,
+    )
+    .ok()?;
+    if !matches!(
+        claims.get("iss")?.as_str()?,
+        "accounts.google.com" | "https://accounts.google.com"
+    ) {
+        return None;
+    }
+    claims
+        .get("sub")?
+        .as_str()
+        .filter(|subject| !subject.is_empty() && subject.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn same_google_account(auth: &AcpCachedAuth, spec: &crate::acp_registry::AcpLaunchSpec) -> bool {
+    let legacy_home = spec
+        .env
+        .get("GEMINI_CLI_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("GEMINI_CLI_HOME").map(PathBuf::from))
+        .or_else(|| {
+            spec.env
+                .get("HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                .map(|home| home.join(".gemini"))
+        });
+    let legacy = legacy_home
+        .and_then(|home| bounded_auth_profile(&home.join("oauth_creds.json")))
+        .and_then(|profile| google_subject(&profile));
+    let current = bounded_auth_profile(&auth.profile).and_then(|profile| google_subject(&profile));
+    legacy.is_some() && legacy == current
+}
+
+fn retired_google_individual_client(error: &AcpClientError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no longer supported")
+        && message.contains("gemini code assist for individuals")
+        && message.contains("antigravity.google")
+}
+
+fn recovery_gemini_model(models: &[AcpModel], requested: Option<&str>) -> Option<String> {
+    let gemini = |model: &&AcpModel| model.id.to_ascii_lowercase().starts_with("gemini-");
+    if let Some(requested) = requested {
+        return models
+            .iter()
+            .filter(gemini)
+            .find(|model| model.id == requested)
+            .map(|model| model.id.clone());
+    }
+    models
+        .iter()
+        .filter(gemini)
+        .find(|model| model.current)
+        .or_else(|| models.iter().filter(gemini).next())
+        .map(|model| model.id.clone())
+}
+
+fn agent_mcp_launch(
+    command: &str,
+    args: &[String],
+    mut options: AcpSessionOptions,
+) -> (Vec<String>, AcpSessionOptions) {
+    let mut args = args.to_vec();
+    if std::path::Path::new(command)
+        .file_stem()
+        .is_some_and(|name| name == "copilot")
+        && !options.mcp_servers.is_empty()
+    {
+        let servers: serde_json::Map<String, Value> = options
+            .mcp_servers
+            .drain(..)
+            .map(|server| {
+                (server.name, serde_json::json!({"type":"local","command":server.command,"args":server.args,"tools":["*"]}))
+            })
+            .collect();
+        args.extend([
+            "--additional-mcp-config".to_string(),
+            serde_json::json!({"mcpServers":servers}).to_string(),
+        ]);
+    }
+    (args, options)
 }
 
 /// Read `mcp.toml` at `mcp_toml` and derive the launch specs safe to forward to
@@ -448,6 +799,8 @@ struct AcpDiscovery {
     /// Whether `modes` came from the response's dedicated `modes` state (the
     /// richer source); a Mode-category config option never overwrites it then.
     modes_from_state: bool,
+    models_from_legacy: bool,
+    handshake_phase: Option<&'static str>,
 }
 
 impl AcpDiscovery {
@@ -480,6 +833,42 @@ impl AcpDiscovery {
         if let Some(options) = &response.config_options {
             self.apply_config_options(options);
         }
+    }
+
+    fn apply_legacy_models(&mut self, response: &Value) {
+        if self.model_config_id.is_some() {
+            return;
+        }
+        let Some(models) = response
+            .pointer("/models/availableModels")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let current = response
+            .pointer("/models/currentModelId")
+            .and_then(Value::as_str);
+        self.models = models
+            .iter()
+            .take(256)
+            .filter_map(|model| {
+                let id = model.get("modelId")?.as_str()?;
+                if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+                    return None;
+                }
+                let name = model
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| name.len() <= 512)
+                    .unwrap_or(id);
+                Some(AcpModel {
+                    id: id.into(),
+                    name: name.into(),
+                    current: current == Some(id),
+                })
+            })
+            .collect();
+        self.models_from_legacy = !self.models.is_empty();
     }
 
     /// Fold a full config-option set (from `session/new`, a
@@ -519,7 +908,10 @@ impl AcpDiscovery {
                 _ => {}
             }
         }
-        self.models = models;
+        if model_config_id.is_some() || !self.models_from_legacy {
+            self.models = models;
+            self.models_from_legacy = false;
+        }
         self.model_config_id = model_config_id;
         // `session/new`'s dedicated `modes` state is the richer source; a
         // Mode-category config option never overwrites it.
@@ -552,6 +944,23 @@ fn auth_methods_hint(methods: &[AcpAuthMethod]) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(" (the agent advertises authentication: {methods})")
+}
+
+fn authentication_required(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "auth required",
+        "authentication required",
+        "not authenticated",
+        "sign-in required",
+        "sign in required",
+        "login required",
+        "not logged in",
+        "unauthorized",
+        "authentication failed",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
 }
 
 /// Receives the events an ACP turn produces and answers the agent's permission
@@ -587,6 +996,7 @@ pub struct AcpClient {
     /// Handshake discovery (auth methods, models, modes), kept live by the
     /// driver as the agent announces config changes.
     discovery: Arc<Mutex<AcpDiscovery>>,
+    google_home: Option<crate::acp_google_home::GoogleHome>,
 }
 
 /// A clonable handle that asks the agent to wind down the in-flight prompt
@@ -615,6 +1025,16 @@ impl Drop for AcpClient {
         // awaiting the external agent, so detaching would also retain its child
         // process. Aborting drops the SDK transport's process-group guard.
         self.driver.abort();
+    }
+}
+
+struct PendingConnection(Option<tokio::task::AbortHandle>);
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        if let Some(driver) = &self.0 {
+            driver.abort();
+        }
     }
 }
 
@@ -668,10 +1088,95 @@ impl AcpClient {
         cwd: &str,
         options: AcpSessionOptions,
     ) -> Result<AcpClient, AcpClientError> {
-        let config = AcpAgentConfig::new(command)
-            .args(args.iter().cloned())
-            .envs(env.clone());
-        Self::connect_transport(AcpAgent::new(config), cwd, options).await
+        let (args, options) = agent_mcp_launch(command, args, options);
+        let google_home = options
+            .google_home
+            .as_deref()
+            .map(crate::acp_google_home::GoogleHome::prepare)
+            .transpose()
+            .map_err(AcpClientError::Io)?;
+        let mut env = env.clone();
+        if let Some(home) = &google_home {
+            env.insert(
+                "GEMINI_HOME".into(),
+                home.path().to_string_lossy().into_owned(),
+            );
+        }
+        let config = AcpAgentConfig::new(command).args(args).envs(env);
+        let mut client = Self::connect_transport(AcpAgent::new(config), cwd, options).await?;
+        client.google_home = google_home;
+        Ok(client)
+    }
+
+    /// Recover only Google's explicitly retired individual-client route before any prompt.
+    pub async fn spawn_with_google_recovery(
+        spec: &crate::acp_registry::AcpLaunchSpec,
+        coordinate: &str,
+        data_dir: &std::path::Path,
+        cwd: &str,
+        options: AcpSessionOptions,
+    ) -> Result<AcpResolvedConnection, AcpClientError> {
+        let original = match Self::spawn_with(
+            &spec.command.to_string_lossy(),
+            &spec.args,
+            &spec.env,
+            cwd,
+            options.clone(),
+        )
+        .await
+        {
+            Ok(client) => {
+                return Ok(AcpResolvedConnection {
+                    client,
+                    spec: spec.clone(),
+                    selected_model: None,
+                })
+            }
+            Err(error) => error,
+        };
+        if crate::acp_registry::agent_id_from_coordinate(coordinate) != "gemini"
+            || !retired_google_individual_client(&original)
+        {
+            return Err(original);
+        }
+        let Ok(replacement) =
+            crate::acp_registry::AcpRegistryStore::new(data_dir).launch_spec("antigravity-acp")
+        else {
+            return Err(original);
+        };
+        let mut replacement_options = AcpSessionOptions::for_agent(&replacement);
+        if !replacement_options
+            .cached_auth
+            .as_ref()
+            .is_some_and(|auth| same_google_account(auth, spec))
+        {
+            return Err(original);
+        }
+        replacement_options.mcp_servers = options.mcp_servers;
+        let client = Self::spawn_with(
+            &replacement.command.to_string_lossy(),
+            &replacement.args,
+            &replacement.env,
+            cwd,
+            replacement_options,
+        )
+        .await
+        .map_err(|error| {
+            AcpClientError::Handshake(format!(
+                "{original}; the existing Antigravity session could not connect: {error}"
+            ))
+        })?;
+        let Some(selected_model) = recovery_gemini_model(
+            &client.discovered_models(),
+            crate::acp_registry::agent_model_from_coordinate(coordinate),
+        ) else {
+            return Err(original);
+        };
+        Ok(AcpResolvedConnection {
+            client,
+            spec: replacement,
+            selected_model: Some(selected_model),
+        })
     }
 
     async fn connect_transport<T>(
@@ -691,7 +1196,10 @@ impl AcpClient {
         }
         let (ready_tx, ready_rx) = oneshot::channel();
         let (commands, command_rx) = mpsc::channel(PROMPT_QUEUE_DEPTH);
-        let discovery = Arc::new(Mutex::new(AcpDiscovery::default()));
+        let discovery = Arc::new(Mutex::new(AcpDiscovery {
+            handshake_phase: Some("initialization"),
+            ..AcpDiscovery::default()
+        }));
         let driver = tokio::spawn(run_connection(
             transport,
             cwd,
@@ -700,11 +1208,15 @@ impl AcpClient {
             ready_tx,
             command_rx,
         ));
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
+        let mut pending = PendingConnection(Some(driver.abort_handle()));
+        let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
             Err(_) => {
                 driver.abort();
+                let phase = lock_recovering(&discovery)
+                    .handshake_phase
+                    .unwrap_or("connection");
                 Err(AcpClientError::Handshake(format!(
-                    "agent did not initialize within {} seconds",
+                    "agent did not complete {phase} within {} seconds",
                     HANDSHAKE_TIMEOUT.as_secs()
                 )))
             }
@@ -712,6 +1224,7 @@ impl AcpClient {
                 commands,
                 driver,
                 discovery,
+                google_home: None,
             }),
             // The driver reported a specific handshake failure before returning.
             Ok(Ok(Err(error))) => {
@@ -729,7 +1242,11 @@ impl AcpClient {
                     "acp connection task failed: {join_error}"
                 ))),
             },
+        };
+        if result.is_ok() {
+            pending.0 = None;
         }
+        result
     }
 
     /// Delegate `objective` to the agent as one ACP `session/prompt` turn,
@@ -755,9 +1272,25 @@ impl AcpClient {
                 AcpClientError::Prompt("acp connection is no longer running".to_string())
             })?;
 
+        let mut assistant_text = String::new();
         while let Some(message) = incoming.recv().await {
             match message {
-                PromptOut::Event(event) => sink.on_event(event).await,
+                PromptOut::Event(event) => {
+                    if let EventBody::ModelStreamDelta {
+                        text,
+                        thought: false,
+                        ..
+                    } = &event
+                    {
+                        let remaining = (256 * 1024_usize).saturating_sub(assistant_text.len());
+                        let end = (0..=text.len().min(remaining))
+                            .rev()
+                            .find(|end| text.is_char_boundary(*end))
+                            .unwrap_or(0);
+                        assistant_text.push_str(&text[..end]);
+                    }
+                    sink.on_event(event).await;
+                }
                 PromptOut::Permission {
                     tool_call,
                     options,
@@ -768,7 +1301,14 @@ impl AcpClient {
                     // the turn is already ending, so a failed send is harmless.
                     let _ = reply.send(choice);
                 }
-                PromptOut::Done(stop) => return Ok(stop),
+                PromptOut::Done(stop) => {
+                    if stop == AcpStopReason::EndTurn {
+                        if let Some(message) = streamed_provider_failure(&assistant_text) {
+                            return Err(AcpClientError::Prompt(message));
+                        }
+                    }
+                    return Ok(stop);
+                }
                 PromptOut::Failed(reason) => return Err(AcpClientError::Prompt(reason)),
             }
         }
@@ -777,10 +1317,8 @@ impl AcpClient {
         ))
     }
 
-    /// The models the agent advertised over the session-config handshake, in
-    /// the agent's own order. Empty when the agent predates `config_options`
-    /// or exposes no model selector — the agent's default model then applies,
-    /// exactly the pre-discovery behavior.
+    /// Models advertised through current configuration options or legacy model
+    /// state, in the agent's own order. Empty when it exposes no selector.
     #[must_use]
     pub fn discovered_models(&self) -> Vec<AcpModel> {
         lock_recovering(&self.discovery).models.clone()
@@ -798,21 +1336,21 @@ impl AcpClient {
         lock_recovering(&self.discovery).auth_methods.clone()
     }
 
-    /// Switch the session to one of the agent's own models via
-    /// `session/set_config_option`, targeting the Model-category selector the
-    /// handshake advertised. `model_id` goes to the agent verbatim — the agent
-    /// is the authority on its catalog, so an unknown id fails with the
-    /// agent's own error rather than a local guess. Fails when the agent
-    /// advertised no model selector at all.
+    /// Select a model through the advertised current or legacy protocol.
+    /// Legacy requests require an exact advertised identifier.
     pub async fn set_model(&mut self, model_id: &str) -> Result<(), AcpClientError> {
-        let config_id = lock_recovering(&self.discovery)
-            .model_config_id
-            .clone()
-            .ok_or_else(|| {
-                AcpClientError::Prompt(format!(
-                    "the agent advertises no model selector; cannot select `{model_id}`"
-                ))
-            })?;
+        let config_id = {
+            let discovery = lock_recovering(&self.discovery);
+            if discovery.model_config_id.is_none()
+                && (!discovery.models_from_legacy
+                    || !discovery.models.iter().any(|model| model.id == model_id))
+            {
+                return Err(AcpClientError::Prompt(format!(
+                    "the agent advertises no model selector matching `{model_id}`"
+                )));
+            }
+            discovery.model_config_id.clone()
+        };
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(PromptCommand::SetConfigOption {
@@ -852,6 +1390,7 @@ impl AcpClient {
 struct ActivePrompt {
     run_id: RunId,
     events: mpsc::Sender<PromptOut>,
+    tools: Arc<Mutex<crate::acp_tool_history::AcpToolHistory>>,
 }
 
 /// A command from an [`AcpClient`] handle (or [`AcpCancelHandle`]) to its
@@ -865,7 +1404,7 @@ enum PromptCommand {
     /// `session/set_config_option` — switch a select option (the model) and
     /// report back whether the agent accepted it.
     SetConfigOption {
-        config_id: String,
+        config_id: Option<String>,
         value: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -932,7 +1471,9 @@ where
                     }
                     let current = lock_recovering(&active).clone();
                     if let Some(prompt) = current {
-                        for event in session_update_to_events(&notification.update, prompt.run_id) {
+                        let events = lock_recovering(&prompt.tools)
+                            .events(&notification.update, prompt.run_id);
+                        for event in events {
                             let _ = prompt.events.send(PromptOut::Event(event)).await;
                         }
                     }
@@ -969,6 +1510,31 @@ where
                     return Err(error);
                 }
             }
+            if let Some(auth) = &options.cached_auth {
+                let advertised = lock_recovering(&discovery)
+                    .auth_methods
+                    .iter()
+                    .any(|method| method.id == auth.method_id);
+                if !advertised || !cached_google_personal_profile(&auth.profile) {
+                    let _ = ready.send(Err(AcpClientError::Handshake(
+                        "Existing Google sign-in is unavailable; authentication is required."
+                            .into(),
+                    )));
+                    return Ok(());
+                }
+                lock_recovering(&discovery).handshake_phase = Some("existing sign-in");
+                if let Err(error) = cx
+                    .send_request(AuthenticateRequest::new(auth.method_id.clone()))
+                    .block_task()
+                    .await
+                {
+                    let _ = ready.send(Err(AcpClientError::Handshake(format!(
+                        "existing sign-in failed: {error}"
+                    ))));
+                    return Err(error);
+                }
+            }
+            lock_recovering(&discovery).handshake_phase = Some("session creation");
             let mcp_servers = options
                 .mcp_servers
                 .iter()
@@ -979,22 +1545,35 @@ where
                     )
                 })
                 .collect::<Vec<_>>();
-            let session_id = match cx
-                .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
-                .block_task()
-                .await
-            {
+            let request = agent_client_protocol::UntypedMessage::new(
+                "session/new",
+                NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
+            )?;
+            let session_id = match cx.send_request(request).block_task().await {
                 Ok(response) => {
+                    let parsed: NewSessionResponse = match serde_json::from_value(response.clone())
+                    {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            let _ = ready.send(Err(AcpClientError::Handshake(format!(
+                                "invalid session/new response: {error}"
+                            ))));
+                            return Err(error.into());
+                        }
+                    };
                     let mut slot = lock_recovering(&discovery);
-                    slot.apply_session(&response);
-                    response.session_id
+                    slot.apply_session(&parsed);
+                    slot.apply_legacy_models(&response);
+                    parsed.session_id
                 }
                 Err(error) => {
                     // An auth-gated agent fails exactly here; name its
                     // advertised remedies instead of an opaque failure.
-                    let hint = {
+                    let hint = if authentication_required(&error.to_string()) {
                         let slot = lock_recovering(&discovery);
                         auth_methods_hint(&slot.auth_methods)
+                    } else {
+                        String::new()
                     };
                     let _ = ready.send(Err(AcpClientError::Handshake(format!(
                         "session/new failed: {error}{hint}"
@@ -1002,6 +1581,7 @@ where
                     return Err(error);
                 }
             };
+            lock_recovering(&discovery).handshake_phase = None;
             let _ = ready.send(Ok(()));
 
             // One delegated prompt turn per command. The `active` slot lets the
@@ -1017,6 +1597,7 @@ where
                         *lock_recovering(&active) = Some(ActivePrompt {
                             run_id,
                             events: events.clone(),
+                            tools: Arc::new(Mutex::new(Default::default())),
                         });
                         let request = cx
                             .send_request(PromptRequest::new(
@@ -1075,6 +1656,23 @@ where
                         value,
                         reply,
                     } => {
+                        let Some(config_id) = config_id else {
+                            let request = agent_client_protocol::UntypedMessage::new(
+                                "session/set_model",
+                                serde_json::json!({"sessionId":session_id,"modelId":value}),
+                            )?;
+                            let outcome = match cx.send_request(request).block_task().await {
+                                Ok(_) => {
+                                    for model in &mut lock_recovering(&discovery).models {
+                                        model.current = model.id == value;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(format!("session/set_model failed: {error}")),
+                            };
+                            let _ = reply.send(outcome);
+                            continue;
+                        };
                         let result = cx
                             .send_request(SetSessionConfigOptionRequest::new(
                                 session_id.clone(),
@@ -1221,11 +1819,71 @@ where
 mod mapping_tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        Content, ImageContent, Plan, SessionConfigSelectOption, TextContent, ToolCallUpdateFields,
+        Content, ImageContent, Plan, SessionConfigSelectOption, TextContent, ToolCallContent,
+        ToolCallUpdateFields,
     };
 
     fn rid() -> RunId {
         RunId::new()
+    }
+
+    #[test]
+    fn copilot_receives_stdio_servers_through_its_session_only_cli_configuration() {
+        let server = AcpMcpServer {
+            name: "codypendent-desktop".to_string(),
+            command: "/test/codypendent".to_string(),
+            args: vec!["__desktop_tools_mcp".to_string()],
+        };
+        let (args, options) = agent_mcp_launch(
+            "/test/copilot",
+            &["--acp".to_string()],
+            AcpSessionOptions {
+                mcp_servers: vec![server.clone()],
+                ..AcpSessionOptions::default()
+            },
+        );
+        assert!(options.mcp_servers.is_empty());
+        assert_eq!(args[0], "--acp");
+        assert_eq!(args[1], "--additional-mcp-config");
+        let config: Value = serde_json::from_str(&args[2]).unwrap();
+        assert_eq!(config["mcpServers"]["codypendent-desktop"]["type"], "local");
+        assert_eq!(
+            config["mcpServers"]["codypendent-desktop"]["command"],
+            "/test/codypendent"
+        );
+        assert!(config["mcpServers"]["codypendent-desktop"]
+            .get("env")
+            .is_none());
+        let (args, options) = agent_mcp_launch(
+            "/test/codex-acp",
+            &[],
+            AcpSessionOptions {
+                mcp_servers: vec![server.clone()],
+                ..AcpSessionOptions::default()
+            },
+        );
+        assert!(args.is_empty());
+        assert_eq!(options.mcp_servers, vec![server]);
+    }
+
+    #[test]
+    fn streamed_provider_error_is_not_a_successful_assistant_answer() {
+        let error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"This model is not supported by this account."}}"#;
+        assert_eq!(
+            streamed_provider_failure(&format!(
+                "Warning: Model metadata unavailable.\n\n{error}\n"
+            )),
+            Some("This model is not supported by this account.".to_string())
+        );
+        for text in [
+            format!("Here is an example error:\n{error}"),
+            format!("```json\n{error}\n```"),
+            r#"{"status":400,"error":{"message":"Example data"}}"#.to_string(),
+            r#"{"type":"error","status":200,"error":{"message":"Example data"}}"#.to_string(),
+            "The operation succeeded.".to_string(),
+        ] {
+            assert_eq!(streamed_provider_failure(&text), None, "{text}");
+        }
     }
 
     /// A `ContentChunk` wrapping a single text block, the common case for
@@ -1268,6 +1926,7 @@ mod mapping_tests {
         *active.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActivePrompt {
             run_id: rid(),
             events,
+            tools: Arc::new(Mutex::new(Default::default())),
         });
         let resolved = tokio::spawn({
             let active = Arc::clone(&active);
@@ -1343,11 +2002,118 @@ mod mapping_tests {
             events,
             vec![EventBody::ToolStarted {
                 run_id,
-                tool: "read_file".to_string(),
+                tool: "acp:t1".to_string(),
                 args_digest: String::new(),
-                label: None,
+                label: Some("read_file".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn acp_tool_calls_with_the_same_title_keep_distinct_identities() {
+        let run_id = rid();
+        for id in ["second", "first"] {
+            let start = session_update_to_events(
+                &SessionUpdate::ToolCall(ToolCall::new(id, "Terminal")),
+                run_id,
+            );
+            let done = session_update_to_events(
+                &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    id,
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                )),
+                run_id,
+            );
+            assert!(matches!((&start[0], &done[0]),
+                (EventBody::ToolStarted { tool: started, label, .. },
+                 EventBody::ToolCompleted { tool: completed, .. })
+                if started == completed && started == &format!("acp:{id}")
+                    && label.as_deref() == Some("Terminal")));
+        }
+    }
+
+    #[test]
+    fn acp_tool_refinement_keeps_command_and_file_targets_bounded_and_single_line() {
+        let command = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "shell",
+            ToolCallUpdateFields::new()
+                .title("Terminal")
+                .kind(ToolKind::Execute)
+                .raw_input(serde_json::json!({"command": "git\nstatus\u{202e}"})),
+        ));
+        assert!(
+            matches!(session_update_to_events(&command, rid()).as_slice(),
+            [EventBody::ToolUpdated { tool, label, .. }]
+            if tool == "acp:shell" && label.as_deref() == Some("Terminal · git status"))
+        );
+        let file = ToolCall::new("read", "Read File")
+            .kind(ToolKind::Read)
+            .raw_input(
+                serde_json::json!({"file_path": "src/main.rs", "content": "do not display this"}),
+            );
+        assert_eq!(
+            acp_tool_display_label(
+                &file.title,
+                Some(file.kind),
+                file.raw_input.as_ref(),
+                &file.locations
+            ),
+            "Read File · src/main.rs"
+        );
+        let huge = ToolCall::new("huge", "Terminal")
+            .raw_input(serde_json::json!({"command": "x".repeat(10000)}));
+        let label = acp_tool_display_label(
+            &huge.title,
+            Some(huge.kind),
+            huge.raw_input.as_ref(),
+            &huge.locations,
+        );
+        assert_eq!(label.chars().count(), 200);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn acp_already_completed_call_reports_its_terminal_outcome() {
+        let events = session_update_to_events(
+            &SessionUpdate::ToolCall(
+                ToolCall::new("done", "Read File").status(ToolCallStatus::Completed),
+            ),
+            rid(),
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                EventBody::ToolStarted { .. },
+                EventBody::ToolCompleted {
+                    outcome: ToolOutcome::Succeeded,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn acp_terminal_updates_keep_action_details_and_ignore_generic_title_only_refinements() {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "shell",
+            ToolCallUpdateFields::new()
+                .title("Terminal")
+                .kind(ToolKind::Execute)
+                .status(ToolCallStatus::Completed)
+                .raw_input(serde_json::json!({"command": "git status --short"})),
+        ));
+        assert!(
+            matches!(session_update_to_events(&update, rid()).as_slice(),
+            [EventBody::ToolUpdated { label, .. }, EventBody::ToolCompleted { outcome: ToolOutcome::Succeeded, .. }]
+            if label.as_deref() == Some("Terminal · git status --short"))
+        );
+        let generic = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "shell",
+            ToolCallUpdateFields::new()
+                .title("Terminal")
+                .status(ToolCallStatus::InProgress),
+        ));
+        assert!(session_update_to_events(&generic, rid()).is_empty());
     }
 
     #[test]
@@ -1364,7 +2130,7 @@ mod mapping_tests {
             events,
             vec![EventBody::ToolCompleted {
                 run_id,
-                tool: "read_file".to_string(),
+                tool: "acp:t1".to_string(),
                 outcome: ToolOutcome::Succeeded,
                 artifact: None,
             }]
@@ -1407,7 +2173,7 @@ mod mapping_tests {
             events,
             vec![EventBody::ToolCompleted {
                 run_id,
-                tool: "shell".to_string(),
+                tool: "acp:shell-1".to_string(),
                 outcome: ToolOutcome::Failed {
                     message: "permission denied".to_string()
                 },
@@ -1417,7 +2183,22 @@ mod mapping_tests {
     }
 
     #[test]
-    fn tool_call_update_without_a_title_falls_back_to_the_tool_call_id() {
+    fn failed_tool_call_initial_snapshot_preserves_the_reported_exit() {
+        let events = session_update_to_events(
+            &SessionUpdate::ToolCall(
+                ToolCall::new("search-137", "Search")
+                    .status(ToolCallStatus::Failed)
+                    .raw_output(serde_json::json!({"formatted_output":"", "exit_code":137})),
+            ),
+            rid(),
+        );
+        assert!(matches!(events.last(), Some(EventBody::ToolCompleted {
+            outcome: ToolOutcome::Failed { message }, ..
+        }) if message == "Process exited with code 137 (SIGKILL)."));
+    }
+
+    #[test]
+    fn tool_call_update_without_a_title_preserves_the_tool_call_identity() {
         let run_id = rid();
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "t-42",
@@ -1428,7 +2209,7 @@ mod mapping_tests {
             events,
             vec![EventBody::ToolCompleted {
                 run_id,
-                tool: "t-42".to_string(),
+                tool: "acp:t-42".to_string(),
                 outcome: ToolOutcome::Succeeded,
                 artifact: None,
             }]
@@ -1436,7 +2217,7 @@ mod mapping_tests {
     }
 
     #[test]
-    fn an_incomplete_tool_call_update_produces_no_events() {
+    fn tool_call_updates_preserve_input_refinements_without_completion() {
         let run_id = rid();
         let in_progress = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "t1",
@@ -1444,13 +2225,21 @@ mod mapping_tests {
                 .title("x")
                 .status(ToolCallStatus::InProgress),
         ));
-        assert!(session_update_to_events(&in_progress, run_id).is_empty());
+        assert!(
+            matches!(session_update_to_events(&in_progress, run_id).as_slice(),
+                [EventBody::ToolUpdated { tool, label, .. }] if tool == "acp:t1" && label.as_deref() == Some("x")
+            )
+        );
 
         let no_status_change = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "t1",
             ToolCallUpdateFields::new().title("renamed"),
         ));
-        assert!(session_update_to_events(&no_status_change, run_id).is_empty());
+        assert!(
+            matches!(session_update_to_events(&no_status_change, run_id).as_slice(),
+                [EventBody::ToolUpdated { tool, label, .. }] if tool == "acp:t1" && label.as_deref() == Some("renamed")
+            )
+        );
     }
 
     #[test]
@@ -1653,6 +2442,252 @@ mod client_tests {
     use serde_json::json;
     use tokio::io::AsyncBufRead;
 
+    fn cached_google_fixture(
+        home: &std::path::Path,
+    ) -> (PathBuf, crate::acp_registry::AcpLaunchSpec) {
+        let profile = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(&profile, json!({
+            "auth_method":"consumer",
+            "token":{"access_token":"sentinel-access-secret", "refresh_token":"sentinel-refresh-secret", "expiry":"2000-01-01T00:00:00Z"}
+        }).to_string()).unwrap();
+        let spec = crate::acp_registry::AcpLaunchSpec {
+            registry_id: "antigravity-acp".into(),
+            name: "Google Antigravity".into(),
+            version: "test".into(),
+            command: "/test/agy_acp_server.par".into(),
+            args: Vec::new(),
+            env: [("HOME".into(), home.to_string_lossy().into_owned())].into(),
+        };
+        (profile, spec)
+    }
+
+    #[test]
+    fn cached_google_auth_requires_an_existing_consumer_profile_and_official_family() {
+        let home = tempfile::tempdir().unwrap();
+        let (profile, mut spec) = cached_google_fixture(home.path());
+        let options = AcpSessionOptions::for_agent(&spec);
+        assert_eq!(
+            options.cached_auth.as_ref().unwrap().method_id,
+            "oauth-personal"
+        );
+        assert!(!format!("{options:?}").contains("sentinel"));
+        spec.registry_id = "antigravity-community".into();
+        assert!(AcpSessionOptions::for_agent(&spec).cached_auth.is_none());
+        spec.registry_id = "antigravity-acp".into();
+        for content in [
+            "",
+            "{}",
+            r#"{"auth_method":"consumer","token":{"access_token":"expired","expiry":"2000-01-01T00:00:00Z"}}"#,
+            r#"{"auth_method":"business","token":{"refresh_token":"present","expiry":"2030-01-01T00:00:00Z"}}"#,
+            r#"{"auth_method":"consumer","token":{"refresh_token":"present","expiry":"invalid"}}"#,
+        ] {
+            std::fs::write(&profile, content).unwrap();
+            assert!(AcpSessionOptions::for_agent(&spec).cached_auth.is_none());
+        }
+        std::fs::write(&profile, vec![b' '; 65_537]).unwrap();
+        assert!(AcpSessionOptions::for_agent(&spec).cached_auth.is_none());
+        std::fs::remove_file(profile).unwrap();
+        assert!(AcpSessionOptions::for_agent(&spec).cached_auth.is_none());
+    }
+
+    #[test]
+    fn google_recovery_requires_the_same_cached_account_and_an_advertised_gemini() {
+        use base64::Engine;
+        let home = tempfile::tempdir().unwrap();
+        let (profile, spec) = cached_google_fixture(home.path());
+        let jwt = |subject: &str| {
+            format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(json!({"iss":"https://accounts.google.com","sub":subject}).to_string())
+            )
+        };
+        let mut current = bounded_auth_profile(&profile).unwrap();
+        current["id_token"] = json!(jwt("same-account"));
+        std::fs::write(&profile, current.to_string()).unwrap();
+        let legacy = home.path().join(".gemini/oauth_creds.json");
+        std::fs::write(&legacy, json!({"id_token":jwt("same-account")}).to_string()).unwrap();
+        let auth = AcpSessionOptions::for_agent(&spec).cached_auth.unwrap();
+        assert!(same_google_account(&auth, &spec));
+        std::fs::write(
+            &legacy,
+            json!({"id_token":jwt("other-account")}).to_string(),
+        )
+        .unwrap();
+        assert!(!same_google_account(&auth, &spec));
+        std::fs::write(&legacy, r#"{"id_token":"invalid"}"#).unwrap();
+        assert!(!same_google_account(&auth, &spec));
+        let mut models = vec![
+            AcpModel {
+                id: "claude-default".into(),
+                name: "Claude".into(),
+                current: true,
+            },
+            AcpModel {
+                id: "gemini-listed".into(),
+                name: "Gemini".into(),
+                current: false,
+            },
+        ];
+        assert_eq!(
+            recovery_gemini_model(&models, None).as_deref(),
+            Some("gemini-listed")
+        );
+        assert_eq!(recovery_gemini_model(&models, Some("invented")), None);
+        assert_eq!(recovery_gemini_model(&models, Some("claude-default")), None);
+        models.push(AcpModel {
+            id: "gemini-current".into(),
+            name: "Current Gemini".into(),
+            current: true,
+        });
+        assert_eq!(
+            recovery_gemini_model(&models, None).as_deref(),
+            Some("gemini-current")
+        );
+        assert_eq!(
+            recovery_gemini_model(&models, Some("gemini-listed")).as_deref(),
+            Some("gemini-listed")
+        );
+        assert!(retired_google_individual_client(&AcpClientError::Handshake(
+            "This client is no longer supported for Gemini Code Assist for individuals. Migrate to https://antigravity.google".into()
+        )));
+        assert!(!retired_google_individual_client(
+            &AcpClientError::Handshake("Authentication required".into())
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_google_auth_precedes_new_session_and_never_forwards_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, spec) = cached_google_fixture(home.path());
+        let (_client, sent) = connect_with_options(
+            Script {
+                auth_methods: json!([{"id":"oauth-personal", "name":"Google account"}]),
+                ..Script::default()
+            },
+            AcpSessionOptions::for_agent(&spec),
+        )
+        .await
+        .unwrap();
+        let sent = lock_recovering(&sent);
+        let methods: Vec<_> = sent
+            .iter()
+            .filter_map(|value| value.get("method").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            &methods[..3],
+            &["initialize", "authenticate", "session/new"]
+        );
+        let auth = sent
+            .iter()
+            .find(|value| value["method"] == "authenticate")
+            .unwrap();
+        assert_eq!(auth["params"], json!({"methodId":"oauth-personal"}));
+        assert!(!serde_json::to_string(&*sent).unwrap().contains("sentinel"));
+    }
+
+    #[tokio::test]
+    async fn cached_google_auth_rechecks_removed_credentials_and_advertised_methods() {
+        let home = tempfile::tempdir().unwrap();
+        let (profile, spec) = cached_google_fixture(home.path());
+        let options = AcpSessionOptions::for_agent(&spec);
+        std::fs::remove_file(profile).unwrap();
+        let error = connect_with_options(
+            Script {
+                auth_methods: json!([{"id":"oauth-personal", "name":"Google account"}]),
+                ..Script::default()
+            },
+            options,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("authentication is required"));
+        let (_, spec) = cached_google_fixture(home.path());
+        let error = connect_with_options(Script::default(), AcpSessionOptions::for_agent(&spec))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("authentication is required"));
+    }
+
+    #[tokio::test]
+    async fn a_retired_google_client_preserves_the_vendor_remedy_without_sign_in_advice() {
+        let error = connect_with_options(
+            Script {
+                auth_methods: json!([{"id":"oauth-personal", "name":"Google login", "description":"Sign in again"}]),
+                session_new_error: Some(json!({"code":-32000,"message":"This client is no longer supported. Please migrate to Antigravity: https://antigravity.google"})),
+                ..Script::default()
+            },
+            AcpSessionOptions::default(),
+        ).await.err().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("https://antigravity.google"));
+        assert!(!message.contains("Sign in again"));
+        assert!(!message.contains("advertises authentication"));
+    }
+
+    #[tokio::test]
+    async fn legacy_model_state_is_preserved_and_only_advertised_ids_can_be_selected() {
+        let extra = json!({"models":{
+            "currentModelId":"gemini-current",
+            "availableModels":[
+                {"modelId":"gemini-current", "name":"Current Gemini"},
+                {"modelId":"gemini-other", "name":"Other Gemini"}
+            ]
+        }})
+        .as_object()
+        .unwrap()
+        .clone();
+        let (mut client, sent) = connect_with_options(
+            Script {
+                session_new_extra: extra,
+                ..Script::default()
+            },
+            AcpSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.discovered_models().len(), 2);
+        assert!(client.discovered_models()[0].current);
+        client.set_model("gemini-other").await.unwrap();
+        assert!(client.discovered_models()[1].current);
+        assert!(!client.discovered_models()[0].current);
+        assert!(client.set_model("invented-model").await.is_err());
+        let request = sent_method(&sent, "session/set_model").unwrap();
+        assert_eq!(
+            request["params"],
+            json!({"sessionId":"s-1","modelId":"gemini-other"})
+        );
+        assert!(sent_method(&sent, "session/set_config_option").is_none());
+    }
+
+    #[tokio::test]
+    async fn current_model_config_takes_precedence_over_legacy_state() {
+        let extra = json!({
+            "models":{"currentModelId":"legacy", "availableModels":[{"modelId":"legacy","name":"Legacy"}]},
+            "configOptions":[wire_model_selector("modern", &[("modern", "Modern")])]
+        }).as_object().unwrap().clone();
+        let (client, _) = connect_with_options(
+            Script {
+                session_new_extra: extra,
+                ..Script::default()
+            },
+            AcpSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.discovered_models(),
+            vec![AcpModel {
+                id: "modern".into(),
+                name: "Modern".into(),
+                current: true
+            }]
+        );
+    }
+
     /// Records mapped events and auto-approves any permission request by choosing
     /// the first offered option.
     struct RecordingSink {
@@ -1691,6 +2726,7 @@ mod client_tests {
         permission: bool,
         /// `session/update` payloads streamed before the turn resolves.
         updates: Vec<Value>,
+        final_text: Option<String>,
         /// Park the turn until the client sends `session/cancel`, then resolve
         /// with `stopReason: cancelled` instead of `end_turn`.
         await_cancel: bool,
@@ -1806,6 +2842,9 @@ mod client_tests {
                     };
                     write_message(&mut writer, &reply).await;
                 }
+                "authenticate" => {
+                    write_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
+                }
                 "session/set_config_option" => {
                     let reply = match &script.set_config_options {
                         Some(options) => json!({
@@ -1818,6 +2857,9 @@ mod client_tests {
                         }),
                     };
                     write_message(&mut writer, &reply).await;
+                }
+                "session/set_model" => {
+                    write_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
                 }
                 "session/prompt" => {
                     if script.permission {
@@ -1857,7 +2899,7 @@ mod client_tests {
                             "jsonrpc": "2.0", "method": "session/update",
                             "params": { "sessionId": "s-1", "update": {
                                 "sessionUpdate": "agent_message_chunk",
-                                "content": { "type": "text", "text": "hi from agent" }
+                                "content": { "type": "text", "text": script.final_text.as_deref().unwrap_or("hi from agent") }
                             } }
                         }),
                     )
@@ -1923,6 +2965,30 @@ mod client_tests {
             .expect("handshake completes")
     }
 
+    #[tokio::test]
+    async fn cancelled_handshakes_close_their_agent_transport() {
+        let (client, agent) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(client);
+        let pending = tokio::spawn(AcpClient::connect(reader, writer, "."));
+        let mut agent = BufReader::new(agent);
+        let mut request = String::new();
+        tokio::time::timeout(Duration::from_secs(2), agent.read_line(&mut request))
+            .await
+            .expect("initialize arrives")
+            .expect("initialize request");
+        assert!(request.contains("initialize"));
+        pending.abort();
+        let _ = pending.await;
+        let mut remaining = String::new();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), agent.read_line(&mut remaining))
+                .await
+                .expect("transport closes")
+                .expect("read EOF"),
+            0
+        );
+    }
+
     /// [`connect_to_scripted_agent`] without the success expectation, so a
     /// handshake failure is itself assertable.
     async fn connect_with_options(
@@ -1943,6 +3009,49 @@ mod client_tests {
         // a real agent rejects relative ACP working-directory URIs.
         let client = AcpClient::connect_with(client_reads, client_writes, ".", options).await?;
         Ok((client, sent))
+    }
+
+    #[tokio::test]
+    async fn dropping_acp_handshake_closes_its_transport() {
+        use tokio::io::AsyncReadExt;
+        let (client_reads, _agent_writes) = tokio::io::duplex(8192);
+        let (mut agent_reads, client_writes) = tokio::io::duplex(8192);
+        {
+            let connection = AcpClient::connect(client_reads, client_writes, ".");
+            tokio::pin!(connection);
+            let mut byte = [0_u8; 1];
+            tokio::select! {
+                _ = &mut connection => panic!("the silent agent must not finish handshaking"),
+                read = agent_reads.read(&mut byte) => assert_eq!(read.unwrap(), 1),
+            }
+        }
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            agent_reads.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("cancelling initialization closes its transport")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_rejects_a_provider_error_streamed_as_an_end_turn_answer() {
+        let script = Script {
+            final_text: Some(r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The selected model is unavailable for this account."}}"#.to_string()),
+            ..Script::default()
+        };
+        let (mut client, _sent) = connect_to_scripted_agent(script).await;
+        let mut sink = RecordingSink {
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let error = client
+            .prompt("check the selected model", RunId::new(), &mut sink)
+            .await
+            .expect_err("a provider error must not complete the run successfully");
+        assert!(error
+            .to_string()
+            .contains("The selected model is unavailable for this account."));
     }
 
     #[tokio::test]
@@ -1972,7 +3081,7 @@ mod client_tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                EventBody::ToolStarted { tool, .. } if tool == "read_file"
+                EventBody::ToolStarted { tool, label, .. } if tool == "acp:t1" && label.as_deref() == Some("read_file")
             )),
             "expected a ToolStarted(read_file) from the streamed tool_call, got {events:?}"
         );
@@ -2016,6 +3125,112 @@ mod client_tests {
                 .any(|event| matches!(event, EventBody::ModelStreamDelta { .. })),
             "expected streamed updates after the permission, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_streams_tool_lifecycle_fixture_with_stable_identity_and_action_labels() {
+        let updates =
+            serde_json::from_str(include_str!("../../../testdata/acp-tool-lifecycle.json"))
+                .unwrap();
+        let (mut client, _sent) = connect_to_scripted_agent(Script {
+            updates,
+            ..Script::default()
+        })
+        .await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingSink {
+            events: Arc::clone(&events),
+        };
+        let run_id = RunId::new();
+        client
+            .prompt("review fixture", run_id, &mut sink)
+            .await
+            .unwrap();
+        let events = events.lock().unwrap();
+        let fixture: Vec<_> = events
+            .iter()
+            .filter(|event| match event {
+                EventBody::ToolStarted { tool, .. }
+                | EventBody::ToolUpdated { tool, .. }
+                | EventBody::ToolCompleted { tool, .. } => tool.starts_with("acp:fixture-"),
+                _ => false,
+            })
+            .collect();
+        assert_eq!(
+            fixture
+                .iter()
+                .filter(|event| matches!(event, EventBody::ToolStarted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .iter()
+                .filter(|event| matches!(event, EventBody::ToolUpdated { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            fixture
+                .iter()
+                .filter(|event| matches!(event, EventBody::ToolCompleted { .. }))
+                .count(),
+            2
+        );
+        assert!(fixture.iter().any(|event| matches!(event,
+            EventBody::ToolUpdated { tool, label, .. } if tool == "acp:fixture-read"
+                && label.as_deref() == Some("Read File · src/main.rs"))));
+        assert!(fixture.iter().any(|event| matches!(event,
+            EventBody::ToolUpdated { tool, label, .. } if tool == "acp:fixture-terminal"
+                && label.as_deref() == Some("Terminal · git status --short"))));
+        assert!(fixture.iter().any(|event| matches!(event,
+            EventBody::ToolCompleted { tool, outcome: ToolOutcome::Failed { message }, .. }
+                if tool == "acp:fixture-terminal" && message == "fixture command failed")));
+        assert!(fixture.iter().any(|event| matches!(event,
+            EventBody::ToolCompleted { tool, outcome: ToolOutcome::Succeeded, .. }
+                if tool == "acp:fixture-read")));
+        // An explicit QA output path lets the native acceptance harness seed
+        // these real wire-mapped events into its disposable session ledger.
+        if let Some(path) = std::env::var_os("CODY_ACP_FIXTURE_OUTPUT") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.write_all(
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "run_id": run_id, "events": fixture,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn client_preserves_streamed_search_failure_details() {
+        let (mut client, _) = connect_to_scripted_agent(Script {
+            updates: vec![
+                json!({"sessionUpdate":"tool_call","toolCallId":"killed-search","title":"Search","kind":"search","status":"in_progress"}),
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"killed-search","rawOutput":{"formatted_output":"","exit_code":137}}),
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"other","rawOutput":{"stderr":"unrelated tool"}}),
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"killed-search","status":"failed"}),
+            ],
+            ..Script::default()
+        }).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingSink {
+            events: Arc::clone(&events),
+        };
+        client
+            .prompt("search the repository", RunId::new(), &mut sink)
+            .await
+            .unwrap();
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event,
+            EventBody::ToolCompleted { tool, outcome: ToolOutcome::Failed { message }, .. }
+            if tool == "acp:killed-search" && message.contains("137") && message.contains("SIGKILL") && !message.contains("unrelated")
+        )));
     }
 
     // -- model discovery ----------------------------------------------------
@@ -2317,6 +3532,7 @@ mod client_tests {
                     command: "server-bin".to_string(),
                     args: vec!["--stdio".to_string()],
                 }],
+                ..AcpSessionOptions::default()
             },
         )
         .await

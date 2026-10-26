@@ -1,3 +1,4 @@
+import { EmptyState, PageShell } from "./PageShell.js";
 /**
  * The repository task board.
  *
@@ -21,8 +22,7 @@
  *    body forward, re-ordinals it and republishes; this pane renders the
  *    replacement it gets back and never edits its own copy.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { useLoadOnMount } from "../useLoadOnMount.js";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BlackboardItemView } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
@@ -39,6 +39,7 @@ export interface KanbanViewProps {
    * `BlackboardView` already close.
    */
   connectionEpoch?: number;
+  onOpenRepository?: () => void;
 }
 
 /** The columns the board models, in order. Mirrors `KANBAN_COLUMNS`. */
@@ -48,7 +49,7 @@ export type KanbanColumn = (typeof KANBAN_COLUMNS)[number];
 type Board =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "loaded"; repository: string; scopeId: string; cards: BlackboardItemView[] }
+  | { status: "loaded"; repository: string; scopeId: string; cards: BlackboardItemView[]; epoch: number }
   /** The board was never read. Distinct from a board that is read and empty. */
   | { status: "failed"; detail: string };
 
@@ -66,42 +67,43 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
   transport,
   unavailable,
   connectionEpoch = 0,
+  onOpenRepository,
 }) => {
   const [board, setBoard] = useState<Board>({ status: "idle" });
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  const generation = useRef(0);
+  const epoch = useRef(connectionEpoch);
+  epoch.current = connectionEpoch;
 
   const load = useCallback(async () => {
     if (!transport?.watchBoard) {
+      setBoard({ status: "failed", detail: "The task board is unavailable. Reconnect your workspace and try again." });
       return;
     }
+    const request = ++generation.current;
     setBoard({ status: "loading" });
     try {
       const view = await transport.watchBoard();
+      if (request !== generation.current) return;
       setBoard({
         status: "loaded",
         repository: view.repository,
         scopeId: view.board_scope_id,
         cards: view.cards,
+        epoch: connectionEpoch,
       });
     } catch (error) {
       // Never "no tasks": nobody looked. The two states are drawn differently
       // on purpose — one of them means the backlog is genuinely clear.
-      setBoard({ status: "failed", detail: describe(error) });
+      if (request === generation.current) setBoard({ status: "failed", detail: describe(error) });
     }
-  }, [transport]);
+  }, [transport, connectionEpoch]);
 
-  useLoadOnMount(load);
-
-  // Re-establish the watch on a NEW connection (`useLoadOnMount` by design
-  // ignores identity changes, so a reconnect never re-ran `load`).
   useEffect(() => {
-    if (connectionEpoch > 0) {
-      void load();
-    }
-    // Deliberately keyed on the epoch alone: "the connection changed".
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionEpoch]);
+    void load();
+    return () => { generation.current++; };
+  }, [load]);
 
   // Live board deliveries. A post from an agent's `task.*` tool lands here the
   // same way an operator's does, so the board does not go stale behind a run.
@@ -130,7 +132,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
 
   const [creating, setCreating] = useState(false);
   const createCard = useCallback(async () => {
-    if (!transport?.createBoardCard || creating) {
+    if (!transport?.createBoardCard || creating || board.status !== "loaded" || board.epoch !== connectionEpoch || unavailable) {
       return;
     }
     const title = draft.trim();
@@ -138,28 +140,34 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
       setNotice("task title must not be empty");
       return;
     }
+    const request = generation.current;
+    const currentEpoch = connectionEpoch;
     setCreating(true);
     try {
       const card = await transport.createBoardCard(title);
+      if (request !== generation.current || epoch.current !== currentEpoch) return;
       setDraft("");
       setNotice(null);
       setBoard((current) =>
         current.status === "loaded" ? { ...current, cards: mergeCard(current.cards, card) } : current,
       );
     } catch (error) {
-      setNotice(describe(error));
+      if (request === generation.current && epoch.current === currentEpoch) setNotice(describe(error));
     } finally {
       setCreating(false);
     }
-  }, [transport, draft, creating]);
+  }, [transport, draft, creating, board, connectionEpoch, unavailable]);
 
   const moveCard = useCallback(
     async (itemId: string, status: KanbanColumn) => {
-      if (!transport?.moveBoardCard) {
+      if (!transport?.moveBoardCard || board.status !== "loaded" || board.epoch !== connectionEpoch || unavailable) {
         return;
       }
+      const request = generation.current;
+      const currentEpoch = connectionEpoch;
       try {
         const replacement = await transport.moveBoardCard(itemId, status);
+        if (request !== generation.current || epoch.current !== currentEpoch) return;
         setBoard((current) =>
           current.status === "loaded"
             ? { ...current, cards: mergeCard(current.cards, replacement) }
@@ -168,10 +176,10 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
       } catch (error) {
         // `blackboard.already-superseded` lands here when two moves raced. The
         // daemon's words, not a re-render of the move as if it had worked.
-        setNotice(describe(error));
+        if (request === generation.current && epoch.current === currentEpoch) setNotice(describe(error));
       }
     },
-    [transport],
+    [transport, board, connectionEpoch, unavailable],
   );
 
   const columns = useMemo(
@@ -180,26 +188,26 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
   );
 
   return (
-    <div
+    <PageShell
       role="region"
       aria-label="Task board"
-      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflow: "hidden" }}
+      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", background: "var(--cody-canvas)", color: "var(--cody-text)", overflow: "hidden" }}
     >
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
+      <div className="cody-page-header" style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
           <div>
-            <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Task Board</h1>
+            <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Task board</h1>
             {board.status === "loaded" ? (
               <p data-testid="board-anchor" style={{ margin: "4px 0 0", fontSize: 12, color: "var(--cody-text-muted)" }}>
-                anchored to <code>{board.repository}</code>
+                Working in <code>{board.repository}</code>
               </p>
             ) : (
               <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
-                Cards the repository&rsquo;s agents and operators share
+                Keep your team and agents working from the same task list.
               </p>
             )}
           </div>
-          <button style={button} onClick={() => void load()}>
+          <button style={button} disabled={!transport?.watchBoard || Boolean(unavailable) || board.status === "loading"} onClick={() => void load()}>
             Refresh
           </button>
         </div>
@@ -207,6 +215,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
           <input
             aria-label="New task title"
+            disabled={creating || board.status !== "loaded" || board.epoch !== connectionEpoch || Boolean(unavailable) || !transport?.createBoardCard}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
@@ -227,7 +236,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
           />
           <button
             style={{ ...button, background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }}
-            disabled={creating}
+            disabled={creating || board.status !== "loaded" || board.epoch !== connectionEpoch || Boolean(unavailable) || !transport?.createBoardCard || !draft.trim()}
             onClick={() => void createCard()}
           >
             {creating ? "Adding…" : "Add task"}
@@ -245,11 +254,13 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
           Task board unavailable — {unavailable}
         </div>
       ) : board.status === "failed" ? (
-        <div data-testid="board-failed" role="status" style={note("var(--cody-danger-soft)")}>
-          The task board could not be read — {board.detail}
-          <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
-            This is not an empty backlog: the board was never read.
-          </div>
+        <div data-testid="board-failed" className="cody-page-body">
+          <EmptyState state="unavailable"
+            title={board.detail.includes("Choose a repository") ? "Choose a project for your tasks" : "Couldn’t load tasks"}
+            description={board.detail}
+            action={board.detail.includes("Choose a repository") && onOpenRepository
+              ? <button style={button} onClick={onOpenRepository}>Choose repository</button>
+              : <button style={button} onClick={() => void load()}>Try again</button>} />
         </div>
       ) : board.status !== "loaded" ? (
         <div role="status" style={note("var(--cody-text-muted)")}>
@@ -301,7 +312,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
           })}
         </div>
       )}
-    </div>
+    </PageShell>
   );
 };
 

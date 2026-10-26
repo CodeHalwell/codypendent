@@ -156,6 +156,50 @@ describe("connection ownership and recovery", () => {
     expect(socket.destroyed).toBe(true);
   });
 
+  it("validates the full ledger while emitting only requested run activity across reconnects", async () => {
+    const runId = "66666666-6666-6666-6666-666666666666";
+    const documentId = "77777777-7777-7777-7777-777777777777";
+    const { client, socket, sockets } = setup({
+      subscriptions: [{ type: "RunTrace", run_id: runId }, { type: "Document", document_id: documentId }],
+      wait: async () => {},
+    });
+    const attach = socket.sent().find(frame => frame.payload.type === "Command" && frame.payload.body.type === "AttachSession");
+    expect(attach?.payload).toMatchObject({ body: { subscriptions: [
+      { type: "RunTrace", run_id: runId }, { type: "Document", document_id: documentId }, { type: "SessionSummary" },
+    ] } });
+    socket.deliver(catchupPayload(1, 1, [{ sequence: 1, occurred_at: "", actor: { type: "System" }, body: { type: "SessionClosed" } }]));
+    const seen: number[] = [];
+    client.on("event", event => seen.push(event.sequence));
+    socket.deliver(eventPayload(2));
+    socket.deliver({ ...eventPayload(3), body: { type: "ModelStreamDelta", run_id: runId, text: "first" } } as Payload);
+    expect(seen).toEqual([3]);
+    expect(client.store.getSnapshot().events.map(event => event.sequence)).toEqual([1, 2, 3]);
+    expect(socket.destroyed).toBe(false);
+    socket.destroy();
+    await flush();
+    const next = sockets[1]; next.emit("connect"); next.deliver(serverHelloPayload());
+    const resumed = next.sent().find(frame => frame.payload.type === "Command" && frame.payload.body.type === "AttachSession");
+    expect(resumed?.payload).toMatchObject({ body: { last_seen_sequence: 3 } });
+    next.deliver(catchupPayload(4, 4, [{ sequence: 4, occurred_at: "", actor: { type: "System" }, body: { type: "SessionClosed" } }]));
+    next.deliver({ ...eventPayload(5), body: { type: "ModelStreamDelta", run_id: runId, text: "resumed" } } as Payload);
+    next.deliver({ ...eventPayload(6), body: { type: "ToolUpdated", run_id: runId, tool: "shell.run", label: "cargo check" } } as Payload);
+    expect(seen).toEqual([3, 5, 6]);
+    expect(client.sequenceCursor).toBe(6);
+    expect(next.destroyed).toBe(false);
+  });
+
+  it("still rejects missing ledger events for a filtered run subscription", () => {
+    const runId = "66666666-6666-6666-6666-666666666666";
+    const { client, socket } = setup({ subscriptions: [{ type: "RunTrace", run_id: runId }] });
+    socket.deliver(catchupPayload(1, 0));
+    const seen: number[] = [];
+    client.on("event", event => seen.push(event.sequence));
+    socket.deliver({ ...eventPayload(2), body: { type: "ModelStreamDelta", run_id: runId, text: "missing predecessor" } } as Payload);
+    expect(seen).toEqual([]);
+    expect(client.sequenceCursor).toBe(0);
+    expect(socket.destroyed).toBe(true);
+  });
+
   it("rejects an invalid catch-up before announcing attachment or flushing queued commands", () => {
     const { client, socket } = setup();
     client.submitUserInput("queued work");

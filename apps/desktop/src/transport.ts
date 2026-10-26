@@ -1,3 +1,4 @@
+import type { UiWireMessage } from "@codypendent/ui";
 /**
  * The desktop client's only route to `codypendentd`.
  *
@@ -12,9 +13,12 @@
  * no shell there is no transport, and the UI must say so rather than pretend.
  */
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { desktopManifest } from "./agui/types.js";
+import type { ApprovalGrant } from "./approval.js";
 import type {
   CodeGraphPage,
   CodeGraphQuery,
+  CodeGraphScanReport,
   CodeGraphStatusView,
 } from "@codypendent/protocol";
 import type {
@@ -39,7 +43,7 @@ import type {
   WorkflowEvent,
   WorkflowRunSnapshot,
 } from "@codypendent/protocol";
-import type { QuestionOutcomeView } from "./types.js";
+import type { QuestionOutcomeView, WorkspaceTarget, WorkspaceOpenRequest } from "./types.js";
 import type {
   DocCard,
   DocumentPublishPlan,
@@ -88,7 +92,7 @@ export type DaemonLaunchStatus = {
   socketPath: string;
   listening: boolean;
   invocation?: { program: string; args: string[] };
-  source?: "override" | "path" | "known-directory" | "beside-this-app";
+  source?: "override" | "path" | "known-directory" | "beside-this-app" | "development-build";
   manualCommand: string;
   logPath: string;
   searched: string[];
@@ -111,6 +115,7 @@ export type SessionEventFrame = SessionEvent;
 export type ApprovalChoice = "approve" | "reject";
 
 export type DaemonFrame =
+  | { kind: "remote_ui"; session_id: string | null; message: import("@codypendent/protocol").UiWireMessage }
   | { kind: "event"; session_id: string | null; event: SessionEvent }
   | { kind: "catchup"; session_id: string; snapshot: Catchup }
   | { kind: "history"; session_id: string; through: number; events: SessionEvent[] }
@@ -174,6 +179,7 @@ export type BoardView = {
 };
 
 export type DesktopTransport = {
+  sendRemoteUi?(sessionId: string, message: UiWireMessage): Promise<void>;
   /** Where the shell will look for the daemon socket. */
   socketPath(): Promise<string>;
   /** Connect and handshake. Rejects when no daemon answers. */
@@ -201,8 +207,8 @@ export type DesktopTransport = {
    */
   startDaemon?(): Promise<DaemonStartOutcome>;
   listSessions(): Promise<SessionSummary[]>;
-  /** Send a real `StartRun` (preceded by `CreateSession` + `AttachSession`). */
-  startObjective(objective: string): Promise<RunHandle>;
+  /** Start a run in the confirmed session, or create one when sessionId is null. */
+  startObjective(objective: string, sessionId?: string | null): Promise<RunHandle>;
   /** Attach to an existing session and replay its catch-up. */
   attachSession(sessionId: string): Promise<void>;
   /**
@@ -232,7 +238,7 @@ export type DesktopTransport = {
    */
   queueSteering?(runId: string, text: string): Promise<void>;
   /** Resolve a daemon-owned pending approval for this attached client. */
-  resolveApproval(approvalId: string, decision: ApprovalChoice): Promise<void>;
+  resolveApproval(approvalId: string, decision: ApprovalChoice, scope?: ApprovalGrant): Promise<void>;
   /**
    * Answer or reject a parked question (`ResolveQuestion`). Optional because
    * an older shell has no handler; the card then says the run is waiting and
@@ -307,6 +313,8 @@ export type DesktopTransport = {
    * caller decodes with `TextDecoder` when it knows the media type is textual.
    */
   readArtifact?(artifact: ArtifactRef): Promise<Uint8Array>;
+  /** Native Save dialog; null means cancelled, a path means verified bytes saved. */
+  saveArtifact?(artifact: ArtifactRef): Promise<string | null>;
 
   /**
    * Ranked session search. The reply carries the query it answers; a caller
@@ -355,6 +363,8 @@ export type DesktopTransport = {
   /** Select by path, through the same gate the picker uses. */
   setRepository?(path: string): Promise<RepositorySelection>;
   clearRepository?(): Promise<void>;
+  workspaceTargets?(): Promise<WorkspaceTarget[]>;
+  openWorkspace?(request: WorkspaceOpenRequest): Promise<void>;
 
   /** Every configured council, from `councils.toml`. */
   listCouncils?(): Promise<CouncilCard[]>;
@@ -386,6 +396,8 @@ export type DesktopTransport = {
 
   /** What the STORED graph holds right now, with no re-scan. */
   codeGraphStatus?(): Promise<CodeGraphStatusView>;
+  /** Rebuild the selected checkout's stored map; the daemon enforces Controller access. */
+  buildCodeGraph?(): Promise<CodeGraphScanReport>;
   /**
    * One FILTERED, LIMITED page of nodes and edges.
    *
@@ -445,14 +457,14 @@ export function createTransport(): DesktopTransport | null {
     daemonLaunchStatus: () => invoke<DaemonLaunchStatus>("daemon_launch_status"),
     startDaemon: () => invoke<DaemonStartOutcome>("daemon_start"),
     listSessions: () => invoke<SessionSummary[]>("list_sessions"),
-    startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
+    startObjective: (objective, sessionId) => invoke<RunHandle>("start_objective", { objective, sessionId: sessionId ?? null, desktop: desktopManifest() }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
     readSessionEventRange: (sessionId, afterSequence, through) =>
       invoke<SessionEvent[]>("read_session_event_range", { sessionId, afterSequence, through }),
     cancelRun: (runId) => invoke<void>("cancel_run", { runId }),
     queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
-    resolveApproval: (approvalId, decision) =>
-      invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
+    resolveApproval: (approvalId, decision, scope = "Once") =>
+      invoke<void>("resolve_approval", { approvalId, approved: decision === "approve", scope: { type: scope } }),
     resolveQuestion: (questionId, outcome) =>
       invoke<void>("resolve_question", { questionId, outcome }),
     pauseRun: (runId) => invoke<void>("pause_run", { runId }),
@@ -474,8 +486,10 @@ export function createTransport(): DesktopTransport | null {
     // The shell answers with a raw IPC body, which Tauri delivers to the
     // webview as an `ArrayBuffer`; the bytes are the daemon's, verified against
     // `artifact` in the shell before they get here.
+    sendRemoteUi: (sessionId, message) => invoke<void>("send_remote_ui", { sessionId, message }),
     readArtifact: async (artifact) =>
       new Uint8Array(await invoke<ArrayBuffer>("read_artifact", { artifact })),
+    saveArtifact: (artifact) => invoke<string | null>("save_artifact", { artifact }),
 
     searchSessions: (query, cursor) =>
       invoke<SessionSearchAnswer>("search_sessions", { query, cursor: cursor ?? null }),
@@ -504,6 +518,8 @@ export function createTransport(): DesktopTransport | null {
 
     pickRepository: () => invoke<RepositorySelection | null>("pick_repository"),
     currentRepository: () => invoke<RepositorySelection | null>("current_repository"),
+    workspaceTargets: () => invoke<WorkspaceTarget[]>("workspace_targets"),
+    openWorkspace: (request) => invoke<void>("workspace_open", { ...request }),
     setRepository: (path) => invoke<RepositorySelection>("set_repository", { path }),
     clearRepository: () => invoke<void>("clear_repository"),
 
@@ -528,6 +544,7 @@ export function createTransport(): DesktopTransport | null {
     },
 
     codeGraphStatus: () => invoke<CodeGraphStatusView>("code_graph_status"),
+    buildCodeGraph: () => invoke<CodeGraphScanReport>("build_code_graph"),
     readCodeGraph: (query) => invoke<CodeGraphPage>("read_code_graph", { query }),
 
     forkSession: (checkpoint, name) =>

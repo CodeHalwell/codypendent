@@ -9,7 +9,6 @@ use codypendent_protocol::{ApprovalScope, RunDisposition};
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::action::Action;
-use crate::input::KEY_BINDINGS;
 use crate::remote_ui::{project_accessibility, render_remote_ui, RemoteKey, RemoteUiRenderOptions};
 use crate::state::{
     filter_council_member_models, filter_model_names, filter_models, filter_modes,
@@ -119,9 +118,13 @@ pub fn accessible_snapshot(state: &AppState) -> String {
                 .min(state.pending_approvals.len())
         ));
         if let Some(approval) = state.focused_approval() {
-            lines.push(format!("Approval action: {:?}", approval.action));
+            lines.extend(crate::approval::describe_action(&approval.action));
             lines.push(format!("Approval risk: {:?}", approval.risk));
-            lines.push("Approval controls: approve, approve-run, reject".to_owned());
+            lines.push(if crate::approval::can_review(&approval.action) {
+                "Approval controls: approve, approve-run, reject".to_owned()
+            } else {
+                "Approval controls: reject".to_owned()
+            });
         }
     }
 
@@ -175,10 +178,21 @@ fn usage_sentence(run: &crate::state::RunView) -> Option<String> {
     }
     if let Some(micros) = run.cost_micros {
         parts.push(format!(
-            "cost {}.{:04} US dollars",
-            micros / 1_000_000,
-            (micros % 1_000_000) / 100
+            "cost {} US dollars",
+            crate::usage::format_cost_micros(micros).trim_start_matches('$')
         ));
+    }
+    if !parts.is_empty() {
+        if let Some(label) = crate::state::usage_coverage_label(
+            run.usage_coverage,
+            [
+                run.prompt_tokens.is_some(),
+                run.completion_tokens.is_some(),
+                run.cost_micros.is_some(),
+            ],
+        ) {
+            parts.push(format!("measured subtotal; {label}"));
+        }
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
@@ -459,8 +473,9 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             );
         }
         Overlay::Help => {
+            lines.push(format!("Shortcut filter: {}", clean(&state.help_query)));
             lines.push("Help:".to_owned());
-            lines.extend(KEY_BINDINGS.iter().map(|binding| {
+            lines.extend(crate::input::filtered_key_bindings(&state.help_query).iter().map(|binding| {
                 format!(
                     "  {}: {}",
                     ascii_keys(binding.keys),
@@ -991,6 +1006,7 @@ fn onboard_class_accessible_label(class: OnboardProviderClass) -> &'static str {
 
 fn controls_for(mode: InputMode) -> &'static str {
     match mode {
+        InputMode::Help => "Help controls: type TEXT to filter; backspace, clear, up, down, pageup, pagedown, home, end; esc closes; quit detaches.",
         InputMode::Composer => {
             "Controls: type a message and press Enter, Home/End move within a line, or use help, /, F6, Shift-F6, quit"
         }
@@ -1080,6 +1096,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         }
         "tab" => return vec![tab_action(mode, false)],
         "backtab" | "shift-tab" => return vec![tab_action(mode, true)],
+        "clear" if mode == InputMode::Help => return vec![Action::DeleteToLineStart],
         "up" => return vec![navigation_action(mode, true)],
         "down" => return vec![navigation_action(mode, false)],
         "pageup" | "page-up" => return vec![page_action(mode, true)],
@@ -1104,7 +1121,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 },
                 InputMode::Palette => Action::RemoveSelected,
                 InputMode::Normal => Action::ClearIssues,
-                InputMode::CouncilResults => Action::NoOp,
+                InputMode::CouncilResults | InputMode::Help => Action::NoOp,
                 InputMode::Composer
                 | InputMode::Editing
                 | InputMode::Confirm
@@ -1132,7 +1149,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                     key: RemoteKey::Backspace,
                     character: None,
                 },
-                InputMode::Composer | InputMode::Editing | InputMode::Palette => {
+                InputMode::Composer | InputMode::Editing | InputMode::Palette | InputMode::Help => {
                     Action::InputBackspace
                 }
                 InputMode::Question => Action::QuestionInputBackspace,
@@ -1200,6 +1217,7 @@ fn accepts_text(mode: InputMode) -> bool {
             | InputMode::RemoteUi
             | InputMode::Editing
             | InputMode::Palette
+            | InputMode::Help
             // The custom-answer and reject-feedback fields: `type ...` routes
             // per-character through `QuestionInputChar` (see
             // `map_accessible_input`'s text paths), so a screen-reader user
@@ -1219,7 +1237,7 @@ fn submit_action(mode: InputMode) -> Action {
             character: None,
         },
         InputMode::Confirm => Action::ConfirmCancel,
-        InputMode::Approval => Action::NoOp,
+        InputMode::Approval | InputMode::Help => Action::NoOp,
         InputMode::Normal | InputMode::CouncilResults => Action::Expand,
         InputMode::Question => Action::QuestionSelectOrConfirm,
         _ => Action::InputSubmit,
@@ -1276,6 +1294,13 @@ fn navigation_action(mode: InputMode, previous: bool) -> Action {
                 Action::HistoryNext
             }
         }
+        InputMode::Help => {
+            if previous {
+                Action::ScrollLinesUp
+            } else {
+                Action::ScrollLinesDown
+            }
+        }
         InputMode::Normal
         | InputMode::Palette
         | InputMode::Approval
@@ -1314,7 +1339,7 @@ fn page_action(mode: InputMode, previous: bool) -> Action {
                 Action::SelectPageNext
             }
         }
-        InputMode::Composer | InputMode::Normal | InputMode::CouncilResults => {
+        InputMode::Composer | InputMode::Normal | InputMode::CouncilResults | InputMode::Help => {
             if previous {
                 Action::ScrollPageUp
             } else {
@@ -1335,7 +1360,7 @@ fn edge_action(mode: InputMode, start: bool) -> Action {
             },
             character: None,
         },
-        InputMode::Palette => {
+        InputMode::Palette | InputMode::Help => {
             if start {
                 Action::SelectFirst
             } else {
@@ -2063,6 +2088,7 @@ mod tests {
                 prompt_tokens: Some(10_000),
                 completion_tokens: Some(642),
                 cost_micros: Some(3_400),
+                coverage: None,
             }),
         );
         let snapshot = accessible_snapshot(&state);

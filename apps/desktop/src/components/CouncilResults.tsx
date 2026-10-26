@@ -1,427 +1,134 @@
-import React, { useCallback, useEffect, useState } from "react";
+import { EmptyState, PageShell } from "./PageShell.js";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowUpRight, Check, ChevronRight, Crown, Folder, LoaderCircle, RefreshCw, UsersRound } from "lucide-react";
+import { renderMarkdown } from "../markdown.js";
 import { relativeTime } from "../time.js";
+import { modelLabel } from "../modelPresentation.js";
 import { useLoadOnMount } from "../useLoadOnMount.js";
-import type {
-  CouncilProgressFrame,
-  CouncilResultCard,
-  CouncilResultsPage,
-  CouncilRunReply,
-} from "../localConfig.js";
+import { useCouncilRun, type CouncilRunController, type CouncilRunner } from "../useCouncilRun.js";
+import { CouncilModel, councilTitle, repositoryName } from "./CouncilParticipants.js";
+import type { CouncilResultCard, CouncilResultsPage } from "../localConfig.js";
+import "./Councils.css";
 
-/**
- * Convening a council, and reading what previous ones decided.
- *
- * Results are durable files under `<data_dir>/councils/<name>/`, written for
- * EVERY exit — completed, quorum-failed and chair-failed alike — so a partial
- * deliberation is never lost and never presented as a whole one. This view
- * keeps those apart: `status` is shown on every card, and a failure's reason is
- * shown next to the members that did complete.
- *
- * A run takes minutes (each member and the chair is a real daemon run), so the
- * progress channel is the only thing standing between the operator and a frozen
- * screen. Every line it emits is the council crate's own wording.
- *
- * Measured usage is passed through untouched: the crate omits tokens and cost
- * for a run that measured neither, and this view prints its `costLine` verbatim
- * rather than substituting zeros.
- */
 export interface CouncilResultsProps {
   onLoad: () => Promise<CouncilResultsPage>;
-  /**
-   * Convene `name` against `objective`. `onProgress` receives each transition
-   * while the promise is still pending.
-   */
-  onRun?: (
-    name: string,
-    objective: string,
-    onProgress: (frame: CouncilProgressFrame) => void,
-  ) => Promise<CouncilRunReply>;
-  /** Pre-selected council, e.g. from the browser's Convene button. */
+  onRun?: CouncilRunner;
+  runController?: CouncilRunController;
   initialCouncil?: string | null;
-  /** Names available to convene, when the caller knows them. */
   councilNames?: string[];
-  /**
-   * The repository the run will be anchored to, for display. A council's members
-   * run against a checkout, so a run with none selected is refused by the shell.
-   */
-  /**
-   * `undefined` = the async repository read has not answered yet; `null` =
-   * it answered "none selected". Collapsing the two asserted "no repository
-   * — choose one first" during the read.
-   */
   repository?: string | null | undefined;
+  onOpenRepository?: () => void;
 }
+type Status = { kind: "loading" } | { kind: "loaded"; page: CouncilResultsPage } | { kind: "unavailable"; detail: string };
+const phaseLabel: Record<string, string> = {
+  "round-started": "Members are considering your question.", "member-completed": "Another perspective is ready.",
+  "member-failed": "A member could not finish; the council is checking its remaining responses.",
+  "chair-started": "The chair is bringing the findings together.", "warning": "The council has an update to review.",
+};
+const statuses: Record<string, string> = { completed: "Completed", "quorum-failed": "Not enough responses", "chair-failed": "Chair could not finish", "runtime-failed": "Interrupted" };
 
-type Status =
-  | { kind: "loading" }
-  | { kind: "loaded"; page: CouncilResultsPage }
-  | { kind: "unavailable"; detail: string };
-
-export const CouncilResults: React.FC<CouncilResultsProps> = ({
-  onLoad,
-  onRun,
-  initialCouncil,
-  councilNames,
-  repository,
-}) => {
+export const CouncilResults: React.FC<CouncilResultsProps> = ({ onLoad, onRun, runController, initialCouncil, councilNames, repository, onOpenRepository }) => {
   const [status, setStatus] = useState<Status>({ kind: "loading" });
-  const [council, setCouncil] = useState(initialCouncil ?? "");
-  const [objective, setObjective] = useState("");
-  const [progress, setProgress] = useState<CouncilProgressFrame[]>([]);
-  const [running, setRunning] = useState(false);
-  const [runFailure, setRunFailure] = useState<string | null>(null);
-  const [runResult, setRunResult] = useState<CouncilResultCard | null>(null);
-
+  const localRun = useCouncilRun(onRun, initialCouncil ?? "");
+  const councilRun = runController ?? localRun;
+  const { council, objective, progress, running, failure: runFailure, result: runResult, setCouncil, setObjective } = councilRun;
+  const generation = useRef(0);
+  const seenCompletion = useRef(councilRun.completion);
+  const [askAgainOpen, setAskAgainOpen] = useState(false);
   const load = useCallback(async () => {
-    setStatus({ kind: "loading" });
-    try {
-      setStatus({ kind: "loaded", page: await onLoad() });
-    } catch (error) {
-      setStatus({ kind: "unavailable", detail: describe(error) });
-    }
+    const current = ++generation.current; setStatus({ kind: "loading" });
+    try { const page = await onLoad(); if (generation.current === current) setStatus({ kind: "loaded", page }); }
+    catch (error) { if (generation.current === current) setStatus({ kind: "unavailable", detail: describe(error) }); }
   }, [onLoad]);
-
   useLoadOnMount(load);
-
+  useEffect(() => { if (initialCouncil) setCouncil(initialCouncil); }, [initialCouncil, setCouncil]);
   useEffect(() => {
-    if (initialCouncil) {
-      setCouncil(initialCouncil);
+    if (seenCompletion.current !== councilRun.completion) {
+      seenCompletion.current = councilRun.completion;
+      setAskAgainOpen(false);
+      void load();
     }
-  }, [initialCouncil]);
-
-  const run = async () => {
-    if (!onRun || council.trim().length === 0 || objective.trim().length === 0) {
-      return;
-    }
-    setRunning(true);
-    setProgress([]);
-    setRunFailure(null);
-    setRunResult(null);
-    try {
-      const reply = await onRun(council.trim(), objective.trim(), (frame) =>
-        setProgress((current) => [...current, frame]),
-      );
-      // A quorum or chair failure still persisted a report naming every member
-      // that DID complete. Show both — the failure and the partial result.
-      setRunResult(reply.result ?? null);
-      setRunFailure(reply.failure ?? null);
-      await load();
-    } catch (error) {
-      setRunFailure(describe(error));
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  const active = progress.length > 0 ? progress[progress.length - 1].activeSubagents : 0;
-
-  return (
-    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
-      <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Council results</h2>
-      <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 760 }}>
-        Every council run writes a durable report, including the ones that failed quorum or
-        whose chair failed. The report snapshots the definition it ran with, so editing{" "}
-        <code>councils.toml</code> later cannot rewrite what a past run convened.
-      </p>
-
-      {onRun && (
-        <div style={{ ...panel, marginBottom: 20 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Convene</div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <input
-              data-testid="council-run-name"
-              value={council}
-              onChange={(event) => setCouncil(event.target.value)}
-              placeholder="council name"
-              list={councilNames ? "council-run-choices" : undefined}
-              style={{ ...inputStyle, width: 220 }}
-            />
-            <input
-              data-testid="council-run-objective"
-              value={objective}
-              onChange={(event) => setObjective(event.target.value)}
-              onKeyDown={(event) => {
-                if (
-                  event.key === "Enter" &&
-                  !running &&
-                  council.trim().length > 0 &&
-                  objective.trim().length > 0
-                ) {
-                  void run();
-                }
-              }}
-              placeholder="objective"
-              style={{ ...inputStyle, flex: 1, minWidth: 260 }}
-            />
-            <button
-              onClick={() => void run()}
-              disabled={running || council.trim().length === 0 || objective.trim().length === 0}
-              style={primaryButtonStyle}
-              data-testid="council-run-submit"
-            >
-              {running ? "Deliberating…" : "Convene"}
-            </button>
-          </div>
-          {councilNames && (
-            <datalist id="council-run-choices">
-              {councilNames.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
-          )}
-          <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
-            {repository ? (
-              <>
-                Members run against <code>{repository}</code>.
-              </>
-            ) : repository === undefined ? (
-              <>Reading the repository selection…</>
-            ) : (
-              /* No silent default: the shell refuses a run with no repository. */
-              <>No repository is selected, so a run will be refused — choose one first.</>
-            )}
-          </div>
-        </div>
-      )}
-
-      {(running || progress.length > 0) && (
-        <div style={{ ...panel, marginBottom: 20 }} data-testid="council-progress">
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-            Progress {running && <span style={{ color: "var(--cody-text-muted)" }}>· {active} active</span>}
-          </div>
-          <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "var(--cody-text-muted)" }}>
-            {progress.map((frame, index) => (
-              <li key={`${frame.occurredAt}-${index}`} style={{ marginBottom: 2 }}>
-                <span style={{ color: frame.phase === "member-failed" || frame.phase === "warning" ? "var(--cody-warning)" : "var(--cody-text-muted)" }}>
-                  {frame.message}
-                </span>
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-
-      {runFailure && (
-        <div role="alert" data-testid="council-run-failure" style={refusalStyle}>
-          {runFailure}
-        </div>
-      )}
-
-      {runResult && (
-        <div style={{ marginBottom: 20 }} data-testid="council-run-result">
-          <ResultCard result={runResult} expanded />
-        </div>
-      )}
-
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-        <h3 style={{ margin: "0 0 12px", fontSize: 15, fontWeight: 600 }}>Saved results</h3>
-        <button onClick={() => void load()} style={buttonStyle} data-testid="council-results-refresh">
-          Refresh
-        </button>
+  }, [councilRun.completion, load]);
+  const canRun = Boolean(onRun && repository && council.trim() && objective.trim() && !running);
+  const run = () => { if (canRun && repository) void councilRun.start(repository); };
+  const shownRepository = running ? councilRun.repository : repository;
+  const latest = progress.at(-1);
+  const saved = status.kind === "loaded" ? status.page.results.filter((result) => result.resultId !== runResult?.resultId) : [];
+  const questionForm = onRun && <form className="council-card council-run-form" aria-label="Start a council" onSubmit={(event) => { event.preventDefault(); void run(); }}>
+      <div className="council-run-top"><span><UsersRound size={19} aria-hidden="true" /></span><h2>What would you like a second opinion on?</h2></div>
+      <label className="council-label"><span>Council</span>{councilNames ? <select className="council-input" data-testid="council-run-name" value={council} disabled={running} onChange={(event) => setCouncil(event.target.value)}>
+        <option value="">Choose a council</option>{council && !councilNames.includes(council) && <option value={council}>{councilTitle(council)}</option>}
+        {councilNames.map((name) => <option key={name} value={name}>{councilTitle(name)}</option>)}
+      </select> : <input className="council-input" data-testid="council-run-name" value={council} disabled={running} placeholder="Choose a council" onChange={(event) => setCouncil(event.target.value)} />}</label>
+      <textarea className="council-input" data-testid="council-run-objective" aria-label="Question for the council" value={objective} disabled={running} rows={3} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the decision, review or problem you want your council to consider…" />
+      <div className="council-run-footer"><div className="council-note">{shownRepository ? <><Folder size={12} aria-hidden="true" /> Working in {repositoryName(shownRepository)}</> : shownRepository === undefined ? "Reading the repository selection…" : "Choose a repository for the council to work in."}</div>
+        {shownRepository === null && onOpenRepository && <button type="button" className="council-button" onClick={onOpenRepository}>Choose repository</button>}
+        <button type="submit" className="council-button primary" disabled={!canRun} data-testid="council-run-submit">{running ? "Council is working…" : "Start council"}{!running && <ArrowUpRight size={14} aria-hidden="true" />}</button>
       </div>
-
-      {status.kind === "loading" && (
-        <div role="status" data-testid="council-results-loading" style={{ ...panel, color: "var(--cody-text-muted)" }}>
-          Reading the council report store…
-        </div>
-      )}
-
-      {status.kind === "unavailable" && (
-        /* Could not read the store. Not the same as "no council has run". */
-        <div role="status" data-testid="council-results-unavailable" style={{ ...panel, color: "var(--cody-warning)" }}>
-          Council results unavailable — {status.detail}
-        </div>
-      )}
-
-      {status.kind === "loaded" && (
-        <>
-          {status.page.warnings.map((warning, index) => (
-            /* One unreadable report degrades its own row, not the page. */
-            <div
-              key={index}
-              role="status"
-              data-testid="council-results-warning"
-              style={{ ...panel, marginBottom: 8, color: "var(--cody-warning)", fontSize: 13 }}
-            >
-              {warning}
-            </div>
-          ))}
-          {status.page.results.length === 0 && status.page.warnings.length === 0 && (
-            <div data-testid="council-results-empty" style={{ ...panel, color: "var(--cody-text-muted)" }}>
-              No council has run yet.
-            </div>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {status.page.results.map((result) => (
-              <ResultCard key={result.resultId} result={result} />
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
+    </form>;
+  return <PageShell className="councils-page"><div className="councils-content">
+    <header className="councils-header"><div><div className="councils-eyebrow"><UsersRound size={14} aria-hidden="true" /> A shared answer</div>
+      <h1>Council results</h1><p>Put a question to your team, follow the discussion and return to what they found.</p></div></header>
+    {questionForm && (runResult?.status === "completed" && !running
+      ? <details className="council-details council-ask-again" open={askAgainOpen} onToggle={(event) => setAskAgainOpen(event.currentTarget.open)}>
+          <summary>Ask another question</summary>{questionForm}
+        </details>
+      : questionForm)}
+    {running && <section className="council-card council-live" data-testid="council-progress" role="status" aria-live="polite">
+      <div className="council-live-heading"><LoaderCircle size={21} aria-hidden="true" /><div><h3>{councilTitle(council)} is working</h3>
+        <p>{latest ? phaseLabel[latest.phase] ?? "The council is working through your question." : "Getting the council ready…"}{latest && latest.activeSubagents > 0 && ` ${latest.activeSubagents} ${latest.activeSubagents === 1 ? "model is" : "models are"} active.`}</p></div></div>
+    </section>}
+    {progress.length > 0 && <details className="council-details" style={{ margin: "0 0 22px" }}><summary>Discussion activity</summary><ol className="council-activity">{progress.map((frame, index) => <li key={`${frame.occurredAt}-${index}`}>{frame.message}</li>)}</ol></details>}
+    {runFailure && <div role="alert" className="council-notice error" data-testid="council-run-failure"><h2>The council could not finish</h2>{runFailure}{runResult && <p>The responses that did finish are saved below.</p>}</div>}
+    {runResult && <section data-testid="council-run-result" aria-label="Latest council result"><ResultCard result={runResult} /></section>}
+    <div className="councils-toolbar"><h2>Saved results</h2><button type="button" className="council-button quiet" onClick={() => void load()} disabled={status.kind === "loading"} data-testid="council-results-refresh"><RefreshCw size={13} aria-hidden="true" /> Refresh</button></div>
+    {status.kind === "loading" && <div data-testid="council-results-loading"><EmptyState state="loading" title="Loading council results" /></div>}
+    {status.kind === "unavailable" && <div data-testid="council-results-unavailable"><EmptyState state="unavailable" title="Could not load saved results" description={status.detail} action={<button type="button" className="council-button" onClick={() => void load()}>Try again</button>} /></div>}
+    {status.kind === "loaded" && <>
+      {status.page.warnings.map((warning, index) => <div key={index} role="status" className="council-notice" data-testid="council-results-warning">{warning}</div>)}
+      {status.page.results.length === 0 && status.page.warnings.length === 0 && !runResult && <div data-testid="council-results-empty"><EmptyState title="Your council’s answers will live here" description="Start a council above. Completed answers and partial findings are saved so you can return to them." /></div>}
+      {saved.map((result) => <ResultCard key={result.resultId} result={result} />)}
+    </>}
+  </div></PageShell>;
 };
 
-const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = ({
-  result,
-  expanded = false,
-}) => {
-  const [open, setOpen] = useState(expanded);
-  const completed = result.status === "completed";
-
-  return (
-    <div style={panel} data-testid={`council-result-${result.resultId}`}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 15, fontWeight: 600 }}>{result.council}</div>
-          <div style={{ marginTop: 2, fontSize: 13, color: "var(--cody-text-muted)" }}>{result.objective}</div>
-        </div>
-        <span
-          data-testid={`council-result-status-${result.resultId}`}
-          style={{
-            alignSelf: "flex-start",
-            padding: "3px 8px",
-            borderRadius: 999,
-            fontSize: 12,
-            background: completed ? "var(--cody-success-bg)" : "var(--cody-danger-bg)",
-            color: completed ? "var(--cody-success)" : "var(--cody-danger-soft)",
-            flexShrink: 0,
-          }}
-        >
-          {result.status}
-        </span>
-      </div>
-
-      <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
-        {relativeTime(result.finishedAt)} · {result.repository}
-        {result.evidence && " · evidence mode"}
-      </div>
-
-      {/* The crate's own measured-cost line. It omits what was not measured;
-          nothing here fills a gap with a zero. */}
-      <div style={{ marginTop: 6, fontSize: 12, color: "var(--cody-text-muted)" }} data-testid={`council-cost-${result.resultId}`}>
-        {result.costLine}
-      </div>
-
-      {result.failure && (
-        <div role="alert" style={{ marginTop: 10, fontSize: 13, color: "var(--cody-danger-text)" }} data-testid={`council-failure-${result.resultId}`}>
-          {result.failure}
-        </div>
-      )}
-
-      {result.warnings.map((warning, index) => (
-        <div key={index} role="status" style={{ marginTop: 6, fontSize: 12, color: "var(--cody-warning)" }}>
-          {warning}
-        </div>
-      ))}
-
-      {result.synthesis ? (
-        <div style={{ marginTop: 12 }}>
-          <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Chair synthesis</div>
-          <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{result.synthesis}</div>
-        </div>
-      ) : (
-        /* No chair answer. `status` above says whether the chair never ran or
-           failed — this is never drawn as a chair that said nothing. */
-        <div style={{ marginTop: 12, fontSize: 13, color: "var(--cody-text-muted)" }} data-testid={`council-no-synthesis-${result.resultId}`}>
-          No chair synthesis in this report.
-        </div>
-      )}
-
-      <button onClick={() => setOpen((current) => !current)} style={{ ...buttonStyle, marginTop: 12 }} data-testid={`council-toggle-${result.resultId}`}>
-        {open ? "Hide rounds" : `Show ${result.rounds.length} round(s)`}
-      </button>
-
-      {open && (
-        <div style={{ marginTop: 12 }}>
-          {result.participants.length > 0 && (
-            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 8 }}>
-              {result.participants.map((line, index) => (
-                <div key={index}>{line}</div>
-              ))}
-            </div>
-          )}
-          {result.rounds.map((round) => (
-            <div key={round.round} style={{ borderTop: "1px solid var(--cody-border-strong)", paddingTop: 10, marginTop: 10 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>Round {round.round}</div>
-              {round.members.map((member) => (
-                <div key={member.runId} style={{ marginTop: 8 }}>
-                  <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
-                    {member.role} · <code>{member.model}</code>
-                    {/* Absent measurements stay absent. */}
-                    {member.tokens !== null && member.tokens !== undefined && ` · ${member.tokens} tokens`}
-                  </div>
-                  <div style={{ whiteSpace: "pre-wrap", fontSize: 13, marginTop: 2 }}>{member.response}</div>
-                </div>
-              ))}
-              {round.failures.map((failure, index) => (
-                <div key={index} role="status" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-warning)" }}>
-                  {failure}
-                </div>
-              ))}
-            </div>
-          ))}
-          {result.rounds.length === 0 && (
-            <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
-              This projection carries no per-round detail; the full report is at{" "}
-              <code>{result.reportMarkdown}</code>.
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const panel: React.CSSProperties = {
-  padding: 16,
-  background: "var(--cody-panel-raised)",
-  border: "1px solid var(--cody-border-strong)",
-  borderRadius: 8,
-};
-
-const inputStyle: React.CSSProperties = {
-  padding: "6px 10px",
-  borderRadius: 6,
-  border: "1px solid var(--cody-border-strong)",
-  background: "var(--cody-canvas)",
-  color: "var(--cody-text)",
-  fontSize: 13,
-};
-
-const buttonStyle: React.CSSProperties = {
-  padding: "6px 12px",
-  borderRadius: 6,
-  border: "1px solid var(--cody-border-strong)",
-  background: "var(--cody-inset)",
-  color: "var(--cody-text)",
-  fontSize: 13,
-  cursor: "pointer",
-};
-
-const primaryButtonStyle: React.CSSProperties = {
-  ...buttonStyle,
-  background: "var(--cody-success-strong)",
-  borderColor: "var(--cody-success)",
-};
-
-const refusalStyle: React.CSSProperties = {
-  marginBottom: 16,
-  padding: 12,
-  borderRadius: 8,
-  border: "1px solid var(--cody-danger)",
-  background: "var(--cody-danger-bg)",
-  color: "var(--cody-danger-text)",
-  fontSize: 13,
-  whiteSpace: "pre-wrap",
-};
-
-function describe(error: unknown): string {
-  if (typeof error === "string") {
-    return error;
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
+function ResultCard({ result }: { result: CouncilResultCard }) {
+  const [open, setOpen] = useState(false);
+  const complete = result.status === "completed";
+  return <article className="council-card council-result" data-testid={`council-result-${result.resultId}`}>
+    <div className="council-card-header"><div className="council-card-heading"><h3>{councilTitle(result.council)}</h3><p>{result.objective}</p></div>
+      <span className={`council-status ${complete ? "" : "incomplete"}`} data-testid={`council-result-status-${result.resultId}`}>{complete && <Check size={12} aria-hidden="true" />}{statuses[result.status] ?? "Incomplete"}</span></div>
+    <div className="council-result-meta"><span>{relativeTime(result.finishedAt)}</span><span>{repositoryName(result.repository)}</span>{result.evidence && <span>Evidence review</span>}
+      {result.costLine && <span data-testid={`council-cost-${result.resultId}`}>{result.costLine}</span>}</div>
+    {result.failure && <div role="alert" className="council-notice error" data-testid={`council-failure-${result.resultId}`}>{result.failure}</div>}
+    {result.warnings.map((warning, index) => <p key={index} role="status" className="council-note warning">{councilWarning(warning)}</p>)}
+    <section className="council-result-answer"><h4><Crown size={14} aria-hidden="true" /> The chair’s answer</h4>
+      {result.synthesis ? <div>{renderMarkdown(result.synthesis)}</div> : <p className="council-note" data-testid={`council-no-synthesis-${result.resultId}`}>The chair did not produce a final answer. Any member responses are available below.</p>}
+    </section>
+    {result.review && <details className="council-member-answer" data-testid={`council-review-${result.resultId}`}>
+      <summary><span>Independent review</span><ChevronRight size={13} aria-hidden="true" /></summary>
+      <CouncilModel model={result.review.model} role={result.review.role} />
+      {result.review.tokens != null && <p className="council-note">{result.review.tokens.toLocaleString()} tokens measured</p>}
+      <div className="council-member-body">{renderMarkdown(result.review.response)}</div>
+    </details>}
+    <button type="button" className="council-button quiet" aria-expanded={open} onClick={() => setOpen((current) => !current)} style={{ marginTop: 12 }} data-testid={`council-toggle-${result.resultId}`}><UsersRound size={14} aria-hidden="true" />{open ? "Hide member responses" : "Explore member responses"}<ChevronRight size={13} aria-hidden="true" /></button>
+    {open && <div>{result.rounds.map((round) => <section className="council-round" key={round.round}><h4>Round {round.round} · {round.members.length} {round.members.length === 1 ? "response" : "responses"}</h4>
+      {round.members.map((member) => <details className="council-member-answer" key={member.runId}><summary><CouncilModel model={member.model} role={member.role} /><ChevronRight size={13} aria-hidden="true" /></summary>
+        {member.tokens != null && <p className="council-note">{member.tokens.toLocaleString()} tokens measured</p>}<div className="council-member-body">{renderMarkdown(member.response)}</div>
+      </details>)}
+      {round.failures.map((failure, index) => <p key={index} role="status" className="council-note warning">{failure}</p>)}
+    </section>)}{result.rounds.length === 0 && <p className="council-note">This saved result has no individual round detail. The full report location is in report details.</p>}</div>}
+    <details className="council-details"><summary>Report details</summary><dl>
+      <dt>Result ID</dt><dd>{result.resultId}</dd><dt>Council ID</dt><dd>{result.council}</dd><dt>Outcome</dt><dd>{result.status}</dd><dt>Repository</dt><dd>{result.repository}</dd>
+      <dt>Started</dt><dd>{result.startedAt}</dd><dt>Finished</dt><dd>{result.finishedAt}</dd><dt>Report</dt><dd>{result.reportMarkdown}</dd>
+      {result.originSessionId && <><dt>Original chat</dt><dd>{result.originSessionId}</dd></>}
+      {result.participants.length > 0 && <><dt>Recorded participants</dt><dd>{result.participants.map((line, index) => <div key={index}>{line}</div>)}</dd></>}
+      {result.warnings.some((warning) => councilWarning(warning) !== warning) && <><dt>Recorded warnings</dt><dd>{result.warnings.map((warning, index) => <div key={index}>{warning}</div>)}</dd></>}
+    </dl></details>
+  </article>;
 }
+function councilWarning(warning: string): string {
+  const chair = /^chair `([^`]+)` is also a council member; its synthesis will weigh its own report$/.exec(warning);
+  return chair ? `${modelLabel(chair[1])} also contributes a member response. As chair, it considers its own findings alongside the other members’ responses.` : warning;
+}
+function describe(error: unknown) { return error instanceof Error ? error.message : String(error); }

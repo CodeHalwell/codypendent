@@ -9,6 +9,7 @@
 //! inline composer, and one contextual status row. Secondary inspectors and
 //! approvals draw on top only while requested.
 
+use crate::usage::{format_cost_micros, format_usage as usage_label, thousands};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -22,10 +23,11 @@ use unicode_width::UnicodeWidthStr;
 
 use codypendent_protocol::{
     AgentMode, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition,
-    RunState, BUILD_ID,
+    RunState,
 };
 
 use crate::action::{Action, KeyTarget};
+use crate::approval::{can_review, describe_action};
 use crate::dag::DagLayout;
 use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
@@ -480,6 +482,7 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         status.prompt_tokens,
         status.completion_tokens,
         status.cost_micros,
+        status.usage_coverage,
     );
     if let Some(usage) = measured_usage {
         optional.push(TelemetryItem {
@@ -623,6 +626,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         status.prompt_tokens,
         status.completion_tokens,
         status.cost_micros,
+        status.usage_coverage,
     )
     .or_else(|| status.cost_minor.map(|minor| format_cost(Some(minor))));
     let mut show_title = title.is_some();
@@ -725,249 +729,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     );
 }
 
-/// The startup welcome, drawn by the CLI harness on the same alternate screen
-/// while boot proceeds and held after boot until the user presses Enter. It
-/// combines the `CODYPENDENT` block-letter wordmark, a short product promise,
-/// the build id, and either the current animated boot stage or a clear ready
-/// call-to-action. `warnings` carries the boot
-/// diagnostics collected so far (reconcile warnings, best-effort loader
-/// failures) — rendered as extra lines UNDER the stage line, warning-tinted,
-/// capped at [`MAX_SPLASH_WARNINGS`] with a `+N more` overflow line so a
-/// chatty boot can't push the wordmark off a short terminal. Pure projection
-/// onto the frame — theme tokens only, no I/O.
-///
-/// Degradation: under 70 columns (or 12 rows) the block wordmark collapses to
-/// a plain `codypendent` line; under 8 rows the supporting copy drops too,
-/// leaving just name + status + the Enter call-to-action when ready.
-pub fn render_splash(
-    frame: &mut Frame,
-    tick: u64,
-    stage: &str,
-    warnings: &[String],
-    ready: bool,
-    needs_setup: bool,
-    theme: &Theme,
-) {
-    // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
-    // use, e.g. pnpm's); cycled by tick so the stage line animates while boot
-    // waits on the daemon.
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub use crate::splash::render_splash;
 
-    let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme.surface.background)),
-        area,
-    );
-
-    let expanded = area.width >= 70 && area.height >= 12;
-    let mut lines: Vec<Line> = Vec::new();
-    if expanded {
-        lines.push(Line::styled(
-            "◈   C O O R D I N A T E   ·   C O L L A B O R A T E   ·   S H I P   ◈",
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::raw(""));
-        for line in wordmark_lines_with_shine("CODYPENDENT", tick, theme) {
-            lines.push(line);
-        }
-        lines.push(Line::raw(""));
-    } else {
-        lines.push(Line::styled(
-            "codypendent",
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if area.height >= 8 {
-        lines.push(Line::styled(
-            "Many agents. One shared workspace. You stay in control.",
-            Style::default()
-                .fg(theme.text.secondary)
-                .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::from(vec![
-            Span::styled("✦ ", Style::default().fg(theme.text.heading)),
-            Span::styled(
-                format!("v{BUILD_ID}"),
-                Style::default().fg(theme.text.muted),
-            ),
-            Span::styled(
-                "  ·  AUTONOMOUS AGENT RUNTIME",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
-        lines.push(Line::raw(""));
-    }
-    if ready {
-        // Boot finished; whether that is good news depends on whether a model
-        // can run. A green tick beside "set up a model to continue" read as
-        // success attached to a failure message.
-        let (glyph, color) = if needs_setup {
-            ("▲ ", theme.status.warning)
-        } else {
-            ("✓ ", theme.status.success)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                glyph,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                stage,
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    } else {
-        let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
-        lines.push(Line::from(vec![
-            Span::styled(
-                spinner.to_string(),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {stage}"),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
-    for warning in warnings.iter().take(MAX_SPLASH_WARNINGS) {
-        lines.push(Line::from(vec![
-            Span::styled("! ", Style::default().fg(theme.status.warning)),
-            Span::styled(warning.clone(), Style::default().fg(theme.status.warning)),
-        ]));
-    }
-    let overflow = warnings.len().saturating_sub(MAX_SPLASH_WARNINGS);
-    if overflow > 0 {
-        lines.push(Line::styled(
-            format!("… +{overflow} more"),
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-
-    if ready {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                " ENTER ",
-                Style::default()
-                    .fg(theme.surface.background)
-                    .bg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if needs_setup {
-                    "  connect a model"
-                } else {
-                    "  open workspace"
-                },
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        if area.height >= 16 {
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "/ commands   ·   F2 workspace   ·   F6 extension UI   ·   Esc quit",
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-    }
-
-    // A restrained, centered card makes the opening state read as a deliberate
-    // welcome rather than transient debug output. It safely collapses to the
-    // available terminal dimensions without clipping the outer border.
-    let card_width = 82.min(area.width.saturating_sub(4)).max(1);
-    let card_height = (lines.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    let card = Rect {
-        x: area.x + area.width.saturating_sub(card_width) / 2,
-        y: area.y + area.height.saturating_sub(card_height) / 2,
-        width: card_width,
-        height: card_height,
-    };
-    let border = if ready {
-        theme.text.heading
-    } else {
-        theme.surface.border
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme.surface.panel));
-    let content = block.inner(card);
-    frame.render_widget(block, card);
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
-}
-
-/// The most boot diagnostics [`render_splash`] draws under the stage line
-/// before collapsing the rest into a `+N more` overflow line.
-const MAX_SPLASH_WARNINGS: usize = 4;
-
-/// The splash wordmark's per-glyph height in rows.
-const WORDMARK_GLYPH_ROWS: usize = 5;
-
-/// One 5×5 block-letter glyph of the splash wordmark (hand-drawn — no figlet
-/// dependency). Only the letters of `CODYPENDENT` are defined.
-fn wordmark_glyph(ch: char) -> [&'static str; WORDMARK_GLYPH_ROWS] {
-    match ch {
-        'C' => [" ███ ", "█   █", "█    ", "█   █", " ███ "],
-        'O' => [" ███ ", "█   █", "█   █", "█   █", " ███ "],
-        'D' => ["████ ", "█   █", "█   █", "█   █", "████ "],
-        'Y' => ["█   █", "█   █", " █ █ ", "  █  ", "  █  "],
-        'P' => ["████ ", "█   █", "████ ", "█    ", "█    "],
-        'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
-        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
-        'T' => ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
-        _ => ["     "; WORDMARK_GLYPH_ROWS],
-    }
-}
-
-/// Renders `text`'s block-letter wordmark with an animated white chrome shine
-/// beam sweeping across the glyphs as `tick` progresses.
-fn wordmark_lines_with_shine(text: &str, tick: u64, theme: &Theme) -> Vec<Line<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let num_letters = chars.len();
-    // A traveling shine beam sweeping left-to-right every ~18 ticks
-    let shine_head = ((tick / 2) % (num_letters as u64 + 6)) as usize;
-
-    let mut lines = Vec::with_capacity(WORDMARK_GLYPH_ROWS);
-    for row_idx in 0..WORDMARK_GLYPH_ROWS {
-        let mut spans = Vec::new();
-        for (letter_idx, &ch) in chars.iter().enumerate() {
-            if letter_idx > 0 {
-                spans.push(Span::raw(" "));
-            }
-            let glyph_row = wordmark_glyph(ch)[row_idx];
-            let is_shine =
-                letter_idx == shine_head || (shine_head > 0 && letter_idx == shine_head - 1);
-            let style = if is_shine {
-                Style::default()
-                    .fg(theme.selection.foreground)
-                    .bg(theme.surface.overlay)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD)
-            };
-            spans.push(Span::styled(glyph_row.to_string(), style));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
-}
+#[cfg(test)]
+use crate::splash::MAX_SPLASH_WARNINGS;
 
 /// The workspace layout: a runs pane, the conversation, and an approvals + run
 /// detail pane. The panes are at-a-glance context — interaction stays the same
@@ -1217,7 +982,7 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         ));
         lines.push(field(
             "cost",
-            cost_field(run.cost_micros, run.cost_minor),
+            cost_field(run.cost_micros, run.cost_minor, run.usage_coverage),
             theme.status.warning,
         ));
         lines.push(field(
@@ -2132,8 +1897,9 @@ fn hash_run_rows(run: &RunView, hash: &mut MeasureHash) {
         cost_minor: _,
         prompt_tokens: _,     // status row only
         completion_tokens: _, // status row only
-        cost_micros: _,       // status row only
-        disposition: _,       // status row only; `Completed` carries its own
+        cost_micros: _,
+        usage_coverage: _, // status row only
+        disposition: _,    // status row only; `Completed` carries its own
         launch_checkpoint: _,
         transcript,
         entry_times,            // the turn clock on user/agent headers
@@ -2258,6 +2024,7 @@ fn hash_entry(entry: &TranscriptEntry, hash: &mut MeasureHash) {
                 preview,
                 preview_truncated,
                 expanded,
+                review,
             } = patch;
             hash.debug(changeset_id);
             hash.debug(artifact);
@@ -2270,6 +2037,7 @@ fn hash_entry(entry: &TranscriptEntry, hash: &mut MeasureHash) {
             hash.text(preview);
             hash.add(u64::from(*preview_truncated));
             hash.add(u64::from(*expanded));
+            hash.debug(review);
         }
         TranscriptEntry::Steering { applied } => {
             hash.add(0x05);
@@ -2817,7 +2585,13 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // offset moves — `run.scroll`/`run.follow` are untouched, so the view
     // returns to the tail the moment browsing ends.
     if let Some((start, end)) = browsed_span {
-        if start < offset {
+        let reviewing_patch = state.fold_focus().is_some_and(|run| {
+            matches!(
+                run.transcript.get(run.transcript_selected),
+                Some(TranscriptEntry::Patch(patch)) if patch.review.is_some()
+            )
+        });
+        if reviewing_patch || start < offset {
             offset = start;
         } else if end > offset.saturating_add(u32::from(inner.height)) {
             offset = end.saturating_sub(u32::from(inner.height)).min(max_scroll);
@@ -3422,7 +3196,12 @@ fn lifecycle_status_line(run: &RunView, theme: &Theme) -> Option<Line<'static>> 
     // header: the header shows the SELECTED run, and a stacked conversation
     // has many. This is the row that used to be followed by
     // `? unsupported event` — the same measurement, thrown away.
-    if let Some(usage) = usage_label(run.prompt_tokens, run.completion_tokens, run.cost_micros) {
+    if let Some(usage) = usage_label(
+        run.prompt_tokens,
+        run.completion_tokens,
+        run.cost_micros,
+        run.usage_coverage,
+    ) {
         spans.push(Span::styled(
             format!("  ·  {usage}"),
             Style::default().fg(theme.text.muted),
@@ -3839,10 +3618,14 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
         ToolStatus::Running => ("running", theme.status.running),
         ToolStatus::Completed => match &card.outcome {
             Some(codypendent_protocol::ToolOutcome::Failed { .. }) => ("✗", theme.status.error),
+            None => ("finished · result unavailable", theme.text.muted),
             _ => ("✓", theme.status.success),
         },
     };
-    let name = if card.tool.is_empty() {
+    let acp = card.tool.starts_with("acp:") || card.tool.starts_with("toolu_");
+    let name = if acp {
+        card.label.as_deref().unwrap_or("Tool")
+    } else if card.tool.is_empty() {
         card.action.as_ref().map_or("tool", action_kind)
     } else {
         card.tool.as_str()
@@ -3859,7 +3642,7 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
     // `⏺ codypendent · <model>` convention the turn header already uses.
     const LABEL_RENDER_MAX_CHARS: usize = 48;
     let mut head = vec![Span::styled(format!("{marker} ⏺ {name} "), head_style)];
-    if let Some(label) = card.label.as_deref().filter(|l| !l.is_empty()) {
+    if let Some(label) = card.label.as_deref().filter(|l| !l.is_empty() && !acp) {
         head.push(Span::styled(
             format!("· {} ", truncate(label, LABEL_RENDER_MAX_CHARS)),
             Style::default().fg(theme.text.muted),
@@ -3964,7 +3747,21 @@ fn patch_lines<'a>(
     out.push(Line::from(head));
 
     if patch.expanded {
-        if patch.files.len() > 1 {
+        out.push(Line::styled(
+            if patch.review.is_some() {
+                "    Alt-N/P hunks · Alt-Shift-N/P files · Alt-O open in IDE · Alt-Enter full preview"
+            } else {
+                "    Alt-N/P hunks · Alt-Shift-N/P files · Alt-O open in IDE · Alt-Enter close"
+            },
+            Style::default().fg(theme.focus.active),
+        ));
+        if let Some(review) = &patch.review {
+            out.push(Line::styled(
+                format!("    {}", review.label),
+                Style::default().fg(theme.diff.header),
+            ));
+        }
+        if patch.review.is_none() && patch.files.len() > 1 {
             for file in &patch.files {
                 out.push(Line::styled(
                     format!("    {file}"),
@@ -3973,7 +3770,10 @@ fn patch_lines<'a>(
             }
             out.push(Line::raw(""));
         }
-        for line in patch.preview.lines() {
+        let (start, count) = patch.review.as_ref().map_or((0, usize::MAX), |review| {
+            (review.start, review.end.saturating_sub(review.start))
+        });
+        for line in patch.preview.lines().skip(start).take(count) {
             let (color, bg) = if line.starts_with('+') && !line.starts_with("+++") {
                 (theme.diff.added, theme.diff.added_bg)
             } else if line.starts_with('-') && !line.starts_with("---") {
@@ -4198,11 +3998,18 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     // supersede it.)
     let (left, right): (Vec<Span>, Vec<Chip>) = if state.voice.recording {
         let right = if status.pending_approvals > 0 {
-            vec![
-                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
-                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
-                Chip::new("r", "reject", Action::Reject),
-            ]
+            if state
+                .focused_approval()
+                .is_some_and(|approval| can_review(&approval.action))
+            {
+                vec![
+                    Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                    Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                    Chip::new("r", "reject", Action::Reject),
+                ]
+            } else {
+                vec![Chip::new("r", "reject", Action::Reject)]
+            }
         } else if !state.issues.is_empty() {
             vec![Chip::new("/", "diagnostics", Action::OpenIssues)]
         } else {
@@ -4299,11 +4106,18 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                         .add_modifier(Modifier::BOLD),
                 ),
             ],
-            vec![
-                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
-                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
-                Chip::new("r", "reject", Action::Reject),
-            ],
+            if state
+                .focused_approval()
+                .is_some_and(|approval| can_review(&approval.action))
+            {
+                vec![
+                    Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                    Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                    Chip::new("r", "reject", Action::Reject),
+                ]
+            } else {
+                vec![Chip::new("r", "reject", Action::Reject)]
+            },
         )
     } else if !state.issues.is_empty() {
         state.register_hit(area, Action::OpenIssues);
@@ -9198,7 +9012,10 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
 
     lines.push(section("Requested capabilities", theme));
     lines.push(Line::styled(
-        format!("  {}", capability_label(&approval.action)),
+        format!(
+            "  {}",
+            crate::remote_ui::sanitize_terminal_text(&capability_label(&approval.action))
+        ),
         Style::default().fg(theme.text.primary),
     ));
     lines.push(Line::raw(""));
@@ -9282,7 +9099,21 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
         rect.width.saturating_sub(2),
         1,
     );
-    if approval.pattern.is_some() {
+    if !can_review(&approval.action) {
+        let controls = " [r] reject · update Codypendent to review this action";
+        frame.render_widget(
+            Paragraph::new(controls).style(Style::default().fg(theme.status.warning)),
+            controls_area,
+        );
+        register_text_hit(
+            state,
+            controls_area,
+            controls,
+            controls_area.y,
+            "[r] reject",
+            Action::Reject,
+        );
+    } else if approval.pattern.is_some() {
         let controls = " [a] once · [A] run · [p] pattern · [P] repo · [r] reject";
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -9621,6 +9452,7 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let inner_width = usize::from(rect.width.saturating_sub(2)).max(1);
+    let bindings = crate::input::filtered_key_bindings(&state.help_query);
     let mut lines: Vec<Line> = Vec::new();
     for row in wrap_display_width(
         "Keys — every mouse action has a keyboard equivalent",
@@ -9629,16 +9461,34 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lines.push(Line::styled(row, theme.heading()));
     }
     for row in wrap_display_width(
-        "Single-letter keys apply inside their overlay. / is the always-on front door.",
+        "Type to filter shortcuts. Ctrl-U clears. Esc or ? closes help.",
         inner_width,
     ) {
         lines.push(Line::styled(row, theme.muted()));
+    }
+    lines.push(Line::styled(
+        format!(
+            "  Filter: {}  ·  {} shortcuts",
+            if state.help_query.is_empty() {
+                "all"
+            } else {
+                &state.help_query
+            },
+            bindings.len()
+        ),
+        theme.secondary(),
+    ));
+    if bindings.is_empty() {
+        lines.push(Line::styled(
+            "No matching shortcuts. Try a key, action or view name.",
+            theme.muted(),
+        ));
     }
     lines.push(Line::raw(""));
     // Pad to the widest binding actually in the table. A fixed 12 silently
     // stopped padding for every longer key, so those rows ran their label
     // straight into their description ("Delete / Ctrl-Dremove a model").
-    let widest_key = crate::input::KEY_BINDINGS
+    let widest_key = bindings
         .iter()
         .map(|b| UnicodeWidthStr::width(b.keys))
         .max()
@@ -9659,7 +9509,7 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         GUTTER * 2 + widest_key
     };
     let description_width = inner_width.saturating_sub(indent).max(8);
-    for binding in crate::input::KEY_BINDINGS {
+    for binding in bindings {
         let mut description = binding.description.to_owned();
         if let Some(mouse) = binding.mouse {
             description.push_str(&format!("  (mouse: {mouse})"));
@@ -10580,119 +10430,11 @@ fn risk_lines<'a>(risk: &'a Risk, theme: &Theme) -> Vec<Line<'a>> {
     ])];
     for reason in &risk.reasons {
         lines.push(Line::styled(
-            format!("  - {reason}"),
+            format!("  - {}", crate::remote_ui::sanitize_terminal_text(reason)),
             Style::default().fg(theme.text.secondary),
         ));
     }
     lines
-}
-
-/// Verbatim rendering of a proposed action's fields (approval modal).
-fn describe_action(action: &ProposedAction) -> Vec<String> {
-    match action {
-        ProposedAction::ReadFiles { paths } => {
-            let mut v = vec!["read files:".to_owned()];
-            v.extend(paths.iter().map(|p| format!("  {p}")));
-            v
-        }
-        ProposedAction::WritePatch { patch } => vec![format!("apply patch: {patch}")],
-        ProposedAction::ExecuteCommand {
-            program,
-            args,
-            environment,
-            cwd,
-        } => {
-            // Render the FULL environment and cwd: an unshown binding could
-            // smuggle an execution-hijacking variable past a benign-looking
-            // command line, so the approver must see every one verbatim.
-            let mut v = vec![format!("command: {program} {}", args.join(" "))];
-            if let Some(cwd) = cwd {
-                v.push(format!("cwd: {cwd}"));
-            }
-            for (name, value) in environment {
-                v.push(format!("env: {name}={value}"));
-            }
-            v
-        }
-        ProposedAction::NetworkRequest { destination } => {
-            vec![format!("network request: {destination}")]
-        }
-        ProposedAction::GitCommit { repository } => vec![format!("git commit: {repository}")],
-        ProposedAction::GitPush { remote, branch } => {
-            vec![format!("git push: {remote} {branch}")]
-        }
-        // STEP 4.4.2: every publish displays target, changed files, and the
-        // resulting Git action before approval — render all three verbatim
-        // from the plan, exactly as computed (never re-derived here).
-        ProposedAction::PublishDocument {
-            target,
-            changed_files,
-            git_action,
-            ..
-        } => {
-            let mut v = vec![format!("publish document: {target}")];
-            v.push("changed files:".to_owned());
-            v.extend(changed_files.iter().map(|f| format!("  {f}")));
-            v.push(format!("git action: {git_action}"));
-            v
-        }
-        // PR B (MCP client): the approver must see WHICH server and tool, the
-        // human summary, and the `args` string VERBATIM — it is canonical JSON,
-        // already auditable — exactly as ExecuteCommand renders program/args/env
-        // verbatim.
-        ProposedAction::McpToolCall {
-            server,
-            tool,
-            summary,
-            args,
-        } => vec![
-            format!("mcp tool: {server}.{tool}"),
-            format!("summary: {summary}"),
-            format!("args: {args}"),
-        ],
-        ProposedAction::AcpToolCall {
-            agent,
-            title,
-            details,
-        } => vec![
-            format!("ACP agent: {agent}"),
-            format!("tool: {title}"),
-            format!("details: {details}"),
-        ],
-        ProposedAction::CouncilCreate { name, summary } => vec![
-            format!("create council: {name}"),
-            format!("preview: {summary}"),
-        ],
-        ProposedAction::CouncilRun { name, summary } => vec![
-            format!("run council: {name}"),
-            format!("preview: {summary}"),
-        ],
-        ProposedAction::WorkflowCreate {
-            workflow_id,
-            summary,
-        } => vec![
-            format!("create workflow: {workflow_id}"),
-            format!("preview: {summary}"),
-        ],
-        ProposedAction::WorkflowRun {
-            workflow_id,
-            kind,
-            summary,
-        } => vec![
-            format!("run {kind} workflow: {workflow_id}"),
-            format!("preview: {summary}"),
-        ],
-        // Adoption 09: stdin to a live process carries the same authority as
-        // spawning a command, so the approver must see which process and how
-        // many bytes. The bytes themselves are never carried (no echoed secret).
-        ProposedAction::WriteProcessStdin {
-            process_id,
-            byte_len,
-        } => vec![format!(
-            "write to process {process_id}: {byte_len} bytes to stdin"
-        )],
-        _ => vec!["unsupported action".to_owned()],
-    }
 }
 
 /// A short kind label for a proposed action (list rows).
@@ -10704,6 +10446,8 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::NetworkRequest { .. } => "network",
         ProposedAction::GitCommit { .. } => "git commit",
         ProposedAction::GitPush { .. } => "git push",
+        ProposedAction::GitHubMutation { .. } => "GitHub write",
+        ProposedAction::RestoreCheckpoint { .. } => "restore checkpoint",
         ProposedAction::PublishDocument { .. } => "publish document",
         ProposedAction::McpToolCall { .. } => "mcp tool",
         ProposedAction::AcpToolCall { .. } => "acp tool",
@@ -12414,60 +12158,13 @@ fn format_cost(cost_minor: Option<u64>) -> String {
     }
 }
 
-/// A MEASURED cost, in USD millionths (`EventBody::RunUsage.cost_micros`).
-///
-/// Four decimals, matching `crates/cli/src/commands.rs`'s `render_cost` — a run
-/// against a cheap model costs a fraction of a cent, and a two-decimal figure
-/// would report almost every one of them as `$0.00`.
-fn format_cost_micros(micros: u64) -> String {
-    format!("${}.{:04}", micros / 1_000_000, (micros % 1_000_000) / 100)
-}
-
-/// `1234` → `1,234`. Token counts are the one place in the shell where the
-/// magnitude is the message; unseparated digits make 10000 and 100000 read
-/// alike at a glance.
-fn thousands(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// The measured-usage chip: `1,234 in · 567 out · $0.0034`.
-///
-/// Only measured dimensions appear. An absent one means the provider did not
-/// report it, never zero — so a run with tokens and no price (every unpriced
-/// local model) shows its tokens and no money, rather than a dash that reads as
-/// "this run was free". `None` here means nothing at all was measured.
-fn usage_label(
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    cost_micros: Option<u64>,
-) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(tokens) = prompt_tokens {
-        parts.push(format!("{} in", thousands(tokens)));
-    }
-    if let Some(tokens) = completion_tokens {
-        parts.push(format!("{} out", thousands(tokens)));
-    }
-    if let Some(micros) = cost_micros {
-        parts.push(format_cost_micros(micros));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
 /// The same measurement packed for the header, where every column is contested:
 /// total tokens, abbreviated, plus the price when one was measured.
 fn usage_label_compact(
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     cost_micros: Option<u64>,
+    coverage: Option<codypendent_protocol::UsageCoverage>,
 ) -> Option<String> {
     let total = match (prompt_tokens, completion_tokens) {
         (None, None) => None,
@@ -12479,6 +12176,18 @@ fn usage_label_compact(
     }
     if let Some(micros) = cost_micros {
         parts.push(format_cost_micros(micros));
+    }
+    if !parts.is_empty() {
+        if let Some(label) = crate::state::usage_coverage_label(
+            coverage,
+            [
+                prompt_tokens.is_some(),
+                completion_tokens.is_some(),
+                cost_micros.is_some(),
+            ],
+        ) {
+            parts.push(label.to_string());
+        }
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
@@ -12496,9 +12205,16 @@ fn abbreviate_count(value: u64) -> String {
 /// one, else the budget-projected cost, else a dash. Two inputs, one field —
 /// `format_cost` alone could only ever see the budget projection, which nothing
 /// in the workspace emits.
-fn cost_field(cost_micros: Option<u64>, cost_minor: Option<u64>) -> String {
+fn cost_field(
+    cost_micros: Option<u64>,
+    cost_minor: Option<u64>,
+    coverage: Option<codypendent_protocol::UsageCoverage>,
+) -> String {
     match cost_micros {
-        Some(micros) => format_cost_micros(micros),
+        Some(micros) => match crate::state::usage_coverage_label(coverage, [false, false, true]) {
+            Some(label) => format!("{} ({label})", format_cost_micros(micros)),
+            None => format_cost_micros(micros),
+        },
         None => format_cost(cost_minor),
     }
 }
@@ -16324,7 +16040,7 @@ mod tests {
     fn antigravity_consent_names_third_party_terms_and_verified_install() {
         let mut state = running_build_state();
         state.overlay = Overlay::ConfirmCommunityAcpInstall {
-            provider_id: "antigravity-acp".to_owned(),
+            provider_id: "antigravity-community".to_owned(),
             query: "anti".to_owned(),
             selected: 0,
             onboard_class: None,
@@ -16350,7 +16066,7 @@ mod tests {
     fn the_consent_dialog_never_clips_its_own_decision_controls() {
         let mut state = running_build_state();
         state.overlay = Overlay::ConfirmCommunityAcpInstall {
-            provider_id: "antigravity-acp".to_owned(),
+            provider_id: "antigravity-community".to_owned(),
             query: "anti".to_owned(),
             selected: 0,
             onboard_class: None,
@@ -16381,7 +16097,7 @@ mod tests {
     fn a_clipped_consent_notice_says_so() {
         let mut state = running_build_state();
         state.overlay = Overlay::ConfirmCommunityAcpInstall {
-            provider_id: "antigravity-acp".to_owned(),
+            provider_id: "antigravity-community".to_owned(),
             query: String::new(),
             selected: 0,
             onboard_class: None,
@@ -18747,6 +18463,44 @@ mod tests {
     /// target, so the expanded detail and the diff renderer are reachable by
     /// mouse — they registered nothing at all before.
     #[test]
+    fn patch_navigation_keeps_selected_hunk_visible_on_small_terminal() {
+        let mut state = state_with_tool_and_patch();
+        let TranscriptEntry::Patch(patch) = state.runs[0].transcript.last_mut().unwrap() else {
+            unreachable!()
+        };
+        patch.preview = format!("diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+first\n{}diff --git a/b.rs b/b.rs\n@@ -1 +1 @@\n-before\n+TARGET_REVIEW_LINE", " context\n".repeat(120));
+        patch.files.push("b.rs".into());
+        patch.preview_truncated = true;
+        reduce(&mut state, Action::BrowseFoldPrev);
+        reduce(
+            &mut state,
+            Action::NavigatePatch {
+                forward: true,
+                files: false,
+            },
+        );
+        // Seed the geometry cache, then change the selected section.
+        let _ = render_to_string(&state, 100, 18);
+        reduce(
+            &mut state,
+            Action::NavigatePatch {
+                forward: true,
+                files: false,
+            },
+        );
+        let output = render_to_string(&state, 100, 18);
+        assert!(output.contains("Hunk 2/2"), "{output}");
+        assert!(output.contains("TARGET_REVIEW_LINE"), "{output}");
+        assert!(output.contains("Alt-N/P"), "{output}");
+        assert!(
+            !output.contains("+first"),
+            "only the requested section is shown"
+        );
+        let _ = render_to_string(&state, 12, 5);
+        let _ = render_to_string(&state, 0, 0);
+    }
+
+    #[test]
     fn tool_and_patch_heads_register_click_targets() {
         let state = state_with_tool_and_patch();
         let _ = render_to_string(&state, 100, 30);
@@ -19397,6 +19151,7 @@ mod tests {
                 prompt_tokens: Some(10_000),
                 completion_tokens: Some(642),
                 cost_micros,
+                coverage: None,
             }),
         );
         s
@@ -19771,8 +19526,8 @@ mod tests {
     fn help_descriptions_wrap_with_a_hanging_indent() {
         let mut state = AppState::new();
         state.overlay = crate::state::Overlay::Help;
-        // The two prose lines are the only unindented copy in the overlay.
-        let prose = "Keys — every mouse action has a keyboard equivalent              Single-letter keys apply inside their overlay. / is the always-on front door.              Ctrl-C detaches this client — it never stops the run.               PgUp / PgDn scrolls.  ? or Esc closes.";
+        // Introductory and footer copy are not table descriptions.
+        let prose = "Keys — every mouse action has a keyboard equivalent              Type to filter shortcuts. Ctrl-U clears. Esc or ? closes help.              Ctrl-C detaches this client — it never stops the run.               PgUp / PgDn scrolls.  ? or Esc closes.";
         for (width, height) in [(120u16, 40u16), (80, 24), (60, 20)] {
             let text = render_to_string(&state, width, height);
             let mut orphans: Vec<String> = Vec::new();
@@ -19949,6 +19704,7 @@ mod tests {
             deletions: 4,
             preview: "+added\n-removed\n context".to_owned(),
             preview_truncated: false,
+            review: None,
             artifact: codypendent_protocol::ArtifactRef {
                 id: codypendent_protocol::ArtifactId::new(),
                 media_type: "text/x-patch".to_owned(),

@@ -29,9 +29,19 @@ const MAX_PASTE_BYTES: usize = 64 * 1024;
 /// invisible composer instructions. The byte cap always ends on a UTF-8
 /// boundary.
 fn sanitized_paste(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut clean = String::with_capacity(normalized.len().min(MAX_PASTE_BYTES));
-    for character in normalized.chars() {
+    let mut clean = String::with_capacity(text.len().min(MAX_PASTE_BYTES));
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        // Normalise in one bounded pass. A large clipboard previously made
+        // two full-size copies before the 64 KiB limit could take effect.
+        let character = if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            '\n'
+        } else {
+            character
+        };
         let fragment = match character {
             '\n' => "\n",
             '\t' => "    ",
@@ -84,6 +94,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         keys: "Enter",
         description: "send: start a run, or steer the active one",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Shift-Enter",
+        description: "insert a line break (modern terminals); Alt-Enter also works",
         mouse: None,
     },
     KeyBinding {
@@ -167,12 +182,12 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
-        keys: "Ctrl-←/→ · Ctrl-A / Ctrl-E",
+        keys: "Ctrl-←/→ · Alt-B/F · Ctrl-A/E",
         description: "move the cursor by word · to line start / end (composer)",
         mouse: None,
     },
     KeyBinding {
-        keys: "Ctrl-W / Ctrl-U / Ctrl-K",
+        keys: "Ctrl-W / Alt-⌫ · Ctrl-U/K",
         description: "delete word / to line start (any prompt) · to line end (composer)",
         mouse: None,
     },
@@ -204,6 +219,21 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         keys: "Alt-Y · Shift-drag",
         description: "copy the browsed card · native terminal selection / copy",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Alt-N / Alt-P",
+        description: "next / previous hunk in the browsed patch preview",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Alt-O",
+        description: "open the reviewed file / hunk in the same session's IDE",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Alt-Shift-N / P",
+        description: "next / previous changed file in the browsed patch preview",
         mouse: None,
     },
     KeyBinding {
@@ -320,7 +350,7 @@ pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, A
         Event::Paste(text)
             if matches!(
                 mode,
-                InputMode::Editing | InputMode::Composer | InputMode::Palette
+                InputMode::Editing | InputMode::Composer | InputMode::Palette | InputMode::Help
             ) =>
         {
             Action::InputPaste(sanitized_paste(text))
@@ -341,10 +371,22 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::NoOp;
     }
+    if matches!(mode, InputMode::Composer | InputMode::Normal) && alt(key) {
+        if key.code == KeyCode::Char('o') {
+            return Action::OpenReviewedSource;
+        }
+        if let KeyCode::Char(c @ ('n' | 'p' | 'N' | 'P')) = key.code {
+            return Action::NavigatePatch {
+                forward: matches!(c, 'n' | 'N'),
+                files: c.is_uppercase() || key.modifiers.contains(KeyModifiers::SHIFT),
+            };
+        }
+    }
     match mode {
         InputMode::Editing => map_editing_key(key),
         InputMode::Confirm => map_confirm_key(key),
         InputMode::Palette => map_palette_key(key),
+        InputMode::Help => map_help_key(key),
         InputMode::Composer => map_composer_key(key),
         InputMode::Approval => map_approval_key(key),
         InputMode::Question => map_question_key(key),
@@ -472,10 +514,13 @@ fn map_normal_char(c: char) -> Action {
 
 fn map_editing_key(key: &KeyEvent) -> Action {
     match key.code {
-        // Alt+Enter inserts a manual line break; plain Enter still submits.
+        // Modern terminals distinguish Shift+Enter; Alt+Enter also works in
+        // terminals that send the same sequence for Enter and Shift+Enter.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Action::InsertNewline,
         KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
+        KeyCode::Backspace if alt(key) || ctrl(key) => Action::DeleteWordBack,
         KeyCode::Backspace => Action::InputBackspace,
         // In a multi-step text wizard, Tab is an ergonomic synonym for the
         // visible Continue action. Other editing prompts ignore this reducer
@@ -496,11 +541,14 @@ fn map_editing_key(key: &KeyEvent) -> Action {
         // one-Backspace-per-character.
         KeyCode::Left if ctrl(key) || alt(key) => Action::CursorWordLeft,
         KeyCode::Right if ctrl(key) || alt(key) => Action::CursorWordRight,
+        KeyCode::Char('b') if alt(key) => Action::CursorWordLeft,
+        KeyCode::Char('f') if alt(key) => Action::CursorWordRight,
         KeyCode::Left => Action::CursorLeft,
         KeyCode::Right => Action::CursorRight,
         KeyCode::Home => Action::CursorLineStart,
         KeyCode::End => Action::CursorLineEnd,
         KeyCode::Delete => Action::DeleteForward,
+        KeyCode::Char('d') if ctrl(key) => Action::DeleteForward,
         KeyCode::Char('a') if ctrl(key) => Action::CursorLineStart,
         KeyCode::Char('e') if ctrl(key) => Action::CursorLineEnd,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
@@ -548,6 +596,42 @@ fn map_palette_key(key: &KeyEvent) -> Action {
     }
 }
 
+fn map_help_key(key: &KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
+        KeyCode::Char('c') if ctrl(key) => Action::Detach,
+        KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
+        KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
+        KeyCode::Char(c) if !ctrl(key) && !alt(key) => Action::InputChar(c),
+        KeyCode::Backspace => Action::InputBackspace,
+        KeyCode::Up => Action::ScrollLinesUp,
+        KeyCode::Down => Action::ScrollLinesDown,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
+        KeyCode::Home => Action::SelectFirst,
+        KeyCode::End => Action::SelectLast,
+        _ => Action::NoOp,
+    }
+}
+
+pub(crate) fn filtered_key_bindings(query: &str) -> Vec<&'static KeyBinding> {
+    let query = query.to_lowercase();
+    let words: Vec<_> = query.split_whitespace().collect();
+    KEY_BINDINGS
+        .iter()
+        .filter(|binding| {
+            let searchable = format!(
+                "{} {} {}",
+                binding.keys,
+                binding.description,
+                binding.mouse.unwrap_or("")
+            )
+            .to_lowercase();
+            words.iter().all(|word| searchable.contains(word))
+        })
+        .collect()
+}
+
 /// The base conversation view. The composer captures typed text; Enter sends it;
 /// `/` is a literal character (the reducer opens the palette only when it lands on
 /// an empty composer); PgUp/PgDn scroll the transcript; Ctrl-↑/↓ switch runs;
@@ -559,9 +643,11 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         // — the reducer owns that choice because only it knows whether the
         // transcript is being browsed (this mapper is pure). Plain Enter
         // always submits.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Action::InsertNewline,
         KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
+        KeyCode::Backspace if alt(key) || ctrl(key) => Action::DeleteWordBack,
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
@@ -581,6 +667,8 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         // meaning here before.
         KeyCode::Left if ctrl(key) || alt(key) => Action::CursorWordLeft,
         KeyCode::Right if ctrl(key) || alt(key) => Action::CursorWordRight,
+        KeyCode::Char('b') if alt(key) => Action::CursorWordLeft,
+        KeyCode::Char('f') if alt(key) => Action::CursorWordRight,
         KeyCode::Char('y') if alt(key) => Action::CopyFocusedCard,
         KeyCode::Char('r') if alt(key) => Action::RetryFailedRun,
         KeyCode::Char('a') if alt(key) => Action::ReauthenticateFailedModel,
@@ -618,6 +706,7 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Char('g') if ctrl(key) => Action::HistorySearchNext,
         KeyCode::Char('s') if ctrl(key) => Action::HistorySearchNext,
         KeyCode::Delete => Action::DeleteSelectedPrompt,
+        KeyCode::Char('d') if ctrl(key) => Action::DeleteForward,
         // `F1` opens help from the base view, where `?` is ordinary text
         // (the reducer additionally opens it for `?` on an EMPTY composer,
         // mirroring the `/` palette rule).
@@ -746,7 +835,7 @@ fn map_mouse(
         // List surfaces — browsers, the palette, stacked approvals — move their
         // selection on the wheel. A left click resolves through the same
         // hit-test map (a registered row), falling back to inert otherwise.
-        InputMode::CouncilResults => match mouse.kind {
+        InputMode::CouncilResults | InputMode::Help => match mouse.kind {
             MouseEventKind::ScrollUp => Action::ScrollLinesUp,
             MouseEventKind::ScrollDown => Action::ScrollLinesDown,
             MouseEventKind::Down(MouseButton::Left) => {

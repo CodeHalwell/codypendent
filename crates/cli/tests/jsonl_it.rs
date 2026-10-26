@@ -9,9 +9,9 @@
 
 use std::time::Duration;
 
-use codypendent_cli::commands::run_over_connection;
+use codypendent_cli::commands::run_over_connection_with_format;
 use codypendent_cli::connection::Connection;
-use codypendent_cli::stream::RunExit;
+use codypendent_cli::stream::{OutputFormat, RunExit};
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, AgentMode, Catchup, ClientCapabilities, ClientId,
     Command, CommandBody, CommandId, DaemonInstanceId, Envelope, EventBody, Payload,
@@ -175,6 +175,10 @@ async fn mock_daemon(mut stream: UnixStream, session_id: SessionId, events: Vec<
 /// Drive one `run_over_connection` call against a mock server scripted with
 /// `events`, returning the client's captured JSONL bytes and its `RunExit`.
 async fn drive(events: Vec<SessionEvent>) -> (Vec<u8>, RunExit) {
+    drive_format(events, OutputFormat::Jsonl).await
+}
+
+async fn drive_format(events: Vec<SessionEvent>, format: OutputFormat) -> (Vec<u8>, RunExit) {
     let (socket, listener) = MockSocket::bind();
     let session_id = SessionId::new();
 
@@ -193,13 +197,14 @@ async fn drive(events: Vec<SessionEvent>) -> (Vec<u8>, RunExit) {
     let mut out = Vec::new();
     let exit = tokio::time::timeout(
         Duration::from_secs(5),
-        run_over_connection(
+        run_over_connection_with_format(
             &mut conn,
             "diagnose the failing test".to_string(),
             AgentMode::Build,
             "/repo/under/test",
             None,
             &mut out,
+            format,
         ),
     )
     .await
@@ -476,6 +481,7 @@ async fn measured_usage_published_after_the_terminal_event_still_reaches_stdout(
                 prompt_tokens: Some(9_000),
                 completion_tokens: Some(1_000),
                 cost_micros: Some(42_000),
+                coverage: None,
             },
         ),
     ];
@@ -542,4 +548,132 @@ fn client_capabilities_default_is_all_false() {
     let caps = ClientCapabilities::default();
     assert!(!caps.rich_text);
     assert!(!caps.mouse);
+}
+
+#[tokio::test]
+async fn text_output_streams_only_the_requested_runs_answer_and_keeps_its_exit_status() {
+    let run = RunId::new();
+    let sibling = RunId::new();
+    let (out, exit) = drive_format(
+        vec![
+            run_started(run),
+            event(
+                3,
+                EventBody::ModelStreamDelta {
+                    run_id: run,
+                    text: "private reasoning".into(),
+                    thought: true,
+                },
+            ),
+            event(
+                4,
+                EventBody::ModelStreamDelta {
+                    run_id: run,
+                    text: "Hello ".into(),
+                    thought: false,
+                },
+            ),
+            event(
+                5,
+                EventBody::ModelStreamDelta {
+                    run_id: sibling,
+                    text: "sibling output".into(),
+                    thought: false,
+                },
+            ),
+            event(
+                6,
+                EventBody::RunCompleted {
+                    run_id: sibling,
+                    disposition: RunDisposition::Failed {
+                        reason: "sibling failed".into(),
+                        error: None,
+                    },
+                    chronicle: artifact_ref(),
+                },
+            ),
+            event(
+                7,
+                EventBody::ModelStreamDelta {
+                    run_id: run,
+                    text: "世界\x1b[2J".into(),
+                    thought: false,
+                },
+            ),
+            event(
+                8,
+                EventBody::RunCompleted {
+                    run_id: run,
+                    disposition: RunDisposition::Completed {
+                        summary: Some("must not duplicate the answer".into()),
+                    },
+                    chronicle: artifact_ref(),
+                },
+            ),
+        ],
+        OutputFormat::Text,
+    )
+    .await;
+    assert_eq!(String::from_utf8(out).unwrap(), "Hello 世界\n");
+    assert_eq!(exit, RunExit::Completed);
+}
+
+#[tokio::test]
+async fn text_output_uses_a_completion_summary_when_no_answer_was_streamed() {
+    let run = RunId::new();
+    let (out, exit) = drive_format(
+        vec![
+            run_started(run),
+            event(
+                3,
+                EventBody::RunCompleted {
+                    run_id: run,
+                    disposition: RunDisposition::Completed {
+                        summary: Some("Done".into()),
+                    },
+                    chronicle: artifact_ref(),
+                },
+            ),
+        ],
+        OutputFormat::Text,
+    )
+    .await;
+    assert_eq!(out, b"Done\n");
+    assert_eq!(exit, RunExit::Completed);
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_text_runs_keep_the_jsonl_exit_contract() {
+    for (disposition, expected) in [
+        (
+            RunDisposition::Failed {
+                reason: "provider unavailable".into(),
+                error: None,
+            },
+            RunExit::Failed,
+        ),
+        (
+            RunDisposition::Cancelled { reason: None },
+            RunExit::Cancelled,
+        ),
+    ] {
+        let run = RunId::new();
+        let (out, exit) = drive_format(
+            vec![
+                run_started(run),
+                event(
+                    3,
+                    EventBody::RunCompleted {
+                        run_id: run,
+                        disposition,
+                        chronicle: artifact_ref(),
+                    },
+                ),
+            ],
+            OutputFormat::Text,
+        )
+        .await;
+        assert!(out.is_empty());
+        assert_eq!(exit, expected);
+    }
 }

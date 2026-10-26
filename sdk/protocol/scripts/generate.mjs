@@ -20,7 +20,7 @@ const targets = [
   {
     schema: "session-event.schema.json",
     output: "events.ts",
-    exports: ["Actor", "EventBody", "SessionEvent"],
+    exports: ["Actor", "EventBody", "SessionEvent", "UsageCoverage"],
   },
   {
     schema: "payload.schema.json",

@@ -1,33 +1,35 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { QuestionOutcomeView, SessionId } from "./types.js";
-import { Navigation, type DesktopView } from "./components/Navigation.js";
+import { Navigation, NAV_GROUPS, type DesktopView } from "./components/Navigation.js";
+import { NativeAgent } from "./agui/NativeAgent.js";
+import { useDesktopTools } from "./agui/useDesktopTools.js";
+import { AgentToolsView } from "./agui/AgentToolsView.js";
+import type { DesktopContext } from "./agui/types.js";
+import type { ArtifactRef } from "@codypendent/protocol";
+import type { ApprovalGrant } from "./approval.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
 import { Steering } from "./components/Steering.js";
 import { PromptQueue } from "./components/PromptQueue.js";
+import { usePromptQueueActions } from "./usePromptQueueActions.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
 import { ViewBar } from "./components/ViewBar.js";
+import { WorkspaceBar } from "./components/WorkspaceBar.js";
+import { preferredWorkspaceEditor } from "./components/WorkspaceLauncher.js";
+import { useNativeDesktopActions } from "./useNativeDesktopActions.js";
+import { useWorkspacePreferences } from "./useWorkspacePreferences.js";
 import { InboxView } from "./components/InboxView.js";
-import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
-import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
 import { CommandPalette, type PaletteEntry } from "./components/CommandPalette.js";
 import { ShortcutsCard } from "./components/ShortcutsCard.js";
 import { SkillsView } from "./components/SkillsView.js";
 import { MemoryView } from "./components/MemoryView.js";
-import { DocsView } from "./components/DocsView.js";
 import { PluginsView } from "./components/PluginsView.js";
 import { ContextView } from "./components/ContextView.js";
-import { EdgesView } from "./components/EdgesView.js";
 import { BacktrackView } from "./components/BacktrackView.js";
 import { SessionLibrary } from "./components/SessionLibrary.js";
-import { WorkflowView } from "./components/WorkflowView.js";
-import { KanbanView } from "./components/KanbanView.js";
-import { BlackboardView } from "./components/BlackboardView.js";
 import { RepoPicker } from "./components/RepoPicker.js";
 import { CouncilBrowser } from "./components/CouncilBrowser.js";
-import { CouncilBuilder } from "./components/CouncilBuilder.js";
-import { CouncilResults } from "./components/CouncilResults.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { ProviderPicker } from "./components/ProviderPicker.js";
 import type { ProviderRow } from "./components/localConfig.js";
@@ -55,11 +57,24 @@ import {
   type UiPluginLifecycleStatus,
 } from "./components/knowledgeTransport.js";
 import { useDaemon } from "./useDaemon.js";
+import { useConnectionPresentation } from "./useConnectionPresentation.js";
+import { useModelRecovery } from "./useModelRecovery.js";
+import { newCouncilDraft, useCouncilRun } from "./useCouncilRun.js";
 import { runLifecycleAffordance } from "./daemonState.js";
 import { createKnowledgeTransport, type DesktopTransport } from "./transport.js";
 import type { NotificationSink } from "./osNotifications.js";
-import type { InboxDeepLink, PublishTarget } from "@codypendent/protocol";
-import type { UiDocument } from "@codypendent/ui";
+import { useCommandActions } from "./useCommandActions.js";
+import type { InboxDeepLink, InboxEntry, PublishTarget } from "@codypendent/protocol";
+
+/** Load secondary tools only when their workspace is opened. */
+const AnalyticsDashboard = React.lazy(() => import("./components/AnalyticsDashboard.js").then((module) => ({ default: module.AnalyticsDashboard })));
+const DocsView = React.lazy(() => import("./components/DocsView.js").then((module) => ({ default: module.DocsView })));
+const EdgesView = React.lazy(() => import("./components/EdgesView.js").then((module) => ({ default: module.EdgesView })));
+const WorkflowView = React.lazy(() => import("./components/WorkflowView.js").then((module) => ({ default: module.WorkflowView })));
+const KanbanView = React.lazy(() => import("./components/KanbanView.js").then((module) => ({ default: module.KanbanView })));
+const BlackboardView = React.lazy(() => import("./components/BlackboardView.js").then((module) => ({ default: module.BlackboardView })));
+const CouncilBuilder = React.lazy(() => import("./components/CouncilBuilder.js").then((module) => ({ default: module.CouncilBuilder })));
+const CouncilResults = React.lazy(() => import("./components/CouncilResults.js").then((module) => ({ default: module.CouncilResults })));
 
 /** The bridge commands each surface needs, named in its unavailable panel. */
 const REQUIRED_COMMANDS = {
@@ -84,12 +99,9 @@ const REQUIRED_COMMANDS = {
   ],
 } as const;
 
-/**
- * The RemoteUiRenderer's document set while the daemon streams none. One
- * module-level instance: a per-render `new Map()` would hand the renderer a
- * fresh identity on every streamed token.
- */
-const NO_REMOTE_DOCUMENTS = new Map<string, UiDocument>();
+/** Load extension rendering only after a confirmed session attachment. */
+const RemoteUiHost = React.lazy(() => import("./components/RemoteUiHost.js")
+  .then((module) => ({ default: module.RemoteUiHost })));
 
 /**
  * The views that read through the knowledge transport. Without one they are
@@ -128,6 +140,14 @@ interface AppProps {
   knowledge?: KnowledgeTransport;
   /** How to reach the shell's knowledge commands; overridden only in tests. */
   makeKnowledge?: () => KnowledgeTransport | null;
+}
+
+/** Native menu shortcuts must not move focus behind a confirmation dialog. */
+function blockingModalOpen(): boolean {
+  return Array.from(document.querySelectorAll('[aria-modal="true"]')).some((modal) => {
+    const label = modal.getAttribute("aria-label");
+    return label !== "Command palette" && label !== "Keyboard shortcuts" && label !== "Workspace sidebar";
+  });
 }
 
 function describe(error: unknown): string {
@@ -190,8 +210,13 @@ export const App: React.FC<AppProps> = ({
     () => injectedKnowledge ?? makeKnowledge() ?? undefined,
   );
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
+  const viewIdentity = useRef({ view: currentView });
+  if (viewIdentity.current.view !== currentView) viewIdentity.current = { view: currentView };
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
+  const [composerFocusRequested, setComposerFocusRequested] = useState(false);
+  const { sidebarVisible, toggleSidebar, closeSidebar, compact, appearance, setAppearance } = useWorkspacePreferences();
   /**
    * Whether the operator has picked a view themselves yet.
    *
@@ -212,7 +237,9 @@ export const App: React.FC<AppProps> = ({
   const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const selectView = useCallback(
     (view: DesktopView) => {
+      if (compact) closeSidebar();
       chosenView.current = true;
+      setFocusDecision(null);
       // The history push happens here, not inside the `setCurrentView`
       // updater: StrictMode double-invokes updaters, which would push twice.
       if (currentView !== view) {
@@ -231,11 +258,12 @@ export const App: React.FC<AppProps> = ({
       }
       setCurrentView(view);
     },
-    [currentView],
+    [currentView, compact, closeSidebar],
   );
   /** Escape: pop back, or fall back to the session — never a dead end. */
   const goBack = useCallback(() => {
     chosenView.current = true;
+    setFocusDecision(null);
     // The history pop likewise stays out of the updater (double-invoke would
     // pop twice).
     const target = viewHistory.current.pop();
@@ -253,9 +281,10 @@ export const App: React.FC<AppProps> = ({
     startDaemon,
     dismissError,
     submit,
-    cancel,
+    newSession,
+    cancel: cancelNative,
     steer,
-    pauseRun,
+    pauseRun: pauseNativeRun,
     resumeRun,
     queuePrompt,
     updateQueuedPrompt,
@@ -271,6 +300,24 @@ export const App: React.FC<AppProps> = ({
     exportAnalytics,
     transport,
   } = useDaemon(makeTransport, notify);
+  const [workspaceStarting, setWorkspaceStarting] = useState(false);
+  const connectionPresentation = useConnectionPresentation(state.status, workspaceStarting);
+  const startWorkspace = useCallback(async () => {
+    setWorkspaceStarting(true);
+    try { return await startDaemon(); }
+    finally { setWorkspaceStarting(false); }
+  }, [startDaemon]);
+  const commandActions = useCommandActions(`${state.connectionEpoch}:${state.status}`);
+  const [focusDecision, setFocusDecision] = useState<string | null>(null);
+  const [followLatestRequest, setFollowLatestRequest] = useState(0);
+  const readArtifact = useCallback((artifact: ArtifactRef) => {
+    if (!transport?.readArtifact) return Promise.reject(new Error("Artifact reading is unavailable on this connection."));
+    return transport.readArtifact(artifact);
+  }, [transport]);
+  const saveArtifact = useCallback((artifact: ArtifactRef) => {
+    if (!transport?.saveArtifact) return Promise.reject(new Error("Saving requires the desktop shell."));
+    return transport.saveArtifact(artifact);
+  }, [transport]);
   /**
    * A referentially STABLE launch-status probe.
    *
@@ -332,6 +379,9 @@ export const App: React.FC<AppProps> = ({
    */
   const [repository, setRepository] = useState<RepositorySelection | null | undefined>(undefined);
   const [councilNames, setCouncilNames] = useState<string[] | undefined>(undefined);
+  const [councilDraft, setCouncilDraft] = useState(newCouncilDraft);
+  const councilRun = useCouncilRun(transport?.runCouncil && ((name, objective, onProgress) =>
+    transport.runCouncil!(name, objective, { repository: repository?.path ?? null, sessionId: state.activeSessionId }, onProgress)));
   /** True while the council builder is open in place of the browser. */
   const [buildingCouncil, setBuildingCouncil] = useState(false);
   /**
@@ -349,8 +399,19 @@ export const App: React.FC<AppProps> = ({
    * there is always followed by a return here).
    */
   const [runDefaultsLabel, setRunDefaultsLabel] = useState<string | null>(null);
+  const [modelDiscoveryReady, setModelDiscoveryReady] = useState(!shellAvailable());
+  const discoveryPromise = useRef<Promise<unknown> | null>(null);
+  const selectedModel = useRef<string | null>(null);
   /** The composer draft, lifted so a view round-trip cannot lose it. */
   const [composerDraft, setComposerDraft] = useState("");
+  const draftRevision = useRef(0);
+  const modelRevision = useRef(0);
+  const liveDraft = useRef(composerDraft);
+  liveDraft.current = composerDraft;
+  const changeComposerDraft = useCallback((text: string) => { draftRevision.current++; liveDraft.current = text; setComposerDraft(text); }, []);
+  const acceptComposerDraft = useCallback((submittedDraft: string) => {
+    if (liveDraft.current === submittedDraft) { liveDraft.current = ""; setComposerDraft(""); }
+  }, []);
   useEffect(() => {
     if (currentView !== "sessions" || !shellAvailable()) {
       return;
@@ -361,6 +422,7 @@ export const App: React.FC<AppProps> = ({
       .then((defaults) => {
         if (!cancelled) {
           const mode = defaults.mode.type === "Unknown" ? "Build" : defaults.mode.type;
+          selectedModel.current = defaults.model;
           setRunDefaultsLabel(`${mode} mode · ${defaults.model ?? "model: daemon chooses"}`);
         }
       })
@@ -370,9 +432,9 @@ export const App: React.FC<AppProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [currentView]);
+  }, [currentView, modelDiscoveryReady]);
   useEffect(() => {
-    if (!buildingCouncil || configuredModelIds !== undefined || !shellAvailable()) {
+    if (currentView !== "council" || !buildingCouncil || !shellAvailable()) {
       return;
     }
     let cancelled = false;
@@ -390,9 +452,7 @@ export const App: React.FC<AppProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [buildingCouncil, configuredModelIds]);
-  /** The council the results panel opens on, when the browser named one. */
-  const [councilToRun, setCouncilToRun] = useState<string | null>(null);
+  }, [currentView, buildingCouncil, modelDiscoveryReady]);
 
   const [skills, setSkills] = useState<Loaded<SkillCard>>(unloaded);
   const [memories, setMemories] = useState<Loaded<MemoryCard>>(unloaded);
@@ -404,6 +464,26 @@ export const App: React.FC<AppProps> = ({
   const [pluginNotice, setPluginNotice] = useState<string | null>(null);
 
   const connected = state.status === "connected";
+  useEffect(() => {
+    if (!connected || !shellAvailable()) return;
+    let live = true;
+    setModelDiscoveryReady(false);
+    discoveryPromise.current = localConfigClient.discoverModels?.(true).catch(() => undefined).finally(() => { if (live) setModelDiscoveryReady(true); }) ?? null;
+    return () => { live = false; };
+  }, [connected, state.connectionEpoch]);
+  const openSourceFile = useCallback(async (file: string, line?: number, runId?: string | null) => {
+    if (!transport?.openWorkspace || !transport.workspaceTargets || !repository?.path) {
+      throw new Error("Choose a repository in the desktop app before opening a source file.");
+    }
+    const editors = (await transport.workspaceTargets()).filter((target) => target.kind === "editor");
+    const preferred = preferredWorkspaceEditor();
+    const editor = editors.find((target) => target.id === preferred) ?? editors[0];
+    if (!editor) throw new Error("Install a supported editor to open source files.");
+    await transport.openWorkspace({
+      target: editor.id, expectedRepository: repository.path,
+      expectedSession: runId === null ? null : state.activeSessionId, expectedRun: runId === undefined ? state.activeRunId : runId, file, line,
+    });
+  }, [transport, repository?.path, state.activeSessionId, state.activeRunId]);
   /**
    * Whether a run-scoped command (`CancelRun`, `QueueSteering`) can actually
    * be sent: connected, and holding the run id the daemon named. Without both
@@ -415,17 +495,10 @@ export const App: React.FC<AppProps> = ({
     state.attachingSessionId === null &&
     state.sessionAttachmentConfirmed &&
     state.activeRunId !== null;
-  /**
-   * What the operator would be throwing away, read from the run's own
-   * `RunStarted` event. Unknown when this client attached mid-run; the
-   * confirmation says so rather than filling in a plausible objective.
-   * Memoized: `runAtStake` scans the stream backwards, which is O(n) in the
-   * worst case (no matching `RunStarted`) and must not run per render — i.e.
-   * per streamed token.
-   */
+  /** Read cancellation details only while the confirmation is open. */
   const atStake = useMemo(
-    () => runAtStake(state.durableEvents, state.activeRunId),
-    [state.durableEvents, state.activeRunId],
+    () => cancelPending ? runAtStake(state.durableEvents, state.activeRunId) : null,
+    [cancelPending, state.durableEvents, state.activeRunId],
   );
   /**
    * Which of pause/resume the daemon would accept for this run right now, or
@@ -445,6 +518,15 @@ export const App: React.FC<AppProps> = ({
     state.sessionAttachmentConfirmed &&
     state.activeSessionId !== null &&
     Boolean(transport?.queuePrompt);
+  const promptQueueActions = usePromptQueueActions({
+    scope: JSON.stringify([state.connectionEpoch, state.status, state.activeSessionId, state.attachingSessionId]),
+    sessionId: state.activeSessionId,
+    prompts: state.pendingPrompts,
+    canMutate: canQueuePrompts,
+    onEdit: updateQueuedPrompt,
+    onPromote: promoteQueuedPrompt,
+    onDelete: deleteQueuedPrompt,
+  });
   /** Shown when the queue has something to say even if nobody opened it. */
   const queueVisible =
     !queueDismissed &&
@@ -459,81 +541,170 @@ export const App: React.FC<AppProps> = ({
       setSteeringOpen(false);
     }
   }, [canControlRun]);
-  // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
-  // streams them there are none, and the panel stays closed. Module-level so
-  // the renderer is not handed a fresh Map identity on every render.
-  const documents = NO_REMOTE_DOCUMENTS;
 
   // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
   // skipped entirely while a reply streams, instead of reconciling per token.
   const openPalette = useCallback(() => {
+    if (compact) closeSidebar();
     // The palette always opens on top: closing shortcuts here keeps
     // `shortcutsOpen` from going stale-true underneath it, which was letting
     // one Escape dismiss both overlays instead of just the topmost one.
     setShortcutsOpen(false);
     setPaletteOpen(true);
-  }, []);
+  }, [compact, closeSidebar]);
   const selectSessionFromNav = useCallback(
     (id: SessionId) => {
+      modelRecovery.cancel();
+      setFocusDecision(null);
       setCurrentView("sessions");
       void selectSession(id);
     },
     [selectSession],
   );
+  const startNewChat = useCallback(() => {
+    modelRecovery.cancel();
+    if (!newSession()) return;
+    setPaletteOpen(false);
+    setShortcutsOpen(false);
+    setFocusDecision(null);
+    setQueueOpen(false);
+    setQueueDismissed(true);
+    setSteeringOpen(false);
+    selectView("sessions");
+    setComposerFocusRequested(true);
+  }, [newSession, selectView]);
 
   // Referentially stable across renders. Inline arrows here would hand
   // `TranscriptRow` a new `onApprove`/`onReject` on every token and defeat its
   // memo entirely — the whole transcript would reconcile per token again.
   const approve = useCallback(
-    (approvalId: string) => void resolveApproval(approvalId, "approve"),
+    (approvalId: string, scope: ApprovalGrant = "Once") => resolveApproval(approvalId, "approve", scope),
     [resolveApproval],
   );
   const answerQuestion = useCallback(
     (questionId: string, outcome: QuestionOutcomeView) =>
-      void resolveQuestion(questionId, outcome),
+      resolveQuestion(questionId, outcome),
     [resolveQuestion],
   );
+  // An accepted local message explicitly returns to the latest turn. Incoming
+  // output alone still leaves a reader in the history they chose to inspect.
+  const nativeSubmit = useRef(submit);
+  nativeSubmit.current = submit;
+  const attachedSession = useRef(state.activeSessionId);
+  attachedSession.current = state.activeSessionId;
+  const [agent] = useState(() => new NativeAgent({ submit: async (text) => {
+    const session = attachedSession.current;
+    const send = nativeSubmit.current;
+    if (shellAvailable() && !selectedModel.current) await discoveryPromise.current;
+    if (attachedSession.current !== session || nativeSubmit.current !== send) return false;
+    return send(text);
+  }, sessionId: () => attachedSession.current }));
+  useEffect(() => { agent.observeNative(); return () => agent.close(); }, [agent]);
+  useEffect(() => { if (!connected) agent.close(); }, [connected, agent]);
+  const previousAgentSession = useRef(state.activeSessionId);
+  useEffect(() => {
+    if (previousAgentSession.current !== null && previousAgentSession.current !== state.activeSessionId) {
+      agent.close();
+      agent.setMessages([]);
+    }
+    if (state.activeSessionId) agent.threadId = state.activeSessionId;
+    previousAgentSession.current = state.activeSessionId;
+  }, [agent, state.activeSessionId]);
+  const sendWithAgent = useCallback(async (objective: string): Promise<boolean> => {
+    const accepted = await agent.submitObjective(objective);
+    if (accepted) {
+      setFocusDecision(null);
+      setFollowLatestRequest((request) => request + 1);
+    }
+    return accepted;
+  }, [agent]);
+  const modelRecovery = useModelRecovery({
+    snapshot: () => ({ connected, epoch: state.connectionEpoch, sessionId: state.activeSessionId,
+      attached: state.sessionAttachmentConfirmed, attaching: state.attachingSessionId !== null,
+      running: state.isRunning, draftRevision: draftRevision.current, modelRevision: modelRevision.current,
+      model: selectedModel.current, repository: repository?.path ?? null,
+      mode: runDefaultsLabel?.split(" mode")[0] ?? "Build", view: currentView }),
+    submit: sendWithAgent,
+    discover: async () => shellAvailable() ? localConfigClient.discoverModels?.() : undefined,
+    models: () => localConfigClient.listModels(),
+    stage: async (model, current) => {
+      if (!current()) return;
+      await localConfigClient.setRunModel(model);
+      if (!current()) return;
+      selectedModel.current = model;
+      setRunDefaultsLabel((label) => `${label?.split(" mode")[0] ?? "Build"} mode · ${model}`);
+    },
+  });
+  const sendObjective = modelRecovery.submit;
+  const cancel = useCallback(() => { modelRecovery.cancel(); return cancelNative(); }, [cancelNative, modelRecovery.cancel]);
+  const pauseRun = useCallback(() => { modelRecovery.cancel(); return pauseNativeRun(); }, [pauseNativeRun, modelRecovery.cancel]);
+  const desktopContext: DesktopContext = {
+    view: currentView, appearance, repository: repository?.path ?? null,
+    sessionId: state.activeSessionId, runId: state.activeRunId,
+    selectedModel: selectedModel.current, mode: runDefaultsLabel?.split(" mode")[0] ?? "Build", draftLength: composerDraft.length,
+    title: state.sessions.find((session) => session.id === state.activeSessionId)?.title ?? "New chat",
+  };
+  const desktopTools = useDesktopTools(connected, state.sessionAttachmentConfirmed ? state.activeSessionId : null, desktopContext, {
+    context: () => desktopContext,
+    navigate: (view) => {
+      if (!NAV_GROUPS.some((group) => group.views.some(([candidate]) => candidate === view))) throw new Error("Unknown workspace page.");
+      selectView(view as DesktopView);
+    },
+    focusComposer: () => { selectView("sessions"); setComposerFocusRequested(true); },
+    draft: () => liveDraft.current,
+    setDraft: (text, expected) => {
+      if (liveDraft.current !== expected) throw new Error("Your draft changed. Read it again before preparing a replacement.");
+      changeComposerDraft(text);
+    },
+    setAppearance: (value) => {
+      if (value !== "system" && value !== "light" && value !== "dark") throw new Error("Unknown appearance.");
+      setAppearance(value);
+    },
+    searchChats: async (query) => {
+      if (!transport?.searchSessions) throw new Error("Chat search is unavailable.");
+      return transport.searchSessions(query);
+    },
+    listModels: () => localConfigClient.listModels(),
+    listProviders: () => localConfigClient.listProviders(),
+    listSkills: async () => { if (!knowledge) throw new Error("Skills are unavailable."); return knowledge.listSkills(); },
+    listDocuments: async () => { if (!knowledge) throw new Error("Documents are unavailable."); return knowledge.listDocuments(); },
+    listMemory: async () => { if (!knowledge) throw new Error("Memory is unavailable."); return knowledge.listMemories(); },
+    openFile: openSourceFile,
+  });
+  useEffect(() => { agent.setState(desktopContext); }, [agent, currentView, appearance, repository?.path, state.activeSessionId, state.activeRunId, runDefaultsLabel, composerDraft.length]);
   /** A failure card's Retry: the same objective, a new run. */
   const retryObjective = useCallback(
-    (objective: string) => void submit(objective),
-    [submit],
+    (objective: string) => void sendObjective(objective),
+    [sendObjective],
   );
   const reject = useCallback(
-    (approvalId: string) => void resolveApproval(approvalId, "reject"),
+    (approvalId: string) => resolveApproval(approvalId, "reject"),
     [resolveApproval],
   );
 
-  /**
-   * The connection this render belongs to, readable from an async callback.
-   * `state.connectionEpoch` captured in a closure is the value at call time,
-   * which is precisely the value a staleness check must not use.
-   */
-  const liveEpoch = useRef(state.connectionEpoch);
-  liveEpoch.current = state.connectionEpoch;
-  /**
-   * A read of a REPOSITORY-SCOPED surface: its answer is discarded if the
-   * connection changed while it was in flight, because a reconnect is what
-   * rebinds the repository.
-   */
+  const knowledgeScope = useMemo(
+    () => ({ epoch: state.connectionEpoch, session: state.activeSessionId }),
+    [state.connectionEpoch, state.activeSessionId],
+  );
+  const liveScope = useRef(knowledgeScope);
+  liveScope.current = knowledgeScope;
   const scopedRead = useCallback(
     <T,>(
       fetcher: (() => Promise<T[]>) | undefined,
       commands: readonly string[],
       set: React.Dispatch<React.SetStateAction<Loaded<T>>>,
     ) => {
-      const startedUnder = liveEpoch.current;
-      return read(fetcher, commands, set, () => liveEpoch.current === startedUnder);
+      const startedUnder = liveScope.current;
+      return read(fetcher, commands, set, () => liveScope.current === startedUnder);
     },
     [],
   );
 
   const loadSkills = useCallback(
     () =>
-      read(knowledge && (() => knowledge.listSkills()), REQUIRED_COMMANDS.skills, setSkills),
-    [knowledge],
+      scopedRead(knowledge && (() => knowledge.listSkills()), REQUIRED_COMMANDS.skills, setSkills),
+    [knowledge, scopedRead],
   );
-  // These three are scoped to the repository the connection carries, so their
-  // answers are discarded if a reconnect rebound it mid-flight.
   const loadMemories = useCallback(
     () =>
       scopedRead(
@@ -581,7 +752,7 @@ export const App: React.FC<AppProps> = ({
    *   while the read was in flight.
    */
   useEffect(() => {
-    if (skipOnboarding || !shellAvailable()) {
+    if (skipOnboarding || !shellAvailable() || !connected || !modelDiscoveryReady) {
       return;
     }
     let cancelled = false;
@@ -600,7 +771,7 @@ export const App: React.FC<AppProps> = ({
     // Mount-only: this is a boot decision, not a subscription. `skipOnboarding`
     // is read at mount; toggling it later must not re-open the surface.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [skipOnboarding, connected, modelDiscoveryReady]);
 
   /**
    * The repository selection and the council roster, read from the shell.
@@ -650,28 +821,19 @@ export const App: React.FC<AppProps> = ({
     };
   }, [transport]);
 
-  /**
-   * Drop the repository-scoped surfaces when the connection changes.
-   *
-   * A reconnect is what rebinds the repository, so Memory, Learnings and Docs
-   * are now about a DIFFERENT checkout. Leaving them `loaded` meant the
-   * read-once effect below never refetched: reopening Docs showed the previous
-   * repository's records while every mutation addressed the new one — and
-   * `deleteDocumentBlock` addresses a document by id alone, so acting on a
-   * stale card could modify a checkout the operator had already left.
-   *
-   * Skills and Plugins are daemon-wide and survive the change.
-   */
-  const knownEpoch = useRef(state.connectionEpoch);
+  const knownScope = useRef(knowledgeScope);
   useEffect(() => {
-    if (knownEpoch.current === state.connectionEpoch) {
+    if (knownScope.current === knowledgeScope) {
       return;
     }
-    knownEpoch.current = state.connectionEpoch;
+    knownScope.current = knowledgeScope;
+    setSkills(unloaded);
     setMemories(unloaded);
     setLearnings(unloaded);
     setDocs(unloaded);
-  }, [state.connectionEpoch]);
+    setDocsNotice(null);
+    setMemoryNotice(null);
+  }, [knowledgeScope]);
 
   // Each surface reads once, the first time it is opened. An unavailable
   // surface is not retried automatically — its Refresh button is the retry,
@@ -709,6 +871,18 @@ export const App: React.FC<AppProps> = ({
   // still types a slash in the composer.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing || event.defaultPrevented) return;
+      if ((event.metaKey || event.ctrlKey) && blockingModalOpen()) return;
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        startNewChat();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        toggleSidebar();
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         openPalette();
@@ -738,7 +912,7 @@ export const App: React.FC<AppProps> = ({
           setCancelPending(false);
           return;
         }
-        if (buildingCouncil) {
+        if (currentView === "council" && buildingCouncil) {
           setBuildingCouncil(false);
           return;
         }
@@ -767,22 +941,28 @@ export const App: React.FC<AppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen, goBack, cancelPending, buildingCouncil, shortcutsOpen, openPalette]);
+  }, [paletteOpen, goBack, cancelPending, currentView, buildingCouncil, shortcutsOpen, openPalette, toggleSidebar, startNewChat]);
 
-  const handleNavigateInbox = (deepLink: InboxDeepLink) => {
-    if (deepLink.type === "Session") {
-      void selectSession(deepLink.session_id);
+  const handleNavigateInbox = async (deepLink: InboxDeepLink, entry: InboxEntry) => {
+    const epoch = liveScope.current.epoch;
+    const originView = viewIdentity.current;
+    if (deepLink.type === "Session" || deepLink.type === "Run") {
+      if (!await selectSession(deepLink.session_id)) throw new Error("Could not open this session. Retry after reconnecting.");
+      if (liveScope.current.epoch !== epoch || viewIdentity.current !== originView) return;
+      setFocusDecision(null);
       setCurrentView("sessions");
-    } else if (deepLink.type === "Run") {
-      void selectSession(deepLink.session_id);
-      setCurrentView("sessions");
-    } else if (deepLink.type === "Approval") {
-      setCurrentView("sessions");
-    } else if (deepLink.type === "Question") {
+    } else if (deepLink.type === "Approval" || deepLink.type === "Question") {
+      const id = deepLink.type === "Approval" ? deepLink.approval_id : deepLink.question_id;
+      const sessionId = entry.source.session_id;
+      if (sessionId) {
+        if (!await selectSession(sessionId)) throw new Error("Could not open the session that owns this request. Retry after reconnecting.");
+      } else if (!state.transcript.some((item) => deepLink.type === "Approval" ? item.approvalId === id : item.questionId === id)) {
+        throw new Error("This inbox entry does not identify its session. Open the owning session from the session library to review the request.");
+      }
+      if (liveScope.current.epoch !== epoch || viewIdentity.current !== originView) return;
+      setFocusDecision(`${deepLink.type}:${id}`);
       setCurrentView("sessions");
     } else if (deepLink.type === "Workflow") {
-      // The inbox row says "Open Workflow wf-…"; these three used to be
-      // silent no-ops — a labeled button that did nothing at all.
       setCurrentView("workflow");
     } else if (deepLink.type === "Plugin") {
       setCurrentView("plugins");
@@ -796,65 +976,73 @@ export const App: React.FC<AppProps> = ({
     run: () => Promise<string | void>,
     setNotice: (notice: string | null) => void,
     reload: () => Promise<void>,
+    stillCurrent: () => boolean = () => true,
   ) => {
     try {
       const outcome = await run();
+      if (!stillCurrent()) return;
       setNotice(typeof outcome === "string" && outcome.length > 0 ? outcome : null);
     } catch (error) {
       // A refused mutation is an outcome, not an absence: say what happened
       // and leave the list showing what the daemon last actually reported.
+      if (!stillCurrent()) return;
       setNotice(describe(error));
     }
     await reload();
   };
+  const applyScopedMutation = (...args: Parameters<typeof applyMutation>) => {
+    const scope = liveScope.current;
+    return applyMutation(args[0], args[1], args[2], () => liveScope.current === scope);
+  };
 
   const paletteEntries: PaletteEntry[] = [
+    { id: "action:new-session", title: "New chat", description: state.isRunning ? "finish or cancel the current run first" : "start a separate conversation and keep your unsent draft", key: "⌘N / Ctrl-N", group: "Run" },
     {
       id: "view:onboarding",
-      title: "Get Started  First-run setup",
+      title: "Get started",
       description:
-        "re-read what setup still needs: a configured model, a credential that resolves, a repository",
+        "check your detected models and workspace",
       key: "—",
       group: "Setup",
     },
     {
       id: "view:repository",
       title: "Repository",
-      description: "choose the git checkout every repository-scoped command anchors to",
+      description: "choose the project to work on",
       key: "—",
       group: "Setup",
     },
     {
       id: "view:sessions",
-      title: "Sessions",
-      description: "the attached session's transcript and composer",
+      title: "Chat",
+      description: "return to your conversation",
       key: "—",
       group: "Run",
     },
     {
       id: "view:inbox",
       title: "Inbox",
-      description: "notifications and human work from the durable inbox",
+      description: "review updates and requests waiting for you",
       key: "—",
       group: "Run",
     },
     {
       id: "view:analytics",
-      title: "Analytics",
-      description: "measured execution observations and aggregates",
+      title: "Usage",
+      description: "review usage and measured results",
       key: "—",
       group: "Run",
     },
     {
       id: "view:context",
-      title: "/context  Context usage breakdown",
+      title: "Context",
       description: "view detailed token usage breakdown for the active run",
       key: "—",
       group: "Run",
     },
     {
       id: "view:library",
-      title: "/library  Session library",
+      title: "All chats",
       description: "search every session and rename, pin, archive, or export one",
       key: "—",
       group: "Run",
@@ -890,71 +1078,76 @@ export const App: React.FC<AppProps> = ({
     },
     {
       id: "view:workflow",
-      title: "/workflow  Executable workflow graph",
-      description: "open and control persisted workflow runs with a live DAG",
+      title: "Workflows",
+      description: "start a workflow and follow its progress",
       key: "—",
       group: "Workflow",
     },
     {
       id: "view:board",
-      title: "/board  Kanban task board",
+      title: "Task board",
       description: "create, assign, and move repository backlog tasks in Kanban columns",
       key: "—",
       group: "Workflow",
     },
     {
       id: "view:blackboard",
-      title: "/blackboard  Blackboard evidence stream",
-      description: "inspect attributed workflow evidence, or post an open question",
+      title: "Shared results",
+      description: "inspect the workflow blackboard, shared evidence and open questions",
       key: "—",
       group: "Workflow",
     },
     {
       id: "view:docs",
-      title: "/docs  Docs Studio · existing docs",
-      description: `edit, review, and publish documents that already exist${knowledge ? "" : " (not in this build)"}`,
+      title: "Documents",
+      description: `create, edit and publish workspace documents${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:skills",
-      title: "/skills  Skill Studio · read only",
+      title: "Skills",
       description: `inspect registered skills and their permissions${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:memory",
-      title: "/memory  Memory",
+      title: "Memory",
       description: `browse curated memories and their provenance${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:plugins",
-      title: "/plugins  Remote UI plugins",
-      description: `inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins${knowledge ? "" : " (not in this build)"}`,
+      title: "Extensions",
+      description: `manage verified workspace extensions${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:council",
-      title: "/council  Agent council",
+      title: "Councils",
       description: "list, run, and manage persisted multi-model councils",
       key: "—",
       group: "Models",
     },
     {
       id: "view:councilResults",
-      title: "/council result  Council results",
+      title: "Council results",
       description: "open durable council outcomes",
       key: "—",
       group: "Models",
     },
+    { id: "action:sidebar", title: sidebarVisible ? "Hide sidebar" : "Show sidebar", description: "make more room for the current workspace", key: "⌘B / Ctrl-B", group: "Workspace" },
+    ...(["system", "light", "dark"] as const).map((theme) => ({ id: `appearance:${theme}`, title: `Appearance: ${theme}`, description: theme === "system" ? "follow your operating system appearance" : `use the ${theme} appearance`, key: "—", group: "Appearance" })),
   ];
 
   const runPaletteCommand = (id: string) => {
     setPaletteOpen(false);
+    if (id === "action:new-session") { startNewChat(); return; }
+    if (id === "action:sidebar") { toggleSidebar(); return; }
+    if (id === "appearance:system" || id === "appearance:light" || id === "appearance:dark") { setAppearance(id.slice(11) as "system" | "light" | "dark"); return; }
     if (id === "action:steer") {
       setCurrentView("sessions");
       setSteeringOpen(true);
@@ -979,23 +1172,76 @@ export const App: React.FC<AppProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (!composerFocusRequested) return;
+    if (currentView !== "sessions" || paletteOpen || shortcutsOpen || blockingModalOpen()) {
+      setComposerFocusRequested(false);
+      return;
+    }
+    // Focus after the committed view and the palette's passive cleanup have
+    // restored their DOM. Native menu actions must not wait for an animation
+    // frame, which WebKit can defer while the window is being activated.
+    document.querySelector<HTMLTextAreaElement>(".workspace-composer textarea:not(:disabled)")?.focus();
+    setComposerFocusRequested(false);
+  }, [composerFocusRequested, currentView, paletteOpen, shortcutsOpen]);
+
+  useNativeDesktopActions((action) => {
+    if (blockingModalOpen()) return;
+    if (action === "choose-repository" || action === "settings" || action === "focus-composer") {
+      setPaletteOpen(false);
+      setShortcutsOpen(false);
+    }
+    if (action === "command-palette") openPalette();
+    else if (action === "new-session") startNewChat();
+    else if (action === "toggle-sidebar") toggleSidebar();
+    else if (action === "choose-repository") selectView("repository");
+    else if (action === "settings") selectView("models");
+    else if (action === "focus-composer") {
+      selectView("sessions");
+      setComposerFocusRequested(true);
+    }
+  });
+
   return (
-    <div style={{ display: "flex", width: "100vw", height: "100vh", overflow: "hidden", background: "var(--cody-bg)" }}>
+    <div className="workspace-shell" data-sidebar={sidebarVisible ? "visible" : "hidden"}>
       <Navigation
+        hidden={!sidebarVisible}
+        modal={compact && sidebarVisible && !paletteOpen && !shortcutsOpen}
+        onClose={closeSidebar}
+        restoreFocusFallback={sidebarToggleRef}
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
         onSelectSession={selectSessionFromNav}
-        connectionStatus={state.status}
+        connectionStatus={connectionPresentation}
         statusDetail={state.detail}
         connectionInfo={state.info}
         currentView={currentView}
         onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
         onOpenPalette={openPalette}
+        onNewSession={startNewChat}
+        newSessionDisabled={state.isRunning || state.attachingSessionId !== null}
         unavailableViews={knowledge ? undefined : KNOWLEDGE_VIEWS}
       />
+      {sidebarVisible && <button className="workspace-sidebar-scrim" type="button" aria-label="Close sidebar" onClick={toggleSidebar} />}
 
-      <main style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+      <main className="workspace-main" id="workspace-main" inert={compact && sidebarVisible}>
+        <WorkspaceBar
+          view={currentView}
+          sidebarToggleRef={sidebarToggleRef}
+          sessionTitle={state.sessions.find((session) => session.id === state.activeSessionId)?.title}
+          sessionId={connected ? state.activeSessionId : null}
+          repository={repository?.path}
+          connectionStatus={connectionPresentation}
+          sidebarVisible={sidebarVisible}
+          onToggleSidebar={toggleSidebar}
+          appearance={appearance}
+          onAppearanceChange={setAppearance}
+          onOpenPalette={openPalette}
+          onOpenRepository={() => selectView("repository")}
+          onNewSession={startNewChat}
+          newSessionDisabled={state.isRunning || state.attachingSessionId !== null}
+        />
         {/*
           The connection state lives here, across every view, not in a sidebar
           corner: "not connected" changes what everything below can be trusted
@@ -1004,11 +1250,11 @@ export const App: React.FC<AppProps> = ({
           and a reconnect loop that could not succeed.
         */}
         <ConnectionBanner
-          status={state.status}
+          status={connectionPresentation}
           detail={state.detail}
           hasTransport={transport !== null}
           canStart={Boolean(transport?.startDaemon)}
-          onStart={startDaemon}
+          onStart={startWorkspace}
           // The rejection is already on screen: a failed attempt dispatches
           // `connect-failed`, which is what this banner renders. Catching it
           // keeps the promise from surfacing as an unhandled rejection — which
@@ -1064,11 +1310,21 @@ export const App: React.FC<AppProps> = ({
         */}
         {currentView !== "sessions" && <ViewBar view={currentView} onBack={goBack} />}
 
+        <React.Suspense fallback={<div className="workspace-loading" role="status">Opening workspace…</div>}>
         {currentView === "sessions" && (
           <>
+            {modelRecovery.status && <div role="status" style={{ padding: "10px 24px", color: "var(--cody-text-muted)", fontSize: 13 }}>{modelRecovery.status}</div>}
             <Transcript
+              recoveredRuns={modelRecovery.recoveredRuns}
+              key={state.activeSessionId}
+              commandActions={commandActions}
+              focusDecision={focusDecision}
+              followLatestRequest={followLatestRequest}
+              onReadArtifact={connected && transport?.readArtifact ? readArtifact : undefined}
+              onSaveArtifact={connected && transport?.saveArtifact ? saveArtifact : undefined}
+              onOpenFile={connected && transport?.openWorkspace && repository?.path ? openSourceFile : undefined}
               items={state.transcript}
-              connectionStatus={state.status}
+              connectionStatus={connectionPresentation}
               statusDetail={state.detail}
               onApprove={connected ? approve : undefined}
               onReject={connected ? reject : undefined}
@@ -1107,9 +1363,7 @@ export const App: React.FC<AppProps> = ({
                     : state.detail
                 }
                 error={state.promptQueueError}
-                onPromote={(promptId) => void promoteQueuedPrompt(promptId)}
-                onEdit={(promptId, text) => updateQueuedPrompt(promptId, text)}
-                onDelete={(promptId) => void deleteQueuedPrompt(promptId)}
+                actions={promptQueueActions}
                 onClose={() => {
                   setQueueOpen(false);
                   setQueueDismissed(true);
@@ -1118,12 +1372,15 @@ export const App: React.FC<AppProps> = ({
             )}
             <Composer
               statusLabel={runDefaultsLabel}
+              onOpenModels={() => selectView("models")}
+              onOpenMode={() => selectView("mode")}
               draft={composerDraft}
-              onDraftChange={setComposerDraft}
-              onSend={submit}
+              onDraftChange={changeComposerDraft}
+              onDraftAccepted={acceptComposerDraft}
+              onSend={sendObjective}
               activity={state.activity}
               usage={state.usage}
-              onQueue={(text) => void queuePrompt(text)}
+              onQueue={queuePrompt}
               canQueue={canQueuePrompts}
               queuedCount={state.pendingPrompts.length}
               queueOpen={queueVisible}
@@ -1149,7 +1406,7 @@ export const App: React.FC<AppProps> = ({
           </>
         )}
 
-        {cancelPending && state.activeRunId !== null && (
+        {atStake && state.activeRunId !== null && (
           <ConfirmCancel
             runId={state.activeRunId}
             objective={atStake.objective}
@@ -1165,11 +1422,11 @@ export const App: React.FC<AppProps> = ({
         {currentView === "inbox" && (
           <InboxView
             entries={state.inbox}
-            onAcknowledge={(id) => void acknowledgeInbox(id)}
-            onDismiss={(id) => void dismissInbox(id)}
+            onAcknowledge={acknowledgeInbox}
+            onDismiss={dismissInbox}
+            connected={connected}
+            commandActions={commandActions}
             onNavigate={handleNavigateInbox}
-            onApprove={connected ? approve : undefined}
-            onReject={connected ? reject : undefined}
             onRefresh={() => void loadInbox()}
             unavailable={state.inboxStatus === "unavailable" ? state.inboxDetail : null}
           />
@@ -1177,15 +1434,17 @@ export const App: React.FC<AppProps> = ({
 
         {currentView === "analytics" && (
           <AnalyticsDashboard
-            onQueryAnalytics={queryAnalytics}
-            onExportAnalytics={exportAnalytics}
+            connectionEpoch={state.connectionEpoch}
+            onQueryAnalytics={connected ? queryAnalytics : undefined}
+            onExportAnalytics={connected ? exportAnalytics : undefined}
+            onSaveArtifact={connected && transport?.saveArtifact ? saveArtifact : undefined}
           />
         )}
 
         {currentView === "library" && (
           <SessionLibrary
             transport={transport}
-            unavailable={transport ? null : state.detail}
+            unavailable={connected ? null : state.detail}
             onOpenSession={(sessionId) => {
               setCurrentView("sessions");
               void selectSession(sessionId);
@@ -1207,6 +1466,7 @@ export const App: React.FC<AppProps> = ({
 
         {currentView === "board" && (
           <KanbanView
+            onOpenRepository={() => selectView("repository")}
             transport={transport}
             unavailable={transport ? null : state.detail}
             connectionEpoch={state.connectionEpoch}
@@ -1230,7 +1490,8 @@ export const App: React.FC<AppProps> = ({
             limit on every read and renders the daemon's pre-limit totals, so a
             cut page never reads as the whole graph. */}
         {currentView === "edges" && (
-          <EdgesView transport={transport} unavailable={transport ? null : state.detail} />
+          <EdgesView transport={transport} unavailable={transport ? null : state.detail}
+            onOpenFile={connected && transport?.openWorkspace && repository?.path ? (file, line) => openSourceFile(file, line, null) : undefined} />
         )}
 
         {/* Backtrack reads the attached session's own ledger — the same durable
@@ -1268,12 +1529,19 @@ export const App: React.FC<AppProps> = ({
             unavailable state, so they take no props — see localConfig.ts. */}
         {currentView === "models" && (
           <ModelPicker
+            onModelPinned={(model) => {
+              modelRecovery.cancel();
+              modelRevision.current++;
+              selectedModel.current = model;
+            }}
             initialProvider={pendingProvider}
             onInitialProviderUsed={() => setPendingProvider(null)}
           />
         )}
         {currentView === "providers" && (
           <ProviderPicker
+            repositoryPath={repository?.path}
+            onConnected={() => selectView("models")}
             // The page had no `onSelect`, so every click optional-chained into
             // nothing and the list looked inert. A chosen provider now opens the
             // add-model flow already on it, which is where its credential and
@@ -1286,6 +1554,11 @@ export const App: React.FC<AppProps> = ({
         )}
         {currentView === "keys" && <ApiKeys />}
         {currentView === "mode" && <ModePicker />}
+        {currentView === "agentTools" && <AgentToolsView sessionId={state.sessionAttachmentConfirmed ? state.activeSessionId : null} connected={connected} error={desktopTools.error} onCompose={(text) => {
+          if (!liveDraft.current) changeComposerDraft(text);
+          selectView("sessions");
+          setComposerFocusRequested(true);
+        }} />}
 
         {currentView === "skills" && (
           <SkillsView skills={skills} onRefresh={knowledge && (() => void loadSkills())} />
@@ -1307,7 +1580,7 @@ export const App: React.FC<AppProps> = ({
             onCorrectMemory={
               knowledge &&
               ((memoryId, statement) =>
-                void applyMutation(
+                void applyScopedMutation(
                   () => knowledge.correctMemory(memoryId, statement),
                   setMemoryNotice,
                   loadMemories,
@@ -1316,7 +1589,7 @@ export const App: React.FC<AppProps> = ({
             onForgetMemory={
               knowledge &&
               ((memoryId) =>
-                void applyMutation(
+                void applyScopedMutation(
                   () => knowledge.forgetMemory(memoryId),
                   setMemoryNotice,
                   loadMemories,
@@ -1325,7 +1598,7 @@ export const App: React.FC<AppProps> = ({
             onMutateLearning={
               knowledge &&
               ((id: string, revision: number, mutation: LearningMutation) =>
-                void applyMutation(
+                void applyScopedMutation(
                   () => knowledge.mutateLearning(id, revision, mutation),
                   setMemoryNotice,
                   loadLearnings,
@@ -1348,7 +1621,7 @@ export const App: React.FC<AppProps> = ({
             onCreateDocument={
               knowledge &&
               ((title) =>
-                void applyMutation(
+                void applyScopedMutation(
                   async () => {
                     await knowledge.createDocument(title);
                     return "document created";
@@ -1360,7 +1633,7 @@ export const App: React.FC<AppProps> = ({
             onReplaceBlock={
               knowledge &&
               ((documentId, blockId, original, replacement) =>
-                void applyMutation(
+                void applyScopedMutation(
                   async () => {
                     await knowledge.replaceDocumentBlock(
                       documentId,
@@ -1377,7 +1650,7 @@ export const App: React.FC<AppProps> = ({
             onDeleteBlock={
               knowledge &&
               ((documentId, blockId) =>
-                void applyMutation(
+                void applyScopedMutation(
                   async () => {
                     await knowledge.deleteDocumentBlock(documentId, blockId);
                     return "block deleted";
@@ -1389,7 +1662,7 @@ export const App: React.FC<AppProps> = ({
             onPublish={
               knowledge &&
               ((documentId: string, target: PublishTarget) =>
-                void applyMutation(
+                void applyScopedMutation(
                   async () => {
                     const plan = await knowledge.publishDocument(documentId, target);
                     const files = plan.changed_files.length;
@@ -1529,7 +1802,10 @@ export const App: React.FC<AppProps> = ({
         {currentView === "council" &&
           (buildingCouncil ? (
             <CouncilBuilder
+              draft={councilDraft}
+              onDraftChange={setCouncilDraft}
               configuredModels={configuredModelIds}
+              onOpenModels={() => selectView("models")}
               onCreate={async (draft) => {
                 if (!transport?.createCouncil) {
                   throw new Error(
@@ -1543,6 +1819,7 @@ export const App: React.FC<AppProps> = ({
                 setCouncilNames((current) =>
                   current === undefined ? [council.name] : [...current, council.name],
                 );
+                setCouncilDraft(newCouncilDraft());
                 setBuildingCouncil(false);
               }}
             />
@@ -1567,19 +1844,24 @@ export const App: React.FC<AppProps> = ({
                   );
                 })
               }
-              onCreate={() => setBuildingCouncil(true)}
+              onCreate={() => { setCouncilDraft(newCouncilDraft()); setBuildingCouncil(true); }}
+              onOpenResults={() => {
+                councilRun.setCouncil("");
+                selectView("councilResults");
+              }}
               onRun={(name) => {
-                setCouncilToRun(name);
-                setCurrentView("councilResults");
+                councilRun.setCouncil(name);
+                selectView("councilResults");
               }}
             />
           ))}
 
         {currentView === "councilResults" && (
           <CouncilResults
-            initialCouncil={councilToRun}
+            runController={councilRun}
             councilNames={councilNames}
             repository={repository === undefined ? undefined : (repository?.path ?? null)}
+            onOpenRepository={() => selectView("repository")}
             onLoad={async () => {
               if (!transport?.listCouncilResults) {
                 throw new Error(
@@ -1602,17 +1884,22 @@ export const App: React.FC<AppProps> = ({
             }
           />
         )}
+        </React.Suspense>
       </main>
 
-      {shortcutsOpen && <ShortcutsCard onClose={() => setShortcutsOpen(false)} />}
-      <CommandPalette
-        open={paletteOpen}
+      {shortcutsOpen && <ShortcutsCard onClose={() => setShortcutsOpen(false)} restoreFocusFallback={sidebarToggleRef} />}
+      {paletteOpen && <CommandPalette
+        open={true}
+        restoreFocusFallback={sidebarToggleRef}
         entries={paletteEntries}
         onRun={runPaletteCommand}
         onClose={() => setPaletteOpen(false)}
-      />
+      />}
 
-      <RemoteUiRenderer documents={documents} />
+      {connected && state.sessionAttachmentConfirmed && !state.attachingSessionId && state.activeSessionId && transport?.sendRemoteUi &&
+        <React.Suspense fallback={null}>
+          <RemoteUiHost key={`${state.connectionEpoch}:${state.activeSessionId}`} transport={transport} sessionId={state.activeSessionId} />
+        </React.Suspense>}
     </div>
   );
 };

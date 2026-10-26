@@ -218,3 +218,87 @@ async fn an_empty_batch_makes_no_request() {
         HttpEmbedder::from_config(&config("http://127.0.0.1:1/v1", "m")).expect("builds");
     assert!(embedder.embed_batch(&[]).await.expect("no-op").is_empty());
 }
+
+#[tokio::test]
+async fn gemma_uses_separate_query_and_document_tasks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(responder)
+        .expect(2)
+        .mount(&server)
+        .await;
+    let embedder =
+        HttpEmbedder::from_config(&config(&format!("{}/v1", server.uri()), "embeddinggemma-2"))
+            .unwrap();
+    embedder
+        .embed_batch(&["restore a checkpoint".to_string()])
+        .await
+        .unwrap();
+    embedder.embed_query("undo my work").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let document: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let query: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        document["input"][0],
+        "title: none | text: restore a checkpoint"
+    );
+    assert_eq!(
+        query["input"][0],
+        "task: search result | query: undo my work"
+    );
+    assert!(embedder.space_id().contains("retrieval-v1"));
+}
+
+#[tokio::test]
+#[ignore = "runs the packaged EmbeddingGemma 2 weights"]
+async fn bundled_gemma_retrieves_a_paraphrase_offline() {
+    use codypendent_runtime::embedding::BundledEmbedder;
+    use std::time::{Duration, Instant};
+    let model = BundledEmbedder::discover().expect("prepared bundle");
+    let started = Instant::now();
+    let query = loop {
+        if let Ok(vector) = model
+            .embed_query("undo my latest changes and go back to an earlier saved state")
+            .await
+        {
+            break vector;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(50),
+            "bundled model never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let documents = model
+        .embed_batch(&[
+            "Restore a previous checkpoint of the repository and its files".to_string(),
+            "Search the internet for current weather forecasts".to_string(),
+            "Prepare an invoice and charge the customer's credit card".to_string(),
+        ])
+        .await
+        .unwrap();
+    let cosine = |a: &[f32], b: &[f32]| {
+        a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>()
+            / (a.iter().map(|v| v * v).sum::<f32>().sqrt()
+                * b.iter().map(|v| v * v).sum::<f32>().sqrt())
+    };
+    let scores: Vec<_> = documents.iter().map(|v| cosine(&query, v)).collect();
+    assert_eq!(query.len(), 768);
+    assert!(scores[0] > scores[1] && scores[0] > scores[2], "{scores:?}");
+    let warm = Instant::now();
+    assert_eq!(
+        query,
+        model
+            .embed_query("undo my latest changes and go back to an earlier saved state")
+            .await
+            .unwrap()
+    );
+    println!(
+        "bundled_model={} space={} ready_ms={} scores={scores:?} cached_query_us={}",
+        model.model(),
+        model.space_id(),
+        started.elapsed().as_millis(),
+        warm.elapsed().as_micros()
+    );
+}

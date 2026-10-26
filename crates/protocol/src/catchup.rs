@@ -66,6 +66,8 @@ pub struct PendingApprovalProjection {
     pub run_id: RunId,
     pub action: ProposedAction,
     pub risk: Risk,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
 }
 
 #[cfg(test)]

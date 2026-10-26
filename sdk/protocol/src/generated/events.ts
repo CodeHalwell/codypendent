@@ -112,6 +112,12 @@ export type EventBody =
       type: "ToolStarted";
     }
   | {
+      label?: string | null;
+      run_id: string;
+      tool: string;
+      type: "ToolUpdated";
+    }
+  | {
       /**
        * Bulk output, if any, as an artifact reference.
        */
@@ -198,6 +204,7 @@ export type EventBody =
   | {
       completion_tokens?: number | null;
       cost_micros?: number | null;
+      coverage?: UsageCoverage | null;
       prompt_tokens?: number | null;
       run_id: string;
       type: "RunUsage";
@@ -841,6 +848,16 @@ interface CodypendentError {
    * A suggested next step the client can surface as an affordance.
    */
   user_action?: UserAction | null;
+}
+/**
+ * Completeness of the measured subtotal. Requests count calls to the model driver, including failed/cancelled calls; each measured dimension counts the calls that reported it. Retries without their own usage leave the subtotal partial even when the final attempt reports a measurement. Absent metadata on older events means coverage is unknown.
+ */
+export interface UsageCoverage {
+  completion_requests: number;
+  cost_requests: number;
+  prompt_requests: number;
+  requests: number;
+  unmeasured_retries?: number;
 }
 /**
  * One question as asked. `custom` is carried on the wire but deliberately NOT advertised in the tool schema — the model can never disable free-text answers (opencode's Prompt/Info split).

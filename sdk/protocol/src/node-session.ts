@@ -63,6 +63,7 @@ export class SharedSession {
 				diff_view: false, mouse: true, unicode: true, true_color: true, session_library: true } });
 		this.client = client;
 		client.on('status', status => { if (this.client === client) { this.state.status = status === 'attached' && this.restoring ? 'restoring' : status; this.publish(); } });
+		client.on('serverHello', () => { if (this.client === client && !session) { this.state.status = 'ready'; this.publish(); } });
 		client.on('event', event => { if (this.client === client) { this.options.onEvent?.(event); } });
 		client.on('error', error => { if (this.client === client) { this.options.onError(error.message); } });
 		client.on('commandRejected', error => { if (this.client === client) { this.options.onError(error.message); } });
@@ -100,7 +101,7 @@ export class SharedSession {
 				this.rejectConnection = undefined;
 				if (error) { reject(error); } else { resolve(); }
 			};
-			const hello = (): void => { if (!session) { this.state.status = 'ready'; this.publish(); finish(); } };
+			const hello = (): void => { if (!session) { finish(); } };
 			const caughtUp = (): void => {
 				if (this.restoration) { void this.restoration.then(() => finish(), error => finish(error)); }
 				else { finish(); }

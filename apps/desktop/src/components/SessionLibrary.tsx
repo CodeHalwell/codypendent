@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * The Session Library: ranked, cursor-paged search over `SearchSessions`, plus
  * the lifecycle mutations `MutateSessionLifecycle` carries.
@@ -22,7 +23,10 @@
  * cannot enumerate other people's sessions. Its refusal is rendered verbatim
  * and nothing here adds a word about which case it was.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArtifactSaveButton } from "./ArtifactActions.js";
+import type { ArtifactRef } from "@codypendent/protocol";
+import { useFocusTrap } from "../useFocusTrap.js";
 import { relativeTime } from "../time.js";
 import type { PageCursor, SessionLifecycleAction, SessionSearchResult } from "@codypendent/protocol";
 import type { DesktopTransport, SessionLifecycleOutcome } from "../transport.js";
@@ -41,7 +45,7 @@ type SearchState =
   | { status: "searching" }
   | { status: "loaded" }
   /** An outcome, not an absence — this is why "searching…" stops. */
-  | { status: "failed"; detail: string };
+  | { status: "failed"; detail: string; continuation: boolean };
 
 type Pending =
   | { kind: "rename"; sessionId: string; title: string; draft: string }
@@ -53,7 +57,7 @@ const panel: React.CSSProperties = {
   flex: 1,
   display: "flex",
   flexDirection: "column",
-  height: "100vh",
+  height: "100%",
   background: "var(--cody-canvas)",
   color: "var(--cody-text)",
   overflowY: "auto",
@@ -101,25 +105,46 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
   onOpenSession,
 }) => {
   const [query, setQuery] = useState("");
+  const searchInput = useRef<HTMLInputElement | null>(null);
   const [results, setResults] = useState<SessionSearchResult[]>([]);
   const [nextCursor, setNextCursor] = useState<PageCursor | null>(null);
   const [search, setSearch] = useState<SearchState>({ status: "idle" });
+  const [exported, setExported] = useState<ArtifactRef | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [pendingError, setPendingError] = useState<string | null>(null);
+  const [busySessions, setBusySessions] = useState<ReadonlySet<string>>(new Set());
+  const operations = useRef(new Map<string, symbol>());
+  const mutationGeneration = useRef(0);
+  const dialogSession = useRef<string | null>(null);
+  dialogSession.current = pending?.sessionId ?? null;
+
+  useLayoutEffect(() => {
+    ++mutationGeneration.current;
+    operations.current.clear();
+    setBusySessions(new Set());
+    setPending(null);
+    setPendingError(null);
+    setNotice(null);
+    setExported(null);
+    return () => { ++mutationGeneration.current; operations.current.clear(); };
+  }, [transport, unavailable]);
 
   /** What is in the box right now. A page answering anything else is dropped. */
+  const searchGeneration = useRef(0);
   const liveQuery = useRef(query);
   liveQuery.current = query;
 
   const runSearch = useCallback(
     async (text: string, cursor: PageCursor | null) => {
-      if (!transport?.searchSessions) {
+      if (!transport?.searchSessions || unavailable) {
         return;
       }
+      const generation = ++searchGeneration.current;
       setSearch({ status: "searching" });
       try {
         const answer = await transport.searchSessions(text, cursor);
-        if (answer.query !== liveQuery.current) {
+        if (generation !== searchGeneration.current || answer.query !== liveQuery.current) {
           // The operator has typed past this query. Showing its page under the
           // current heading would be a lie about what was searched for, so it
           // is discarded — and the newer search's own answer sets the state.
@@ -131,46 +156,89 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
         setNextCursor(answer.page.next_cursor ?? null);
         setSearch({ status: "loaded" });
       } catch (error) {
-        if (liveQuery.current !== text) {
+        if (generation !== searchGeneration.current || liveQuery.current !== text) {
           return;
         }
-        setSearch({ status: "failed", detail: describe(error) });
+        setSearch({ status: "failed", detail: describe(error), continuation: cursor !== null });
       }
     },
-    [transport],
+    [transport, unavailable],
   );
 
   // Debounced first page. Every keystroke restarts from no cursor: a cursor is
   // only meaningful for the query that issued it.
-  useEffect(() => {
-    if (!transport?.searchSessions) {
+  useLayoutEffect(() => {
+    ++searchGeneration.current;
+    setResults([]);
+    setNextCursor(null);
+    setSearch({ status: "idle" });
+    if (!transport?.searchSessions || unavailable) {
       return;
     }
+    setSearch({ status: "searching" });
     const timer = setTimeout(() => {
       setResults([]);
       setNextCursor(null);
       void runSearch(query, null);
     }, SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [query, transport, runSearch]);
+    return () => {
+      ++searchGeneration.current;
+      clearTimeout(timer);
+    };
+  }, [query, transport, unavailable, runSearch]);
 
   const mutate = useCallback(
-    async (sessionId: string, action: SessionLifecycleAction) => {
-      if (!transport?.mutateSession) {
-        return;
-      }
+    async (sessionId: string, action: SessionLifecycleAction): Promise<boolean> => {
+      if (!transport?.mutateSession || unavailable || operations.current.has(sessionId)) return false;
+      const operation = Symbol(sessionId);
+      const generation = mutationGeneration.current;
+      operations.current.set(sessionId, operation);
+      setBusySessions(new Set(operations.current.keys()));
+      setNotice(null);
+      if (action.type === "Export") setExported(null);
       try {
         const outcome = await transport.mutateSession(sessionId, action);
+        if (generation !== mutationGeneration.current) return false;
         setNotice(describeOutcome(outcome));
-        applyOutcome(outcome, setResults);
+        if (outcome.outcome === "exported") {
+          setExported(outcome.artifact);
+        } else {
+          applyOutcome(outcome, setResults);
+          // A lifecycle change can alter search membership, ranking, and cursor
+          // validity. Requery from the first page and retire older responses.
+          setNextCursor(null);
+          void runSearch(liveQuery.current, null);
+        }
+        return true;
       } catch (error) {
-        // The daemon's refusal verbatim. In particular a not-found here says
-        // nothing about whether the session exists and belongs to someone else.
-        setNotice(describe(error));
+        if (generation !== mutationGeneration.current) return false;
+        const detail = describe(error);
+        setNotice(detail);
+        if (dialogSession.current === sessionId) setPendingError(detail);
+        return false;
+      } finally {
+        if (operations.current.get(sessionId) === operation) {
+          operations.current.delete(sessionId);
+          setBusySessions(new Set(operations.current.keys()));
+        }
       }
     },
-    [transport],
+    [transport, unavailable, runSearch],
   );
+
+  const confirmPending = async () => {
+    const request = pending;
+    if (!request || busySessions.has(request.sessionId)) return;
+    setPendingError(null);
+    if (request.kind === "rename" && !validTitle(request.draft)) {
+      setPendingError("A session title must be non-empty and on one line.");
+      return;
+    }
+    const accepted = await mutate(request.sessionId, request.kind === "rename"
+      ? { type: "Rename", title: request.draft.trim() }
+      : { type: "Delete", mode: { type: "RetentionPolicy" } });
+    if (accepted) setPending((current) => current === request ? null : current);
+  };
 
   const total = results.length;
   const truncated = nextCursor !== null;
@@ -191,8 +259,9 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
         <div data-testid="library-failed" role="status" style={notePanel("var(--cody-danger-soft)")}>
           Search failed — {search.detail}
           <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
-            This is not the same as no matches: the daemon did not answer this search.
+            Your chats will appear when the workspace answers. Try again to reload them.
           </div>
+          <button type="button" style={{ ...button, marginTop: 12 }} onClick={() => void runSearch(query, null)}>Retry search</button>
         </div>
       );
     }
@@ -206,7 +275,7 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
     if (search.status === "idle") {
       return (
         <div data-testid="library-idle" style={notePanel("var(--cody-text-muted)")}>
-          Type to search the Session Library.
+          Search by conversation, file, change or phrase.
         </div>
       );
     }
@@ -221,8 +290,8 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {search.status === "failed" && (
           <div data-testid="library-page-failed" role="status" style={{ padding: 12, border: "1px solid var(--cody-danger-soft)", borderRadius: 8, color: "var(--cody-danger-soft)", fontSize: 13 }}>
-            The next page failed — {search.detail}. The rows below are real, but they are not the
-            whole result set.
+            {search.continuation ? "The next page failed" : "Refresh failed"} — {search.detail}. Previously loaded rows are retained.
+            {!search.continuation && <button type="button" style={{ ...button, marginLeft: 8 }} onClick={() => void runSearch(query, null)}>Retry search</button>}
           </div>
         )}
         {results.map((result) => (
@@ -231,26 +300,30 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
             result={result}
             onOpen={onOpenSession}
             onRefuse={setNotice}
-            onMutate={mutate}
-            onAskRename={(sessionId, title) =>
-              setPending({ kind: "rename", sessionId, title, draft: title })
-            }
-            onAskDelete={(sessionId, title) => setPending({ kind: "delete", sessionId, title })}
+            busy={busySessions.has(result.session.session_id)}
+            canMutate={Boolean(transport?.mutateSession)}
+            onMutate={(id, action) => { void mutate(id, action); }}
+            onAskRename={(sessionId, title) => {
+              setPendingError(null);
+              setPending({ kind: "rename", sessionId, title, draft: title });
+            }}
+            onAskDelete={(sessionId, title) => { setPendingError(null); setPending({ kind: "delete", sessionId, title }); }}
           />
         ))}
       </div>
     );
-  }, [unavailable, search, total, query, results, onOpenSession, mutate]);
+  }, [unavailable, search, total, query, results, onOpenSession, mutate, busySessions, transport, runSearch]);
 
   return (
-    <div role="region" aria-label="Session Library" style={panel}>
-      <div style={{ padding: "20px 24px 12px", borderBottom: "1px solid var(--cody-inset)" }}>
-        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Session Library</h1>
+    <PageShell role="region" aria-label="Session Library" style={panel}>
+      <div className="cody-page-header" style={{ padding: "20px 24px 12px", borderBottom: "1px solid var(--cody-inset)" }}>
+        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>All chats</h1>
         <p style={{ margin: "4px 0 12px", fontSize: 13, color: "var(--cody-text-muted)" }}>
-          Ranked search over titles, transcripts, tool observations, patches and changed paths
+          Pick up a previous conversation or find work across your chats.
         </p>
         <input
           aria-label="Search sessions"
+          ref={searchInput}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Search sessions…"
@@ -267,12 +340,14 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
         {search.status !== "idle" && total > 0 && (
           <div data-testid="library-count" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
             {truncated
-              ? `${total} results loaded — the daemon has more beyond this page.`
-              : `${total} results.`}
+              ? `${total} chats loaded · more available`
+              : `${total} ${total === 1 ? "result" : "results"}.`}
           </div>
         )}
       </div>
 
+      {exported && <ArtifactSaveButton key={exported.id} artifact={exported}
+        onSave={transport?.saveArtifact ? (artifact) => transport.saveArtifact!(artifact) : undefined} />}
       {notice && (
         <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "var(--cody-warning)" }}>
           {notice}
@@ -296,45 +371,39 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
       {pending?.kind === "rename" && (
         <Prompt
           title="Rename session"
+          restoreFocusFallback={searchInput}
           value={pending.draft}
           onChange={(draft) => setPending({ ...pending, draft })}
           confirmLabel="Rename"
           onCancel={() => setPending(null)}
-          onConfirm={() => {
-            if (!validTitle(pending.draft)) {
-              setNotice("a session title must be non-empty and on one line");
-              return;
-            }
-            const title = pending.draft.trim();
-            setPending(null);
-            void mutate(pending.sessionId, { type: "Rename", title });
-          }}
+          busy={busySessions.has(pending.sessionId)}
+          error={pendingError}
+          onConfirm={() => void confirmPending()}
         />
       )}
 
       {pending?.kind === "delete" && (
         <Prompt
           title="Delete this session?"
+          restoreFocusFallback={searchInput}
           detail={`${pending.title}\n\nThe daemon applies its retention policy; it may tombstone rather than purge. This cannot be undone from the client.`}
           confirmLabel="Delete"
           destructive
           onCancel={() => setPending(null)}
-          onConfirm={() => {
-            const sessionId = pending.sessionId;
-            setPending(null);
-            // The mode the daemon's own policy decides. The client does not
-            // request a weaker retention than the daemon would apply.
-            void mutate(sessionId, { type: "Delete", mode: { type: "RetentionPolicy" } });
-          }}
+          busy={busySessions.has(pending.sessionId)}
+          error={pendingError}
+          onConfirm={() => void confirmPending()}
         />
       )}
-    </div>
+    </PageShell>
   );
 };
 
 interface SessionRowProps {
   result: SessionSearchResult;
   onOpen?: (sessionId: string) => void;
+  busy: boolean;
+  canMutate: boolean;
   onRefuse: (message: string) => void;
   onMutate: (sessionId: string, action: SessionLifecycleAction) => void | Promise<void>;
   onAskRename: (sessionId: string, title: string) => void;
@@ -343,6 +412,8 @@ interface SessionRowProps {
 
 const SessionRow: React.FC<SessionRowProps> = ({
   result,
+  busy,
+  canMutate,
   onOpen,
   onRefuse,
   onMutate,
@@ -357,6 +428,7 @@ const SessionRow: React.FC<SessionRowProps> = ({
   return (
     <div
       data-testid={`library-row-${id}`}
+      aria-busy={busy}
       style={{
         padding: 14,
         background: "var(--cody-panel-raised)",
@@ -405,6 +477,8 @@ const SessionRow: React.FC<SessionRowProps> = ({
         <button
           style={{ ...button, background: canResume ? "var(--cody-success-strong)" : "var(--cody-inset)", color: canResume ? "var(--cody-on-accent)" : "var(--cody-text-muted)" }}
           aria-label={`Open ${session.title}`}
+          disabled={busy || !canResume || !onOpen}
+          title={!canResume ? "Closed sessions cannot be resumed" : undefined}
           onClick={() => {
             if (!canResume) {
               onRefuse("cannot resume a closed session");
@@ -415,23 +489,26 @@ const SessionRow: React.FC<SessionRowProps> = ({
         >
           Open
         </button>
-        <button style={button} onClick={() => onAskRename(id, session.title)}>
+        <button style={button} disabled={busy || !canMutate} onClick={() => onAskRename(id, session.title)}>
           Rename
         </button>
         <button
           style={button}
+          disabled={busy || !canMutate}
           onClick={() => void onMutate(id, session.pinned ? { type: "Unpin" } : { type: "Pin" })}
         >
           {session.pinned ? "Unpin" : "Pin"}
         </button>
         <button
           style={button}
+          disabled={busy || !canMutate}
           onClick={() => void onMutate(id, archived ? { type: "Restore" } : { type: "Archive" })}
         >
           {archived ? "Restore" : "Archive"}
         </button>
         <button
           style={button}
+          disabled={busy || !canMutate}
           onClick={() =>
             void onMutate(id, {
               type: "Export",
@@ -442,11 +519,13 @@ const SessionRow: React.FC<SessionRowProps> = ({
           Export
         </button>
         <button
+          disabled={busy || !canMutate}
           style={{ ...button, color: "var(--cody-danger-soft)", borderColor: "var(--cody-danger-soft)" }}
           onClick={() => onAskDelete(id, session.title)}
         >
           Delete
         </button>
+        {busy && <span role="status" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>Updating session…</span>}
       </div>
     </div>
   );
@@ -472,6 +551,9 @@ interface PromptProps {
   value?: string;
   confirmLabel: string;
   destructive?: boolean;
+  busy?: boolean;
+  error?: string | null;
+  restoreFocusFallback?: React.RefObject<HTMLElement | null>;
   onChange?: (value: string) => void;
   onConfirm: () => void;
   onCancel: () => void;
@@ -483,30 +565,45 @@ const Prompt: React.FC<PromptProps> = ({
   value,
   confirmLabel,
   destructive,
+  busy = false,
+  error,
+  restoreFocusFallback,
   onChange,
   onConfirm,
   onCancel,
 }) => {
-  // A no-input confirm (delete) has no autoFocus field, so the dialog itself
-  // must take focus for its key handler to hear anything — otherwise Escape
-  // fell through to the app handler, which navigated the view away under
-  // the still-open dialog.
   const dialogRef = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => {
-    if (!onChange) {
-      dialogRef.current?.focus();
-    }
-  }, [onChange]);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const cancelRef = React.useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(dialogRef, {
+    active: true,
+    initialFocus: onChange ? inputRef : cancelRef,
+    restoreFocusFallback,
+    onEscape: () => { if (!busy) onCancel(); },
+  });
+  const wasBusy = React.useRef(busy);
+  React.useLayoutEffect(() => {
+    if (wasBusy.current === busy) return;
+    wasBusy.current = busy;
+    // Browsers blur a focused control when it becomes disabled. Keep keys in
+    // the pending dialog, then return to the draft (or safe Cancel) on refusal.
+    if (busy) dialogRef.current?.focus();
+    else (inputRef.current ?? cancelRef.current)?.focus();
+  }, [busy]);
   return (
   <div
     ref={dialogRef}
     tabIndex={-1}
     role="dialog"
     aria-label={title}
+    aria-modal="true"
+    aria-busy={busy}
     // The dialog owns its own keys: Enter confirms, Escape dismisses it —
     // and stops there, so the app-level Escape handler (which cannot see
     // this overlay) does not ALSO navigate the view away underneath it.
     onKeyDown={(event) => {
+      if (event.nativeEvent.isComposing || event.keyCode === 229) { event.stopPropagation(); return; }
+      if (busy) { event.stopPropagation(); return; }
       if (event.key === "Escape") {
         event.stopPropagation();
         onCancel();
@@ -528,7 +625,8 @@ const Prompt: React.FC<PromptProps> = ({
     style={{
       position: "fixed",
       inset: 0,
-      background: "rgba(1,4,9,0.72)",
+      background: "var(--cody-scrim)",
+      zIndex: 100,
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -537,6 +635,9 @@ const Prompt: React.FC<PromptProps> = ({
     <div
       style={{
         width: 460,
+        maxWidth: "calc(100vw - 64px)",
+        maxHeight: "calc(100vh - 64px)",
+        overflowY: "auto",
         padding: 20,
         background: "var(--cody-panel-raised)",
         border: "1px solid var(--cody-border-strong)",
@@ -552,11 +653,13 @@ const Prompt: React.FC<PromptProps> = ({
       {onChange && (
         <input
           aria-label={title}
-          autoFocus
+          ref={inputRef}
+          disabled={busy}
           value={value ?? ""}
           onChange={(event) => onChange(event.target.value)}
           style={{
             width: "100%",
+            boxSizing: "border-box",
             padding: "8px 10px",
             marginBottom: 14,
             background: "var(--cody-canvas)",
@@ -566,8 +669,10 @@ const Prompt: React.FC<PromptProps> = ({
           }}
         />
       )}
+      {error && <p role="alert" style={{ color: "var(--cody-danger-text)" }}>{error}</p>}
+      {busy && <p role="status">Waiting for the daemon…</p>}
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-        <button style={button} onClick={onCancel}>
+        <button ref={cancelRef} type="button" style={button} disabled={busy} onClick={onCancel}>
           Cancel
         </button>
         <button
@@ -577,6 +682,8 @@ const Prompt: React.FC<PromptProps> = ({
             borderColor: destructive ? "var(--cody-danger-soft)" : "var(--cody-accent)",
             color: "var(--cody-on-accent)",
           }}
+          type="button"
+          disabled={busy}
           onClick={onConfirm}
         >
           {confirmLabel}

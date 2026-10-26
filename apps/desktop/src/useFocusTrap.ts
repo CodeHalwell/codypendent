@@ -43,13 +43,15 @@ export interface FocusTrapOptions {
   active: boolean;
   /** The element to focus first; defaults to the first focusable, else the container. */
   initialFocus?: RefObject<HTMLElement | null>;
+  /** Where to return if the dialog's action removed its original trigger. */
+  restoreFocusFallback?: RefObject<HTMLElement | null>;
   /** Called on Escape, after propagation is stopped. */
   onEscape?: (event: KeyboardEvent) => void;
 }
 
 export function useFocusTrap(
   container: RefObject<HTMLElement | null>,
-  { active, initialFocus, onEscape }: FocusTrapOptions,
+  { active, initialFocus, restoreFocusFallback, onEscape }: FocusTrapOptions,
 ): void {
   // The latest callback, read at key time: callers pass inline arrows, and
   // an effect keyed on them would re-arm — and re-focus — on every render.
@@ -80,6 +82,12 @@ export function useFocusTrap(
     });
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // Escape/Enter can belong to the IME candidate window. Let composition
+      // finish without dismissing the dialog or reaching an app shortcut.
+      if (event.isComposing || event.keyCode === 229) {
+        event.stopPropagation();
+        return;
+      }
       if (event.key === "Escape" && escape.current) {
         event.stopPropagation();
         escape.current(event);
@@ -112,9 +120,11 @@ export function useFocusTrap(
     return () => {
       cancelAnimationFrame(frame);
       node.removeEventListener("keydown", onKeyDown);
-      if (previous && previous.isConnected) {
+      if (previous && previous.isConnected && previous.closest('[hidden], [aria-hidden="true"]') === null) {
         previous.focus();
+      } else {
+        restoreFocusFallback?.current?.focus();
       }
     };
-  }, [active, container, initialFocus]);
+  }, [active, container, initialFocus, restoreFocusFallback]);
 }

@@ -7,13 +7,14 @@
 //! row. Phase 2 uses an in-RAM index ([`Index::create_in_ram`]); like the vector
 //! index it is derived and rebuildable from [`Registry::list`](crate::registry::Registry::list).
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use codypendent_protocol::RegistryItemId;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, ConstScoreQuery, Query, QueryParser, TermSetQuery};
 use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
-use tantivy::{Index, IndexReader, TantivyDocument};
+use tantivy::{Index, IndexReader, TantivyDocument, Term};
 
 use crate::types::RegistryItem;
 
@@ -100,7 +101,25 @@ impl Bm25Index {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<(RegistryItemId, f32)>, Bm25Error> {
-        if top_k == 0 {
+        self.search_filtered(query, top_k, None)
+    }
+
+    pub fn search_allowed(
+        &self,
+        query: &str,
+        top_k: usize,
+        allowed: &HashSet<RegistryItemId>,
+    ) -> Result<Vec<(RegistryItemId, f32)>, Bm25Error> {
+        self.search_filtered(query, top_k, Some(allowed))
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        top_k: usize,
+        allowed: Option<&HashSet<RegistryItemId>>,
+    ) -> Result<Vec<(RegistryItemId, f32)>, Bm25Error> {
+        if top_k == 0 || allowed.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
         let sanitized = sanitize(query);
@@ -121,6 +140,17 @@ impl Bm25Index {
         // Lenient parsing never errors on a stray term; any per-term diagnostics
         // are irrelevant once punctuation is already stripped.
         let (parsed, _errors) = parser.parse_query_lenient(&sanitized);
+        let parsed = match allowed {
+            Some(ids) => {
+                let terms = ids
+                    .iter()
+                    .map(|id| Term::from_field_text(self.fields.id, &id.to_string()));
+                let filter = ConstScoreQuery::new(Box::new(TermSetQuery::new(terms)), 0.0);
+                Box::new(BooleanQuery::intersection(vec![parsed, Box::new(filter)]))
+                    as Box<dyn Query>
+            }
+            None => parsed,
+        };
         let hits = searcher.search(&parsed, &TopDocs::with_limit(top_k))?;
 
         let mut out = Vec::with_capacity(hits.len());

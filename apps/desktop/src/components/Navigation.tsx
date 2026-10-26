@@ -1,4 +1,7 @@
 import React from "react";
+import { ArrowUpRight, BookOpen, ChevronRight, CircleHelp, GitBranch, Inbox, Layers3, MessageSquare, Plus, Search, Settings2, UsersRound, X } from "lucide-react";
+import "./Navigation.css";
+import { useFocusTrap } from "../useFocusTrap.js";
 import { relativeTime } from "../time.js";
 import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
 import type { ConnectionInfo } from "../transport.js";
@@ -12,6 +15,7 @@ export type DesktopView =
   | "memory"
   | "docs"
   | "plugins"
+  | "agentTools"
   | "context"
   | "library"
   | "workflow"
@@ -58,31 +62,32 @@ export const NAV_GROUPS = [
     group: "Run",
     views: [
       ["sessions", "Sessions", "the attached session's transcript and composer"],
-      ["library", "Session Library", "search every session and rename, pin, archive, or export one"],
+      ["library", "All chats", "find saved chats and organise your conversations"],
       ["inbox", "Inbox", "notifications and human work from the durable inbox"],
-      ["analytics", "Analytics", "measured execution observations and aggregates"],
+      ["analytics", "Usage", "review model usage, time and measured results"],
       ["context", "Context", "token usage breakdown for the active run"],
       // Reads the attached session's own ledger for its recorded checkpoints and
       // acts on them with `ForkSession` / `RestoreCheckpoint`, so it belongs here.
-      ["backtrack", "Backtrack", "branch this session at a recorded checkpoint, or ask to rewind a worktree to one"],
+      ["backtrack", "Checkpoints", "continue from an earlier point in this chat"],
     ],
   },
   {
     group: "Workflow",
     views: [
-      ["workflow", "Workflow Runs", "open and control persisted workflow runs with a live DAG"],
+      ["workflow", "Workflows", "start a workflow and follow its progress"],
       ["board", "Task Board", "create, assign, and move repository backlog tasks in Kanban columns"],
-      ["blackboard", "Blackboard", "inspect attributed workflow evidence, or post an open question"],
+      ["blackboard", "Shared results", "inspect the workflow blackboard, shared evidence and open questions"],
     ],
   },
   {
     group: "Workspace",
     views: [
       ["repository", "Repository", "choose the git checkout every repository-scoped command anchors to"],
-      ["docs", "Docs", "edit, review, and publish documents that already exist"],
+      ["docs", "Documents", "create, edit and publish workspace documents"],
       ["skills", "Skills", "inspect registered skills and their permissions"],
       ["memory", "Memory", "browse curated memories and their provenance"],
-      ["plugins", "Plugins", "inspect, scope, approve, reject, or revoke verified UI plugins"],
+      ["plugins", "Extensions", "manage verified workspace extensions"],
+      ["agentTools", "Agent tools", "inspect reusable agent tools and available workspace capabilities"],
       // Daemon-backed like the rest of this group: `ReadCodeGraph` /
       // `ReadCodeGraphStatus` over the socket, never a local index.
       ["edges", "Code Graph", "search the stored code graph one bounded page of nodes and edges at a time"],
@@ -114,17 +119,6 @@ export const NAV_GROUPS = [
   readonly views: ReadonlyArray<readonly [DesktopView, string, string]>;
 }>;
 
-/**
- * The groups the sidebar opens on first paint.
- *
- * 22 destinations listed flat is a wall, not navigation. Everything stays in
- * `NAV_GROUPS` — the palette reads the whole table and `NAV_COVERS_EVERY_VIEW`
- * still proves it covers the union — but the sidebar starts with the surfaces
- * a session actually uses and lets the rest be opened when wanted. The group
- * holding the current view is always open regardless of this set.
- */
-const DEFAULT_OPEN_GROUPS: ReadonlySet<string> = new Set(["Setup", "Run"]);
-
 /** Every view `NAV_GROUPS` actually lists. */
 type NavigatedView = (typeof NAV_GROUPS)[number]["views"][number][0];
 
@@ -138,344 +132,199 @@ type NavigatedView = (typeof NAV_GROUPS)[number]["views"][number][0];
 export const NAV_COVERS_EVERY_VIEW: [DesktopView] extends [NavigatedView] ? true : never = true;
 
 interface NavigationProps {
+  hidden?: boolean;
+  modal?: boolean;
+  onClose?: () => void;
+  restoreFocusFallback?: React.RefObject<HTMLElement | null>;
   sessions: SessionSummary[];
   activeSessionId: SessionId | null;
   onSelectSession: (id: SessionId) => void;
   connectionStatus: ConnectionStatus;
-  /**
-   * Why the client is in this connection state.
-   *
-   * It is NOT rendered as text here any more. The dot below carries the state
-   * for a glance and this string as its accessible name and tooltip; a
-   * connection that is not healthy is reported by the banner across the top of
-   * the main pane (`App.tsx`), where it cannot be missed. A failure hidden in
-   * a 12px footer while the app looks otherwise normal was the bad outcome.
-   */
   statusDetail?: string;
-  /**
-   * The handshake's answer, for the footer: which daemon this is, on which
-   * protocol, beside the shell's own version. The daemon version used to live
-   * only in the tooltip of a 10 px dot; a daemon left running across an
-   * upgrade was invisible until commands started failing one by one.
-   */
   connectionInfo?: ConnectionInfo | null;
   currentView?: DesktopView;
   onSelectView?: (view: DesktopView) => void;
   unreadInboxCount?: number;
-  /** Opens the command palette; the palette is the full command surface. */
   onOpenPalette?: () => void;
-  /**
-   * Views whose data source this build does not have — the knowledge surfaces
-   * while their bridge commands are unregistered. They stay reachable (the
-   * panel explains itself) but wear a badge, so nobody spends four clicks
-   * discovering the same thing four times.
-   */
+  onNewSession?: () => void;
+  newSessionDisabled?: boolean;
   unavailableViews?: ReadonlySet<DesktopView>;
 }
 
-/**
- * The sidebar, memoized.
- *
- * Nothing here changes while a reply streams — not the session list, not the
- * current view, not the unread count — but without this boundary all 6 groups
- * and 22 destinations reconcile once per token alongside the transcript. Every
- * callback prop must be referentially stable at the call site in `App.tsx` or
- * the memo never hits.
- */
+const PRIMARY_VIEWS: ReadonlySet<DesktopView> = new Set(["sessions", "library", "inbox"]);
+const WORKSPACE_TOOLS_PREFERENCE = "codypendent.workspaceTools";
+
+function workspaceToolsExpanded(): boolean {
+  try { return localStorage.getItem(WORKSPACE_TOOLS_PREFERENCE) !== "collapsed"; }
+  catch { return true; }
+}
+const TOOL_GROUP_ORDER = ["Councils", "Workflow", "Workspace", "Run", "Configuration", "Setup"];
+const TOOL_GROUPS = [...NAV_GROUPS].sort((a, b) => TOOL_GROUP_ORDER.indexOf(a.group) - TOOL_GROUP_ORDER.indexOf(b.group));
+const GROUP_ICONS = {
+  Councils: UsersRound, Workflow: GitBranch, Workspace: Layers3,
+  Run: ArrowUpRight, Configuration: Settings2, Setup: CircleHelp,
+};
+const PRIMARY_LINKS = [
+  { view: "sessions", label: "Chat", accessibleLabel: "Sessions", icon: MessageSquare },
+  { view: "library", label: "All chats", accessibleLabel: "Session Library", icon: BookOpen },
+  { view: "inbox", label: "Inbox", accessibleLabel: "Inbox", icon: Inbox },
+] as const;
+
 export const Navigation: React.FC<NavigationProps> = React.memo(function Navigation({
-  sessions,
-  activeSessionId,
-  onSelectSession,
-  connectionStatus,
-  statusDetail,
-  connectionInfo,
-  currentView = "sessions",
-  onSelectView,
-  unreadInboxCount = 0,
-  onOpenPalette,
-  unavailableViews,
+  hidden = false, modal = false, onClose, restoreFocusFallback, sessions, activeSessionId, onSelectSession, connectionStatus,
+  statusDetail, connectionInfo, currentView = "sessions", onSelectView,
+  unreadInboxCount = 0, onOpenPalette, onNewSession, newSessionDisabled, unavailableViews,
 }: NavigationProps) {
   const connected = connectionStatus === "connected";
+  const asideRef = React.useRef<HTMLElement>(null);
+  const [openGroups, setOpenGroups] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [toolsExpanded, setToolsExpanded] = React.useState(workspaceToolsExpanded);
+  const toolsId = React.useId();
+  const [filter, setFilter] = React.useState("");
+  const [filterOpen, setFilterOpen] = React.useState(false);
+  const filterRef = React.useRef<HTMLInputElement>(null);
+  const filterToggleRef = React.useRef<HTMLButtonElement>(null);
+  const activeGroup = PRIMARY_VIEWS.has(currentView) ? undefined
+    : NAV_GROUPS.find(({ views }) => views.some(([view]) => view === currentView))?.group;
+  const visibleSessions = React.useMemo(() => {
+    const query = filter.trim().toLocaleLowerCase();
+    return query ? sessions.filter((session) => (session.title || "Untitled Session").toLocaleLowerCase().includes(query)) : sessions;
+  }, [sessions, filter]);
 
-  // Which group each view lives in, so the group holding the current view is
-  // never collapsed out from under it.
-  const groupOfView = React.useMemo(() => {
-    const index = new Map<DesktopView, string>();
-    for (const { group, views } of NAV_GROUPS) {
-      for (const [view] of views) {
-        index.set(view, group);
-      }
-    }
-    return index;
-  }, []);
-
-  const [openGroups, setOpenGroups] = React.useState<ReadonlySet<string>>(
-    () => new Set(DEFAULT_OPEN_GROUPS),
-  );
-  const toggleGroup = React.useCallback((group: string) => {
-    setOpenGroups((open) => {
-      const next = new Set(open);
-      if (!next.delete(group)) {
-        next.add(group);
-      }
-      return next;
-    });
-  }, []);
-  const activeGroup = currentView ? groupOfView.get(currentView) : undefined;
-
-  const handleSelectSession = (id: SessionId) => {
-    onSelectView?.("sessions");
-    onSelectSession(id);
+  const toggleGroup = (group: string) => setOpenGroups((open) => {
+    const next = new Set(open);
+    if (!next.delete(group)) next.add(group);
+    return next;
+  });
+  const toggleFilter = () => {
+    setFilterOpen((open) => !open);
+    setFilter("");
   };
+  const choose = (action: (() => void) | undefined) => {
+    if (modal) onClose?.();
+    action?.();
+  };
+  useFocusTrap(asideRef, { active: modal && !hidden, restoreFocusFallback, onEscape: (event) => {
+    if (event.target === filterRef.current) {
+      toggleFilter();
+      filterToggleRef.current?.focus();
+    } else onClose?.();
+  } });
+  React.useEffect(() => {
+    if (activeGroup) setOpenGroups((open) => new Set([...open, activeGroup]));
+  }, [activeGroup]);
+  React.useEffect(() => { if (filterOpen) filterRef.current?.focus(); }, [filterOpen]);
+  React.useEffect(() => {
+    try { localStorage.setItem(WORKSPACE_TOOLS_PREFERENCE, toolsExpanded ? "expanded" : "collapsed"); }
+    catch { /* A restricted webview can still use the disclosure without persistence. */ }
+  }, [toolsExpanded]);
 
   return (
-    <aside
-      style={{
-        width: 260,
-        background: "var(--cody-panel)",
-        borderRight: "1px solid var(--cody-border)",
-        display: "flex",
-        flexDirection: "column",
-        height: "100vh",
-        userSelect: "none",
-      }}
-    >
-      {/* Brand Header */}
-      <div
-        style={{
-          padding: "16px",
-          borderBottom: "1px solid var(--cody-border)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div
-            role="img"
-            aria-label={`codypendentd ${connectionStatus}`}
-            title={statusDetail ?? `codypendentd ${connectionStatus}`}
-            style={{
-              width: 10,
-              height: 10,
-              borderRadius: "50%",
-              background: connected ? "var(--cody-success)" : connectionStatus === "connecting" ? "var(--cody-warning)" : "var(--cody-danger)",
-            }}
-          />
-          <span style={{ fontWeight: 600, fontSize: 14, color: "var(--cody-text)" }}>Codypendent</span>
-        </div>
-        {onOpenPalette && (
-          <button
-            onClick={onOpenPalette}
-            aria-label="Open command palette"
-            title="Command palette (⌘K / Ctrl-K)"
-            style={{
-              background: "var(--cody-inset)",
-              border: "1px solid var(--cody-border-strong)",
-              borderRadius: 6,
-              color: "var(--cody-text-muted)",
-              fontSize: 11,
-              padding: "3px 8px",
-              cursor: "pointer",
-            }}
-          >
-            ⌘K
+    <aside ref={asideRef} hidden={hidden} className="workspace-sidebar cody-navigation" aria-label="Workspace sidebar"
+      role={modal ? "dialog" : undefined} aria-modal={modal ? true : undefined}
+      style={{ display: hidden ? "none" : "flex" }}>
+      <div className="cody-nav-brand">
+        <img src="/codypendent-mark.png" alt="" className="workspace-brand-mark" width="28" height="28" />
+        <span>Codypendent</span>
+        <span className="cody-nav-status" data-status={connectionStatus} role="img"
+          aria-label={`codypendentd ${connectionStatus}`} title={statusDetail ?? `codypendentd ${connectionStatus}`} />
+        {modal && <button type="button" className="cody-nav-close" onClick={onClose} aria-label="Close sidebar" title="Close sidebar">
+          <X size={17} aria-hidden="true" />
+        </button>}
+      </div>
+
+      <div className="cody-nav-actions">
+        {onNewSession && <button type="button" className="cody-nav-new" onClick={() => choose(onNewSession)}
+          disabled={newSessionDisabled} aria-label="Start new chat"
+          title={newSessionDisabled ? "Finish or cancel the current run before starting a new chat" : "New chat (⌘N / Ctrl-N) · keeps your draft"}>
+          <Plus size={17} aria-hidden="true" /><span>New chat</span><kbd>⌘N</kbd>
+        </button>}
+        {onOpenPalette && <button type="button" className="cody-nav-search" onClick={() => choose(onOpenPalette)}
+          aria-label="Open command palette" title="Search commands (⌘K / Ctrl-K)">
+          <Search size={16} aria-hidden="true" /><span>Search commands</span><kbd>⌘K</kbd>
+        </button>}
+      </div>
+
+      <nav className="cody-nav-primary" aria-label="Main navigation">
+        {PRIMARY_LINKS.map(({ view, label, accessibleLabel, icon: Icon }) => <button key={view} type="button"
+          className="workspace-nav-item cody-nav-link" onClick={() => choose(() => onSelectView?.(view))}
+          aria-label={`${accessibleLabel} View`} aria-current={currentView === view ? "page" : undefined}
+          style={{ fontWeight: currentView === view ? 600 : 400 }}>
+          <Icon size={16} aria-hidden="true" /><span>{label}</span>
+          {view === "inbox" && unreadInboxCount > 0 && <span className="cody-nav-badge" data-testid="inbox-badge">{unreadInboxCount}</span>}
+        </button>)}
+      </nav>
+
+      <section className="workspace-recent cody-nav-recents" aria-label="Recent chats">
+        <div className="cody-nav-section-heading">
+          <span>Recent chats</span>
+          <button ref={filterToggleRef} type="button" className="cody-nav-small-button" onClick={toggleFilter}
+            aria-label={filterOpen ? "Close chat filter" : "Filter recent chats"} aria-expanded={filterOpen}
+            title={filterOpen ? "Close chat filter" : "Filter recent chats"}>
+            {filterOpen ? <X size={13} aria-hidden="true" /> : <Search size={13} aria-hidden="true" />}
           </button>
-        )}
-      </div>
-
-      {/* Main Views Nav */}
-      <div
-        style={{
-          padding: "8px 8px 8px",
-          borderBottom: "1px solid var(--cody-border)",
-          display: "flex",
-          flexDirection: "column",
-          gap: 2,
-          // A flex child defaults to `min-height: auto`, which refuses to shrink
-          // below its content — so with several groups open this list grew past
-          // the viewport, pushed the session list off the bottom of a
-          // `height: 100vh` aside that has no overflow of its own, and left the
-          // sidebar with destinations that could not be reached OR scrolled to.
-          // `minHeight: 0` lets it shrink; `overflowY` gives it somewhere to go.
-          minHeight: 0,
-          overflowY: "auto",
-          flexShrink: 1,
-        }}
-      >
-        {NAV_GROUPS.map(({ group, views }) => {
-          // The group holding the current view is always open: collapsing the
-          // ground you are standing on is how a sidebar loses you.
-          const open = openGroups.has(group) || group === activeGroup;
-          return (
-          <React.Fragment key={group}>
-            <button
-              type="button"
-              onClick={() => toggleGroup(group)}
-              aria-expanded={open}
-              aria-label={`${group} group`}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                width: "100%",
-                background: "transparent",
-                border: "none",
-                fontSize: 10,
-                letterSpacing: 0.6,
-                textTransform: "uppercase",
-                color: "var(--cody-text-faint)",
-                padding: "8px 10px 2px",
-                cursor: "pointer",
-                textAlign: "left",
-              }}
-            >
-              <span
-                aria-hidden="true"
-                style={{
-                  display: "inline-block",
-                  transition: "transform 120ms ease",
-                  transform: open ? "rotate(90deg)" : "none",
-                }}
-              >
-                ›
-              </span>
-              {group}
-            </button>
-            {open &&
-            views.map(([view, label]) => {
-              const active = currentView === view;
-              return (
-                <button
-                  key={view}
-                  onClick={() => onSelectView?.(view)}
-                  aria-label={`${label} View`}
-                  aria-current={active ? "page" : undefined}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "7px 10px",
-                    borderRadius: 6,
-                    background: active ? "var(--cody-panel-hover)" : "transparent",
-                    border: active ? "1px solid var(--cody-accent)" : "1px solid transparent",
-                    color: "var(--cody-text)",
-                    fontSize: 13,
-                    fontWeight: active ? 600 : 400,
-                    cursor: "pointer",
-                    textAlign: "left",
-                    width: "100%",
-                  }}
-                >
-                  <span>{label}</span>
-                  {unavailableViews?.has(view) && (
-                    <span
-                      data-testid={`nav-unavailable-${view}`}
-                      title="This build's shell does not provide the data for this view yet"
-                      style={{ fontSize: 10, color: "var(--cody-text-faint)", border: "1px solid var(--cody-border-strong)", borderRadius: 8, padding: "0 5px" }}
-                    >
-                      not in this build
-                    </span>
-                  )}
-                  {view === "inbox" && unreadInboxCount > 0 && (
-                    <span
-                      data-testid="inbox-badge"
-                      style={{
-                        padding: "1px 6px",
-                        borderRadius: 10,
-                        fontSize: 11,
-                        fontWeight: 600,
-                        background: "var(--cody-accent-strong)",
-                        color: "var(--cody-on-accent)",
-                      }}
-                    >
-                      {unreadInboxCount}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </React.Fragment>
-          );
-        })}
-      </div>
-
-      {/* Sessions List */}
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px" }}>
-        <div style={{ fontSize: 11, color: "var(--cody-text-muted)", padding: "6px 8px", textTransform: "uppercase" }}>
-          Recent Sessions
         </div>
-        {sessions.length === 0 ? (
-          <div style={{ padding: "12px 8px", color: "var(--cody-text-faint)", fontSize: 13 }}>
-            {connected ? "No sessions yet" : "No sessions (not connected)"}
-          </div>
-        ) : (
-          sessions.map((session) => {
+        {filterOpen && <input ref={filterRef} className="cody-nav-filter" type="search" value={filter}
+          onChange={(event) => setFilter(event.target.value)} placeholder="Find a recent chat…" aria-label="Filter recent chats"
+          onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); toggleFilter(); filterToggleRef.current?.focus(); } }} />}
+        <div className="cody-nav-session-list">
+          {visibleSessions.length === 0 ? <p className="cody-nav-empty">
+            {filter.trim() ? "No matching chats" : connected ? "Your chats will appear here." : "Connect to load your chats."}
+          </p> : visibleSessions.map((session) => {
             const active = session.id === activeSessionId && currentView === "sessions";
-            return (
-              // A `<button>`, not a clickable `<div>`: the TUI is entirely
-              // keyboard-driven, and a session you can only reach with a mouse
-              // has no equivalent there at all.
-              <button
-                key={session.id}
-                onClick={() => handleSelectSession(session.id)}
-                aria-label={`Session ${session.title || "Untitled Session"}`}
-                aria-current={active ? "true" : undefined}
-                style={{
-                  display: "block",
-                  width: "100%",
-                  textAlign: "left",
-                  font: "inherit",
-                  padding: "8px 10px",
-                  borderRadius: 6,
-                  marginBottom: 4,
-                  cursor: "pointer",
-                  background: active ? "var(--cody-panel-hover)" : "transparent",
-                  border: active ? "1px solid var(--cody-accent)" : "1px solid transparent",
-                }}
-              >
-                <div style={{ fontSize: 13, fontWeight: active ? 600 : 400, color: "var(--cody-text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {session.title || "Untitled Session"}
-                </div>
-                <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}>
-                  {session.state} · {relativeTime(session.updated_at)}
-                </div>
-              </button>
-            );
-          })
-        )}
-      </div>
+            return <button key={session.id} type="button" className="workspace-session-item cody-nav-session"
+              onClick={() => choose(() => { onSelectView?.("sessions"); onSelectSession(session.id); })}
+              aria-label={`Session ${session.title || "Untitled Session"}`} aria-current={active ? "true" : undefined}
+              title={session.title || "Untitled Session"}>
+              <span className="cody-nav-session-title">{session.title || "Untitled Session"}</span>
+              <span className="cody-nav-session-meta"><span>{session.state}</span><span>{relativeTime(session.updated_at)}</span></span>
+            </button>;
+          })}
+        </div>
+      </section>
 
-      {/* Versions footer: what we are talking to, and whether it matches us. */}
+      <nav className="cody-nav-tools" aria-label="Workspace tools" data-collapsed={!toolsExpanded}>
+        <button type="button" className="cody-nav-section-heading cody-nav-workspace-toggle"
+          aria-expanded={toolsExpanded} aria-controls={toolsId}
+          onClick={() => setToolsExpanded((expanded) => !expanded)}>
+          <span>Your workspace</span>
+          <ChevronRight size={13} aria-hidden="true" className="cody-nav-chevron" data-open={toolsExpanded} />
+        </button>
+        <div id={toolsId} hidden={!toolsExpanded}>
+        {toolsExpanded && TOOL_GROUPS.map(({ group, views: destinations }) => {
+          const views = destinations.filter(([view]) => !PRIMARY_VIEWS.has(view));
+          const open = openGroups.has(group);
+          const Icon = GROUP_ICONS[group as keyof typeof GROUP_ICONS] ?? Layers3;
+          return <div className="cody-nav-group" key={group}>
+            <button type="button" className="cody-nav-group-toggle" onClick={() => toggleGroup(group)}
+              aria-expanded={open} aria-label={`${group} group`}>
+              <Icon size={15} aria-hidden="true" /><span>{group}</span>
+              <ChevronRight size={12} aria-hidden="true" className="cody-nav-chevron" data-open={open} />
+            </button>
+            {open && <div className="cody-nav-group-links">{views.map(([view, label]) => <button key={view} type="button"
+              className="workspace-nav-item cody-nav-link cody-nav-tool" onClick={() => choose(() => onSelectView?.(view))}
+              aria-label={`${label} View`} aria-current={currentView === view ? "page" : undefined}
+              style={{ fontWeight: currentView === view ? 600 : 400 }}>
+              <span>{label}</span>
+              {unavailableViews?.has(view) && <span className="cody-nav-unavailable" data-testid={`nav-unavailable-${view}`}
+                title="This build's shell does not provide the data for this view yet">not in this build</span>}
+            </button>)}</div>}
+          </div>;
+        })}
+        </div>
+      </nav>
+
       {connected && connectionInfo && <VersionFooter info={connectionInfo} />}
     </aside>
   );
 });
 
-/** `daemon 0.14.0 · protocol 1.4 · desktop 0.14.0`, with a mismatch called out. */
 const VersionFooter: React.FC<{ info: ConnectionInfo }> = ({ info }) => {
-  const mismatch =
-    info.client_version !== undefined && info.client_version !== info.daemon_version;
-  return (
-    <div
-      data-testid="version-footer"
-      title={`codypendentd ${info.daemon_version} on ${info.socket_path} (build ${info.build_id})`}
-      style={{
-        padding: "8px 16px",
-        borderTop: "1px solid var(--cody-border)",
-        fontSize: 11,
-        color: mismatch ? "var(--cody-warning-text)" : "var(--cody-text-faint)",
-        lineHeight: 1.5,
-      }}
-    >
-      daemon {info.daemon_version} · protocol {info.protocol_version}
-      {info.client_version !== undefined && ` · desktop ${info.client_version}`}
-      {mismatch && (
-        <div>
-          The daemon is a different version from this app. Restart it after upgrading:{" "}
-          <code>codypendent daemon restart</code>.
-        </div>
-      )}
-    </div>
-  );
+  const mismatch = info.client_version !== undefined && info.client_version !== info.daemon_version;
+  return <div className="cody-nav-version" data-testid="version-footer" data-mismatch={mismatch}
+    title={`codypendentd ${info.daemon_version} on ${info.socket_path} (build ${info.build_id})`}>
+    daemon {info.daemon_version} · protocol {info.protocol_version}
+    {info.client_version !== undefined && ` · desktop ${info.client_version}`}
+    {mismatch && <div>The daemon is a different version from this app. Restart it after upgrading: <code>codypendent daemon restart</code>.</div>}
+  </div>;
 };

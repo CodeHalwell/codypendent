@@ -48,6 +48,20 @@ pub trait SemanticEmbedder: Send + Sync {
     /// alongside every vector so a model change invalidates stored rows.
     fn model(&self) -> &str;
 
+    fn space_id(&self) -> &str {
+        self.model()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let mut vectors = self.embed_batch(&[text.to_string()]).await?;
+        if vectors.len() != 1 {
+            return Err(EmbedError(
+                "embedding response must contain one query".to_string(),
+            ));
+        }
+        Ok(vectors.remove(0))
+    }
+
     /// Embed `texts` into dense vectors, one per input, in input order. All
     /// vectors must share one dimensionality.
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;

@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/vt100_snapshot_tests.rs
-assertion_line: 98
 expression: terminal.backend().to_string()
 ---
   ✦ codypendent                                                                              Build  
@@ -10,44 +9,44 @@ expression: terminal.backend().to_string()
                                                                                                     
                ┌ Help ──────────────────────────────────────────────────────────────┐               
                │Keys — every mouse action has a keyboard equivalent                 │               
-               │Single-letter keys apply inside their overlay. / is the always-on   │               
-               │front door.                                                         │               
+               │Type to filter shortcuts. Ctrl-U clears. Esc or ? closes help.      │               
+               │  Filter: all  ·  46 shortcuts                                      │               
                │                                                                    │               
-               │  type…                       compose a message in the bottom       │               
-               │                              composer                              │               
-               │  Enter                       send: start a run, or steer the active│               
-       ✦  Conne│                              one                                   │               
-               │  /                           command palette — every command,      │               
-       No model│                              searchable                            │n.             
-       Press En│  PgUp / PgDn                 page the focused pane (or scroll the  │               
-       Setup va│                              conversation) (mouse: wheel)          │.              
-               │  Ctrl-↑ / Ctrl-↓             switch to the previous / next run     │               
-               │  F2                          toggle layout: chat ⇄ workspace panes │               
-               │  a / A / p / P               approve once / for the run / this     │               
-               │                              command pattern / this repository     │               
-               │  r                           reject the pending action             │               
-               │  1-9 · Space · Enter · r     question card: pick an option · toggle│               
-               │                              · confirm · reject                    │               
-               │  Esc                         clear the draft (Ctrl-Z restores it), │               
-               │                              or close an overlay                   │               
-               │  ? (empty) / F1              show / hide this help overlay         │               
-               │  S / M / J / D / G           open Skills · Memory · Journey · Docs │               
-               │                              · code-graph Edges                    │               
-               │  ↑ / ↓                       move selection in a browser, palette, │               
-               │                              or workspace side pane (mouse: wheel) │               
-               │  Tab / e / a / r             Docs: switch rail · edit block ·      │               
-               │                              accept / reject suggestion            │               
-               │  Ctrl-C                      detach (the run keeps going)          │               
-               │  ↑↓ + Enter                  activate the selected row in a browser│               
-               │                              or the palette (mouse: click a row)   │               
-               │  Tab                         focus the next workspace pane (same as│               
-               │                              clicking it) (mouse: click a pane)    │               
-               │  ↑ / ↓ (composer)            recall the previous / next composer   │               
-               │                              message                               │               
-               │  Ctrl-←/→ · Ctrl-A / Ctrl-E  move the cursor by word · to line     │               
-               │                              start / end (composer)                │               
-               │  Ctrl-W / Ctrl-U / Ctrl-K    delete word / to line start (any      │               
-   MESSAGE · En└ 62 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
+               │  type…                          compose a message in the bottom    │               
+               │                                 composer                           │               
+               │  Enter                          send: start a run, or steer the    │               
+       ✦  Conne│                                 active one                         │               
+               │  Shift-Enter                    insert a line break (modern        │               
+       No model│                                 terminals); Alt-Enter also works   │n.             
+       Press En│  /                              command palette — every command,   │               
+       Setup va│                                 searchable                         │.              
+               │  PgUp / PgDn                    page the focused pane (or scroll   │               
+               │                                 the conversation) (mouse: wheel)   │               
+               │  Ctrl-↑ / Ctrl-↓                switch to the previous / next run  │               
+               │  F2                             toggle layout: chat ⇄ workspace    │               
+               │                                 panes                              │               
+               │  a / A / p / P                  approve once / for the run / this  │               
+               │                                 command pattern / this repository  │               
+               │  r                              reject the pending action          │               
+               │  1-9 · Space · Enter · r        question card: pick an option ·    │               
+               │                                 toggle · confirm · reject          │               
+               │  Esc                            clear the draft (Ctrl-Z restores   │               
+               │                                 it), or close an overlay           │               
+               │  ? (empty) / F1                 show / hide this help overlay      │               
+               │  S / M / J / D / G              open Skills · Memory · Journey ·   │               
+               │                                 Docs · code-graph Edges            │               
+               │  ↑ / ↓                          move selection in a browser,       │               
+               │                                 palette, or workspace side pane    │               
+               │                                 (mouse: wheel)                     │               
+               │  Tab / e / a / r                Docs: switch rail · edit block ·   │               
+               │                                 accept / reject suggestion         │               
+               │  Ctrl-C                         detach (the run keeps going)       │               
+               │  ↑↓ + Enter                     activate the selected row in a     │               
+               │                                 browser or the palette (mouse:     │               
+               │                                 click a row)                       │               
+               │  Tab                            focus the next workspace pane (same│               
+               │                                 as clicking it) (mouse: click a    │               
+   MESSAGE · En└ 76 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
   ❯ Ask Codypendent to build, fix, explain, or explore…                                             
                                                                                                     
                                                                                                     

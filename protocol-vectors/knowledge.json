@@ -36,9 +36,11 @@
         }
       ],
       "next_offset": 50,
+      "repository": "/home/user/project",
       "section": {
         "type": "Memories"
-      }
+      },
+      "workspace_id": "10000000-0000-0000-0000-000000000001"
     },
     "type": "KnowledgePage"
   }

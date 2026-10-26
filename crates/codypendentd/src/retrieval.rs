@@ -8,8 +8,7 @@
 //! runtime) binds them together:
 //!
 //! 1. [`build_embedder`] turns `models.toml`'s `[embedding]` entry into a
-//!    `SemanticEmbedder`. Absent or misconfigured ⇒ `None`, and every consumer
-//!    keeps the offline hashing embedder — today's behavior exactly.
+//!    `SemanticEmbedder`; absent configuration uses the bundled local model.
 //! 2. [`spawn_index_maintenance`] is the indexer worker `lib.rs` promised and
 //!    never had: a startup reconcile plus a periodic
 //!    [`drain_outbox`](codypendent_knowledge::drain_outbox) that finally
@@ -26,16 +25,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use codypendent_integrations::mcp::McpBridge;
 use codypendent_knowledge::{
     drain_outbox, reconcile_embeddings, retrieve, semantic_indexes, CapabilityRequest, Registry,
     RegistryItem, RegistryItemKind, RetrievalConfig, RetrievalQuery, RiskClass, Scope,
     SemanticEmbedder, ToolCard,
 };
 use codypendent_protocol::discovery::RuntimePaths;
+use codypendent_runtime::embedding::BundledEmbedder;
 use codypendent_runtime::models::{load_model_extras, RetrievalSettings};
 use codypendent_runtime::tools::{
     RegistryCard, RegistrySearch, RegistrySearchOutcome, RegistrySearchRequest, SkillDocument,
-    SEARCH_CARD_LIMIT,
+    ToolSchema, SEARCH_CARD_LIMIT,
 };
 use codypendent_runtime::HttpEmbedder;
 use sha2::{Digest as _, Sha256};
@@ -52,12 +53,7 @@ const DRAIN_BATCH: i64 = 256;
 /// inline at assembly time anyway, so retrieval is never actually stale.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Build the configured embedding model, or `None` when none is configured.
-///
-/// `None` is the normal, supported state: retrieval then uses the offline
-/// hashing embedder exactly as it did before embeddings existed. A PRESENT but
-/// broken entry (unknown provider, blank URL) is warned about loudly and also
-/// yields `None` — a typo must degrade retrieval, never fail daemon startup.
+/// Use an explicit provider override or the packaged local embedding model.
 #[must_use]
 pub fn build_embedder(paths: &RuntimePaths) -> Option<Arc<dyn SemanticEmbedder>> {
     let extras = match load_model_extras(&paths.data_dir.join("models.toml")) {
@@ -67,7 +63,15 @@ pub fn build_embedder(paths: &RuntimePaths) -> Option<Arc<dyn SemanticEmbedder>>
             return None;
         }
     };
-    let config = extras.embedding?;
+    let Some(config) = extras.embedding else {
+        return match BundledEmbedder::discover() {
+            Ok(embedder) => Some(Arc::new(embedder)),
+            Err(error) => {
+                warn!(%error, "bundled semantic retrieval unavailable");
+                None
+            }
+        };
+    };
     match HttpEmbedder::from_config(&config) {
         Ok(embedder) => {
             info!(
@@ -109,17 +113,19 @@ pub fn retrieval_settings(paths: &RuntimePaths) -> RetrievalSettings {
 /// correctness.
 pub fn spawn_index_maintenance(pool: SqlitePool, embedder: Option<Arc<dyn SemanticEmbedder>>) {
     tokio::spawn(async move {
-        if let Some(embedder) = &embedder {
-            match reconcile_embeddings(&pool, embedder.as_ref()).await {
-                Ok(0) => info!("registry embeddings already current"),
-                Ok(written) => info!(written, "backfilled registry embeddings at startup"),
-                Err(error) => {
-                    warn!(%error, "could not reconcile registry embeddings; retrieval degrades to the offline embedder")
+        let mut reconciled_space = String::new();
+        loop {
+            if let Some(embedder) = &embedder {
+                if reconciled_space != embedder.space_id() {
+                    match reconcile_embeddings(&pool, embedder.as_ref()).await {
+                        Ok(written) => {
+                            reconciled_space = embedder.space_id().to_string();
+                            info!(written, "registry semantic embeddings current");
+                        }
+                        Err(error) => warn!(%error, "semantic index warm-up deferred"),
+                    }
                 }
             }
-        }
-        loop {
-            tokio::time::sleep(DRAIN_INTERVAL).await;
             match drain_outbox(&pool, embedder.as_deref(), DRAIN_BATCH).await {
                 Ok(report) if report.processed == 0 => {}
                 Ok(report) => info!(
@@ -131,6 +137,12 @@ pub fn spawn_index_maintenance(pool: SqlitePool, embedder: Option<Arc<dyn Semant
                 ),
                 Err(error) => warn!(%error, "index outbox drain failed; retrying next pass"),
             }
+            let interval = if embedder.is_some() && reconciled_space.is_empty() {
+                Duration::from_secs(2)
+            } else {
+                DRAIN_INTERVAL
+            };
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -141,6 +153,7 @@ pub fn spawn_index_maintenance(pool: SqlitePool, embedder: Option<Arc<dyn Semant
 pub struct PoolRegistrySearch {
     pool: SqlitePool,
     embedder: Option<Arc<dyn SemanticEmbedder>>,
+    mcp: Option<Arc<dyn McpBridge>>,
 }
 
 impl PoolRegistrySearch {
@@ -150,7 +163,16 @@ impl PoolRegistrySearch {
     /// ranked by.
     #[must_use]
     pub fn new(pool: SqlitePool, embedder: Option<Arc<dyn SemanticEmbedder>>) -> Self {
-        Self { pool, embedder }
+        Self {
+            pool,
+            embedder,
+            mcp: None,
+        }
+    }
+
+    pub fn with_mcp_catalog(mut self, mcp: Option<Arc<dyn McpBridge>>) -> Self {
+        self.mcp = mcp;
+        self
     }
 
     /// Read a registered skill's `SKILL.md`.
@@ -182,21 +204,35 @@ impl PoolRegistrySearch {
                 item.name
             ));
         }
-        let manifest_text = snapshot
-            .text(Path::new("skill.toml"))
-            .map_err(|error| format!("could not read `{}`'s manifest: {error}", item.name))?;
-        let manifest: codypendent_knowledge::SkillManifest = toml::from_str(&manifest_text)
-            .map_err(|error| format!("could not parse `{}`'s manifest: {error}", item.name))?;
-        if manifest.id != item.name || manifest.version != item.version.0 {
-            return Err(format!(
-                "`{}` no longer matches its registered identity",
-                item.name
-            ));
-        }
-        let instructions = manifest
-            .entrypoints
-            .instructions
-            .ok_or_else(|| format!("`{}` declares no instructions entrypoint", item.name))?;
+        let instructions = if snapshot.files.contains_key("skill.toml") {
+            let manifest_text = snapshot
+                .text(Path::new("skill.toml"))
+                .map_err(|error| format!("could not read `{}`'s manifest: {error}", item.name))?;
+            let manifest: codypendent_knowledge::SkillManifest = toml::from_str(&manifest_text)
+                .map_err(|error| format!("could not parse `{}`'s manifest: {error}", item.name))?;
+            if manifest.id != item.name || manifest.version != item.version.0 {
+                return Err(format!(
+                    "`{}` no longer matches its registered identity",
+                    item.name
+                ));
+            }
+            manifest
+                .entrypoints
+                .instructions
+                .ok_or_else(|| format!("`{}` declares no instructions entrypoint", item.name))?
+        } else {
+            let slug = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "skill".to_string());
+            if item.name != slug || item.version.0 != "0.0.0" {
+                return Err(format!(
+                    "`{}` no longer matches its registered identity",
+                    item.name
+                ));
+            }
+            "SKILL.md".to_string()
+        };
         let content = snapshot
             .text(Path::new(&instructions))
             .map_err(|error| format!("could not read `{}`: {error}", instructions))?;
@@ -411,7 +447,13 @@ fn to_registry_card(card: &ToolCard, item: Option<&RegistryItem>) -> RegistryCar
         .to_string(),
         summary: card.summary.clone(),
         permissions: item
-            .map(|item| item.permissions.iter().map(render_permission).collect())
+            .map(|item| {
+                item.permissions
+                    .iter()
+                    .map(render_permission)
+                    .chain(crate::retrieval_catalog::policy_marker(item))
+                    .collect()
+            })
             .unwrap_or_default(),
     }
 }
@@ -436,14 +478,23 @@ impl RegistrySearch for PoolRegistrySearch {
         request: RegistrySearchRequest<'_>,
     ) -> Result<RegistrySearchOutcome, String> {
         let repository = crate::scan::repository_id_for(request.repository);
-        let items = Registry::new()
+        let mut items = Registry::new()
             .list(&self.pool)
             .await
             .map_err(|error| format!("could not read the registry: {error}"))?;
-        let (indexes, query_vector) =
-            semantic_indexes(&self.pool, &items, self.embedder.as_deref(), request.query)
-                .await
-                .map_err(|error| format!("could not build the retrieval indexes: {error}"))?;
+        let catalog = crate::retrieval_catalog::offered_items(self.mcp.as_deref());
+        let (indexes, query_vector) = if catalog.is_empty() {
+            semantic_indexes(&self.pool, &items, self.embedder.as_deref(), request.query).await
+        } else {
+            items.extend(catalog);
+            codypendent_runtime::tool_retrieval::tool_indexes(
+                &items,
+                request.query,
+                self.embedder.as_deref(),
+            )
+            .await
+        }
+        .map_err(|error| format!("could not build the retrieval indexes: {error}"))?;
 
         // The SAME visibility and risk ceiling `assemble_context` applies: an
         // agent-initiated search can never see more than the system-assembled
@@ -483,28 +534,49 @@ impl RegistrySearch for PoolRegistrySearch {
             .map(|card| to_registry_card(card, by_id.get(&card.id).copied()))
             .collect();
 
-        // `open` resolves against the DISCLOSED skills only, so the tool can
-        // never be used to read a package the funnel's hard filters just
-        // excluded (a deprecated, out-of-scope, or over-risk skill).
-        let (document, open_note) = match request.open {
-            None => (None, None),
+        let (document, tool_schema, open_note) = match request.open {
+            None => (None, None, None),
             Some(name) => {
-                let disclosed = result
-                    .skills
+                if let Some(item) = result
+                    .tools
                     .iter()
                     .find(|card| card.name == name)
-                    .and_then(|card| by_id.get(&card.id).copied());
-                match disclosed {
-                    None => (
-                        None,
-                        Some(format!(
-                            "`{name}` is not among the skills this search disclosed"
-                        )),
-                    ),
-                    Some(item) => match Self::read_skill_document(item) {
-                        Ok(document) => (Some(document), None),
-                        Err(note) => (None, Some(note)),
-                    },
+                    .and_then(|card| by_id.get(&card.id).copied())
+                {
+                    match &item.input_schema {
+                        Some(parameters) => (
+                            None,
+                            Some(ToolSchema {
+                                name: name.to_string(),
+                                parameters: parameters.clone(),
+                            }),
+                            None,
+                        ),
+                        None => (
+                            None,
+                            None,
+                            Some(format!("`{name}` has no registered input schema")),
+                        ),
+                    }
+                } else {
+                    let disclosed = result
+                        .skills
+                        .iter()
+                        .find(|card| card.name == name)
+                        .and_then(|card| by_id.get(&card.id).copied());
+                    match disclosed {
+                        None => (
+                            None,
+                            None,
+                            Some(format!(
+                                "`{name}` is not among the skills or tools this search disclosed"
+                            )),
+                        ),
+                        Some(item) => match Self::read_skill_document(item) {
+                            Ok(document) => (Some(document), None, None),
+                            Err(note) => (None, None, Some(note)),
+                        },
+                    }
                 }
             }
         };
@@ -512,6 +584,7 @@ impl RegistrySearch for PoolRegistrySearch {
         Ok(RegistrySearchOutcome {
             cards,
             document,
+            tool_schema,
             open_note,
         })
     }
@@ -620,6 +693,88 @@ publisher = "local-user"
             .content
             .contains("reproduce locally with cargo test"));
         assert_eq!(outcome.open_note, None);
+    }
+
+    #[tokio::test]
+    async fn ecosystem_markdown_skills_open_securely_and_missing_packages_stop_ranking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = db::open(&tmp.path().join("ecosystem.db")).await.unwrap();
+        let package = tmp.path().join("azure-resource-visualizer");
+        std::fs::create_dir_all(package.join("references")).unwrap();
+        std::fs::create_dir_all(package.join("assets")).unwrap();
+        let procedure = "---\nname: Display title\ndescription: Visualise Azure resources as a knowledge graph.\n---\n\nRead the resource inventory and draw its connections.\n";
+        std::fs::write(package.join("SKILL.md"), procedure).unwrap();
+        std::fs::write(
+            package.join("references/guide.md"),
+            "Use the current inventory.",
+        )
+        .unwrap();
+        std::fs::write(package.join("assets/example.txt"), "graph example").unwrap();
+        let repository = crate::scan::repository_id_for(tmp.path());
+        let item = Registry::new()
+            .register_package(&pool, &package, Scope::Repository(repository))
+            .await
+            .unwrap();
+        assert_eq!(item.name, "azure-resource-visualizer");
+        assert_eq!(item.version.0, "0.0.0");
+        let search = PoolRegistrySearch::new(pool.clone(), None);
+        let request = RegistrySearchRequest {
+            query: "Visualise Azure resources as a knowledge graph",
+            open: Some("azure-resource-visualizer"),
+            repository: tmp.path(),
+        };
+        let opened = search.search(request).await.unwrap();
+        assert_eq!(opened.document.unwrap().content, procedure);
+        assert_eq!(opened.open_note, None);
+
+        let mut wrong_identity = item.clone();
+        wrong_identity.name = "wrong-slug".to_string();
+        assert!(PoolRegistrySearch::read_skill_document(&wrong_identity)
+            .unwrap_err()
+            .contains("registered identity"));
+        std::fs::write(package.join("assets/example.txt"), "changed").unwrap();
+        assert!(PoolRegistrySearch::read_skill_document(&item)
+            .unwrap_err()
+            .contains("changed after registration"));
+        std::fs::write(package.join("assets/example.txt"), "graph example").unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside.md");
+            std::fs::write(&outside, "DO NOT DISCLOSE").unwrap();
+            std::fs::remove_file(package.join("SKILL.md")).unwrap();
+            std::os::unix::fs::symlink(outside, package.join("SKILL.md")).unwrap();
+            let error = PoolRegistrySearch::read_skill_document(&item).unwrap_err();
+            assert!(error.contains("symlink"));
+            assert!(!error.contains("DO NOT DISCLOSE"));
+            std::fs::remove_file(package.join("SKILL.md")).unwrap();
+            std::fs::write(package.join("SKILL.md"), procedure).unwrap();
+        }
+
+        let context = codypendent_knowledge::ContextAssembler::new();
+        let before = context
+            .assemble(&pool, repository, request.query, &[])
+            .await
+            .unwrap();
+        assert!(before.skill_cards.iter().any(|card| card.name == item.name));
+        std::fs::rename(&package, tmp.path().join("removed-package")).unwrap();
+        let gone = search.search(request).await.unwrap();
+        assert!(gone.cards.iter().all(|card| card.name != item.name));
+        assert!(gone.document.is_none());
+        let after = context
+            .assemble(&pool, repository, request.query, &[])
+            .await
+            .unwrap();
+        assert!(after.skill_cards.iter().all(|card| card.name != item.name));
+        assert_eq!(
+            Registry::new()
+                .get(&pool, item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            codypendent_knowledge::RegistryStatus::Active
+        );
     }
 
     #[tokio::test]
@@ -768,10 +923,8 @@ publisher = "local-user"
             .contains("built-in"));
     }
 
-    /// With no `[embedding]` entry there is no embedder — the supported default,
-    /// under which retrieval keeps the offline hashing model.
     #[test]
-    fn no_embedding_entry_yields_no_embedder_and_default_tuning() {
+    fn explicit_embedding_settings_override_the_bundled_default() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = paths_at(tmp.path());
         assert!(build_embedder(&paths).is_none());

@@ -9,8 +9,8 @@
 #
 # Windows is not built: the daemon speaks over a Unix domain socket
 # (`UnixListener`) and uses Unix signals + process groups, so it does not
-# compile on Windows without a named-pipe port. Targets are all NATIVE (no
-# cross-compilation) so the release is as robust as possible.
+# compile on Windows without a named-pipe port. Apple Silicon and Linux builds
+# are native; the Intel CLI is cross-compiled on the Apple Silicon runner.
 name: release
 
 on:
@@ -20,6 +20,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      require_apple_signing:
+        description: Require Developer ID signing and notarization (artifacts only; never publishes)
+        type: boolean
+        default: true
 
 permissions:
   # Build, test, and packaging jobs are read-only. The publish job below is the
@@ -55,6 +60,12 @@ jobs:
           fi
       - name: Check release workflow security invariants
         run: python3 .github/scripts/check_release_workflow_security.py
+      - name: Check Apple release tooling
+        run: |
+          python3 apps/desktop/scripts/test_apple_release.py
+          python3 apps/desktop/scripts/test_prepare_embedding_runtime.py
+          python3 .github/scripts/tests/test_release_install.py
+          bash -n install.sh apps/desktop/scripts/apple-signing-env.sh apps/desktop/scripts/sign-apple-release.sh apps/desktop/scripts/sign-apple-runtime.sh apps/desktop/scripts/package-apple-release.sh
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
@@ -65,6 +76,7 @@ jobs:
       - name: Check migration immutability
         run: |
           python3 .github/scripts/check_migration_immutability.py
+          python3 .github/scripts/check_release_versions.py
           python3 .github/scripts/check_migration_immutability.py --directory crates/control-plane/migrations
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: .github/scripts/check_generated_protocol.sh
@@ -160,12 +172,17 @@ jobs:
 
   desktop-tauri-quality:
     name: desktop Tauri quality gate
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install Tauri Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -190,6 +207,10 @@ jobs:
           npm --prefix sdk/ui run build
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop run build
+      - name: Prepare bundled native runtimes
+        run: |
+          python3 apps/desktop/scripts/prepare-monty-runtime.py
+          python3 apps/desktop/scripts/prepare-embedding-runtime.py
       - name: Check the complete Tauri bridge and application
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --features app --all-targets --locked
       - name: Build native clients for desktop handoff
@@ -199,6 +220,7 @@ jobs:
           cargo build --locked -p codypendent-cli --bin codypendent -p codypendent-ui-worker-launcher --bin codypendent-ui-worker-launcher
           cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --features app,tauri/custom-protocol --bin codypendent-desktop
       - name: Native desktop disconnect and replay
+        if: runner.os == 'Linux'
         timeout-minutes: 5
         env:
           CODYPENDENT_TEST_BINARY: ${{ github.workspace }}/target/debug/codypendent
@@ -350,8 +372,7 @@ jobs:
           version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Package the tarball
-        id: package
+      - name: Stage the CLI archive payload
         shell: bash
         run: |
           dist="codypendent-${{ matrix.target }}"
@@ -365,6 +386,8 @@ jobs:
           # `codypendentd` stays as an OPTIONAL standalone daemon for advanced
           # use; ship it if this build produced it, but never fail if absent.
           cp "target/${{ matrix.target }}/release/codypendentd" "$dist/" 2>/dev/null || true
+          python3 apps/desktop/scripts/prepare-monty-runtime.py --target "${{ matrix.target }}" --output "$dist"
+          python3 apps/desktop/scripts/prepare-embedding-runtime.py --target "${{ matrix.target }}" --output "$dist" --no-tauri
           # Remote UI executes only on a pinned, self-contained runtime tree.
           # Release binaries deliberately do not fall back to PATH/system Node.
           node_version="22.23.4"
@@ -406,6 +429,37 @@ jobs:
           )
           PY
           cp README.md ROADMAP.md "$dist/" 2>/dev/null || true
+
+      - name: Sign and notarize macOS CLI payload
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          REQUIRE_APPLE_SIGNING: ${{ inputs.require_apple_signing || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            bash apps/desktop/scripts/sign-apple-runtime.sh "codypendent-${{ matrix.target }}"
+            echo "CLI ${{ matrix.target }}: every executable Developer ID signed and notarization verified." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$REQUIRE_APPLE_SIGNING" = "true" ]; then
+            echo "::error::Apple CLI signing was required but APPLE_CERTIFICATE is not configured."
+            exit 1
+          else
+            echo "::warning::CLI ${{ matrix.target }} is an unsigned preview, not a production Apple release."
+            echo "CLI ${{ matrix.target }}: **UNSIGNED preview**." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Package the tarball
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="codypendent-${{ matrix.target }}"
           tar -czf "$dist.tar.gz" "$dist"
           echo "artifact=$dist.tar.gz" >> "$GITHUB_OUTPUT"
 
@@ -422,20 +476,12 @@ jobs:
   # `ci` ever compiles it. This job is the only thing in the repository that
   # produces an installable desktop artefact.
   #
-  # ON SIGNING, stated plainly because the artefact names depend on it: there
-  # are no Apple signing or notarization secrets in this repository. The macOS
-  # bundle is therefore UNSIGNED, and an unsigned bundle is only installable
-  # through a delivery path that does not set `com.apple.quarantine`. That is
-  # why macOS ships a `.tar.gz` of `Codypendent.app` and NOT a `.dmg`: `gh
-  # release download` (what `codypendent install desktop` uses) leaves no
-  # quarantine bit, whereas a browser-downloaded `.dmg` arrives quarantined
-  # with no notarization ticket and macOS 15 removed the right-click → Open
-  # bypass. Attaching a `.dmg` here would ship something that LOOKS installable
-  # and is not. The signing env below is wired so that adding the secrets later
-  # makes Tauri sign without any further workflow change.
+  # macOS is staged with the matching CLI, worker launcher and sealed Node
+  # runtime, then signed inside-out and notarized when Apple credentials exist.
+  # Unsigned builds remain clearly labelled preview archives.
   desktop-bundle:
     name: desktop bundle ${{ matrix.target }}
-    needs: [desktop-tauri-quality, frontend-quality, rust-lint, rust-test, supply-chain]
+    needs: [build, desktop-tauri-quality, frontend-quality, rust-lint, rust-test, supply-chain]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -515,37 +561,58 @@ jobs:
           (cd sdk/protocol && npm ci && npm run build)
           (cd sdk/ui && npm ci && npm run build)
 
+      - name: Download the matching Apple runtime
+        if: runner.os == 'macOS'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: codypendent-${{ matrix.target }}
+          path: apple-runtime
+
       - name: Build the desktop bundle
         working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          npm ci
+          # Stage the complete runtime before applying any distribution signature.
+          npm run tauri:build -- --bundles ${{ matrix.bundles }} --no-sign
+
+      - name: Stage the self-contained Apple runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "apple-runtime/codypendent-${{ matrix.target }}.tar.gz" -C apple-runtime
+          python3 apps/desktop/scripts/apple-release.py stage \
+            apps/desktop/src-tauri/target/release/bundle/macos/Codypendent.app \
+            "apple-runtime/codypendent-${{ matrix.target }}"
+          python3 apps/desktop/scripts/apple-release.py verify \
+            apps/desktop/src-tauri/target/release/bundle/macos/Codypendent.app
+
+      - name: Sign and notarize the complete Apple app
+        if: runner.os == 'macOS'
+        shell: bash
         env:
-          # Absent in this repository today. An unset GitHub secret expands to the
-          # EMPTY STRING, not to nothing — and Tauri treats a set-but-empty
-          # APPLE_CERTIFICATE as "sign this", then fails in `security import`
-          # with "failed to import keychain certificate". So the run script below
-          # unsets them when no certificate is configured; populating the secret
-          # is what turns signing on.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          REQUIRE_APPLE_SIGNING: ${{ inputs.require_apple_signing || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) }}
         run: |
           set -euo pipefail
-          npm ci
-          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            # No signing identity configured. Unset every Apple variable so Tauri
-            # does not attempt to sign with an empty certificate, and say plainly
-            # that the artefact is unsigned — a quarantined .app that looks
-            # installable and is not would be worse than an honest label.
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
-                  APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD
-            echo "::warning::No APPLE_CERTIFICATE configured — building an UNSIGNED desktop bundle. macOS will quarantine it; users must run 'xattr -dr com.apple.quarantine <app>' to open it."
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            bash apps/desktop/scripts/sign-apple-release.sh \
+              apps/desktop/src-tauri/target/release/bundle/macos/Codypendent.app \
+              "codypendent-desktop-${{ matrix.target }}.dmg"
+            echo "macOS: Developer ID signatures, hardened runtime, stapled notarization and Gatekeeper verified." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$REQUIRE_APPLE_SIGNING" = "true" ]; then
+            echo "::error::Apple signing was required but APPLE_CERTIFICATE is not configured."
+            exit 1
+          else
+            echo "::warning::Building an unsigned Apple preview; this is not a notarized public release."
+            echo "macOS: self-contained **UNSIGNED preview**, not a notarized Apple release." >> "$GITHUB_STEP_SUMMARY"
           fi
-          # `tauri:build` is `tauri build -f app`; `-f app` is required because
-          # the binary's `required-features` gate exists so `cargo check`/
-          # `clippy` on this crate need no prior `npm run build`.
-          npm run tauri:build -- --bundles ${{ matrix.bundles }}
 
       - name: Package the desktop artefact
         id: package
@@ -556,6 +623,10 @@ jobs:
           case "${{ matrix.bundles }}" in
             app)
               test -d "$bundle/macos/Codypendent.app"
+              if [ ! -f "codypendent-desktop-${{ matrix.target }}.dmg" ]; then
+                bash apps/desktop/scripts/package-apple-release.sh \
+                  "$bundle/macos/Codypendent.app" "codypendent-desktop-${{ matrix.target }}.dmg"
+              fi
               tar -czf "codypendent-desktop-${{ matrix.target }}.tar.gz" \
                 -C "$bundle/macos" "Codypendent.app"
               echo "artifact=codypendent-desktop-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -569,47 +640,17 @@ jobs:
               ;;
           esac
 
-      # Say in the run summary whether what was just built is signed, so nobody
-      # has to infer it from the absence of a secret.
-      - name: Record the signing status
-        shell: bash
-        env:
-          # Compared as a boolean so the secret's VALUE never reaches a shell.
-          APPLE_IDENTITY_CONFIGURED: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
-        run: |
-          if [ "${{ runner.os }}" != "macOS" ]; then
-            echo "Linux AppImage: unsigned (Linux does not gate on code signing)." \
-              >> "$GITHUB_STEP_SUMMARY"
-          elif [ "$APPLE_IDENTITY_CONFIGURED" = "true" ]; then
-            echo "macOS bundle: SIGNED with the configured Apple identity." \
-              >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "macOS bundle: **UNSIGNED and NOT notarized** — no Apple secrets are configured." \
-              >> "$GITHUB_STEP_SUMMARY"
-            echo "Install it with \`codypendent install desktop\` (via \`gh\`, which sets no" \
-              >> "$GITHUB_STEP_SUMMARY"
-            echo "quarantine attribute). A browser download of this same tarball needs" \
-              >> "$GITHUB_STEP_SUMMARY"
-            echo "\`xattr -dr com.apple.quarantine /Applications/Codypendent.app\` to launch." \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       - name: Upload the desktop artefact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: codypendent-desktop-${{ matrix.target }}
-          path: ${{ steps.package.outputs.artifact }}
+          path: codypendent-desktop-${{ matrix.target }}.*
           if-no-files-found: error
 
-  publish:
-    name: publish release
+  release-artifacts:
+    name: verify release artifacts
     needs: [build, desktop-bundle]
-    if: >-
-      startsWith(github.ref, 'refs/tags/') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -646,6 +687,7 @@ jobs:
             codypendent-x86_64-apple-darwin.tar.gz
             codypendent-aarch64-apple-darwin.tar.gz
             codypendent-desktop-aarch64-apple-darwin.tar.gz
+            codypendent-desktop-aarch64-apple-darwin.dmg
             codypendent-desktop-x86_64-unknown-linux-gnu.AppImage
           )
           for archive in "${expected[@]}"; do
@@ -657,8 +699,43 @@ jobs:
           # it is counted rather than named.
           count() { find dist -maxdepth 1 -type f -name "$1" | wc -l | tr -d ' '; }
           test "$(count '*.tar.gz')" = "4"
+          test "$(count '*.dmg')" = "1"
           test "$(count '*.AppImage')" = "1"
           test "$(count '*.vsix')" = "1"
+
+      - name: Hash the final distribution assets
+        run: python3 .github/scripts/generate_release_manifest.py dist
+
+      - name: Upload verified distribution set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [release-artifacts]
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-artifacts
+          path: dist
+      - name: Resolve the workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
@@ -669,6 +746,8 @@ jobs:
             dist/*.tar.gz
             dist/*.AppImage
             dist/*.vsix
+            dist/*.dmg
+            dist/SHA256SUMS
 
       # Every push to main cuts one fresh, per-commit prerelease after every
       # platform artifact has passed the same quality gates.
@@ -685,3 +764,5 @@ jobs:
             dist/*.tar.gz
             dist/*.AppImage
             dist/*.vsix
+            dist/*.dmg
+            dist/SHA256SUMS

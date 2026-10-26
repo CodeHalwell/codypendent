@@ -1,3 +1,4 @@
+import { PageSection, PageShell } from "./PageShell.js";
 import React, { useCallback, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import type { RepositorySelection } from "../localConfig.js";
@@ -161,12 +162,10 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
   };
 
   return (
-    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
+    <PageShell style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Repository</h2>
       <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 720 }}>
-        The checkout every session, run and council is anchored to. Codypendent indexes it
-        into a code graph, so it must be a git working tree — a home or projects directory
-        is refused rather than indexed.
+        Choose the Git project your chats, agents and councils work in.
       </p>
 
       {status.kind === "loading" && (
@@ -191,8 +190,7 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
         <div data-testid="repo-none" style={{ ...panel, color: "var(--cody-text-muted)" }}>
           <strong style={{ color: "var(--cody-text)" }}>No repository selected.</strong>
           <div style={{ marginTop: 6, fontSize: 13 }}>
-            Sessions started now carry no repository, so the daemon has nothing to index and
-            repository-scoped surfaces stay empty. Choose a checkout below.
+            Choose a project folder to use its files, tasks and code graph.
           </div>
         </div>
       )}
@@ -254,9 +252,7 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
             fontSize: 13,
           }}
         >
-          The repository is bound into the daemon connection when it is made, so this change
-          reaches <code>CreateSession</code>, <code>AttachSession</code> and{" "}
-          <code>StartRun</code> only after a reconnect.
+          Reconnect to apply this project to new chats and runs.
           {connected && onReconnect ? (
             <button onClick={() => void reconnect()} disabled={busy} style={buttonStyle} data-testid="repo-reconnect-now">
               Reconnect now
@@ -282,9 +278,9 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
       </div>
 
       {onSetPath && (
-        <div style={{ marginTop: 20, maxWidth: 720 }}>
+        <PageSection title="Enter a folder path" description="An alternative to Choose folder">
           <label htmlFor="repo-path-input" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
-            Or type a path — validated exactly the same way
+            Project folder path
           </label>
           <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
             <input
@@ -309,9 +305,9 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
               Select
             </button>
           </div>
-        </div>
+        </PageSection>
       )}
-    </div>
+    </PageShell>
   );
 };
 

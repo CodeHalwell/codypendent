@@ -1,15 +1,13 @@
 //! Hybrid retrieval — the Chapter 05 funnel (STEP 2.3).
 //!
-//! Given a task, the registry retrieves a broad candidate set from four
-//! complementary sources, removes anything the caller is not allowed to see with
-//! **hard filters** (security is a filter, never a score), reranks the survivors
+//! Given a task, the registry applies visibility and governance filters before
+//! collecting bounded candidates from four complementary sources, reranks them
 //! by a weighted sum, pulls a selected skill's required tools in by dependency
 //! closure, and discloses a compact set of [`ToolCard`]s within a context budget:
 //!
 //! ```text
-//! candidates = dense top N ∪ BM25 top N ∪ exact id/keyword/intent top N ∪ history top N
-//!   → hard filters: scope chain, minimum trust, drop non-executable behaviours,
-//!                    drop risk above the query's ceiling   (security is a FILTER)
+//! hard filters: scope, trust, executable tools, risk, status, scope overrides
+//!   → candidates = dense top N ∪ BM25 top N ∪ exact top N ∪ history top N
 //!   → rerank: dense + lexical + exact + dependency + trust_bonus − risk_penalty
 //!   → dependency closure: a selected skill pulls its required tools by name
 //!   → context budget: 6–12 tool cards + 1–3 skill cards + 0–2 command cards
@@ -121,7 +119,7 @@ pub struct RetrievalResult {
 pub struct RetrievalTrace {
     /// The [`RetrievalConfig::version`] that produced this selection.
     pub config_version: u32,
-    /// Every candidate id in the pre-filter union, in source order.
+    /// Every eligible candidate id in the bounded union, in source order.
     pub candidate_ids: Vec<RegistryItemId>,
     /// The disclosed ids (tools then skills), in disclosure order.
     pub selected_ids: Vec<RegistryItemId>,
@@ -218,6 +216,13 @@ pub fn retrieve(
 ) -> Result<RetrievalResult, RetrievalError> {
     let by_id: HashMap<RegistryItemId, &RegistryItem> =
         items.iter().map(|item| (item.id, item)).collect();
+    let eligible = collapse_shadowed(
+        items
+            .iter()
+            .filter(|item| passes_hard_filters(item, query))
+            .collect(),
+    );
+    let allowed: HashSet<_> = eligible.iter().map(|item| item.id).collect();
 
     // ---- Candidate union: four complementary sources ------------------------
     // A caller-supplied vector (async/remote model, same space as the index)
@@ -226,9 +231,13 @@ pub fn retrieve(
         Some(vector) => vector.clone(),
         None => indexes.embedder.embed(&query.text),
     };
-    let dense = indexes.vector.search(&query_vec, config.dense_top);
-    let lexical = indexes.bm25.search(&query.text, config.bm25_top)?;
-    let exact = exact_match(items, &query.text, config.exact_top);
+    let dense = indexes
+        .vector
+        .search_allowed(&query_vec, config.dense_top, &allowed);
+    let lexical = indexes
+        .bm25
+        .search_allowed(&query.text, config.bm25_top, &allowed)?;
+    let exact = exact_match(&eligible, &query.text, config.exact_top);
 
     let dense_scores: HashMap<RegistryItemId, f32> = dense.iter().copied().collect();
     let lexical_scores: HashMap<RegistryItemId, f32> = lexical.iter().copied().collect();
@@ -251,23 +260,20 @@ pub fn retrieve(
     for (id, _) in &exact {
         push(*id, &mut seen, &mut candidate_ids);
     }
-    for id in query.history.iter().take(config.history_top) {
-        if by_id.contains_key(id) {
-            push(*id, &mut seen, &mut candidate_ids);
-        }
+    for id in query
+        .history
+        .iter()
+        .filter(|id| allowed.contains(id))
+        .take(config.history_top)
+    {
+        push(*id, &mut seen, &mut candidate_ids);
     }
 
-    // ---- Hard filters: security is a FILTER, never a score ------------------
     let survivors: Vec<&RegistryItem> = candidate_ids
         .iter()
+        .filter(|id| allowed.contains(id))
         .filter_map(|id| by_id.get(id).copied())
-        .filter(|item| passes_hard_filters(item, query))
         .collect();
-    // Collapse shadowed duplicates: several survivors can share `(kind, name)` at
-    // different scopes; the registry contract says the most specific scope wins
-    // SELECTION, so keep only the winner per identity before ranking + disclosure
-    // — otherwise the broader item could rank, or a duplicate card could show.
-    let survivors = collapse_shadowed(survivors);
 
     // Normalizers so each signal lands in ~[0, 1] before the weighted sum.
     let max_lexical = lexical_scores.values().copied().fold(0.0_f32, f32::max);
@@ -479,6 +485,19 @@ fn passes_hard_filters(item: &RegistryItem, query: &RetrievalQuery) -> bool {
     if item.risk > query.risk_ceiling {
         return false;
     }
+    if item.kind == RegistryItemKind::Skill {
+        if let crate::types::Provenance::Package { path } = &item.provenance {
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+                Err(error) => {
+                    tracing::warn!(skill = item.name, %error, "registered skill package is unreadable");
+                    return false;
+                }
+            }
+        }
+    }
     true
 }
 
@@ -486,7 +505,7 @@ fn passes_hard_filters(item: &RegistryItem, query: &RetrievalQuery) -> bool {
 /// `top_k`. A tool whose name/keyword/intent tokens the user typed verbatim is a
 /// strong, precise signal — this both seeds the candidate union and feeds the
 /// `exact` rerank term.
-fn exact_match(items: &[RegistryItem], query: &str, top_k: usize) -> Vec<(RegistryItemId, f32)> {
+fn exact_match(items: &[&RegistryItem], query: &str, top_k: usize) -> Vec<(RegistryItemId, f32)> {
     let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
     let mut scored: Vec<(RegistryItemId, f32)> = items
         .iter()
@@ -610,6 +629,71 @@ fn bounded(available: usize, min: usize, max: usize) -> usize {
 mod tests {
     use super::*;
     use crate::builtin::{builtin_commands, builtin_tools};
+
+    #[test]
+    fn inaccessible_and_shadowed_rows_cannot_consume_candidate_budgets() {
+        let repository = codypendent_protocol::RepositoryId::new();
+        let mut visible = builtin_tools().remove(0);
+        visible.kind = RegistryItemKind::Skill;
+        visible.name = "needle".to_string();
+        visible.description = "needle".to_string();
+        visible.intents = vec!["needle".to_string()];
+        visible.keywords = vec!["needle".to_string()];
+        visible.scope = Scope::Repository(repository);
+        visible.risk = RiskClass::Low;
+        let mut rows = Vec::new();
+        for reason in 0..5 {
+            let mut hidden = visible.clone();
+            hidden.id = RegistryItemId::new();
+            hidden.scope = Scope::System;
+            hidden.description = "needle ".repeat(20);
+            match reason {
+                0 => hidden.scope = Scope::Repository(codypendent_protocol::RepositoryId::new()),
+                1 => hidden.risk = RiskClass::High,
+                2 => hidden.trust.tier = TrustTier::Untrusted,
+                3 => hidden.status = RegistryStatus::Deprecated,
+                _ => {}
+            }
+            rows.push(hidden);
+        }
+        rows.push(visible.clone());
+        let mut vector = VectorIndex::new();
+        for row in &rows {
+            vector.insert(
+                row.id,
+                if row.id == visible.id {
+                    vec![0.0, 1.0]
+                } else {
+                    vec![1.0, 0.0]
+                },
+            );
+        }
+        let indexes = RetrievalIndexes::from_parts(&rows, vector, HashingEmbedder::new()).unwrap();
+        let mut query = RetrievalQuery::new(
+            "needle",
+            vec![Scope::Repository(repository)],
+            RiskClass::Low,
+        );
+        query.min_trust = TrustTier::FirstParty;
+        query.query_vector = Some(vec![1.0, 0.0]);
+        query.history = rows.iter().map(|item| item.id).collect();
+        for source in 0..4 {
+            let config = RetrievalConfig {
+                dense_top: usize::from(source == 0),
+                bm25_top: usize::from(source == 1),
+                exact_top: usize::from(source == 2),
+                history_top: usize::from(source == 3),
+                ..RetrievalConfig::default()
+            };
+            let result = retrieve(&rows, &indexes, &query, &config).unwrap();
+            assert_eq!(
+                result.trace.candidate_ids,
+                vec![visible.id],
+                "source {source}"
+            );
+            assert_eq!(result.skills[0].id, visible.id, "source {source}");
+        }
+    }
 
     /// The regression for the silently-discarded third kind: `Command` items pass
     /// the hard filters, enter the candidate union, and get scored — and used to

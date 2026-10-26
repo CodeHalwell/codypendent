@@ -145,6 +145,8 @@ pub enum Action {
     /// Ollama, LM Studio, vLLM (and any user-defined local provider) answered
     /// a TCP connect on its base URL. Replaces the previous probe wholesale.
     LocalEndpointsProbed(Vec<crate::state::LocalEndpoint>),
+    /// Updated local provider projection after an off-thread registry refresh.
+    ProviderCatalogLoaded(Vec<crate::state::ProviderCard>),
     /// Replace the harness-authoritative set of model profiles that can start a
     /// run without another setup/auth step. `onboard_attempt` correlates the
     /// refresh caused by one onboarding `AddModel`; only a matching runnable id
@@ -332,6 +334,13 @@ pub enum Action {
     /// Move the transcript fold selection to the next foldable entry
     /// (`Alt-↓`). Client-only.
     BrowseFoldNext,
+    /// Step through changed files or hunks in the browsed patch preview.
+    NavigatePatch {
+        forward: bool,
+        files: bool,
+    },
+    /// Open the browsed patch's current file/hunk in the same session's IDE.
+    OpenReviewedSource,
     /// Copy the exact safe projection of the browsed transcript card. The
     /// harness owns the clipboard; failures use the same redacted text shown
     /// on screen, never the raw provider payload.
@@ -435,6 +444,8 @@ pub enum Action {
     /// submitting — the composer/prompt buffer already renders embedded `\n`
     /// as separate lines, growing to fit.
     InputNewline,
+    /// Insert a line break even while browsing a transcript fold (Shift-Enter).
+    InsertNewline,
     /// Submit the open prompt (`Enter`).
     InputSubmit,
     /// Abandon the open prompt (`Esc`).
@@ -631,7 +642,7 @@ pub enum Action {
     /// `Unverified` to the honest answer.
     ModelKeyVerified {
         model_id: String,
-        ok: bool,
+        ok: Option<bool>,
         reason: String,
     },
 
@@ -801,6 +812,12 @@ pub enum ProjectionKind {
 /// intents produced, never on a socket.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
+    /// Client-only editor handoff; the harness supplies the attached session.
+    OpenReviewedSource {
+        run_id: RunId,
+        file: String,
+        line: u32,
+    },
     /// Send a renderer-originated Remote UI frame on the attached session.
     RemoteUiMessage(Box<UiWireMessage>),
     /// Read daemon-owned installed-plugin lifecycle state.
@@ -1049,6 +1066,8 @@ pub enum Intent {
         api_key: Option<SecretKey>,
         refresh: bool,
     },
+    /// Refresh the downloadable ACP catalogue without blocking input.
+    RefreshAgentCatalog,
 
     /// Verify one model's stored key with a single `/models` call (client-only
     /// — the key never leaves the machine, exactly like [`Intent::SetApiKey`]).

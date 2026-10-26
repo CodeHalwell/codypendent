@@ -1,0 +1,5 @@
+import type { CodeGraphEdgeView, CodeGraphNodeView, CodeGraphPage, CodeGraphStatusView } from "@codypendent/protocol";
+export const node = (id: string, name = `app::${id}`): CodeGraphNodeView => ({ id, qualified_name: name, source_path: `src/${id}.rs`, kind: "function", language: "rust", revision: "abc" });
+export const edge = (from: string, to: string, relation = "calls"): CodeGraphEdgeView => ({ from_id: from, from_name: `app::${from}`, to_id: to, to_name: `app::${to}`, relation, confidence: 1, evidence_kind: "syntax", revision: "abc" });
+export const page = (nodes = [node("start"), node("work")], edges = [edge("start", "work"), edge("work", "finish", "references")]): CodeGraphPage => ({ nodes, edges, total_nodes: nodes.length, total_edges: edges.length, limit: 100 });
+export const status: CodeGraphStatusView = { repository_root: "/actual/repo", nodes: 3, edges: 2, files: 3, by_language: [{ language: "rust", files: 3, nodes: 3, edges: 2 }], by_kind: [{ label: "function", count: 3 }], revisions: [{ label: "abc", count: 3 }], head_revision: "abc", working_tree_dirty: false, stale: false };

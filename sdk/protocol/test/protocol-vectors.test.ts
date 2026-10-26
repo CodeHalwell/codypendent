@@ -48,6 +48,7 @@ import type {
   CodeGraphGrammar,
   CodeGraphLanguageCount,
   CodeGraphNodeView,
+  CodeGraphSourceLocation,
   CodeGraphPage,
   CodeGraphQuery,
   CodeGraphScanReport,
@@ -1201,7 +1202,12 @@ function reconstructCodeGraphStatusView(r: Record<string, unknown>): CodeGraphSt
   };
 }
 
+function reconstructCodeGraphSourceLocation(r: Record<string, unknown>): CodeGraphSourceLocation {
+  return { source_path: str(r, "source_path"), line: num(r, "line"), column: num(r, "column"), end_line: optNum(r, "end_line"), end_column: optNum(r, "end_column") };
+}
+
 function reconstructCodeGraphNodeView(r: Record<string, unknown>): CodeGraphNodeView {
+  const location = optRec(r, "location");
   return {
     id: str(r, "id"),
     language: str(r, "language"),
@@ -1210,6 +1216,7 @@ function reconstructCodeGraphNodeView(r: Record<string, unknown>): CodeGraphNode
     qualified_name: str(r, "qualified_name"),
     kind: str(r, "kind"),
     revision: str(r, "revision"),
+    location: location ? reconstructCodeGraphSourceLocation(location) : undefined,
   };
 }
 
@@ -1219,6 +1226,7 @@ function reconstructCodeGraphEdgeAssertion(r: Record<string, unknown>): CodeGrap
 
 function reconstructCodeGraphEdgeView(r: Record<string, unknown>): CodeGraphEdgeView {
   const assertedBy = optRec(r, "asserted_by");
+  const callSite = optRec(r, "call_site");
   return {
     from_id: str(r, "from_id"),
     from_name: str(r, "from_name"),
@@ -1229,6 +1237,7 @@ function reconstructCodeGraphEdgeView(r: Record<string, unknown>): CodeGraphEdge
     evidence_kind: str(r, "evidence_kind"),
     revision: str(r, "revision"),
     asserted_by: assertedBy ? reconstructCodeGraphEdgeAssertion(assertedBy) : undefined,
+    call_site: callSite ? reconstructCodeGraphSourceLocation(callSite) : undefined,
   };
 }
 
@@ -1239,6 +1248,8 @@ function reconstructCodeGraphQuery(r: Record<string, unknown>): CodeGraphQuery {
     kind: optStr(r, "kind"),
     name: optStr(r, "name"),
     node_id: optStr(r, "node_id"),
+    connected_view: optBool(r, "connected_view"),
+    include_neighbors: optBool(r, "include_neighbors"),
     include_edges: optBool(r, "include_edges"),
     include_nodes: optBool(r, "include_nodes"),
     limit: optNum(r, "limit"),
@@ -1249,11 +1260,22 @@ function reconstructCodeGraphPage(r: Record<string, unknown>): CodeGraphPage {
   return {
     nodes: recArr(r, "nodes").map(reconstructCodeGraphNodeView),
     edges: recArr(r, "edges").map(reconstructCodeGraphEdgeView),
+    related_nodes: optRecArr(r, "related_nodes")?.map(reconstructCodeGraphNodeView),
     total_nodes: num(r, "total_nodes"),
     total_edges: num(r, "total_edges"),
     limit: num(r, "limit"),
   };
 }
+
+describe("CodeGraph source metadata", () => {
+  it("retains definition locations, recorded call sites and separately counted endpoint metadata", () => {
+    const location = { source_path: "src/main.rs", line: 12, column: 5, end_line: 12, end_column: 11 };
+    const node = { id: "n1", language: "rust", source_path: "src/main.rs", qualified_name: "target", kind: "function", revision: "r1", location };
+    const page = { nodes: [node], related_nodes: [{ ...node, id: "n2", qualified_name: "caller" }], edges: [{ from_id: "n2", from_name: "caller", to_id: "n1", to_name: "target", relation: "calls", confidence: 0.45, evidence_kind: "syntax_inferred", revision: "r1", call_site: location }], total_nodes: 1, total_edges: 1, limit: 100 };
+    expect(JSON.parse(JSON.stringify(reconstructCodeGraphPage(page)))).toEqual(page);
+    expect(JSON.parse(JSON.stringify(reconstructCodeGraphQuery({ include_neighbors: true })))).toEqual({ include_neighbors: true });
+  });
+});
 
 // ---------------------------------------------------------------------------
 // input.rs
@@ -1503,6 +1525,13 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         args_digest: str(r, "args_digest"),
         label: optStr(r, "label"),
       };
+    case "ToolUpdated":
+      return {
+        type: "ToolUpdated",
+        run_id: str(r, "run_id"),
+        tool: str(r, "tool"),
+        label: optStr(r, "label"),
+      };
     case "ToolCompleted": {
       const artifact = optRec(r, "artifact");
       return {
@@ -1575,6 +1604,13 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         prompt_tokens: optNum(r, "prompt_tokens"),
         completion_tokens: optNum(r, "completion_tokens"),
         cost_micros: optNum(r, "cost_micros"),
+        coverage: r.coverage == null ? undefined : {
+          requests: num(rec(r, "coverage"), "requests"),
+          prompt_requests: num(rec(r, "coverage"), "prompt_requests"),
+          completion_requests: num(rec(r, "coverage"), "completion_requests"),
+          cost_requests: num(rec(r, "coverage"), "cost_requests"),
+          unmeasured_retries: optNum(rec(r, "coverage"), "unmeasured_retries"),
+        },
       };
     case "LearningsCaptured":
       return {
@@ -2107,6 +2143,7 @@ function reconstructKnowledgeSection(r: Record<string, unknown>): KnowledgeSecti
 function reconstructKnowledgePage(r: Record<string, unknown>): KnowledgePage {
   return {
     section: reconstructKnowledgeSection(rec(r, "section")),
+    workspace_id: optStr(r, "workspace_id"), repository: optStr(r, "repository"),
     next_offset: optNum(r, "next_offset"), warnings: optStrArr(r, "warnings"),
     skills: optRecArr(r, "skills")?.map(item => ({ name: str(item, "name"), kind: str(item, "kind"),
       scope: str(item, "scope"), trust: str(item, "trust"), status: str(item, "status"), risk: str(item, "risk"),
@@ -3288,6 +3325,7 @@ describe("regressions these bindings previously shipped", () => {
     expect(body.prompt_tokens).toBe(1002);
     expect(body.completion_tokens).toBe(60);
     expect(body.cost_micros).toBeUndefined();
+    expect(body.coverage).toEqual({ requests: 2, prompt_requests: 1, completion_requests: 2, cost_requests: 0, unmeasured_retries: 1 });
   });
 
   it("RunCompleted carries a disposition and a chronicle, not duration_ms/cost_usd", () => {

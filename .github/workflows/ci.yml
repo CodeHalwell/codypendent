@@ -48,9 +48,16 @@ jobs:
       - name: Check migration immutability
         run: |
           python3 .github/scripts/check_migration_immutability.py
+          python3 .github/scripts/check_release_versions.py
           python3 .github/scripts/check_migration_immutability.py --directory crates/control-plane/migrations
       - name: Check release workflow security invariants
         run: python3 .github/scripts/check_release_workflow_security.py
+      - name: Check Apple release tooling
+        run: |
+          python3 apps/desktop/scripts/test_apple_release.py
+          python3 apps/desktop/scripts/test_prepare_embedding_runtime.py
+          python3 .github/scripts/tests/test_release_install.py
+          bash -n install.sh apps/desktop/scripts/apple-signing-env.sh apps/desktop/scripts/sign-apple-release.sh apps/desktop/scripts/sign-apple-runtime.sh apps/desktop/scripts/package-apple-release.sh
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -268,6 +275,10 @@ jobs:
           npm --prefix sdk/ui run build
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop run build
+      - name: Prepare bundled native runtimes
+        run: |
+          python3 apps/desktop/scripts/prepare-monty-runtime.py
+          python3 apps/desktop/scripts/prepare-embedding-runtime.py
       - name: Check the complete Tauri bridge and application
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --features app --all-targets --locked
       - name: Build native clients for desktop handoff

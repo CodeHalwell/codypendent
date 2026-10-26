@@ -1,3 +1,4 @@
+import { EmptyState, PageSection, PageShell } from "./PageShell.js";
 /**
  * A durable workflow run: its graph, its live node transitions, and the four
  * lifecycle controls the protocol exposes.
@@ -277,14 +278,8 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
     }
     if (watch.status === "idle") {
       return (
-        <div data-testid="workflow-idle" style={note("var(--cody-text-muted)")}>
-          Open a workflow run by id, or start one.
-          <div style={{ marginTop: 10, fontSize: 12, maxWidth: 640, margin: "10px auto 0" }}>
-            There is no browsable list of workflows here: the daemon exposes no list command, and
-            the TUI builds its list by reading the repository&rsquo;s{" "}
-            <code>.codypendent/workflows</code> directory and its durable run store directly. This
-            shell reads neither, so it will not show you a menu it cannot substantiate.
-          </div>
+        <div data-testid="workflow-idle">
+          <EmptyState title="Bring a workflow to life" description="Start a workflow from this repository, or open an existing run to follow its progress." />
         </div>
       );
     }
@@ -315,52 +310,40 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   }, [unavailable, watch, nodes, control, transport]);
 
   return (
-    <div role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}>
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
-        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Workflow Runs</h1>
+    <PageShell role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}>
+      <div className="cody-page-header" style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
+        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Workflows</h1>
         <p style={{ margin: "4px 0 14px", fontSize: 13, color: "var(--cody-text-muted)" }}>
-          Durable multi-node runs: live node transitions, measured cost, and lifecycle control
+          Follow work across agents, review progress and keep each step moving.
         </p>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <input
-            aria-label="Workflow run id"
-            value={runIdInput}
-            onChange={(event) => setRunIdInput(event.target.value)}
-            onKeyDown={(event) => event.key === "Enter" && void open(runIdInput)}
-            placeholder="workflow run id"
-            style={{ ...field, minWidth: 280 }}
-          />
-          <button style={button} onClick={() => void open(runIdInput)}>
-            Open run
-          </button>
-          {watch.status === "watching" && (
-            <button style={button} onClick={() => void open(watch.runId)}>
-              Refresh
-            </button>
-          )}
-        </div>
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
-          <input
-            aria-label="Workflow id to start"
-            value={startId}
+          <input aria-label="Workflow id to start" value={startId}
             onChange={(event) => setStartId(event.target.value)}
-            placeholder="workflow id (resolved by the daemon)"
-            style={{ ...field, minWidth: 240 }}
-          />
-          <input
-            aria-label="Workflow inputs JSON"
-            value={startInputs}
+            onKeyDown={(event) => event.key === "Enter" && startId.trim() && void startWorkflow()}
+            placeholder="Workflow name or ID" style={{ ...field, minWidth: 240, flex: 1 }} />
+          <button style={{ ...button, background: "var(--cody-accent-strong)", color: "var(--cody-on-accent)" }}
+            disabled={!transport?.startWorkflow || !startId.trim()} onClick={() => void startWorkflow()}>
+            Start workflow
+          </button>
+        </div>
+        <PageSection title="Workflow inputs" description="Optional values for this run">
+          <label htmlFor="workflow-inputs" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>Input values as JSON</label>
+          <input id="workflow-inputs" aria-label="Workflow inputs JSON" value={startInputs}
             onChange={(event) => setStartInputs(event.target.value)}
             onKeyDown={(event) => event.key === "Enter" && void startWorkflow()}
-            placeholder='inputs, a JSON object — e.g. {"branch":"main"}'
-            style={{ ...field, minWidth: 280, flex: 1 }}
-          />
-          <button style={{ ...button, background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }} onClick={() => void startWorkflow()}>
-            Start
-          </button>
-        </div>
+            placeholder='e.g. {"branch":"main"}' style={{ ...field, width: "100%", marginTop: 6 }} />
+        </PageSection>
+        <PageSection title="Open an existing run" description="Continue from a workflow run ID" defaultOpen={Boolean(initialRunId)}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input aria-label="Workflow run id" value={runIdInput}
+              onChange={(event) => setRunIdInput(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && void open(runIdInput)}
+              placeholder="Paste a workflow run ID" style={{ ...field, minWidth: 0, flex: 1 }} />
+            <button style={button} disabled={!transport?.readWorkflowRun || !runIdInput.trim()} onClick={() => void open(runIdInput)}>Open run</button>
+            {watch.status === "watching" && <button style={button} onClick={() => void open(watch.runId)}>Refresh</button>}
+          </div>
+        </PageSection>
       </div>
 
       {watch.status === "watching" && (
@@ -453,7 +436,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
           </div>
         </div>
       )}
-    </div>
+    </PageShell>
   );
 };
 

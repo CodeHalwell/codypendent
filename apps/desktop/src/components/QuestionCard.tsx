@@ -13,20 +13,28 @@
  * The outcome sent is the protocol's own `QuestionOutcome`: one list of chosen
  * labels per question, a custom answer carried verbatim as a label.
  */
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 import type { QuestionOutcomeView, QuestionPromptView } from "../types.js";
+import { useCommandActions, type CommandActions } from "../useCommandActions.js";
+import { CommandFeedbackNote } from "./CommandFeedbackNote.js";
+import { useCommandFocus } from "../useCommandFocus.js";
+import { renderMarkdown } from "../markdown.js";
 
 export interface QuestionCardProps {
   questionId: string;
   prompts: QuestionPromptView[];
   /** Absent when nothing can be sent (not connected, older shell). */
-  onResolve?: (questionId: string, outcome: QuestionOutcomeView) => void;
+  onResolve?: (questionId: string, outcome: QuestionOutcomeView) => void | Promise<void>;
+  revision?: number;
+  commandActions?: CommandActions;
 }
 
 const CARD: React.CSSProperties = {
   alignSelf: "flex-start",
-  width: "85%",
+  width: "100%",
+  boxSizing: "border-box",
+  overflowWrap: "anywhere",
   background: "var(--cody-panel-hover)",
   border: "1px solid var(--cody-accent)",
   borderRadius: 8,
@@ -81,10 +89,18 @@ const NOTE: React.CSSProperties = { fontSize: 12, color: "var(--cody-text-muted)
 /** The answer to one question: the labels picked, plus any typed text. */
 type Draft = { picked: string[]; custom: string };
 
-export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts, onResolve }) => {
+export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts, onResolve, revision, commandActions }) => {
   const [drafts, setDrafts] = useState<Draft[]>(() => prompts.map(() => ({ picked: [], custom: "" })));
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
+  const rejectButton = useRef<HTMLButtonElement>(null);
+  const feedbackInput = useRef<HTMLInputElement>(null);
+  const previousRejecting = useRef(rejecting);
+  useEffect(() => {
+    if (previousRejecting.current === rejecting) return;
+    previousRejecting.current = rejecting;
+    (rejecting ? feedbackInput.current : rejectButton.current)?.focus({ preventScroll: true });
+  }, [rejecting]);
 
   // A REISSUED question replaces its card in place under the same transcript
   // key (`daemonState` does this deliberately), so React keeps this component
@@ -96,7 +112,13 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
   // signature covers the prompts themselves, not just how many there are.
   // Resetting during render is React's documented way to derive state from
   // changed props — it re-renders immediately, before anything is shown.
-  const signature = `${questionId}:${JSON.stringify(prompts)}`;
+  const signature = `${questionId}:${revision ?? ""}:${JSON.stringify(prompts)}`;
+  const localActions = useCommandActions(`${signature}:${Boolean(onResolve)}`);
+  const actions = commandActions ?? localActions;
+  const actionKey = `question:${signature}`;
+  const result = actions.feedback[actionKey];
+  const { ref, preserveFocus } = useCommandFocus(result);
+  const locked = result?.phase === "pending" || result?.phase === "accepted";
   const [issued, setIssued] = useState(() => signature);
   if (issued !== signature) {
     setIssued(signature);
@@ -106,6 +128,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
   }
 
   const update = (index: number, change: (draft: Draft) => Draft) => {
+    if (actions.isLocked(actionKey)) return;
     setDrafts((current) => current.map((draft, at) => (at === index ? change(draft) : draft)));
   };
 
@@ -125,21 +148,24 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
   const complete = answers.every((answer) => answer.length > 0);
 
   const answer = () => {
-    if (!onResolve || !complete) {
+    if (!onResolve || !complete || actions.isLocked(actionKey)) {
       return;
     }
-    onResolve(questionId, { type: "Answered", answers });
+    preserveFocus();
+    actions.run(actionKey, () => onResolve(questionId, { type: "Answered", answers }), true);
   };
   const reject = () => {
-    if (!onResolve) {
+    if (!onResolve || actions.isLocked(actionKey)) {
       return;
     }
     const text = feedback.trim();
-    onResolve(questionId, { type: "Rejected", ...(text.length > 0 ? { feedback: text } : {}) });
+    preserveFocus();
+    actions.run(actionKey, () => onResolve(questionId, { type: "Rejected", ...(text.length > 0 ? { feedback: text } : {}) }), true);
   };
 
   return (
-    <div style={CARD} role="group" aria-label="Question from the agent" data-testid="question-card">
+    <div ref={ref} style={CARD} role="group" aria-label="Question from the agent" data-testid="question-card"
+      data-decision-id={`Question:${questionId}`} tabIndex={-1} aria-busy={result?.phase === "pending"}>
       <div style={TITLE}>
         {prompts.length > 1 ? `${prompts.length} questions from the agent` : "Question from the agent"}
       </div>
@@ -149,7 +175,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
         return (
           <section key={name} aria-label={prompt.header || `Question ${index + 1}`} style={{ marginBottom: 10 }}>
             {prompt.header && <div style={{ ...TITLE, fontSize: 13, marginBottom: 4 }}>{prompt.header}</div>}
-            <div style={QUESTION}>{prompt.question}</div>
+            <div style={QUESTION}>{renderMarkdown(prompt.question)}</div>
             {prompt.options.map((option) => {
               const checked = draft.picked.includes(option.label);
               return (
@@ -158,6 +184,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
                     type={prompt.multiple ? "checkbox" : "radio"}
                     name={name}
                     checked={checked}
+                    disabled={locked}
                     onChange={() =>
                       update(index, (current) => ({
                         ...current,
@@ -182,6 +209,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
                 aria-label={`Your own answer${prompt.header ? ` to ${prompt.header}` : ""}`}
                 placeholder={prompt.options.length > 0 ? "Or type your own answer" : "Type your answer"}
                 value={draft.custom}
+                disabled={locked}
                 onChange={(event) => {
                   const custom = event.target.value;
                   update(index, (current) => ({ ...current, custom }));
@@ -196,28 +224,30 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
         rejecting ? (
           <div>
             <input
+              ref={feedbackInput}
               type="text"
               aria-label="Why you are rejecting this question (optional)"
               placeholder="Optional: tell the agent what to do instead"
               value={feedback}
-              onChange={(event) => setFeedback(event.target.value)}
+              disabled={locked}
+              onChange={(event) => { if (!actions.isLocked(actionKey)) setFeedback(event.target.value); }}
               style={INPUT}
             />
             <div style={ACTIONS}>
-              <button type="button" style={PRIMARY} onClick={reject}>
+              <button type="button" style={PRIMARY} disabled={locked} onClick={reject}>
                 Send rejection
               </button>
-              <button type="button" style={SECONDARY} onClick={() => setRejecting(false)}>
+              <button type="button" style={SECONDARY} disabled={locked} onClick={() => { if (!actions.isLocked(actionKey)) setRejecting(false); }}>
                 Back
               </button>
             </div>
           </div>
         ) : (
           <div style={ACTIONS}>
-            <button type="button" style={PRIMARY} disabled={!complete} onClick={answer}>
+            <button type="button" style={PRIMARY} disabled={!complete || locked} onClick={answer}>
               Answer
             </button>
-            <button type="button" style={SECONDARY} onClick={() => setRejecting(true)}>
+            <button ref={rejectButton} type="button" style={SECONDARY} disabled={locked} onClick={() => { if (!actions.isLocked(actionKey)) setRejecting(true); }}>
               Reject
             </button>
           </div>
@@ -228,6 +258,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
           answer from the TUI.
         </div>
       )}
+      <CommandFeedbackNote feedback={result} />
     </div>
   );
 };

@@ -19,8 +19,12 @@
  *    draw or waive its own gate.
  */
 import React, { useCallback, useMemo, useRef, useState } from "react";
+import { AcpConnectDialog } from "./AcpConnectDialog.js";
+import { ModelDiscoveryPanel } from "./ModelDiscoveryPanel.js";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import { useFocusTrap } from "../useFocusTrap.js";
+import { providerLabel } from "../modelPresentation.js";
+import "./ModelPicker.css";
 
 import {
   describeError,
@@ -34,6 +38,8 @@ import {
 
 export interface ProviderPickerProps {
   client?: LocalConfigClient;
+  repositoryPath?: string;
+  onConnected?: () => void;
   /**
    * Called with a provider the operator picked and this build can execute.
    * Never called for an unavailable row, and never called for the community
@@ -59,14 +65,17 @@ const BADGE: React.CSSProperties = {
   color: "var(--cody-text-muted)",
 };
 
-export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect }) => {
+export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect, repositoryPath, onConnected }) => {
   const api = client ?? localConfigClient;
   const [view, setView] = useState<ProvidersView | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(
     shellAvailable() || client ? null : NO_SHELL,
   );
+  const [acp, setAcp] = useState<ProviderRow | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  const [configuredProviders, setConfiguredProviders] = useState<Set<string>>(() => new Set());
   /** The row awaiting a community-install trust decision, if any. */
   const [consent, setConsent] = useState<ProviderRow | null>(null);
   // The trust prompt takes focus on Decline — never on the consent button —
@@ -85,7 +94,14 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
       return;
     }
     try {
-      setView(await api.listProviders());
+      const [providers, models] = await Promise.allSettled([api.listProviders(), api.listModels?.()]);
+      if (providers.status === "rejected") throw providers.reason;
+      setView(providers.value);
+      setConfiguredProviders(new Set(models.status === "fulfilled" ? models.value?.models.flatMap((model) => {
+        if (model.provider === "acp") return [model.model.split(/[@#]/)[0]];
+        return model.provider_id ? [model.provider_id] : [];
+      }) : []));
+      if (models.status === "rejected") setNotice(`Could not read connected models: ${describeError(models.reason)}`);
       setUnavailable(null);
     } catch (error) {
       setView(null);
@@ -110,6 +126,14 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
   }, [view, query]);
 
   const pick = (row: ProviderRow) => {
+    if (configuredProviders.has(row.id) && !row.community_consent_required) {
+      onConnected?.();
+      return;
+    }
+    if (row.protocol === "acp" && row.available && api.connectAcp) {
+      setAcp(row);
+      return;
+    }
     if (row.community_consent_required) {
       // The confirmation is host chrome. Nothing is installed, downloaded or
       // configured by opening it.
@@ -132,9 +156,11 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
       <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Providers</h2>
         <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
-          The curated catalog, layered with your <code>providers.toml</code>.
+          Use installed agents and existing sign-ins, or connect another provider.
         </p>
       </header>
+
+      {(shellAvailable() || client) && <ModelDiscoveryPanel client={api} onDiscovered={() => { void load(); onConnected?.(); }} />}
 
       {unavailable ? (
         <div
@@ -155,6 +181,7 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
               type="search"
               value={query}
               placeholder="Filter providers"
+              aria-label="Filter providers"
               onChange={(event) => setQuery(event.target.value)}
               style={{
                 width: "100%",
@@ -168,33 +195,14 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
             />
           </div>
 
-          {/* ACP agents come from a crate this build does not link. Said, not
-              silently omitted — the list is otherwise indistinguishable from a
-              catalog that has none. */}
-          <div
-            role="note"
-            data-testid="provider-acp-unavailable"
-            style={{
-              margin: "8px 24px 0",
-              padding: "8px 12px",
-              color: "var(--cody-text-secondary)",
-              fontSize: 12,
-              lineHeight: 1.5,
-              border: "1px solid var(--cody-border-strong)",
-              background: "var(--cody-panel-raised)",
-              borderRadius: 6,
-            }}
-          >
-            <strong>Looking for Claude Code, Codex, Gemini CLI or another coding agent?</strong>{" "}
-            {view.acp_unavailable} In a terminal:{" "}
-            <code style={{ background: "var(--cody-canvas)", padding: "0 4px", borderRadius: 4 }}>
-              codypendent acp list
-            </code>{" "}
-            then{" "}
-            <code style={{ background: "var(--cody-canvas)", padding: "0 4px", borderRadius: 4 }}>
-              codypendent acp connect claude-code
-            </code>
-            . The connected agent then appears under Models here.
+          <div style={{ padding: "8px 24px" }}>
+            {api.refreshAgents && <button type="button" disabled={refreshing} onClick={async () => {
+              setRefreshing(true);
+              try { setView(await api.refreshAgents!()); setNotice(null); }
+              catch (error) { setNotice(describeError(error)); }
+              finally { setRefreshing(false); }
+            }}>{refreshing ? "Refreshing agent catalog…" : "Refresh agent catalog"}</button>}
+            {view.acp_unavailable && <p role="note" data-testid="provider-acp-unavailable">{view.acp_unavailable}</p>}
           </div>
 
           {view.warnings.map((warning) => (
@@ -235,19 +243,19 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                        <span style={{ fontWeight: 600 }}>{row.name}</span>
-                        <span style={{ ...BADGE }}>{row.protocol}</span>
-                        {row.local && <span style={{ ...BADGE, color: "var(--cody-success)" }}>local</span>}
-                        {row.has_key && <span style={{ ...BADGE, color: "var(--cody-success)" }}>key set</span>}
+                        <span style={{ fontWeight: 600 }}>{providerLabel(row.id, row.name)}</span>
+                        {configuredProviders.has(row.id) && <span style={{ ...BADGE, color: "var(--cody-success)" }}>Added to Models</span>}
+                        <span style={{ ...BADGE }}>{row.protocol === "acp" ? "Agent" : row.local ? "Local models" : "API models"}</span>
+                        {row.has_key && <span style={{ ...BADGE, color: "var(--cody-success)" }}>Key available</span>}
                         {row.requires_key && !row.has_key && (
-                          <span style={{ ...BADGE, color: "var(--cody-warning)" }}>needs key</span>
+                          <span style={{ ...BADGE, color: "var(--cody-warning)" }}>API key needed</span>
                         )}
                         {row.catalog_models > 0 && (
-                          <span style={{ ...BADGE }}>{row.catalog_models} catalog models</span>
+                          <span style={{ ...BADGE }}>{row.catalog_models} models</span>
                         )}
                       </div>
                       <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>
-                        {row.id} · {row.auth}
+                        {row.protocol === "acp" ? "Uses the agent’s own sign-in" : row.local ? "Runs on this computer" : "Connect using your provider account"}
                       </div>
                       {row.unusable_reason ? (
                         <div style={{ color: "var(--cody-warning)", fontSize: 12, marginTop: 4 }}>
@@ -262,6 +270,10 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                         </div>
                       ) : null}
                     </button>
+                    <details className="model-connection-details" style={{ margin: "6px 12px 10px" }}>
+                      <summary>Connection details</summary>
+                      <dl><dt>Provider ID</dt><dd><code>{row.id}</code></dd><dt>Protocol</dt><dd>{row.protocol}</dd><dt>Authentication</dt><dd>{row.auth}</dd></dl>
+                    </details>
                   </li>
                 ))}
               </ul>
@@ -275,6 +287,9 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
           {notice}
         </div>
       )}
+
+      {acp && <AcpConnectDialog provider={acp} repositoryPath={repositoryPath} client={api}
+        onClose={() => setAcp(null)} onConnected={() => { setAcp(null); setNotice(`Connected ${acp.name}. Its profiles are available in Models.`); onConnected?.(); }} />}
 
       {consent && (
         /* Host-owned trust confirmation. The evidence the operator is consenting

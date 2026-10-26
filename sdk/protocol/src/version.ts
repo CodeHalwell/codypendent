@@ -9,4 +9,4 @@ export interface ProtocolVersion {
  * `PROTOCOL_V1` in `version.rs`. Additive changes bump `minor`; breaking
  * changes bump `major` and require negotiation.
  */
-export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 10 };
+export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 11 };

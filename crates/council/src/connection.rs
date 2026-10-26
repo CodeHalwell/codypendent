@@ -34,6 +34,7 @@ pub struct Connection {
     /// `forward_events` and `handle_request` write to the same connection
     /// independently).
     pending: VecDeque<Envelope>,
+    selected_protocol: Option<codypendent_protocol::ProtocolVersion>,
 }
 
 impl Connection {
@@ -48,6 +49,7 @@ impl Connection {
             stream,
             client_id: ClientId::new(),
             pending: VecDeque::new(),
+            selected_protocol: None,
         })
     }
 
@@ -76,7 +78,10 @@ impl Connection {
         };
         let reply = self.request(Payload::ClientHello(hello)).await?;
         match reply.payload {
-            Payload::ServerHello(server_hello) => Ok(server_hello),
+            Payload::ServerHello(server_hello) => {
+                self.selected_protocol = Some(server_hello.selected_protocol);
+                Ok(server_hello)
+            }
             Payload::Error(error) => bail!("daemon refused the handshake: {}", error.message),
             other => bail!("expected ServerHello, got {other:?}"),
         }
@@ -93,6 +98,19 @@ impl Connection {
         let command_id = CommandId::new();
         self.send_command_with_idempotency(body, command_id, command_id.to_string())
             .await
+    }
+
+    /// Read readiness from the daemon that owns the configured providers.
+    pub async fn probe_models(
+        &mut self,
+        model: Option<codypendent_protocol::ModelId>,
+        network: bool,
+    ) -> anyhow::Result<Vec<codypendent_protocol::ModelProbe>> {
+        require_model_probe(self.selected_protocol)?;
+        model_probe_reply(
+            self.send_command(CommandBody::ProbeModel { model, network })
+                .await?,
+        )
     }
 
     /// Send a command with a caller-stable operation identity. Lifecycle flows
@@ -181,5 +199,68 @@ impl Connection {
     pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf, VecDeque<Envelope>, ClientId) {
         let (read_half, write_half) = self.stream.into_split();
         (read_half, write_half, self.pending, self.client_id)
+    }
+}
+
+/// Check before sending an additive command to an older daemon.
+pub fn require_model_probe(
+    version: Option<codypendent_protocol::ProtocolVersion>,
+) -> anyhow::Result<()> {
+    if !version
+        .is_some_and(|v| v.major == 1 && v.minor >= codypendent_protocol::PROBE_MODEL_MIN_MINOR)
+    {
+        bail!("Model readiness requires daemon protocol 1.9 or newer. Update and restart the daemon; this does not mean the model is unavailable.");
+    }
+    Ok(())
+}
+
+pub fn model_probe_reply(reply: Envelope) -> anyhow::Result<Vec<codypendent_protocol::ModelProbe>> {
+    match reply.payload {
+        Payload::ModelProbes { models, .. } => Ok(models),
+        Payload::CommandRejected(error) => {
+            bail!("Model probe refused: {} ({})", error.message, error.code)
+        }
+        Payload::Error(error) => bail!("Model probe failed: {} ({})", error.message, error.code),
+        _ => bail!("The daemon returned an unexpected model-probe reply"),
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use codypendent_protocol::{CommandId, ModelId, ModelProbe, ModelReadiness, ProtocolVersion};
+
+    #[test]
+    fn a_probe_requires_a_negotiated_capable_daemon() {
+        for version in [
+            None,
+            Some(ProtocolVersion { major: 1, minor: 8 }),
+            Some(ProtocolVersion { major: 2, minor: 9 }),
+        ] {
+            assert!(require_model_probe(version)
+                .unwrap_err()
+                .to_string()
+                .contains("Update and restart"));
+        }
+        assert!(require_model_probe(Some(PROTOCOL_V1)).is_ok());
+    }
+
+    #[test]
+    fn a_daemon_verdict_keeps_its_detail_and_network_evidence() {
+        let probe = ModelProbe {
+            id: ModelId("daemon-model".into()),
+            probed: false,
+            readiness: ModelReadiness::Unverified {
+                detail: "daemon credentials resolve".into(),
+            },
+        };
+        let reply = Envelope::request(
+            ClientId::new(),
+            Payload::ModelProbes {
+                command_id: CommandId::new(),
+                models: vec![probe.clone()],
+            },
+        );
+        assert_eq!(model_probe_reply(reply).unwrap(), vec![probe]);
     }
 }

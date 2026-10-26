@@ -2384,6 +2384,12 @@ type EventBody =
       type: "ToolStarted";
     }
   | {
+      label?: string | null;
+      run_id: string;
+      tool: string;
+      type: "ToolUpdated";
+    }
+  | {
       /**
        * Bulk output, if any, as an artifact reference.
        */
@@ -2470,6 +2476,7 @@ type EventBody =
   | {
       completion_tokens?: number | null;
       cost_micros?: number | null;
+      coverage?: UsageCoverage | null;
       prompt_tokens?: number | null;
       run_id: string;
       type: "RunUsage";
@@ -3228,9 +3235,11 @@ interface KnowledgePage {
   learnings?: LearningCard[];
   memories?: MemoryCard[];
   next_offset?: number | null;
+  repository?: string | null;
   section: KnowledgeSection;
   skills?: SkillCard[];
   warnings?: string[];
+  workspace_id?: string | null;
 }
 /**
  * `crates/tui/src/state.rs` `DocCard`.
@@ -3816,9 +3825,17 @@ interface BlackboardItemDraft {
  */
 interface CodeGraphQuery {
   /**
+   * An unfiltered visual overview follows one recorded connected neighbourhood, including endpoint metadata.
+   */
+  connected_view?: boolean;
+  /**
    * Include the edges incident to the selected nodes — **every** node the filter selects, not only the ones this page of nodes happens to show. The two row kinds are paged independently (see [`limit`](Self::limit)), so an edge between two nodes that both fall past the node page is still returned and still counted.
    */
   include_edges?: boolean;
+  /**
+   * Return metadata for endpoints of the returned edges in `related_nodes`, separately from the matching node page and its total. At most twice the edge limit can be returned; other query filters still select the main page.
+   */
+  include_neighbors?: boolean;
   /**
    * Include the nodes themselves. Both false is treated as both true — a query that selects nothing is a client bug, not a legal request. Both flags default to `false`, so this is exactly what the default `{}` query asks for: everything.
    */
@@ -4038,6 +4055,16 @@ interface CodypendentError {
    * A suggested next step the client can surface as an affordance.
    */
   user_action?: UserAction | null;
+}
+/**
+ * Completeness of the measured subtotal. Requests count calls to the model driver, including failed/cancelled calls; each measured dimension counts the calls that reported it. Retries without their own usage leave the subtotal partial even when the final attempt reports a measurement. Absent metadata on older events means coverage is unknown.
+ */
+interface UsageCoverage {
+  completion_requests: number;
+  cost_requests: number;
+  prompt_requests: number;
+  requests: number;
+  unmeasured_retries?: number;
 }
 /**
  * One question as asked. `custom` is carried on the wire but deliberately NOT advertised in the tool schema — the model can never disable free-text answers (opencode's Prompt/Info split).
@@ -4650,6 +4677,10 @@ interface CodeGraphPage {
   limit: number;
   nodes: CodeGraphNodeView[];
   /**
+   * Optional endpoint metadata requested by `include_neighbors`. These are not additional filter matches and do not change `total_nodes`.
+   */
+  related_nodes?: CodeGraphNodeView[];
+  /**
    * Edges incident to the filter's nodes, likewise **before** the limit and likewise over the whole filtered node set — a client renders it as the `M` in "showing N of M", so a total clamped to the page, or narrowed to the nodes one page showed, is a wrong number presented as a fact.
    */
   total_edges: number;
@@ -4666,6 +4697,10 @@ interface CodeGraphEdgeView {
    * Present exactly when this edge's stored evidence is an agent assertion — i.e. for an `agent_asserted` edge written by `graph.assert_edge`. Absent for every mechanically-derived edge (whose evidence points at bytes, not a judgement), so the common case stays byte-identical on the wire.
    */
   asserted_by?: CodeGraphEdgeAssertion | null;
+  /**
+   * The recorded call occurrence, verified against its parsed source bytes. Repeated calls may share one stored edge; this is not an exhaustive list.
+   */
+  call_site?: CodeGraphSourceLocation | null;
   confidence: number;
   evidence_kind: string;
   from_id: string;
@@ -4695,6 +4730,16 @@ interface CodeGraphEdgeAssertion {
   session_id: string;
 }
 /**
+ * A location in the parsed repository source. Lines and Unicode-character columns are one-based; the optional end position is exclusive.
+ */
+interface CodeGraphSourceLocation {
+  column: number;
+  end_column?: number | null;
+  end_line?: number | null;
+  line: number;
+  source_path: string;
+}
+/**
  * One node, projected for display.
  */
 interface CodeGraphNodeView {
@@ -4704,6 +4749,10 @@ interface CodeGraphNodeView {
   id: string;
   kind: string;
   language: string;
+  /**
+   * Recorded definition span, present only when the source still matches the parser's evidence. Unresolved references have no definition location.
+   */
+  location?: CodeGraphSourceLocation | null;
   package?: string | null;
   qualified_name: string;
   revision: string;
@@ -4738,6 +4787,7 @@ interface SessionProjection {
 interface PendingApprovalProjection {
   action: ProposedAction;
   approval_id: string;
+  pattern?: string | null;
   risk: Risk;
   run_id: string;
 }

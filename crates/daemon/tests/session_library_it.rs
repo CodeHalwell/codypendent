@@ -46,6 +46,191 @@ fn query(text: &str, limit: u32) -> SessionSearchQuery {
 }
 
 #[tokio::test]
+async fn reasoning_streams_commit_and_rebuild_without_losing_transcript_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = db::open_database(&temp.path().join("reasoning.db"))
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    let run = RunId::new();
+    codypendent_daemon::ledger::create_session(&pool, session, "Reasoning stream")
+        .await
+        .unwrap();
+    for (sequence, thought) in [(1, true), (2, false)] {
+        codypendent_daemon::ledger::append_event(
+            &pool,
+            session,
+            &SessionEvent {
+                sequence,
+                occurred_at: "2026-10-19T10:00:00Z".parse().unwrap(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id: run,
+                    text: format!("streamed fragment {sequence}"),
+                    thought,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let load = || {
+        sqlx::query_as::<_, (String, String, Option<i64>)>(
+        "SELECT source_type, source_id, event_sequence FROM session_search_sources ORDER BY source_type, source_id"
+    ).fetch_all(&pool)
+    };
+    let before = load().await.unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|(kind, _, seq)| kind == "reasoning" && *seq == Some(1))
+    );
+    assert!(
+        before
+            .iter()
+            .any(|(kind, _, seq)| kind == "transcript" && *seq == Some(2))
+    );
+    session_library::rebuild_search_sources(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, load().await.unwrap());
+    assert_eq!(
+        codypendent_daemon::ledger::load_events(&pool, session)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn title_page_pruning_preserves_transcript_ties_and_later_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = db::open_database(&temp.path().join("rank-pruning.db"))
+        .await
+        .unwrap();
+    let repository = RepositoryId::new();
+    let first = SessionId::new();
+    let second = SessionId::new();
+    let token = SessionId::new();
+    for (id, owner, title, repo) in [
+        (first, 1000, "needle first", repository),
+        (second, 1000, "needle second", repository),
+        (token, 1000, "a needle token", repository),
+        (SessionId::new(), 1001, "needle", repository),
+        (SessionId::new(), 1000, "needle", RepositoryId::new()),
+    ] {
+        insert_session(
+            &pool,
+            SessionFixture {
+                id,
+                owner_uid: Some(owner),
+                title,
+                updated_at: "2026-08-17T10:00:00Z",
+                repository_id: Some(repo),
+            },
+        )
+        .await;
+    }
+    sqlx::query("UPDATE sessions SET pinned = 1 WHERE id = ?")
+        .bind(token.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let run_id = RunId::new();
+    for (index, body) in [
+        EventBody::NoteAppended {
+            text: "needle".into(),
+            run_id: None,
+        },
+        EventBody::ModelStreamDelta {
+            run_id,
+            text: "needle".into(),
+            thought: false,
+        },
+        EventBody::PatchProposed {
+            run_id,
+            changeset_id: ChangeSetId::new(),
+            artifact: ArtifactRef {
+                id: codypendent_protocol::ArtifactId::new(),
+                media_type: "text/x-diff".into(),
+                byte_length: 1,
+                sha256: "a".repeat(64),
+                sensitivity: DataClassification::Internal,
+            },
+            files: vec![],
+            additions: 1,
+            deletions: 0,
+            preview: "needle".into(),
+            preview_truncated: false,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        codypendent_daemon::ledger::append_event(
+            &pool,
+            first,
+            &SessionEvent {
+                sequence: index as u64 + 1,
+                occurred_at: chrono::Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut search = query("needle", 100);
+    search.filters.repository_ids = vec![repository];
+    let complete =
+        session_library::search_sessions(&pool, 1000, PeerPrincipal::from_uid(1000), &search)
+            .await
+            .unwrap();
+    assert_eq!(
+        complete
+            .items
+            .iter()
+            .map(|item| item.score)
+            .collect::<Vec<_>>(),
+        vec![900.0, 800.0, 800.0, 700.0, 700.0, 650.0]
+    );
+    assert_eq!(
+        complete.items[3].session.session_id, token,
+        "pinned title wins the exact 700 tie"
+    );
+    assert_eq!(complete.items[4].source, SessionSearchSource::Transcript);
+    let expected = complete
+        .items
+        .into_iter()
+        .map(|item| item.stable_identity)
+        .collect::<Vec<_>>();
+
+    search.limit = 1;
+    let mut paged = Vec::new();
+    for _ in 0..10 {
+        let page =
+            session_library::search_sessions(&pool, 1000, PeerPrincipal::from_uid(1000), &search)
+                .await
+                .unwrap();
+        assert_eq!(page.items.len(), 1);
+        paged.push(page.items[0].stable_identity.clone());
+        search.cursor = page.next_cursor;
+        if search.cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        paged, expected,
+        "title pruning preserves every later transcript and cursor boundary"
+    );
+}
+
+#[tokio::test]
 async fn title_search_is_ranked_filtered_and_cursor_paged_without_overlap() {
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::open_database(&temp.path().join("library.db"))

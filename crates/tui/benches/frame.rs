@@ -360,11 +360,34 @@ fn bench_overlays(c: &mut Criterion) {
     group.finish();
 }
 
+/// Run just the clipboard boundary with:
+/// `cargo bench -p codypendent-tui --bench frame -- tui/paste --quick`.
+/// The event is constructed outside timing: measure production normalisation,
+/// including its allocation, without repeatedly cloning the source clipboard.
+fn bench_paste(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tui/paste");
+    for repeats in [100usize, 750_000] {
+        let event = crossterm::event::Event::Paste("code café\r\n".repeat(repeats));
+        group.bench_function(format!("{}_bytes", repeats * 12), |b| {
+            b.iter(|| {
+                black_box(codypendent_tui::map_event(
+                    black_box(&event),
+                    codypendent_tui::state::InputMode::Composer,
+                    WIDTH,
+                    &[],
+                ));
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_frame,
     bench_keystroke,
     bench_frame_parts,
-    bench_overlays
+    bench_overlays,
+    bench_paste
 );
 criterion_main!(benches);

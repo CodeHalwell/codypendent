@@ -40,6 +40,7 @@ mod edit_match;
 mod git;
 mod github;
 mod graph;
+mod graph_traversal;
 mod label;
 mod memory;
 mod plan;
@@ -94,9 +95,12 @@ pub use github::{
 pub use graph::{
     assertable_relation_names, graph_assert_action, graph_proposed_action, parse_assert_edge,
     parse_symbol_question, parse_tests_covering, relation_name, render_edge_assertions,
-    summarize_assertions, summarize_graph_question, AssertedEdge, CodeGraphAssertions,
-    EdgeAssertionOutcome, EdgeAssertionRequest, GraphAssertEdge, GraphBlastRadius, GraphCallersOf,
-    GraphTestsCovering, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
+    render_graph_answer, summarize_assertions, summarize_graph_question, AssertedEdge,
+    CodeGraphAssertions, EdgeAssertionOutcome, EdgeAssertionRequest, GraphAssertEdge,
+    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
+};
+pub use graph_traversal::{
+    graph_traversal_schema, parse_graph_traversal, traversal_kind, GRAPH_TRAVERSAL_TOOLS,
 };
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
@@ -106,7 +110,7 @@ pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use registry_search::{
     parse_skills_search, render_registry_search, RegistryCard, RegistrySearch,
     RegistrySearchOutcome, RegistrySearchRequest, SkillDocument, SkillsSearch, SkillsSearchInput,
-    SEARCH_CARD_LIMIT, SKILL_DOCUMENT_MAX_BYTES,
+    ToolSchema, SEARCH_CARD_LIMIT, SKILL_DOCUMENT_MAX_BYTES,
 };
 pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};

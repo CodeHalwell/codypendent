@@ -113,6 +113,8 @@ export type CouncilResultCard = {
    * for a chair that answered with nothing.
    */
   synthesis: string;
+  /** The independent verdict, when a reviewer actually ran. */
+  review?: CouncilMemberOutcome | null;
   participants: string[];
   costLine: string;
   reportMarkdown: string;

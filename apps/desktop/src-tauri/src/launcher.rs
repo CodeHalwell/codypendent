@@ -25,8 +25,9 @@ use codypendent_protocol::{read_envelope, write_envelope, ClientId, Envelope, Pa
 use serde::Serialize;
 use tokio::net::UnixStream;
 
-/// How long to wait for the socket to answer after spawning, in total.
-const START_BUDGET: Duration = Duration::from_secs(8);
+/// Cold startup also recovers the database and verifies the bundled runtime.
+/// Keep the launch pending while that work completes, with a bounded wait.
+const START_BUDGET: Duration = Duration::from_secs(90);
 /// How often to poll the socket while waiting.
 const START_POLL: Duration = Duration::from_millis(100);
 
@@ -34,6 +35,7 @@ const START_POLL: Duration = Duration::from_millis(100);
 /// unanswered. Generous for a local socket, and well inside [`START_BUDGET`]
 /// so a wedged peer still leaves room for the poll loop to give up.
 const PING_BUDGET: Duration = Duration::from_secs(2);
+static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The daemon program the shell would launch, and how.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -55,6 +57,7 @@ pub enum InvocationSource {
     Path,
     KnownDirectory,
     BesideThisApp,
+    DevelopmentBuild,
 }
 
 /// What `daemon_launch_status` answers with: whether anything is listening,
@@ -150,6 +153,33 @@ fn known_directories() -> Vec<PathBuf> {
     directories
 }
 
+/// Finder supplies a minimal PATH. Keep the user's explicit order, then add
+/// installed tool locations without evaluating a shell profile (which can
+/// prompt, perform network work, or never finish).
+fn daemon_path() -> Option<std::ffi::OsString> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let mut candidates = known_directories();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for relative in [
+            ".local/share/mise/shims",
+            ".asdf/shims",
+            ".pyenv/shims",
+            ".bun/bin",
+            ".volta/bin",
+        ] {
+            candidates.push(home.join(relative));
+        }
+    }
+    for directory in candidates {
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    std::env::join_paths(directories).ok()
+}
+
 /// The program names to look for, in order: the single binary first (it runs
 /// a daemon that always matches its own protocol), then the standalone daemon.
 const PROGRAM_NAMES: [&str; 2] = ["codypendent", "codypendentd"];
@@ -189,6 +219,7 @@ struct Environment {
     path_entries: Vec<PathBuf>,
     known_directories: Vec<PathBuf>,
     beside_app: Option<PathBuf>,
+    development_build: Option<PathBuf>,
 }
 
 impl Environment {
@@ -204,6 +235,8 @@ impl Environment {
             beside_app: std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+            development_build: cfg!(debug_assertions)
+                .then(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug")),
         }
     }
 }
@@ -220,6 +253,29 @@ fn resolve_in(
             return Ok((invocation_for(program), InvocationSource::Override));
         }
         searched.push(format!("{PROGRAM_OVERRIDE_ENV}={}", program.display()));
+    }
+    // A packaged app must start the daemon it shipped with, even when an
+    // older CLI is also on PATH. The explicit development override still wins.
+    if let Some(beside) = &environment.beside_app {
+        for name in PROGRAM_NAMES {
+            let candidate = beside.join(name);
+            if executable(&candidate) {
+                return Ok((invocation_for(&candidate), InvocationSource::BesideThisApp));
+            }
+            searched.push(candidate.display().to_string());
+        }
+    }
+    if let Some(directory) = &environment.development_build {
+        for name in PROGRAM_NAMES {
+            let candidate = directory.join(name);
+            if executable(&candidate) {
+                return Ok((
+                    invocation_for(&candidate),
+                    InvocationSource::DevelopmentBuild,
+                ));
+            }
+            searched.push(candidate.display().to_string());
+        }
     }
     let candidates = |directories: &[PathBuf]| {
         let mut found = Vec::new();
@@ -240,15 +296,6 @@ fn resolve_in(
         for candidate in candidates(directories) {
             if executable(&candidate) {
                 return Ok((invocation_for(&candidate), source));
-            }
-            searched.push(candidate.display().to_string());
-        }
-    }
-    if let Some(beside) = &environment.beside_app {
-        for name in PROGRAM_NAMES {
-            let candidate = beside.join(name);
-            if executable(&candidate) {
-                return Ok((invocation_for(&candidate), InvocationSource::BesideThisApp));
             }
             searched.push(candidate.display().to_string());
         }
@@ -288,6 +335,7 @@ pub async fn launch_status(paths: &RuntimePaths) -> LaunchStatus {
 /// daemon log — so it outlives this window, exactly as the CLI's does. An
 /// error names what was tried and the command to run by hand.
 pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> {
+    let _starting = START_LOCK.lock().await;
     if ping(&paths.socket_path).await {
         return Ok(StartOutcome::AlreadyRunning);
     }
@@ -320,6 +368,9 @@ pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> 
         .with_context(|| format!("opening {}", log.display()))?;
 
     let mut command = std::process::Command::new(&invocation.program);
+    if let Some(path) = daemon_path() {
+        command.env("PATH", path);
+    }
     command
         .args(&invocation.args)
         .stdin(std::process::Stdio::null())
@@ -331,20 +382,19 @@ pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> 
         // Its own process group: the daemon must not die with this window.
         command.process_group(0);
     }
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("starting {}", invocation.program))?;
     let pid = child.id();
 
-    let deadline = tokio::time::Instant::now() + START_BUDGET;
-    while tokio::time::Instant::now() < deadline {
-        if ping(&paths.socket_path).await {
-            return Ok(StartOutcome::Started {
-                pid,
-                program: invocation.program,
-            });
-        }
-        tokio::time::sleep(START_POLL).await;
+    if wait_for_startup(&paths.socket_path, &mut child, START_BUDGET)
+        .await
+        .with_context(|| format!("starting {}; check {}", invocation.program, log.display()))?
+    {
+        return Ok(StartOutcome::Started {
+            pid,
+            program: invocation.program,
+        });
     }
     bail!(
         "{} (pid {pid}) was started but nothing answered on {} within {} seconds; check {}",
@@ -355,10 +405,115 @@ pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> 
     )
 }
 
+async fn wait_for_startup(
+    socket: &Path,
+    child: &mut std::process::Child,
+    budget: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        // The daemon binds before recovery, then accepts after initialization.
+        // Keep this readiness connection alive until the startup deadline;
+        // dropping it every two seconds leaves closed peers in the accept queue.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ready = ping_within(socket, remaining);
+        tokio::pin!(ready);
+        let answered = loop {
+            tokio::select! {
+                answered = &mut ready => break answered,
+                _ = tokio::time::sleep(START_POLL) => ensure_still_starting(child)?,
+            }
+        };
+        if answered {
+            return Ok(true);
+        }
+        ensure_still_starting(child)?;
+        tokio::time::sleep(START_POLL).await;
+    }
+    Ok(false)
+}
+
+fn ensure_still_starting(child: &mut std::process::Child) -> anyhow::Result<()> {
+    if let Some(status) = child.try_wait().context("checking daemon startup")? {
+        bail!("daemon exited with {status} before the workspace was ready");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    struct StartupChild(std::process::Child);
+
+    impl Drop for StartupChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn startup_child(script: &str) -> StartupChild {
+        StartupChild(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("start fixture child"),
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_one_readiness_connection_while_the_child_initializes() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("starting.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_envelope(&mut stream).await.unwrap().unwrap();
+            tokio::time::sleep(START_POLL * 2).await;
+            write_envelope(&mut stream, &Envelope::reply_to(&request, Payload::Pong))
+                .await
+                .unwrap();
+        });
+        let mut child = startup_child("exec sleep 30");
+        assert!(
+            wait_for_startup(&socket, &mut child.0, Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_remains_bounded_when_a_live_child_never_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("silent.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut child = startup_child("exec sleep 30");
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_for_startup(&socket, &mut child.0, Duration::from_millis(150))
+                .await
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn startup_reports_a_child_exit_without_waiting_for_the_socket_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("exited.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut child = startup_child("exit 7");
+        assert_eq!(child.0.wait().unwrap().code(), Some(7));
+        let started = std::time::Instant::now();
+        let error = wait_for_startup(&socket, &mut child.0, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("7"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     /// A peer that ACCEPTS the connection and then goes silent must not hang
     /// the caller. `daemon_launch_status` and every poll in `start_daemon`
@@ -408,6 +563,7 @@ mod tests {
             path_entries: path_entries.iter().map(PathBuf::from).collect(),
             known_directories: known.iter().map(PathBuf::from).collect(),
             beside_app: beside.map(PathBuf::from),
+            development_build: None,
         }
     }
 
@@ -452,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn known_directories_and_the_app_bundle_are_fallbacks_after_path() {
+    fn bundled_daemon_precedes_path_and_known_installations() {
         let env = environment(
             None,
             &["/usr/bin"],
@@ -466,11 +622,43 @@ mod tests {
 
         let (invocation, source) = resolve_in(
             &env,
-            &present(&["/Applications/Codypendent.app/Contents/MacOS/codypendentd"]),
+            &present(&[
+                "/Applications/Codypendent.app/Contents/MacOS/codypendentd",
+                "/usr/bin/codypendent",
+                "/home/dan/.cargo/bin/codypendent",
+            ]),
         )
         .expect("found");
         assert_eq!(source, InvocationSource::BesideThisApp);
         assert!(invocation.args.is_empty());
+    }
+
+    #[test]
+    fn development_daemon_precedes_installed_cli_but_not_bundle_or_override() {
+        let mut env = environment(None, &["/usr/local/bin"], &[], Some("/app/Contents/MacOS"));
+        env.development_build = Some(PathBuf::from("/workspace/target/debug"));
+        let binaries = present(&[
+            "/workspace/target/debug/codypendent",
+            "/usr/local/bin/codypendent",
+        ]);
+        let (invocation, source) = resolve_in(&env, &binaries).expect("development daemon");
+        assert_eq!(source, InvocationSource::DevelopmentBuild);
+        assert_eq!(invocation.program, "/workspace/target/debug/codypendent");
+
+        let (invocation, source) = resolve_in(
+            &env,
+            &present(&[
+                "/app/Contents/MacOS/codypendent",
+                "/workspace/target/debug/codypendent",
+            ]),
+        )
+        .expect("bundled daemon");
+        assert_eq!(source, InvocationSource::BesideThisApp);
+        assert_eq!(invocation.program, "/app/Contents/MacOS/codypendent");
+
+        env.override_program = Some(PathBuf::from("/usr/local/bin/codypendent"));
+        let (_, source) = resolve_in(&env, &binaries).expect("explicit daemon");
+        assert_eq!(source, InvocationSource::Override);
     }
 
     #[tokio::test]

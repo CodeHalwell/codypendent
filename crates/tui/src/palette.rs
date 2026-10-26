@@ -51,6 +51,8 @@ pub enum PaletteCommand {
     Model,
     /// Open the provider catalog picker (Task 8).
     Provider,
+    /// Refresh the downloadable agent catalogue in the background.
+    RefreshAgents,
     /// Open the submission-mode picker (PR C2 — plan mode).
     Mode,
     /// Open the `/keys` overlay (D1): set/replace/remove API keys.
@@ -179,6 +181,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         description: "browse supported providers and add a usable model",
         // Palette-only (Task 8): no single-key equivalent, mirroring the
         // model picker's own row.
+        key: "—",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::RefreshAgents,
+        title: "/refresh-agents  Refresh agent catalogue",
+        description: "update downloadable ACP agents from the official registry",
         key: "—",
         group: "Models",
     },

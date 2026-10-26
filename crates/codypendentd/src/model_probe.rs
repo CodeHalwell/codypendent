@@ -2,8 +2,8 @@
 //!
 //! The verdicts are the ones the TUI's model picker and the desktop's Models
 //! page already computed in-process, moved to the daemon so every client shares
-//! one answer: a local endpoint is asked, a hosted credential is resolved
-//! without the network unless the caller asked for it, and an ACP agent is left
+//! one answer: credentials are resolved without contacting providers, explicit
+//! Test requests may contact their endpoint, and an ACP agent is left
 //! to the check the executor already runs when a run starts.
 //!
 //! # Why the failure is classified
@@ -22,7 +22,7 @@ use codypendent_daemon::models::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{CodypendentError, ModelProbe, ModelReadiness};
-use codypendent_runtime::models::{is_local_base_url, load_models, ModelConfig, ModelRegistry};
+use codypendent_runtime::models::{load_models, ModelConfig, ModelRegistry};
 
 /// The host:port a person recognises, for the `Ready` sentence.
 fn endpoint_host(url: &str) -> &str {
@@ -52,12 +52,9 @@ async fn probe_one(registry: &ModelRegistry, config: &ModelConfig, network: bool
             },
             false,
         )
-    // A local server costs nothing to ask, so it is probed even when the
-    // caller did not ask for the network. `is_local_base_url` compares the
-    // PARSED HOST: a substring test would call `https://localhost.example.com`
-    // local and send this model's credential to it during the pass that is
-    // supposed to touch nothing.
-    } else if network || is_local_base_url(&config.base_url) {
+    // A passive refresh must never send credentials to a provider, including
+    // local endpoints. Only an explicit Test authorizes a network request.
+    } else if network {
         let verdict = match registry.check_model(&config.id).await {
             Ok(()) => ModelReadiness::Ready {
                 detail: format!(
@@ -301,6 +298,33 @@ api_key_env = "CODYPENDENT_TEST_KEY_THAT_IS_NOT_SET"
             error.user_action,
             Some(codypendent_protocol::UserAction::Reauthenticate)
         );
+    }
+
+    #[tokio::test]
+    async fn a_passive_local_probe_does_not_attempt_a_connection() {
+        let (_dir, paths) = paths_with(
+            r#"
+[[model]]
+id = "local"
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:9/v1"
+model = "local-model"
+api_key_env = ""
+"#,
+        );
+        let ops = ModelProbeOps::new(paths);
+        let passive = ops
+            .run(ProbeModelRequest {
+                model: None,
+                network: false,
+            })
+            .await
+            .unwrap();
+        assert!(!passive[0].probed);
+        assert!(matches!(
+            passive[0].readiness,
+            ModelReadiness::Unverified { .. }
+        ));
     }
 
     /// A model with no base URL is refused without any lookup, and carries no

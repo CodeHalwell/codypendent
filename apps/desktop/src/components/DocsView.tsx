@@ -1,3 +1,4 @@
+import { PageShell } from "./PageShell.js";
 /**
  * Docs Studio — the TUI's `Overlay::Docs` and its publish wizard.
  *
@@ -284,17 +285,17 @@ export const DocsView: React.FC<DocsViewProps> = ({
   };
 
   return (
-    <div style={surfaceStyles.page}>
-      <div style={surfaceStyles.header}>
+    <PageShell style={surfaceStyles.page}>
+      <div className="cody-page-header" style={surfaceStyles.header}>
         <div>
-          <div style={surfaceStyles.title}>Docs Studio</div>
+          <h1 style={surfaceStyles.title}>Documents</h1>
           <div style={surfaceStyles.subtitle}>
-            Edit, review, and publish documents the daemon already holds.
+            Keep plans, notes and agent suggestions together. Review changes before publishing.
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           {onCreateDocument && (
-            <button style={surfaceButton()} onClick={() => setNewTitle("")}>
+            <button style={surfaceButton("primary")} onClick={() => setNewTitle("")}>
               New document…
             </button>
           )}
@@ -306,7 +307,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
         </div>
       </div>
 
-      <div style={surfaceStyles.scroll}>
+      <div className="cody-page-body" style={surfaceStyles.scroll}>
         {notice && (
           <div
             role="status"
@@ -482,12 +483,15 @@ export const DocsView: React.FC<DocsViewProps> = ({
         )}
 
         <SurfaceBody
+          emptyTitle="Create your first document"
+          emptyAction={onCreateDocument && <button style={surfaceButton("primary")} onClick={() => setNewTitle("")}>New document</button>}
+          onRetry={onRefresh}
           status={docs.status}
           detail={docs.detail}
           count={docs.items.length}
           emptyMessage="No documents exist in this workspace yet."
         >
-          <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+          <div className="cody-page-columns">
             <div style={{ width: 240, flexShrink: 0 }}>
               {docs.items.map((doc) => {
                 const active = selected?.document_id === doc.document_id;
@@ -705,6 +709,6 @@ export const DocsView: React.FC<DocsViewProps> = ({
           </div>
         </SurfaceBody>
       </div>
-    </div>
+    </PageShell>
   );
 };

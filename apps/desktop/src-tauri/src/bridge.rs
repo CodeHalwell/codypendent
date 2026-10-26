@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use codypendent_protocol::{
     AgentMode, AnalyticsExportRequest, AnalyticsExportResult, AnalyticsPage, AnalyticsQuery,
-    ApprovalDecision, ApprovalId, ArtifactRef, InboxEntry, InboxListQuery, InboxMutation,
-    InboxPage, RunId, SessionId,
+    ApprovalDecision, ApprovalId, ApprovalScope, ArtifactRef, InboxEntry, InboxListQuery,
+    InboxMutation, InboxPage, RunId, SessionId,
 };
 use tauri::ipc::{Channel, Response};
 use tauri::State;
@@ -68,6 +68,8 @@ impl FrameSink for ChannelSink {
 #[derive(Default)]
 pub struct Bridge {
     connection: Mutex<Option<Connected>>,
+    attempt: Mutex<ConnectionAttempt>,
+    connect_lock: Mutex<()>,
     /// The mode and model the operator has staged for the NEXT run.
     ///
     /// Client state, exactly as in the TUI: picking a mode sets
@@ -78,6 +80,35 @@ pub struct Bridge {
     /// with an objective and nothing else, and the staged selection is applied
     /// on the way past.
     run_defaults: Mutex<RunDefaults>,
+}
+
+#[derive(Default)]
+struct ConnectionAttempt {
+    epoch: u64,
+    generation: Option<u64>,
+}
+
+impl ConnectionAttempt {
+    fn begin(&mut self, generation: Option<u64>) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.generation = Some(generation.unwrap_or(0));
+        self.epoch
+    }
+
+    fn cancel(&mut self, generation: Option<u64>) {
+        if generation.is_none() || self.generation == generation {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.generation = None;
+        }
+    }
+
+    fn validate(&self, epoch: u64) -> Result<(), String> {
+        if self.epoch == epoch && self.generation.is_some() {
+            Ok(())
+        } else {
+            Err("workspace connection was superseded".to_owned())
+        }
+    }
 }
 
 /// What the next run will use unless the caller overrides it.
@@ -133,6 +164,8 @@ impl Bridge {
     pub fn load() -> Self {
         Self {
             connection: Mutex::new(None),
+            attempt: Mutex::new(ConnectionAttempt::default()),
+            connect_lock: Mutex::new(()),
             run_defaults: Mutex::new(RunDefaults::restored()),
         }
     }
@@ -203,7 +236,11 @@ async fn daemon_connect(
     // older frontend, which then behaves as it did before.
     generation: Option<u64>,
 ) -> Result<ConnectionInfo, String> {
-    let socket = socket_path().map_err(|error| format!("{error:#}"))?;
+    let epoch = bridge.attempt.lock().await.begin(generation);
+    let _connecting = bridge.connect_lock.lock().await;
+    bridge.attempt.lock().await.validate(epoch)?;
+    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
+        .map_err(|error| format!("{error:#}"))?;
     // The repository the OPERATOR chose, or `None`.
     //
     // This used to be `std::env::current_dir()`. For a bundled `.app` that is
@@ -231,10 +268,34 @@ async fn daemon_connect(
     // operator's memories and documents vanished again. The stand-in is stable
     // for the life of the process.
     let workspace = Some(crate::repository::workspace_for_connection());
-    let (client, info) =
-        DaemonClient::connect_as(&socket, repository, workspace, Arc::clone(&sink))
-            .await
-            .map_err(|error| format!("{error:#}"))?;
+    bridge.attempt.lock().await.validate(epoch)?;
+    let (client, info) = match DaemonClient::connect_as(
+        &paths.socket_path,
+        repository.clone(),
+        workspace,
+        Arc::clone(&sink),
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(error) if daemon_is_absent(&error) => {
+            bridge.attempt.lock().await.validate(epoch)?;
+            crate::launcher::start_daemon(&paths)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            bridge.attempt.lock().await.validate(epoch)?;
+            DaemonClient::connect_as(&paths.socket_path, repository, workspace, Arc::clone(&sink))
+                .await
+                .map_err(|error| format!("{error:#}"))?
+        }
+        Err(error) => return Err(format!("{error:#}")),
+    };
+    let attempt = bridge.attempt.lock().await;
+    if let Err(error) = attempt.validate(epoch) {
+        drop(attempt);
+        client.shutdown().await;
+        return Err(error);
+    }
 
     // Replacing a live connection tears the old one down for real
     // (`DaemonClient::shutdown`): dropping its Arc alone would leak the reader
@@ -246,10 +307,23 @@ async fn daemon_connect(
         sink,
         generation: generation.unwrap_or(0),
     });
+    drop(attempt);
     if let Some(previous) = previous {
         previous.client.shutdown().await;
     }
     Ok(info)
+}
+
+fn daemon_is_absent(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
 }
 
 /// Drop the connection, tearing it down for real: the reader task is aborted
@@ -262,6 +336,8 @@ async fn daemon_disconnect(
     // what an app teardown wants and what an older frontend sends.
     generation: Option<u64>,
 ) -> Result<(), String> {
+    let mut attempt = bridge.attempt.lock().await;
+    attempt.cancel(generation);
     let mut held = bridge.connection.lock().await;
     // A stale teardown must not close a NEWER connection. Compared while the
     // lock is held, so the check and the take cannot be separated by a connect.
@@ -272,6 +348,7 @@ async fn daemon_disconnect(
     }
     if let Some(connection) = held.take() {
         drop(held);
+        drop(attempt);
         connection.client.shutdown().await;
     }
     Ok(())
@@ -292,19 +369,39 @@ async fn list_sessions(bridge: State<'_, Bridge>) -> Result<Vec<SessionRow>, Str
 /// `mode` and `model` are optional: omitted, the run uses whatever the operator
 /// staged in the mode/model pickers (see [`RunDefaults`]). An explicit argument
 /// wins for that one run without changing the staged selection.
+#[derive(serde::Deserialize)]
+pub struct DesktopManifest {
+    context: serde_json::Value,
+    tools: Vec<codypendent_runtime::desktop_tools::DesktopTool>,
+}
+
 #[tauri::command]
 async fn start_objective(
     bridge: State<'_, Bridge>,
     objective: String,
     mode: Option<AgentMode>,
     model: Option<ModelId>,
+    session_id: Option<SessionId>,
+    desktop: Option<DesktopManifest>,
 ) -> Result<crate::daemon::RunHandle, String> {
     let (client, sink) = connected(&bridge).await?;
     let defaults = bridge.run_defaults.lock().await.clone();
     let mode = mode.unwrap_or(defaults.mode);
     let model = model.or(defaults.model);
     client
-        .start_objective(objective, mode, model, &sink)
+        .start_objective_prepared(objective, mode, model, session_id, &sink, |session| {
+            if let Some(mut desktop) = desktop {
+                desktop
+                    .context
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Desktop context must be an object"))?
+                    .insert("sessionId".into(), serde_json::json!(session.to_string()));
+                codypendent_runtime::desktop_tools::DesktopTools::resolve()
+                    .and_then(|tools| tools.publish(session, desktop.context, desktop.tools))
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        })
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -370,13 +467,12 @@ async fn queue_steering(
         .map_err(|error| format!("{error:#}"))
 }
 
-/// Resolve the exact approval shown by the desktop card. The webview supplies
-/// only approve/reject; the daemon client fixes the authority scope to `Once`.
 #[tauri::command]
 async fn resolve_approval(
     bridge: State<'_, Bridge>,
     approval_id: ApprovalId,
     approved: bool,
+    scope: Option<ApprovalScope>,
 ) -> Result<(), String> {
     let client = client_of(&bridge).await?;
     let decision = if approved {
@@ -385,7 +481,7 @@ async fn resolve_approval(
         ApprovalDecision::Reject
     };
     client
-        .resolve_approval(approval_id, decision)
+        .resolve_approval(approval_id, decision, scope.unwrap_or(ApprovalScope::Once))
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -483,6 +579,42 @@ async fn read_artifact(
         .await
         .map(Response::new)
         .map_err(|error| format!("{error:#}"))
+}
+
+/// The webview supplies an artifact reference, never a writable path. A native
+/// Save dialog chooses the destination; the existing reader verifies every byte
+/// before any file is replaced. Cancellation is a distinct, successful outcome.
+#[tauri::command]
+async fn save_artifact<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    bridge: State<'_, Bridge>,
+    artifact: ArtifactRef,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt as _;
+
+    let client = client_of(&bridge).await?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Save Codypendent artifact")
+        .set_file_name(crate::artifacts::suggested_name(&artifact))
+        .save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let Some(picked) = rx
+        .await
+        .map_err(|_| "the save dialog closed without answering".to_owned())?
+    else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|error| format!("the save destination is not a local path: {error}"))?;
+    client
+        .save_artifact(&artifact, &path)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
 }
 
 // ---------------------------------------------------------------- Session
@@ -743,6 +875,35 @@ async fn list_models(bridge: State<'_, Bridge>) -> Result<ModelsView, String> {
     crate::models::list_models(pinned.as_ref()).map_err(|error| format!("{error:#}"))
 }
 
+#[tauri::command]
+async fn discover_models(
+    bridge: State<'_, Bridge>,
+    prefer_available: Option<bool>,
+) -> Result<crate::models::ModelDiscovery, String> {
+    let starting_model = bridge.run_defaults.lock().await.model.clone();
+    let repository = crate::repository::selected_repository()
+        .map_err(|error| format!("{error:#}"))?
+        .map(|repository| std::path::PathBuf::from(repository.path));
+    let report = crate::models::discover_models(repository.as_deref())
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let mut defaults = bridge.run_defaults.lock().await;
+    if defaults.model != starting_model {
+        return Ok(report);
+    }
+    let selected = crate::models::reconcile_discovery_default(
+        &report,
+        defaults.model.as_ref(),
+        prefer_available.unwrap_or(false),
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    if defaults.model != selected {
+        defaults.model = selected;
+        persist_run_defaults(&defaults)?;
+    }
+    Ok(report)
+}
+
 /// Pin a model for the next run, or clear the pin with `null`.
 ///
 /// Refuses an id that is not in `models.toml`: a pin naming nothing configured
@@ -761,26 +922,50 @@ async fn set_run_model(bridge: State<'_, Bridge>, model: Option<ModelId>) -> Res
     persist_run_defaults(&defaults)
 }
 
-/// Readiness for every configured model — the TUI's picker badges, computed
-/// the same way (`crates/cli/src/tui.rs::load_model_cards`). Local endpoints
-/// are asked; hosted models are credential-checked without the network.
 #[tauri::command]
-async fn list_model_readiness() -> Result<Vec<crate::models::ModelReadinessView>, String> {
-    crate::models::list_model_readiness()
+async fn send_remote_ui(
+    bridge: State<'_, Bridge>,
+    session_id: String,
+    message: codypendent_protocol::UiWireMessage,
+) -> Result<(), String> {
+    let session_id = session_id
+        .parse::<SessionId>()
+        .map_err(|error| error.to_string())?;
+    client_of(&bridge)
+        .await?
+        .send_remote_ui(session_id, message)
         .await
         .map_err(|error| format!("{error:#}"))
 }
 
-/// Readiness for one model; with `probe`, the provider is asked over the
-/// network because the operator pressed Test.
+/// Passive readiness is answered by the connected daemon without provider requests.
 #[tauri::command]
-async fn model_readiness(
-    model_id: String,
-    probe: bool,
-) -> Result<crate::models::ModelReadinessView, String> {
-    crate::models::model_readiness(&model_id, probe)
+async fn list_model_readiness(
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<codypendent_protocol::ModelProbe>, String> {
+    client_of(&bridge)
+        .await?
+        .probe_models(None, false)
         .await
         .map_err(|error| format!("{error:#}"))
+}
+
+/// The operator explicitly requested a provider test.
+#[tauri::command]
+async fn model_readiness(
+    bridge: State<'_, Bridge>,
+    model_id: String,
+    probe: bool,
+) -> Result<codypendent_protocol::ModelProbe, String> {
+    let models = client_of(&bridge)
+        .await?
+        .probe_models(Some(ModelId(model_id.clone())), probe)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    models
+        .into_iter()
+        .find(|row| row.id.0 == model_id)
+        .ok_or_else(|| "The daemon returned no readiness for this model".to_owned())
 }
 
 /// Add a model to `models.toml`, optionally storing its API key.
@@ -828,6 +1013,30 @@ async fn remove_model(bridge: State<'_, Bridge>, model_id: String) -> Result<(),
 #[tauri::command]
 async fn list_providers() -> Result<ProvidersView, String> {
     crate::models::list_providers().map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn refresh_agents() -> Result<ProvidersView, String> {
+    crate::models::refresh_agents()
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn connect_acp(
+    provider_id: String,
+    repository: String,
+    accept_community_risk: bool,
+) -> Result<crate::models::ConnectedAcp, String> {
+    let repository = crate::repository::validate_repository(std::path::Path::new(&repository))
+        .map_err(|error| format!("{error:#}"))?;
+    crate::models::connect_acp(
+        &provider_id,
+        std::path::Path::new(&repository.path),
+        accept_community_risk,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// The curated catalog models for one provider — a real, offline pick-list.
@@ -964,11 +1173,14 @@ async fn list_learnings(bridge: State<'_, Bridge>) -> Result<Vec<LearningCard>, 
 /// the outcome sentence; a conflict or duplicate rejects with its own.
 #[tauri::command]
 async fn mutate_learning(
+    bridge: State<'_, Bridge>,
     learning_id: String,
     revision: u64,
     mutation: LearningMutation,
 ) -> Result<String, String> {
-    crate::knowledge::mutate_learning(&learning_id, revision, &mutation)
+    let client = client_of(&bridge).await?;
+    client
+        .mutate_learning(&learning_id, revision, &mutation)
         .await
         .map_err(knowledge_error)
 }
@@ -1128,8 +1340,10 @@ async fn pick_repository<R: tauri::Runtime>(
 ) -> Result<Option<crate::repository::RepositorySelection>, String> {
     use tauri_plugin_dialog::DialogExt as _;
 
-    let start = crate::repository::selected_repository()
+    let start = tokio::task::spawn_blocking(crate::repository::selected_repository)
+        .await
         .ok()
+        .and_then(Result::ok)
         .flatten()
         .map(|selection| selection.path);
 
@@ -1154,7 +1368,9 @@ async fn pick_repository<R: tauri::Runtime>(
     let path = picked
         .into_path()
         .map_err(|error| format!("the chosen folder is not a local path: {error}"))?;
-    crate::repository::select_repository(&path)
+    tokio::task::spawn_blocking(move || crate::repository::select_repository(&path))
+        .await
+        .map_err(|error| format!("the repository selection task failed: {error}"))?
         .map(Some)
         .map_err(|error| format!("{error:#}"))
 }
@@ -1179,8 +1395,12 @@ async fn current_repository() -> Result<Option<crate::repository::RepositorySele
 /// the same gate the folder picker goes through.
 #[tauri::command]
 async fn set_repository(path: String) -> Result<crate::repository::RepositorySelection, String> {
-    crate::repository::select_repository(std::path::Path::new(&path))
-        .map_err(|error| format!("{error:#}"))
+    tokio::task::spawn_blocking(move || {
+        crate::repository::select_repository(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|error| format!("the repository selection task failed: {error}"))?
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// Forget the selection. The client then has no repository until one is chosen.
@@ -1440,6 +1660,10 @@ fn credential_check(
     let mut undetermined: Vec<String> = Vec::new();
 
     for row in &models.models {
+        if row.provider == "acp" {
+            ready.push(format!("{} (uses the installed agent's sign-in)", row.id));
+            continue;
+        }
         match &row.key {
             crate::models::KeyStatus::Stored => {
                 ready.push(format!("{} (key stored in auth.json)", row.id));
@@ -1529,7 +1753,23 @@ fn repository_check() -> OnboardCheck {
 //
 // A fourth additive `use` block, for the same reason as the ones above.
 // ---------------------------------------------------------------------------
-use codypendent_protocol::{CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphStatusView};
+use codypendent_protocol::{
+    CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport, CodeGraphStatusView,
+};
+
+static CODE_GRAPH_BUILD_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[tauri::command]
+async fn build_code_graph(bridge: State<'_, Bridge>) -> Result<CodeGraphScanReport, String> {
+    let _build = CODE_GRAPH_BUILD_LOCK
+        .try_lock()
+        .map_err(|_| "The code map is already being built. Refresh it in a moment.".to_string())?;
+    client_of(&bridge)
+        .await?
+        .build_code_graph()
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
 
 /// `ReadCodeGraphStatus`: what the stored graph holds for the connection's
 /// checkout, with no re-scan.
@@ -1718,9 +1958,69 @@ async fn connected(
     }
 }
 
+/// Discover installed tools off the UI/reactor thread. Discovery is local and
+/// never runs an editor, invokes a shell profile, or makes a provider request.
+#[tauri::command]
+async fn workspace_targets() -> Result<Vec<crate::environment::WorkspaceTarget>, String> {
+    tokio::task::spawn_blocking(crate::environment::targets)
+        .await
+        .map_err(|error| format!("Detecting workspace applications failed: {error}"))
+}
+
+#[tauri::command]
+async fn workspace_open(
+    bridge: State<'_, Bridge>,
+    target: String,
+    expected_repository: String,
+    expected_session: Option<SessionId>,
+    expected_run: Option<RunId>,
+    file: Option<String>,
+    line: Option<u32>,
+) -> Result<(), String> {
+    if let Some(session) = expected_session {
+        let (client, _) = connected(&bridge).await?;
+        if client.repository() != Some(expected_repository.as_str())
+            || client.attached_session_id().await != Some(session)
+        {
+            return Err(
+                "The active session or repository changed. Retry from the current session.".into(),
+            );
+        }
+    }
+    let socket = socket_path().map_err(|error| format!("{error:#}"))?;
+    let checkout = match (expected_session, expected_run) {
+        (Some(session), Some(run)) => Some(
+            crate::environment::run_checkout(&expected_repository, session, run)
+                .await
+                .map_err(|error| format!("{error:#}"))?,
+        ),
+        (None, Some(_)) => return Err("A reviewed run requires its owning session".into()),
+        _ => None,
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::environment::open_workspace(
+            &target,
+            &expected_repository,
+            checkout.as_deref(),
+            expected_session,
+            &socket,
+            file.as_deref(),
+            line,
+        )
+    })
+    .await
+    .map_err(|error| format!("Opening the workspace application failed: {error}"))?
+    .map_err(|error| format!("{error:#}"))
+}
+
 /// Register the bridge state and command handlers on a Tauri builder.
 pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
+        .register_uri_scheme_protocol("cody-sandbox", |_context, request| {
+            crate::sandbox::response(request)
+        })
+        .menu(crate::native_menu::create)
+        .on_menu_event(crate::native_menu::dispatch)
         // OS notifications for blocking work (approvals, questions). Registered
         // here because the webview reaches the plugin through the same
         // capability set as the bridge commands; the grant is narrowed to
@@ -1752,6 +2052,8 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             query_analytics,
             export_analytics,
             read_artifact,
+            send_remote_ui,
+            save_artifact,
             search_sessions,
             mutate_session,
             start_workflow,
@@ -1767,12 +2069,23 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             create_board_card,
             move_board_card,
             list_models,
+            discover_models,
+            crate::desktop_tools::desktop_tools_publish,
+            crate::python_sandbox::desktop_tools_python_execute,
+            crate::python_sandbox::desktop_tools_python_reply,
+            crate::python_sandbox::desktop_tools_python_cancel,
+            crate::desktop_tools::desktop_tools_pending,
+            crate::desktop_tools::desktop_tools_resolve,
+            crate::desktop_tools::desktop_tools_list,
+            crate::desktop_tools::desktop_tools_remove,
             list_model_readiness,
             model_readiness,
             set_run_model,
             add_model,
             remove_model,
             list_providers,
+            refresh_agents,
+            connect_acp,
             list_catalog_models,
             list_api_keys,
             set_api_key,
@@ -1802,6 +2115,8 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             current_repository,
             set_repository,
             clear_repository,
+            workspace_targets,
+            workspace_open,
             list_councils,
             create_council,
             delete_council,
@@ -1810,6 +2125,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             run_council,
             onboarding_status,
             code_graph_status,
+            build_code_graph,
             read_code_graph,
             fork_session,
             restore_checkpoint,
@@ -1861,5 +2177,57 @@ mod disconnect_generation_tests {
                 "registered={registered} requested={requested:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod automatic_connection_tests {
+    use super::daemon_is_absent;
+    use codypendent_council::connection::Connection;
+    use codypendent_protocol::{read_envelope, write_envelope, Envelope, Payload, ProtocolError};
+
+    #[tokio::test]
+    async fn absent_and_stale_sockets_can_start_a_daemon() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("daemon.sock");
+        let absent = Connection::connect(&socket).await.err().expect("absent");
+        assert!(daemon_is_absent(&absent));
+        drop(tokio::net::UnixListener::bind(&socket).expect("bind"));
+        let refused = Connection::connect(&socket).await.err().expect("refused");
+        assert!(daemon_is_absent(&refused));
+        assert!(!daemon_is_absent(&anyhow::Error::new(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied,)
+        )));
+    }
+
+    #[tokio::test]
+    async fn rejected_handshake_does_not_start_another_daemon() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request = read_envelope(&mut stream)
+                .await
+                .expect("read")
+                .expect("hello");
+            let reply = Envelope::reply_to(
+                &request,
+                Payload::Error(ProtocolError {
+                    code: "protocol.unsupported".to_owned(),
+                    message: "incompatible protocol".to_owned(),
+                    retryable: false,
+                }),
+            );
+            write_envelope(&mut stream, &reply).await.expect("reply");
+        });
+        let mut connection = Connection::connect(&socket).await.expect("connect");
+        let error = connection
+            .handshake("desktop", "test", None)
+            .await
+            .expect_err("refused");
+        assert!(!daemon_is_absent(&error));
+        assert!(error.to_string().contains("incompatible protocol"));
+        server.await.expect("server");
     }
 }

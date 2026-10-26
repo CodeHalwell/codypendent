@@ -26,10 +26,13 @@
  *      daemon's value this build cannot name — labelled as such rather than
  *      bucketed into one of the two it knows.
  */
-import React, { useState } from "react";
+import React, { useLayoutEffect, useRef } from "react";
 
 import type { PendingPromptView } from "@codypendent/protocol";
 import { surfaceButton } from "./surfaceChrome.js";
+import type { PromptQueueActions } from "../usePromptQueueActions.js";
+import { useCommandFocus } from "../useCommandFocus.js";
+import { CommandFeedbackNote } from "./CommandFeedbackNote.js";
 
 export interface PromptQueueProps {
   /** The queue exactly as the daemon last reported it. */
@@ -47,12 +50,8 @@ export interface PromptQueueProps {
    * empty queue.
    */
   error?: string | null;
-  /** Promote to `Steer` and move to the front (`PromoteQueuedPrompt`). */
-  onPromote: (promptId: string) => void;
-  /** Save edited text (`UpdateQueuedPrompt`). Resolves true when accepted. */
-  onEdit: (promptId: string, text: string) => Promise<boolean>;
-  /** Remove without running (`DeleteQueuedPrompt`). */
-  onDelete: (promptId: string) => void;
+  /** Draft and command ownership survives closing this panel. */
+  actions: PromptQueueActions;
   /** Close the panel. */
   onClose?: () => void;
 }
@@ -76,26 +75,9 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
   canMutate,
   unavailableDetail,
   error,
-  onPromote,
-  onEdit,
-  onDelete,
+  actions,
   onClose,
 }) => {
-  /** The row being edited, and its working text. One at a time. */
-  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
-
-  const save = async () => {
-    if (!editing) {
-      return;
-    }
-    const accepted = await onEdit(editing.id, editing.text);
-    if (accepted) {
-      // The edit box closes only when the daemon took the change. A refusal
-      // leaves the text in place so it can be corrected rather than retyped.
-      setEditing(null);
-    }
-  };
-
   return (
     <section
       data-testid="prompt-queue"
@@ -166,8 +148,7 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
 
       {prompts.length === 0 ? (
         <div style={{ fontSize: 12, color: "var(--cody-text-faint)" }} data-testid="prompt-queue-empty">
-          No prompt is queued. The daemon has reported no <code>PendingPromptsChanged</code> entries
-          for this session.
+          No follow-up work is queued for this session.
         </div>
       ) : (
         <ol
@@ -180,126 +161,172 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
             gap: 6,
           }}
         >
-          {prompts.map((prompt, index) => {
-            const isEditing = editing?.id === prompt.id;
-            return (
-              <li
-                key={prompt.id}
-                data-testid="prompt-queue-row"
-                data-prompt-id={prompt.id}
-                data-delivery={prompt.delivery.type}
-                style={{
-                  border: "1px solid var(--cody-border-strong)",
-                  background: "var(--cody-canvas)",
-                  borderRadius: 6,
-                  padding: "8px 10px",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 6,
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>#{index + 1}</span>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: 0.4,
-                      textTransform: "uppercase",
-                      borderRadius: 4,
-                      padding: "1px 6px",
-                      border: `1px solid ${prompt.delivery.type === "Steer" ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
-                      color: prompt.delivery.type === "Steer" ? "var(--cody-link-soft)" : "var(--cody-text-muted)",
-                    }}
-                  >
-                    {deliveryLabel(prompt.delivery)}
-                  </span>
-                  <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>{prompt.mode.type} mode</span>
-                </div>
-
-                {isEditing ? (
-                  <textarea
-                    value={editing.text}
-                    onChange={(e) => setEditing({ id: prompt.id, text: e.target.value })}
-                    rows={2}
-                    aria-label="Queued prompt text"
-                    data-testid="prompt-queue-edit"
-                    style={{
-                      width: "100%",
-                      boxSizing: "border-box",
-                      background: "var(--cody-canvas)",
-                      border: "1px solid var(--cody-border-strong)",
-                      borderRadius: 6,
-                      outline: "none",
-                      color: "var(--cody-text)",
-                      padding: "6px 8px",
-                      fontSize: 13,
-                      resize: "none",
-                      fontFamily: "inherit",
-                    }}
-                  />
-                ) : (
-                  <div style={{ fontSize: 13, color: "var(--cody-text-secondary)", whiteSpace: "pre-wrap" }}>
-                    {prompt.text}
-                  </div>
-                )}
-
-                <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-                  {isEditing ? (
-                    <>
-                      <button
-                        onClick={() => setEditing(null)}
-                        style={surfaceButton()}
-                        data-testid="prompt-queue-cancel-edit"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={() => void save()}
-                        disabled={!canMutate || !editing.text.trim()}
-                        style={surfaceButton(
-                          canMutate && editing.text.trim() ? "primary" : "neutral",
-                        )}
-                        data-testid="prompt-queue-save"
-                      >
-                        Save
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        onClick={() => setEditing({ id: prompt.id, text: prompt.text })}
-                        disabled={!canMutate}
-                        style={surfaceButton()}
-                        data-testid="prompt-queue-start-edit"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => onPromote(prompt.id)}
-                        disabled={!canMutate}
-                        style={surfaceButton(canMutate ? "primary" : "neutral")}
-                        data-testid="prompt-queue-promote"
-                        title="Deliver this one by steering the live run at its next safe point"
-                      >
-                        Send next
-                      </button>
-                      <button
-                        onClick={() => onDelete(prompt.id)}
-                        disabled={!canMutate}
-                        style={surfaceButton(canMutate ? "danger" : "neutral")}
-                        data-testid="prompt-queue-delete"
-                      >
-                        Remove
-                      </button>
-                    </>
-                  )}
-                </div>
-              </li>
-            );
-          })}
+          {prompts.map((prompt, index) => (
+            <PromptRow key={prompt.id} prompt={prompt} index={index} canMutate={canMutate} actions={actions} />
+          ))}
         </ol>
       )}
     </section>
   );
 };
+
+function PromptRow({ prompt, index, canMutate, actions }: {
+  prompt: PendingPromptView;
+  index: number;
+  canMutate: boolean;
+  actions: PromptQueueActions;
+}) {
+  const editing = actions.draft?.id === prompt.id ? actions.draft : null;
+  const isEditing = editing !== null;
+  const feedback = actions.feedback[prompt.id];
+  const locked = actions.isLocked(prompt.id);
+  const { ref, preserveFocus } = useCommandFocus(feedback);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const editTrigger = useRef<HTMLButtonElement>(null);
+  const wasEditing = useRef(false);
+  useLayoutEffect(() => {
+    const before = wasEditing.current;
+    wasEditing.current = isEditing;
+    if (isEditing && !before) input.current?.focus({ preventScroll: true });
+    else if (!isEditing && before && document.activeElement === ref.current) editTrigger.current?.focus({ preventScroll: true });
+  }, [isEditing, ref]);
+  const send = (command: () => void) => {
+    if (!canMutate || locked) return;
+    preserveFocus();
+    command();
+  };
+  const cancel = () => {
+    preserveFocus();
+    actions.setDraft(null);
+  };
+  return (
+    <li
+      data-testid="prompt-queue-row"
+      data-prompt-id={prompt.id}
+      data-delivery={prompt.delivery.type}
+      style={{
+        border: "1px solid var(--cody-border-strong)",
+        background: "var(--cody-canvas)",
+        borderRadius: 6,
+        padding: "8px 10px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div ref={ref} role="group" aria-label={`Queued prompt ${index + 1}`} tabIndex={-1} aria-busy={locked}
+        style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>#{index + 1}</span>
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: 0.4,
+              textTransform: "uppercase",
+              borderRadius: 4,
+              padding: "1px 6px",
+              border: `1px solid ${prompt.delivery.type === "Steer" ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+              color: prompt.delivery.type === "Steer" ? "var(--cody-link-soft)" : "var(--cody-text-muted)",
+            }}
+          >
+            {deliveryLabel(prompt.delivery)}
+          </span>
+          <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>{prompt.mode.type} mode</span>
+        </div>
+
+        {isEditing ? (
+          <textarea
+            ref={input}
+            value={editing!.text}
+            onChange={(e) => actions.setDraft({ id: prompt.id, text: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              if (e.key === "Escape") { e.preventDefault(); cancel(); }
+              else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(actions.save); }
+            }}
+            rows={2}
+            aria-label="Queued prompt text"
+            data-testid="prompt-queue-edit"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              background: "var(--cody-canvas)",
+              border: "1px solid var(--cody-border-strong)",
+              borderRadius: 6,
+              outline: "none",
+              color: "var(--cody-text)",
+              padding: "6px 8px",
+              fontSize: 13,
+              resize: "none",
+              fontFamily: "inherit",
+            }}
+          />
+        ) : (
+          <div style={{ fontSize: 13, color: "var(--cody-text-secondary)", whiteSpace: "pre-wrap" }}>
+            {prompt.text}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+          {isEditing ? (
+            <>
+              <button
+                key="cancel"
+                onClick={cancel}
+                style={surfaceButton()}
+                data-testid="prompt-queue-cancel-edit"
+              >
+                Cancel
+              </button>
+              <button
+                key="save"
+                onClick={() => send(actions.save)}
+                disabled={!canMutate || locked || !editing!.text.trim()}
+                style={surfaceButton(
+                  canMutate && !locked && editing!.text.trim() ? "primary" : "neutral",
+                )}
+                data-testid="prompt-queue-save"
+              >
+                Save
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                key="edit"
+                ref={editTrigger}
+                onClick={() => actions.edit(prompt)}
+                disabled={!canMutate || locked}
+                style={surfaceButton()}
+                data-testid="prompt-queue-start-edit"
+              >
+                Edit
+              </button>
+              <button
+                key="promote"
+                onClick={() => send(() => actions.promote(prompt.id))}
+                disabled={!canMutate || locked}
+                style={surfaceButton(canMutate && !locked ? "primary" : "neutral")}
+                data-testid="prompt-queue-promote"
+                title="Deliver this one by steering the live run at its next safe point"
+              >
+                Send next
+              </button>
+              <button
+                key="remove"
+                onClick={() => send(() => actions.remove(prompt.id))}
+                disabled={!canMutate || locked}
+                style={surfaceButton(canMutate && !locked ? "danger" : "neutral")}
+                data-testid="prompt-queue-delete"
+              >
+                Remove
+              </button>
+            </>
+          )}
+        </div>
+        <CommandFeedbackNote feedback={feedback} />
+      </div>
+    </li>
+  );
+}

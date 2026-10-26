@@ -159,6 +159,20 @@ pub struct CodeGraphStatusView {
     pub stale_reason: Option<String>,
 }
 
+/// A location in the parsed repository source. Lines and Unicode-character
+/// columns are one-based; the optional end position is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct CodeGraphSourceLocation {
+    pub source_path: String,
+    pub line: u32,
+    pub column: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u32>,
+}
+
 /// One node, projected for display.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -175,6 +189,10 @@ pub struct CodeGraphNodeView {
     pub qualified_name: String,
     pub kind: String,
     pub revision: String,
+    /// Recorded definition span, present only when the source still matches
+    /// the parser's evidence. Unresolved references have no definition location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<CodeGraphSourceLocation>,
 }
 
 /// Who asserted an `agent_asserted` edge, and why.
@@ -213,6 +231,10 @@ pub struct CodeGraphEdgeView {
     pub confidence: f32,
     pub evidence_kind: String,
     pub revision: String,
+    /// The recorded call occurrence, verified against its parsed source bytes.
+    /// Repeated calls may share one stored edge; this is not an exhaustive list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_site: Option<CodeGraphSourceLocation>,
     /// Present exactly when this edge's stored evidence is an agent assertion —
     /// i.e. for an `agent_asserted` edge written by `graph.assert_edge`. Absent
     /// for every mechanically-derived edge (whose evidence points at bytes, not
@@ -254,6 +276,14 @@ pub struct CodeGraphQuery {
     /// is not a filter; it is an enumeration oracle with extra steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    /// An unfiltered visual overview follows one recorded connected neighbourhood, including endpoint metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connected_view: bool,
+    /// Return metadata for endpoints of the returned edges in `related_nodes`,
+    /// separately from the matching node page and its total. At most twice the
+    /// edge limit can be returned; other query filters still select the main page.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_neighbors: bool,
     /// Include the edges incident to the selected nodes — **every** node the
     /// filter selects, not only the ones this page of nodes happens to show.
     /// The two row kinds are paged independently (see [`limit`](Self::limit)),
@@ -280,6 +310,10 @@ pub struct CodeGraphQuery {
 pub struct CodeGraphPage {
     pub nodes: Vec<CodeGraphNodeView>,
     pub edges: Vec<CodeGraphEdgeView>,
+    /// Optional endpoint metadata requested by `include_neighbors`. These are
+    /// not additional filter matches and do not change `total_nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_nodes: Vec<CodeGraphNodeView>,
     /// Nodes matching the filter **before** the limit, so a client can say
     /// "showing 50 of 812" rather than implying it showed everything.
     pub total_nodes: u64,
@@ -343,6 +377,58 @@ mod tests {
         assert!(back.node_id.is_none());
     }
 
+    #[test]
+    fn source_locations_and_neighbor_metadata_are_additive() {
+        let legacy = serde_json::json!({ "nodes": [], "edges": [], "total_nodes": 0, "total_edges": 0, "limit": 100 });
+        let page: CodeGraphPage = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(page.related_nodes.is_empty());
+        assert_eq!(serde_json::to_value(page).unwrap(), legacy);
+        let location = CodeGraphSourceLocation {
+            source_path: "src/main.rs".into(),
+            line: 12,
+            column: 5,
+            end_line: Some(12),
+            end_column: Some(11),
+        };
+        let encoded = serde_json::to_value(&location).unwrap();
+        assert_eq!(encoded["line"], 12);
+        assert_eq!(
+            serde_json::from_value::<CodeGraphSourceLocation>(encoded).unwrap(),
+            location
+        );
+        let query = CodeGraphQuery {
+            include_neighbors: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(query).unwrap(),
+            serde_json::json!({ "include_neighbors": true })
+        );
+        let mut call = edge(None);
+        call.call_site = Some(location.clone());
+        assert_eq!(
+            serde_json::to_value(call).unwrap()["call_site"],
+            serde_json::to_value(location).unwrap()
+        );
+    }
+
+    #[test]
+    fn connected_view_is_opt_in_and_false_stays_off_the_wire() {
+        let legacy: CodeGraphQuery = serde_json::from_str("{}").expect("legacy query");
+        assert!(!legacy.connected_view);
+        let disabled: CodeGraphQuery =
+            serde_json::from_str(r#"{"connected_view":false}"#).expect("explicitly disabled");
+        assert_eq!(disabled, legacy);
+        assert_eq!(serde_json::to_string(&disabled).expect("serialize"), "{}");
+        let enabled: CodeGraphQuery =
+            serde_json::from_str(r#"{"connected_view":true}"#).expect("connected view query");
+        assert!(enabled.connected_view);
+        assert_eq!(
+            serde_json::to_value(enabled).expect("serialize connected view"),
+            serde_json::json!({ "connected_view": true })
+        );
+    }
+
     fn edge(asserted_by: Option<CodeGraphEdgeAssertion>) -> CodeGraphEdgeView {
         CodeGraphEdgeView {
             from_id: "90000000-0000-0000-0000-000000000001".to_string(),
@@ -353,6 +439,7 @@ mod tests {
             confidence: 0.6,
             evidence_kind: "agent_asserted".to_string(),
             revision: "9f1c2ab".to_string(),
+            call_site: None,
             asserted_by,
         }
     }
