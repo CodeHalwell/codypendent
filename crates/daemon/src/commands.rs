@@ -3545,7 +3545,7 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         // operator's own configuration: the ownership gate has already refused
         // a foreign principal, and an Observer that cannot see why a run will
         // not start is the readiness gap this command exists to close.
-        CommandBody::ProbeModel { .. } => true,
+        CommandBody::ProbeModel { .. } | CommandBody::ReadKnowledge { .. } => true,
         CommandBody::MarketplaceInstall { .. }
         | CommandBody::MarketplaceUpdate { .. }
         | CommandBody::MarketplaceEnable { .. }

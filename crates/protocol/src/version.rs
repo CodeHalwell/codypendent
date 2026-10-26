@@ -53,7 +53,12 @@ pub struct ProtocolVersion {
 /// (an older daemon never sends the reply, and a client only sends the command
 /// to a daemon whose negotiated minor is ≥ 9), so `major` remains `1` and
 /// `minor` advances to `9`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
+/// Session-scoped knowledge browsing moves read access behind the authenticated
+/// daemon boundary; additive `ReadKnowledge` and `KnowledgePage` require 1.10.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 10,
+};
 
 /// The lowest negotiated minor that understands
 /// [`CommandBody::ProbeModel`](crate::CommandBody::ProbeModel). A client MUST

@@ -453,6 +453,7 @@ pub async fn run_council<S: ProgressSink>(
 
     let council = name.clone();
     let active = Arc::new(AtomicUsize::new(0));
+    #[allow(deprecated, reason = "fetch_update supports the Rust 1.88 MSRV")]
     let progress = move |progress: CouncilProgress| {
         let active_subagents = match &progress.event {
             CouncilEvent::RoundStarted { members, .. } => {

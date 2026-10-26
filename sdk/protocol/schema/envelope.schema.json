@@ -4164,6 +4164,42 @@
       "description": "The specific change a command requests. A wire enum: internally tagged with an [`CommandBody::Unknown`] fallback so a command from a newer client deserializes and is rejected structurally rather than crashing the peer.",
       "oneOf": [
         {
+          "description": "Browse daemon-owned knowledge in the scopes derived from this owned session. Clients cannot supply scope keys or read SQLite themselves.",
+          "properties": {
+            "limit": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "offset": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "section": {
+              "$ref": "#/definitions/KnowledgeSection"
+            },
+            "session_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ReadKnowledge"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "section",
+            "session_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Verify and durably install a `.cody-ui.tgz` package disabled. The archive is base64 because JSON framing has no byte-string scalar and is bounded by the ordinary 16 MiB daemon frame limit.",
           "properties": {
             "allow_unsigned": {
@@ -7041,6 +7077,130 @@
       ],
       "type": "object"
     },
+    "DocBlockView": {
+      "description": "`crates/tui/src/state.rs` `DocBlockView`.",
+      "properties": {
+        "editable": {
+          "description": "The block's primary text verbatim, or `None` for a structured block with no single editable container.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "text": {
+          "description": "A one-line, lossy display rendering.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "text"
+      ],
+      "type": "object"
+    },
+    "DocCard": {
+      "description": "`crates/tui/src/state.rs` `DocCard`.",
+      "properties": {
+        "blocks": {
+          "items": {
+            "$ref": "#/definitions/DocBlockView"
+          },
+          "type": "array"
+        },
+        "document_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "revision": {
+          "description": "Pre-rendered, e.g. `\"r7\"`.",
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "suggestions": {
+          "items": {
+            "$ref": "#/definitions/DocSuggestionView"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "blocks",
+        "document_id",
+        "mode",
+        "revision",
+        "scope",
+        "status",
+        "suggestions",
+        "title"
+      ],
+      "type": "object"
+    },
+    "DocSuggestionView": {
+      "description": "`crates/tui/src/state.rs` `DocSuggestionView`.",
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "block_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "original": {
+          "type": "string"
+        },
+        "range": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "source_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "author",
+        "block_id",
+        "id",
+        "original",
+        "range",
+        "replacement",
+        "source_revision",
+        "status"
+      ],
+      "type": "object"
+    },
     "DocumentEditLease": {
       "description": "A request to lease a block range for exclusive writing (Chapter 03 / STEP 4.3). One writer per block-range; readers are unlimited. Reuses the Phase-1 lease machinery in the daemon; this is only the wire request shape.",
       "properties": {
@@ -9901,6 +10061,176 @@
       },
       "type": "object"
     },
+    "KnowledgePage": {
+      "properties": {
+        "documents": {
+          "items": {
+            "$ref": "#/definitions/DocCard"
+          },
+          "type": "array"
+        },
+        "learnings": {
+          "items": {
+            "$ref": "#/definitions/LearningCard"
+          },
+          "type": "array"
+        },
+        "memories": {
+          "items": {
+            "$ref": "#/definitions/MemoryCard"
+          },
+          "type": "array"
+        },
+        "next_offset": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "section": {
+          "$ref": "#/definitions/KnowledgeSection"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/definitions/SkillCard"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "section"
+      ],
+      "type": "object"
+    },
+    "KnowledgeSection": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Skills"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Memories"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Learnings"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Documents"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LearningCard": {
+      "description": "`crates/tui/src/state.rs` `LearningCard`.",
+      "properties": {
+        "confidence": {
+          "format": "float",
+          "type": "number"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "provenance": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "confidence",
+        "id",
+        "kind",
+        "pinned",
+        "provenance",
+        "revision",
+        "scope",
+        "state",
+        "statement"
+      ],
+      "type": "object"
+    },
     "MarketplacePackageView": {
       "description": "A public package/install metadata view returned by marketplace commands.",
       "properties": {
@@ -9972,6 +10302,49 @@
       "required": [
         "measured",
         "total"
+      ],
+      "type": "object"
+    },
+    "MemoryCard": {
+      "description": "`crates/tui/src/state.rs` `MemoryCard`, plus the memory's id so the desktop can address `CorrectMemory`/`ForgetMemory` at it.",
+      "properties": {
+        "class": {
+          "type": "string"
+        },
+        "confidence": {
+          "format": "float",
+          "type": "number"
+        },
+        "id": {
+          "type": "string"
+        },
+        "observed": {
+          "description": "A date string, exactly as the store rendered it.",
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "source": {
+          "description": "The human-readable evidence source; \"(no evidence)\" when there is none.",
+          "type": "string"
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "class",
+        "confidence",
+        "id",
+        "observed",
+        "revision",
+        "scope",
+        "source",
+        "statement"
       ],
       "type": "object"
     },
@@ -10439,6 +10812,29 @@
     },
     "Payload": {
       "oneOf": [
+        {
+          "properties": {
+            "command_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "page": {
+              "$ref": "#/definitions/KnowledgePage"
+            },
+            "type": {
+              "enum": [
+                "KnowledgePage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command_id",
+            "page",
+            "type"
+          ],
+          "type": "object"
+        },
         {
           "description": "Liveness probe.",
           "properties": {
@@ -15728,6 +16124,49 @@
         "repository_id",
         "revision",
         "shared_node_id"
+      ],
+      "type": "object"
+    },
+    "SkillCard": {
+      "description": "`crates/tui/src/state.rs` `SkillCard`. `permissions` are verbatim strings.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "permissions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "risk": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "trust": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "description",
+        "kind",
+        "name",
+        "permissions",
+        "risk",
+        "scope",
+        "status",
+        "trust"
       ],
       "type": "object"
     },

@@ -70,6 +70,16 @@ pub struct UiPluginLifecycleStatus {
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum CommandBody {
+    /// Browse daemon-owned knowledge in the scopes derived from this owned
+    /// session. Clients cannot supply scope keys or read SQLite themselves.
+    ReadKnowledge {
+        session_id: SessionId,
+        section: crate::knowledge::KnowledgeSection,
+        #[serde(default)]
+        offset: u32,
+        #[serde(default)]
+        limit: u32,
+    },
     /// Verify and durably install a `.cody-ui.tgz` package disabled. The
     /// archive is base64 because JSON framing has no byte-string scalar and is
     /// bounded by the ordinary 16 MiB daemon frame limit.
@@ -1319,6 +1329,10 @@ impl CommandBody {
             Self::PostBlackboardItem { scope, .. } | Self::UpdateBlackboardItem { scope, .. } => {
                 board_scope_resource(scope).into_iter().collect()
             }
+            Self::ReadKnowledge { session_id, .. } => vec![
+                NamedResource::Session(*session_id),
+                NamedResource::DaemonStore(DaemonStore::Memory),
+            ],
             Self::InspectMemory { .. }
             | Self::CorrectMemory { .. }
             | Self::ForgetMemory { .. }

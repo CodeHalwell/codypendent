@@ -1523,6 +1523,7 @@ impl DiagnosticBuffer {
     }
 }
 
+#[allow(deprecated, reason = "fetch_update supports the Rust 1.88 MSRV")]
 fn reserve_output_bytes(counter: &AtomicU64, maximum: u64, amount: u64) -> bool {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {

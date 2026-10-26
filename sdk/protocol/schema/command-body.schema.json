@@ -3574,6 +3574,80 @@
       },
       "type": "object"
     },
+    "KnowledgeSection": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Skills"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Memories"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Learnings"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Documents"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "MemoryScopeTier": {
       "description": "Which of the caller's *visible* scopes a bulk forget targets. Deliberately not a scope key: see the module doc.",
       "oneOf": [
@@ -5389,6 +5463,42 @@
   },
   "description": "The specific change a command requests. A wire enum: internally tagged with an [`CommandBody::Unknown`] fallback so a command from a newer client deserializes and is rejected structurally rather than crashing the peer.",
   "oneOf": [
+    {
+      "description": "Browse daemon-owned knowledge in the scopes derived from this owned session. Clients cannot supply scope keys or read SQLite themselves.",
+      "properties": {
+        "limit": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "section": {
+          "$ref": "#/definitions/KnowledgeSection"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "ReadKnowledge"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "section",
+        "session_id",
+        "type"
+      ],
+      "type": "object"
+    },
     {
       "description": "Verify and durably install a `.cody-ui.tgz` package disabled. The archive is base64 because JSON framing has no byte-string scalar and is bounded by the ordinary 16 MiB daemon frame limit.",
       "properties": {

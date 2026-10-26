@@ -98,7 +98,7 @@ function eventPayload(sequence: number): Payload {
 
 /** The daemon's acknowledgement of a successful attach. */
 function catchupPayload(through = 0): Payload {
-  return { type: "Catchup", catchup: { type: "Events", from: 0, through, events: [] } };
+  return { type: "Catchup", catchup: { type: "Events", from: through + 1, through, events: [] } };
 }
 
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
@@ -290,13 +290,14 @@ describe("DaemonClient handshake + attach", () => {
     const socket = sockets[0];
     socket.emit("connect");
     socket.deliver(serverHelloPayload());
-    socket.deliver(eventPayload(3));
-    socket.deliver(eventPayload(5));
+    socket.deliver(catchupPayload());
+    socket.deliver(eventPayload(1));
+    socket.deliver(eventPayload(2));
 
     expect(hellos).toHaveLength(1);
     expect(hellos[0].daemon_version).toBe("0.1.0");
-    expect(events.map((e) => e.sequence)).toEqual([3, 5]);
-    expect(client.sequenceCursor).toBe(5);
+    expect(events.map((e) => e.sequence)).toEqual([1, 2]);
+    expect(client.sequenceCursor).toBe(2);
 
     client.stop();
   });
@@ -403,10 +404,10 @@ describe("DaemonClient handshake + attach", () => {
 
     replacement.deliver(serverHelloPayload());
     replacement.deliver(catchupPayload());
-    replacement.deliver(eventPayload(2));
+    replacement.deliver(eventPayload(1));
     expect(hellos).toHaveLength(1);
-    expect(events.map((event) => event.sequence)).toEqual([2]);
-    expect(client.sequenceCursor).toBe(2);
+    expect(events.map((event) => event.sequence)).toEqual([1]);
+    expect(client.sequenceCursor).toBe(1);
     client.stop();
   });
 });
@@ -490,7 +491,7 @@ describe("DaemonClient reconnect with resume", () => {
     first.emit("connect");
     first.deliver(serverHelloPayload());
     expect(attachCommand(first).last_seen_sequence).toBeUndefined();
-    first.deliver(eventPayload(9));
+    first.deliver({ type: "Catchup", catchup: { type: "Snapshot", through: 9, projection: { session_id: SESSION_ID, title: "fixture", last_sequence: 9, closed: false } } });
     expect(client.sequenceCursor).toBe(9);
 
     // The daemon (or a kill/reload) drops the connection.
@@ -588,13 +589,13 @@ describe("DaemonClient artifact request correlation", () => {
     client.on("event", (event) => events.push(event.sequence));
     const read = client.readArtifact(artifact);
     const request = socket.sent().at(-1)!;
-    socket.deliverReply(randomUUID(), eventPayload(17));
+    socket.deliverReply(randomUUID(), eventPayload(1));
     socket.deliverReply(request.message_id, {
       type: "ArtifactChunk", artifact_id: artifact.id, offset: 0,
       bytes_base64: "YWJj", eof: true, sha256: artifact.sha256,
     });
     await expect(read).resolves.toEqual(Buffer.from("abc"));
-    expect(events).toEqual([17]);
+    expect(events).toEqual([1]);
     client.stop();
   });
 

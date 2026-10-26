@@ -73,6 +73,10 @@ impl Envelope {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 pub enum Payload {
+    KnowledgePage {
+        command_id: CommandId,
+        page: Box<crate::knowledge::KnowledgePage>,
+    },
     /// Liveness probe.
     Ping,
     Pong,

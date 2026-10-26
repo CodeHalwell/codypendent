@@ -29,6 +29,7 @@ export * from "./ids.js";
 export * from "./input.js";
 export * from "./inbox.js";
 export * from "./memory.js";
+export * from "./knowledge.js";
 export * from "./question.js";
 export * from "./run.js";
 export * from "./session.js";

@@ -80,6 +80,21 @@ pub type MemoryForgetFuture<'a> =
 pub type MemoryEvidenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<MemoryEvidence, CodypendentError>> + Send + 'a>>;
 
+pub struct ReadKnowledgeRequest {
+    pub session_id: codypendent_protocol::SessionId,
+    pub section: codypendent_protocol::knowledge::KnowledgeSection,
+    pub offset: u32,
+    pub limit: u32,
+}
+pub type KnowledgePageFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<codypendent_protocol::knowledge::KnowledgePage, CodypendentError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 /// The daemon's seam for the curated-memory store (outcome 17).
 ///
 /// Every method surfaces the underlying store error verbatim as a
@@ -87,6 +102,15 @@ pub type MemoryEvidenceFuture<'a> =
 /// not exist must both surface as `memory.not-found` — the implementation is
 /// where that collapse happens, and it is the whole point of the seam.
 pub trait MemoryGateway: Send + Sync {
+    fn read_knowledge(&self, _request: ReadKnowledgeRequest) -> KnowledgePageFuture<'_> {
+        Box::pin(async {
+            Err(CodypendentError::new(
+                "knowledge.transport-unavailable",
+                "Knowledge browsing is not enabled on this daemon",
+                false,
+            ))
+        })
+    }
     fn inspect(&self, request: InspectMemoryRequest) -> MemoryViewFuture<'_>;
     fn correct(&self, request: CorrectMemoryRequest) -> MemoryViewFuture<'_>;
     fn forget(&self, request: ForgetMemoryRequest) -> MemoryForgetFuture<'_>;

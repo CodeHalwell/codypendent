@@ -20,10 +20,27 @@ committed bytes exactly, so a Rust type that changes shape without regenerating
 fails on the Rust side, and a regenerated vector that this package cannot
 represent fails here.
 
-This package reads those same files directly by relative path. No copy, no
-second source of truth. (The VS Code extension does the same thing with its own
-hand-written types in `extensions/vscode/src/protocol/types.ts` — this package
-is a second, independent consumer of the same contract, not a fork of it.)
+This package reads those same files directly by relative path. Both editor
+integrations consume these generated contracts rather than maintaining a second
+wire model.
+
+## Node clients and session discovery
+
+The `@codypendent/protocol/node` entry point exports `NodeDaemonClient` and the
+daemon's socket-discovery rules. The main entry point remains host-neutral.
+The Codypendent VS Code client and Son of Anton use this same Node adapter.
+
+After `serverHello`, `requestGlobal` permits session listing, searching, and
+creation without an existing attached session. It returns the entire response
+envelope because `CreateSession` places the new id in `session_id`, outside the
+`CommandAccepted` payload. `request` continues to require an attached session
+and returns a payload.
+
+Correlated requests expire after 15 seconds by default (`requestTimeoutMs`
+overrides this). Disconnect rejects outstanding requests; they are not replayed
+on reconnect. A timeout or lost connection can leave a mutation's outcome
+unknown, so callers should reconcile daemon state before retrying it. These
+request semantics are separate from the existing explicit offline command queue.
 
 ### What the conformance suite actually checks
 

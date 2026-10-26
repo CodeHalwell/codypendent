@@ -113,7 +113,10 @@ async fn process_sandbox_executes_confined_when_available() {
         .unwrap();
 
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let job = sample_job_spec();
+    let mut job = sample_job_spec();
+    // This test exercises process confinement; Linux explicitly refuses to
+    // promise subprocess denial for arbitrary native executables.
+    job.sandbox.allow_subprocess = true;
 
     let outcome = backend.execute(&job, &ws, cancel_rx).await.unwrap();
     assert_eq!(outcome.exit_code, 0);

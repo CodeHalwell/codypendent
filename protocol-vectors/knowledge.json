@@ -1,0 +1,45 @@
+{
+  "CommandBody_ReadKnowledge": {
+    "limit": 50,
+    "offset": 0,
+    "section": {
+      "type": "Memories"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "ReadKnowledge"
+  },
+  "KnowledgeSection_Documents": {
+    "type": "Documents"
+  },
+  "KnowledgeSection_Learnings": {
+    "type": "Learnings"
+  },
+  "KnowledgeSection_Skills": {
+    "type": "Skills"
+  },
+  "KnowledgeSection_Unknown": {
+    "type": "Unknown"
+  },
+  "Payload_KnowledgePage": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "memories": [
+        {
+          "class": "semantic",
+          "confidence": 0.800000011920929,
+          "id": "60000000-0000-0000-0000-000000000001",
+          "observed": "2026-07-17",
+          "revision": "seq:1",
+          "scope": "repository 70000000",
+          "source": "events 1..3 of the session",
+          "statement": "Build artifacts belong to an isolated checkout."
+        }
+      ],
+      "next_offset": 50,
+      "section": {
+        "type": "Memories"
+      }
+    },
+    "type": "KnowledgePage"
+  }
+}

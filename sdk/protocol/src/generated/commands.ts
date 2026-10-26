@@ -8,6 +8,13 @@
  */
 export type CommandBody =
   | {
+      limit?: number;
+      offset?: number;
+      section: KnowledgeSection;
+      session_id: string;
+      type: "ReadKnowledge";
+    }
+  | {
       allow_unsigned?: boolean;
       artifact_base64: string;
       manifest_toml: string;
@@ -649,6 +656,22 @@ export type CommandBody =
   | {
       campaign_id: string;
       type: "CancelCampaign";
+    }
+  | {
+      type: "Unknown";
+    };
+type KnowledgeSection =
+  | {
+      type: "Skills";
+    }
+  | {
+      type: "Memories";
+    }
+  | {
+      type: "Learnings";
+    }
+  | {
+      type: "Documents";
     }
   | {
       type: "Unknown";

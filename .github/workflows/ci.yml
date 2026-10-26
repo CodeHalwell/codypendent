@@ -242,7 +242,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev \
             libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev \
-            libssl-dev libxdo-dev build-essential patchelf file
+            libssl-dev libxdo-dev build-essential patchelf file xvfb webkit2gtk-driver
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
@@ -250,13 +250,40 @@ jobs:
         with:
           key: desktop-tauri
           workspaces: apps/desktop/src-tauri
-      # Default features only, NOT --all-features: the `app` feature gates the
-      # binary because `tauri::generate_context!` embeds `apps/desktop/dist` at
-      # compile time, so enabling it here would require a full frontend build
-      # for no extra coverage of the transport, which is the part with logic.
-      # `cargo fmt --all` in the `lint` job runs on the ROOT workspace, and this
-      # is a separate one, so it is not reached from there — unformatted code
-      # accumulated here unnoticed until someone ran fmt by hand.
+      # Compile the complete shell as well as the headless transport. The app
+      # feature embeds frontendDist, so build the frontend before checking it.
+      # This separate Cargo workspace also needs its own format/lint/tests.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.22.0"
+      - name: Build frontend for the native shell check
+        run: |
+          npm --prefix sdk/protocol ci
+          npm --prefix sdk/protocol run build
+          npm --prefix sdk/ui ci
+          npm --prefix sdk/ui run build
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run build
+      - name: Check the complete Tauri bridge and application
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --features app --all-targets --locked
+      - name: Build native clients for desktop handoff
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          cargo build --locked -p codypendent-cli --bin codypendent -p codypendent-ui-worker-launcher --bin codypendent-ui-worker-launcher
+          cargo build --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --features app,tauri/custom-protocol --bin codypendent-desktop
+      - name: Native desktop disconnect and replay
+        timeout-minutes: 5
+        env:
+          CODYPENDENT_TEST_BINARY: ${{ github.workspace }}/target/debug/codypendent
+          CODYPENDENT_DESKTOP_BINARY: ${{ github.workspace }}/apps/desktop/src-tauri/target/debug/codypendent-desktop
+          CODYPENDENT_SMOKE_OUTPUT: ${{ github.workspace }}/work/desktop-smoke
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          # Only the disposable WebKit fixture; daemon execution policy is unchanged.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: '1'
+        run: xvfb-run -a npm --prefix apps/desktop run test:native
+
       - name: Format
         run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
       - name: Check

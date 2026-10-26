@@ -46,8 +46,9 @@ use codypendent_protocol::{
 };
 
 use crate::daemon::DocumentPublishPlan;
-use crate::knowledge::{
-    DocCard, KnowledgeIdentity, LearningCard, LearningMutation, MemoryCard, SkillCard,
+use crate::knowledge::LearningMutation;
+use codypendent_protocol::knowledge::{
+    DocCard, KnowledgeSection, LearningCard, MemoryCard, SkillCard,
 };
 
 /// A Tauri channel used as the frame sink. This is the only place a daemon
@@ -898,51 +899,29 @@ async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), 
 // (`REQUIRED_COMMANDS` in `App.tsx`), so the names are a contract.
 // ---------------------------------------------------------------------------
 
-/// Who is asking a local read: this connection's workspace, when connected,
-/// and the selected repository, when one is selected. Neither is required —
-/// a read with less identity sees less, never fails.
-async fn knowledge_identity(bridge: &State<'_, Bridge>) -> KnowledgeIdentity {
-    let connected = bridge.connection.lock().await;
-    let client = connected.as_ref().map(|connection| &connection.client);
-    let workspace = client.map(|client| client.workspace());
-    // The LIVE connection's repository, not the persisted selection. Changing
-    // the repository stages a new selection at once while the client keeps the
-    // one it connected with until a reconnect, so reading by the selection and
-    // writing by the connection lists checkout B and creates into A — and the
-    // refresh loses the new document. With no connection there is nothing to
-    // disagree with, and the selection is the best identity available; a read
-    // with less identity sees less, it never fails.
-    let repository = match client {
-        Some(client) => client.repository().map(std::path::PathBuf::from),
-        None => crate::repository::selected_repository()
-            .ok()
-            .flatten()
-            .map(|selection| std::path::PathBuf::from(selection.path)),
-    };
-    KnowledgeIdentity {
-        workspace,
-        repository,
-    }
-}
-
 fn knowledge_error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-/// Every governed registry item (LOCAL SQLite, read-only).
+/// Every governed registry item (authenticated daemon read).
 #[tauri::command]
-async fn list_skills() -> Result<Vec<SkillCard>, String> {
-    crate::knowledge::list_skills()
+async fn list_skills(bridge: State<'_, Bridge>) -> Result<Vec<SkillCard>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_knowledge(KnowledgeSection::Skills)
         .await
+        .map(|page| page.skills)
         .map_err(knowledge_error)
 }
 
-/// The live memories this client may see (LOCAL SQLite, read-only).
+/// The live memories this client may see (authenticated daemon read).
 #[tauri::command]
 async fn list_memories(bridge: State<'_, Bridge>) -> Result<Vec<MemoryCard>, String> {
-    let identity = knowledge_identity(&bridge).await;
-    crate::knowledge::list_memories(&identity)
+    let client = client_of(&bridge).await?;
+    client
+        .read_knowledge(KnowledgeSection::Memories)
         .await
+        .map(|page| page.memories)
         .map_err(knowledge_error)
 }
 
@@ -970,16 +949,18 @@ async fn forget_memory(bridge: State<'_, Bridge>, memory_id: MemoryId) -> Result
         .map_err(knowledge_error)
 }
 
-/// The proposed and active learnings this client may see (LOCAL SQLite).
+/// The proposed and active learnings this client may see (daemon-owned store).
 #[tauri::command]
 async fn list_learnings(bridge: State<'_, Bridge>) -> Result<Vec<LearningCard>, String> {
-    let identity = knowledge_identity(&bridge).await;
-    crate::knowledge::list_learnings(&identity)
+    let client = client_of(&bridge).await?;
+    client
+        .read_knowledge(KnowledgeSection::Learnings)
         .await
+        .map(|page| page.learnings)
         .map_err(knowledge_error)
 }
 
-/// One optimistic-revision learning mutation (LOCAL SQLite write). Returns
+/// One optimistic-revision learning mutation (daemon-owned store write). Returns
 /// the outcome sentence; a conflict or duplicate rejects with its own.
 #[tauri::command]
 async fn mutate_learning(
@@ -993,12 +974,14 @@ async fn mutate_learning(
 }
 
 /// Every document this client may see, with blocks and pending suggestions
-/// (LOCAL SQLite, read-only).
+/// (authenticated daemon read).
 #[tauri::command]
 async fn list_documents(bridge: State<'_, Bridge>) -> Result<Vec<DocCard>, String> {
-    let identity = knowledge_identity(&bridge).await;
-    crate::knowledge::list_documents(&identity)
+    let client = client_of(&bridge).await?;
+    client
+        .read_knowledge(KnowledgeSection::Documents)
         .await
+        .map(|page| page.documents)
         .map_err(knowledge_error)
 }
 

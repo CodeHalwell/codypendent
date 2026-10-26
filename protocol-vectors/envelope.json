@@ -72,7 +72,7 @@
     "supported_protocols": [
       {
         "major": 1,
-        "minor": 9
+        "minor": 10
       }
     ],
     "type": "ClientHello"
@@ -125,7 +125,7 @@
     "pid": 4242,
     "protocol_version": {
       "major": 1,
-      "minor": 9
+      "minor": 10
     },
     "session_count": 2,
     "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
@@ -265,7 +265,7 @@
     "resume_token": "opaque",
     "selected_protocol": {
       "major": 1,
-      "minor": 9
+      "minor": 10
     },
     "type": "ServerHello"
   },

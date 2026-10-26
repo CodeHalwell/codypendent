@@ -1322,7 +1322,33 @@ impl LinuxSandbox {
                          host with user namespaces"
                 .into(),
         })?;
-        Ok(Self { tool })
+        let executor = Self { tool };
+        // A binary on PATH does not establish that this kernel permits user
+        // namespaces (containers commonly deny them). Exercise the same
+        // confinement path with a fixed, side-effect-free command before
+        // advertising an available executor. The normal wall/output bounds
+        // also apply to the probe; a failure never falls back to host exec.
+        let profile = SandboxProfile::new(
+            "codypendent-sandbox-probe",
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            true,
+            128,
+            1,
+            2,
+            1,
+        );
+        let probe = SandboxCommand::new("/bin/true", vec![], "/", "sandbox-probe");
+        match executor.run(&profile, &probe) {
+            Ok(outcome) if outcome.success() => Ok(executor),
+            _ => Err(SandboxError::ToolUnavailable {
+                tool: "bwrap".into(),
+                diagnostic: "bubblewrap confinement probe failed; user namespaces or required kernel capabilities are unavailable".into(),
+            }),
+        }
     }
 }
 
@@ -1578,7 +1604,7 @@ mod tests {
         assert_eq!(child.wait().expect("reap").code(), Some(7));
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while rustix::process::test_kill_process_group(raw).is_ok() {
+        while process_group_has_live_members(pid) {
             assert!(
                 Instant::now() < deadline,
                 "the grandchild outlived the sweep"
@@ -1595,6 +1621,40 @@ mod tests {
             "a reaped pid must not be reported as an observable child"
         );
     }
+    // Minimal container PID 1 implementations may leave killed orphaned
+    // grandchildren as zombies indefinitely. kill(pgid, 0) counts those dead
+    // processes too; the invariant here is that no executable member survives.
+    #[cfg(target_os = "linux")]
+    fn process_group_has_live_members(group: u32) -> bool {
+        std::fs::read_dir("/proc")
+            .expect("read process table")
+            .any(|entry| {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                    return false;
+                }
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    return false;
+                };
+                let Some((_, fields)) = stat.rsplit_once(") ") else {
+                    return false;
+                };
+                let fields: Vec<_> = fields.split_whitespace().collect();
+                fields.get(2).and_then(|value| value.parse::<u32>().ok()) == Some(group)
+                    && fields
+                        .first()
+                        .is_some_and(|state| *state != "Z" && *state != "X")
+            })
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_group_has_live_members(group: u32) -> bool {
+        let raw = rustix::process::Pid::from_raw(i32::try_from(group).unwrap()).unwrap();
+        rustix::process::test_kill_process_group(raw).is_ok()
+    }
+
     use crate::manifest::{parse_manifest, CapabilitiesSpec};
     use crate::permission::CapabilitySet;
 
