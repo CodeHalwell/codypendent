@@ -1041,12 +1041,15 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
             }
         }
     }
+    // Optimize performance: replace O(N) `.chars().count()` traversal across the entire potentially large string
+    // with O(MAX_CHARS) lookups using `.char_indices().nth(...)` to find character boundaries without
+    // fully traversing or allocating strings.
     let mut safe = words.join(" ");
-    if safe.chars().count() > MAX_CHARS {
-        safe = safe.chars().take(MAX_CHARS).collect();
+    if let Some((idx, _)) = safe.char_indices().nth(MAX_CHARS) {
+        safe.truncate(idx);
     }
-    if raw.chars().count() > MAX_CHARS {
-        if safe.chars().count() == MAX_CHARS {
+    if raw.char_indices().nth(MAX_CHARS).is_some() {
+        if safe.char_indices().nth(MAX_CHARS - 1).is_some() {
             safe.pop();
         }
         safe.push('…');
