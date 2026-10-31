@@ -19,12 +19,7 @@ pub(super) fn declaration_name(node: Node, source: &str, language: Language) -> 
     Some(parts.join(language.separator()))
 }
 
-pub(super) fn named_types<'a>(
-    node: Node<'a>,
-    source: &str,
-    output: &mut Vec<Node<'a>>,
-    depth: usize,
-) {
+pub(super) fn named_types<'a>(node: Node<'a>, output: &mut Vec<Node<'a>>, depth: usize) {
     if depth >= MAX_PARSE_DEPTH {
         return;
     }
@@ -36,7 +31,7 @@ pub(super) fn named_types<'a>(
         return;
     }
     for child in node.named_children(&mut node.walk()) {
-        named_types(child, source, output, depth + 1);
+        named_types(child, output, depth + 1);
     }
 }
 

@@ -38,9 +38,24 @@
 //! knowledge-free — the daemon supplies the two directory paths and compiles the
 //! resolved text through the ordinary [`crate::compile_yaml`] path.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::model::{parse_definition, WorkflowDefinition};
+use sha2::{Digest, Sha256};
+
+use crate::model::{parse_definition, WorkflowDefinition, WorkflowInput};
+
+/// Hash the parsed definition so comments and YAML formatting cannot invalidate a selection.
+///
+/// The serialized struct includes inputs, budgets, and every step. Its maps are
+/// ordered, making the digest stable without retaining or exposing manifest text.
+pub fn definition_digest(definition: &WorkflowDefinition) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(definition)?)
+    ))
+}
 
 /// The stable id of the canonical built-in workflow: investigate and repair a
 /// failed GitHub check (the workflow `/fix-ci` runs).
@@ -91,6 +106,69 @@ pub enum WorkflowScope {
     User,
     /// The repository's `.codypendent/workflows` directory (highest precedence).
     Repository,
+}
+
+/// Maximum directory entries inspected per catalog source, including non-YAML files.
+pub const MAX_CATALOG_DIRECTORY_ENTRIES: usize = 512;
+/// Maximum manifests inspected across all catalog sources, including built-ins.
+pub const MAX_CATALOG_MANIFESTS: usize = 256;
+/// Maximum UTF-8 bytes read from one catalog manifest.
+pub const MAX_CATALOG_MANIFEST_BYTES: usize = 256 * 1024;
+/// Maximum manifest bytes read across the entire catalog.
+pub const MAX_CATALOG_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum effective definitions returned in one catalog.
+pub const MAX_CATALOG_ENTRIES: usize = 128;
+/// Maximum bytes in a catalog workflow id, input name, or input type.
+pub const MAX_CATALOG_IDENTIFIER_BYTES: usize = 128;
+/// Maximum bytes in a catalog description; authoritative strings are never shortened.
+pub const MAX_CATALOG_DESCRIPTION_BYTES: usize = 2048;
+/// Maximum typed inputs exposed for one workflow.
+pub const MAX_CATALOG_INPUTS: usize = 32;
+/// Maximum compiled nodes in one catalog workflow.
+pub const MAX_CATALOG_NODES: usize = 256;
+/// Maximum distinct static diagnostic codes returned by a catalog.
+pub const MAX_CATALOG_DIAGNOSTICS: usize = 16;
+
+/// Bounded, non-executable metadata for the effective definition of one id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowCatalogEntry {
+    pub id: String,
+    pub version: u32,
+    pub description: Option<String>,
+    pub inputs: BTreeMap<String, WorkflowInput>,
+    pub node_count: usize,
+    pub source: WorkflowScope,
+    /// Content precondition for starting this exact resolved definition.
+    pub definition_digest: String,
+}
+
+/// Discovery result. Diagnostics are static codes, never parser errors or file contents.
+///
+/// `truncated` also signals an incompletely inspected source. In that case entries
+/// are empty: an omitted manifest could shadow or collide with any visible id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowCatalog {
+    pub entries: Vec<WorkflowCatalogEntry>,
+    pub diagnostics: Vec<String>,
+    pub truncated: bool,
+}
+
+impl WorkflowCatalog {
+    fn diagnostic(&mut self, code: &'static str) {
+        if self.diagnostics.iter().any(|existing| existing == code) {
+            return;
+        }
+        if self.diagnostics.len() < MAX_CATALOG_DIAGNOSTICS {
+            self.diagnostics.push(code.to_string());
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn incomplete(&mut self, code: &'static str) {
+        self.truncated = true;
+        self.diagnostic(code);
+    }
 }
 
 /// A failure to resolve a workflow from its sources.
@@ -150,6 +228,116 @@ pub struct WorkflowSourceRegistry {
 }
 
 impl WorkflowSourceRegistry {
+    /// Enumerate effective metadata using a bounded loader independent of execution.
+    ///
+    /// Resolution still enforces the ordinary precedence and collision rules.
+    /// Invalid YAML siblings are skipped, as execution does. Parsed candidates
+    /// remain in resolution even when structurally invalid or too large to expose,
+    /// so rejecting their metadata never silently selects a lower-precedence copy.
+    /// Unreadable, unsafe, or incompletely scanned sources fail closed for discovery.
+    #[must_use]
+    pub fn catalog(user_dir: Option<&Path>, repository_dir: Option<&Path>) -> WorkflowCatalog {
+        let mut catalog = WorkflowCatalog::default();
+        let mut candidates = Vec::new();
+        let mut manifests = 0;
+        let mut total_bytes = 0;
+        for raw in BUILTIN_WORKFLOW_MANIFESTS {
+            catalog_candidate(
+                raw,
+                WorkflowScope::BuiltIn,
+                &mut candidates,
+                &mut catalog,
+                &mut manifests,
+                &mut total_bytes,
+            );
+        }
+        for (directory, scope) in [
+            (user_dir, WorkflowScope::User),
+            (repository_dir, WorkflowScope::Repository),
+        ] {
+            if let Some(directory) = directory {
+                load_catalog_dir(
+                    directory,
+                    scope,
+                    &mut candidates,
+                    &mut catalog,
+                    &mut manifests,
+                    &mut total_bytes,
+                );
+                if catalog.truncated {
+                    return catalog;
+                }
+            }
+        }
+        if catalog.truncated {
+            return catalog;
+        }
+        let registry = Self { candidates };
+        let ids: BTreeSet<&str> = registry
+            .candidates
+            .iter()
+            .map(|candidate| candidate.definition.id.as_str())
+            .collect();
+        for id in ids {
+            let raw = match registry.resolve(id) {
+                Ok(raw) => raw,
+                Err(_) => {
+                    catalog.diagnostic("workflow.version-collision");
+                    continue;
+                }
+            };
+            // Resolve chose these exact bytes. Identical copies still attribute
+            // their metadata to the winning scope, rather than the first copy.
+            let winner = registry
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.definition.id == id && candidate.raw == raw)
+                .max_by_key(|candidate| (candidate.scope, candidate.definition.version))
+                .expect("resolved manifest belongs to a loaded candidate");
+            let definition = &winner.definition;
+            if !catalog_metadata_valid(definition) {
+                catalog.diagnostic("workflow.catalog-metadata-unavailable");
+                continue;
+            }
+            let compiled = match crate::compile::compile(definition) {
+                Ok(compiled) => compiled,
+                Err(_) => {
+                    catalog.diagnostic("workflow.catalog-invalid-manifest");
+                    continue;
+                }
+            };
+            if compiled.nodes.len() > MAX_CATALOG_NODES {
+                catalog.diagnostic("workflow.catalog-metadata-unavailable");
+                continue;
+            }
+            let definition_digest = match definition_digest(definition) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    catalog.diagnostic("workflow.catalog-metadata-unavailable");
+                    continue;
+                }
+            };
+            if catalog.entries.len() == MAX_CATALOG_ENTRIES {
+                catalog.entries.clear();
+                catalog.incomplete("workflow.catalog-limit");
+                break;
+            }
+            catalog.entries.push(WorkflowCatalogEntry {
+                id: definition.id.clone(),
+                version: definition.version,
+                description: definition.description.clone(),
+                inputs: definition.inputs.clone(),
+                node_count: compiled.nodes.len(),
+                source: winner.scope,
+                definition_digest,
+            });
+        }
+        if catalog.truncated {
+            catalog.entries.clear();
+        }
+        catalog
+    }
+
     /// Gather the built-in workflow(s) plus every parseable `*.yaml` / `*.yml`
     /// manifest under the optional user and repository directories. A missing
     /// directory contributes nothing; an unreadable or unparseable file is
@@ -226,6 +414,187 @@ impl WorkflowSourceRegistry {
     }
 }
 
+fn catalog_metadata_valid(definition: &WorkflowDefinition) -> bool {
+    let identifier = |value: &str| {
+        !value.trim().is_empty()
+            && value.len() <= MAX_CATALOG_IDENTIFIER_BYTES
+            && !value.chars().any(char::is_control)
+    };
+    identifier(&definition.id)
+        && definition
+            .description
+            .as_ref()
+            .is_none_or(|description| description.len() <= MAX_CATALOG_DESCRIPTION_BYTES)
+        && definition.inputs.len() <= MAX_CATALOG_INPUTS
+        && definition.steps.len() <= MAX_CATALOG_NODES
+        && definition
+            .inputs
+            .iter()
+            .all(|(name, input)| identifier(name) && identifier(&input.input_type))
+}
+
+fn catalog_candidate(
+    raw: &str,
+    scope: WorkflowScope,
+    out: &mut Vec<Candidate>,
+    catalog: &mut WorkflowCatalog,
+    manifests: &mut usize,
+    total_bytes: &mut usize,
+) {
+    if *manifests >= MAX_CATALOG_MANIFESTS
+        || raw.len() > MAX_CATALOG_MANIFEST_BYTES
+        || raw.len() > MAX_CATALOG_TOTAL_BYTES.saturating_sub(*total_bytes)
+    {
+        catalog.incomplete("workflow.catalog-limit");
+        return;
+    }
+    *manifests += 1;
+    *total_bytes += raw.len();
+    match parse_definition(raw) {
+        Ok(definition) => out.push(Candidate {
+            scope,
+            // Catalog errors must not disclose filesystem paths or YAML scalars.
+            source: "catalog source".to_string(),
+            definition,
+            raw: raw.to_string(),
+        }),
+        Err(_) => catalog.diagnostic("workflow.catalog-invalid-manifest"),
+    }
+}
+
+fn load_catalog_dir(
+    dir: &Path,
+    scope: WorkflowScope,
+    out: &mut Vec<Candidate>,
+    catalog: &mut WorkflowCatalog,
+    manifests: &mut usize,
+    total_bytes: &mut usize,
+) {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            catalog.incomplete("workflow.catalog-source-unavailable");
+            return;
+        }
+    };
+    if metadata.is_symlink() || !metadata.is_dir() {
+        catalog.incomplete("workflow.catalog-unsafe-source");
+        return;
+    }
+    let root = match std::fs::canonicalize(dir) {
+        Ok(root) => root,
+        Err(_) => {
+            catalog.incomplete("workflow.catalog-source-unavailable");
+            return;
+        }
+    };
+    // A symlinked product configuration parent must not turn discovery into
+    // a read of another checkout's workflow directory.
+    if scope == WorkflowScope::Repository
+        && dir.file_name().is_some_and(|name| name == "workflows")
+        && dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".codypendent" || name == ".son-of-anton")
+    {
+        let repository = dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        if repository.is_none_or(|repository| !root.starts_with(repository)) {
+            catalog.incomplete("workflow.catalog-unsafe-source");
+            return;
+        }
+    }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(_) => {
+            catalog.incomplete("workflow.catalog-source-unavailable");
+            return;
+        }
+    };
+    let mut files = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count == MAX_CATALOG_DIRECTORY_ENTRIES {
+            catalog.incomplete("workflow.catalog-limit");
+            return;
+        }
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => {
+                catalog.incomplete("workflow.catalog-source-unavailable");
+                return;
+            }
+        };
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yaml" | "yml")
+        ) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    for path in files {
+        if *manifests >= MAX_CATALOG_MANIFESTS {
+            catalog.incomplete("workflow.catalog-limit");
+            return;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                catalog.incomplete("workflow.catalog-source-unavailable");
+                return;
+            }
+        };
+        if metadata.is_symlink() || !metadata.is_file() {
+            catalog.incomplete("workflow.catalog-unsafe-source");
+            return;
+        }
+        if metadata.len() > MAX_CATALOG_MANIFEST_BYTES as u64
+            || metadata.len() > MAX_CATALOG_TOTAL_BYTES.saturating_sub(*total_bytes) as u64
+        {
+            catalog.incomplete("workflow.catalog-limit");
+            return;
+        }
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(canonical) if canonical.starts_with(&root) => canonical,
+            _ => {
+                catalog.incomplete("workflow.catalog-unsafe-source");
+                return;
+            }
+        };
+        let bytes = std::fs::File::open(canonical).and_then(|file| {
+            let mut bytes = Vec::new();
+            let limit = (MAX_CATALOG_MANIFEST_BYTES + 1)
+                .min(MAX_CATALOG_TOTAL_BYTES.saturating_sub(*total_bytes) + 1);
+            file.take(limit as u64).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                catalog.incomplete("workflow.catalog-source-unavailable");
+                return;
+            }
+        };
+        if bytes.len() > MAX_CATALOG_MANIFEST_BYTES
+            || bytes.len() > MAX_CATALOG_TOTAL_BYTES.saturating_sub(*total_bytes)
+        {
+            catalog.incomplete("workflow.catalog-limit");
+            return;
+        }
+        match std::str::from_utf8(&bytes) {
+            Ok(raw) => catalog_candidate(raw, scope, out, catalog, manifests, total_bytes),
+            Err(_) => {
+                *manifests += 1;
+                *total_bytes += bytes.len();
+                catalog.diagnostic("workflow.catalog-invalid-manifest");
+            }
+        }
+    }
+}
+
 /// Read every `*.yaml` / `*.yml` manifest in `dir` (sorted for determinism) and
 /// push each parseable one as a [`Candidate`] at `scope`. A missing directory,
 /// an unreadable file, or an unparseable manifest is skipped silently — a broken
@@ -265,6 +634,332 @@ fn load_dir(dir: &Path, scope: WorkflowScope, out: &mut Vec<Candidate>) {
 mod tests {
     use super::*;
     use crate::compile_yaml;
+
+    fn catalog_fixture(id: &str, version: u32) -> String {
+        format!(
+            "schema_version: 1\nid: {id}\nversion: {version}\ndescription: Catalog fixture\n\
+             inputs:\n  request:\n    type: string\n    required: true\n\
+             steps:\n  - id: verify\n    tool: repository.test\n"
+        )
+    }
+
+    #[test]
+    fn definition_digest_ignores_comments_and_yaml_formatting() {
+        let manifest = catalog_fixture("digest-fixture", 1);
+        let reformatted = format!(
+            "# A harmless comment\n{}\n# Another comment\n",
+            manifest.replace("type: string", "type: 'string'")
+        );
+        let first = parse_definition(&manifest).unwrap();
+        let second = parse_definition(&reformatted).unwrap();
+        assert_eq!(
+            definition_digest(&first).unwrap(),
+            definition_digest(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn definition_digest_covers_input_budget_and_step_changes() {
+        let definition = parse_definition(&catalog_fixture("digest-fixture", 1)).unwrap();
+        let original = definition_digest(&definition).unwrap();
+        let mut input = definition.clone();
+        input.inputs.get_mut("request").unwrap().required = false;
+        let mut budget = definition.clone();
+        budget.budget.maximum_cost_usd = Some(1.0);
+        let mut step = definition.clone();
+        step.steps[0].tool = Some("workspace.read_file".to_string());
+        for changed in [input, budget, step] {
+            assert_ne!(original, definition_digest(&changed).unwrap());
+        }
+    }
+
+    #[test]
+    fn catalog_returns_sorted_builtin_metadata_and_compiled_node_counts() {
+        let catalog = WorkflowSourceRegistry::catalog(None, None);
+        assert!(!catalog.truncated);
+        assert!(catalog.diagnostics.is_empty());
+        assert_eq!(catalog.entries.len(), BUILTIN_WORKFLOW_MANIFESTS.len());
+        assert!(catalog
+            .entries
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+        let repair = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == REPAIR_GITHUB_CHECK_ID)
+            .unwrap();
+        assert_eq!(
+            (repair.version, repair.node_count, repair.source),
+            (1, 5, WorkflowScope::BuiltIn)
+        );
+        assert_eq!(
+            repair.inputs["pull_request"].input_type,
+            "github_pull_request"
+        );
+        assert!(repair.inputs["pull_request"].required);
+        let resolved = WorkflowSourceRegistry::load(None, None);
+        let definition = parse_definition(resolved.resolve(&repair.id).unwrap()).unwrap();
+        assert_eq!(
+            repair.definition_digest,
+            definition_digest(&definition).unwrap()
+        );
+    }
+
+    #[test]
+    fn catalog_preserves_scope_precedence_and_same_scope_highest_version() {
+        let user = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("a.yaml"),
+            catalog_fixture("catalog-demo", 8),
+        )
+        .unwrap();
+        std::fs::write(
+            user.path().join("b.yml"),
+            catalog_fixture("catalog-demo", 9),
+        )
+        .unwrap();
+        let user_catalog = WorkflowSourceRegistry::catalog(Some(user.path()), None);
+        let user_entry = user_catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-demo")
+            .unwrap();
+        assert_eq!(
+            (user_entry.version, user_entry.source),
+            (9, WorkflowScope::User)
+        );
+        std::fs::write(
+            repository.path().join("r.yaml"),
+            catalog_fixture("catalog-demo", 2),
+        )
+        .unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(Some(user.path()), Some(repository.path()));
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "catalog-demo")
+            .unwrap();
+        assert_eq!(
+            (entry.version, entry.node_count, entry.source),
+            (2, 1, WorkflowScope::Repository)
+        );
+    }
+
+    #[test]
+    fn catalog_reports_collisions_but_identical_redeclarations_keep_winner_scope() {
+        let user = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let manifest = catalog_fixture("catalog-demo", 1);
+        std::fs::write(user.path().join("a.yaml"), &manifest).unwrap();
+        std::fs::write(repository.path().join("r.yaml"), &manifest).unwrap();
+        let identical = WorkflowSourceRegistry::catalog(Some(user.path()), Some(repository.path()));
+        assert_eq!(
+            identical
+                .entries
+                .iter()
+                .find(|entry| entry.id == "catalog-demo")
+                .unwrap()
+                .source,
+            WorkflowScope::Repository
+        );
+        std::fs::write(
+            repository.path().join("r.yaml"),
+            manifest.replace("Catalog fixture", "Changed definition"),
+        )
+        .unwrap();
+        let collision = WorkflowSourceRegistry::catalog(Some(user.path()), Some(repository.path()));
+        assert!(!collision
+            .entries
+            .iter()
+            .any(|entry| entry.id == "catalog-demo"));
+        assert_eq!(collision.diagnostics, ["workflow.version-collision"]);
+    }
+
+    #[test]
+    fn catalog_keeps_healthy_siblings_without_disclosing_invalid_yaml() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("healthy.yaml"),
+            catalog_fixture("catalog-demo", 1),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("sensitive-file-name.yaml"),
+            "password: sensitive-yaml-scalar\ninvalid: [",
+        )
+        .unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(None, Some(directory.path()));
+        assert!(!catalog.truncated);
+        assert!(catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == "catalog-demo"));
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-invalid-manifest"]);
+        assert!(!format!("{catalog:?}").contains("sensitive"));
+    }
+
+    #[test]
+    fn catalog_does_not_fall_back_past_a_parsed_but_invalid_winner() {
+        let user = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("a.yaml"),
+            catalog_fixture("catalog-demo", 1),
+        )
+        .unwrap();
+        std::fs::write(
+            repository.path().join("r.yaml"),
+            catalog_fixture("catalog-demo", 2).replace("schema_version: 1", "schema_version: 999"),
+        )
+        .unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(Some(user.path()), Some(repository.path()));
+        assert!(!catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == "catalog-demo"));
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-invalid-manifest"]);
+    }
+
+    #[test]
+    fn catalog_rejects_oversized_metadata_without_shortening_identifiers() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixtures = [
+            catalog_fixture(&"i".repeat(MAX_CATALOG_IDENTIFIER_BYTES + 1), 1),
+            catalog_fixture("large-description", 1).replace(
+                "Catalog fixture",
+                &"d".repeat(MAX_CATALOG_DESCRIPTION_BYTES + 1),
+            ),
+            catalog_fixture("large-input-name", 1).replace(
+                "  request:",
+                &format!("  {}:", "n".repeat(MAX_CATALOG_IDENTIFIER_BYTES + 1)),
+            ),
+            catalog_fixture("large-input-type", 1).replace(
+                "type: string",
+                &format!("type: {}", "t".repeat(MAX_CATALOG_IDENTIFIER_BYTES + 1)),
+            ),
+        ];
+        for (index, fixture) in fixtures.iter().enumerate() {
+            std::fs::write(directory.path().join(format!("{index}.yaml")), fixture).unwrap();
+        }
+        let catalog = WorkflowSourceRegistry::catalog(None, Some(directory.path()));
+        assert_eq!(catalog.entries.len(), BUILTIN_WORKFLOW_MANIFESTS.len());
+        assert_eq!(
+            catalog.diagnostics,
+            ["workflow.catalog-metadata-unavailable"]
+        );
+    }
+
+    #[test]
+    fn catalog_bounds_input_and_node_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let inputs: String = (0..=MAX_CATALOG_INPUTS)
+            .map(|index| format!("  input_{index}:\n    type: string\n"))
+            .collect();
+        let nodes: String = (0..=MAX_CATALOG_NODES)
+            .map(|index| format!("  - id: step_{index}\n    tool: repository.test\n"))
+            .collect();
+        std::fs::write(directory.path().join("inputs.yaml"), format!("schema_version: 1\nid: many-inputs\nversion: 1\ninputs:\n{inputs}steps:\n  - id: verify\n    tool: repository.test\n")).unwrap();
+        std::fs::write(
+            directory.path().join("nodes.yaml"),
+            format!("schema_version: 1\nid: many-nodes\nversion: 1\nsteps:\n{nodes}"),
+        )
+        .unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(None, Some(directory.path()));
+        assert_eq!(catalog.entries.len(), BUILTIN_WORKFLOW_MANIFESTS.len());
+        assert_eq!(
+            catalog.diagnostics,
+            ["workflow.catalog-metadata-unavailable"]
+        );
+    }
+
+    #[test]
+    fn catalog_limits_never_advertise_an_unverified_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("oversized.yaml"),
+            "#".repeat(MAX_CATALOG_MANIFEST_BYTES + 1),
+        )
+        .unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(None, Some(directory.path()));
+        assert!(catalog.truncated);
+        assert!(catalog.entries.is_empty());
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-limit"]);
+    }
+
+    #[test]
+    fn catalog_bounds_directory_enumeration_and_output_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_CATALOG_DIRECTORY_ENTRIES {
+            std::fs::write(directory.path().join(format!("{index}.txt")), "ignored").unwrap();
+        }
+        let catalog = WorkflowSourceRegistry::catalog(Some(directory.path()), None);
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_CATALOG_ENTRIES {
+            std::fs::write(
+                directory.path().join(format!("{index}.yaml")),
+                catalog_fixture(&format!("entry-{index}"), 1),
+            )
+            .unwrap();
+        }
+        let catalog = WorkflowSourceRegistry::catalog(Some(directory.path()), None);
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-limit"]);
+    }
+
+    #[test]
+    fn catalog_bounds_manifest_count_and_cumulative_read_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_CATALOG_MANIFESTS {
+            std::fs::write(
+                directory.path().join(format!("{index:04}.yaml")),
+                "not a workflow",
+            )
+            .unwrap();
+        }
+        let catalog = WorkflowSourceRegistry::catalog(Some(directory.path()), None);
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|code| code == "workflow.catalog-limit"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let raw = format!("#{}\n", "a".repeat(MAX_CATALOG_MANIFEST_BYTES - 2));
+        for index in 0..=MAX_CATALOG_TOTAL_BYTES / MAX_CATALOG_MANIFEST_BYTES {
+            std::fs::write(directory.path().join(format!("{index:04}.yaml")), &raw).unwrap();
+        }
+        let catalog = WorkflowSourceRegistry::catalog(Some(directory.path()), None);
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|code| code == "workflow.catalog-limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_refuses_external_file_and_parent_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir(external.path().join("workflows")).unwrap();
+        let manifest = external.path().join("workflows/private.yaml");
+        std::fs::write(&manifest, catalog_fixture("external-workflow", 1)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        symlink(&manifest, directory.path().join("linked.yaml")).unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(None, Some(directory.path()));
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-unsafe-source"]);
+        let repository = tempfile::tempdir().unwrap();
+        symlink(external.path(), repository.path().join(".codypendent")).unwrap();
+        let catalog = WorkflowSourceRegistry::catalog(
+            None,
+            Some(&repository.path().join(".codypendent/workflows")),
+        );
+        assert!(catalog.truncated && catalog.entries.is_empty());
+        assert_eq!(catalog.diagnostics, ["workflow.catalog-unsafe-source"]);
+    }
 
     /// The embedded built-in parses and is the canonical five-node
     /// `repair-github-check` graph — a fresh install ships a working `/fix-ci`.

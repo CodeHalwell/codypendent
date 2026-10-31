@@ -2789,7 +2789,7 @@ fn render_pending_prompts(frame: &mut Frame, area: Rect, state: &AppState, theme
 }
 
 /// The persistent composer: an always-present input line. Empty, it shows a
-/// context-aware placeholder (start a run vs. steer the live one); with a draft,
+/// context-aware placeholder (start a run vs. queue a follow-up); with a draft,
 /// it shows the text and a cursor.
 fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let steering = state.selected_run_is_active();
@@ -2801,7 +2801,7 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .borders(Borders::TOP)
         .title(Span::styled(
             if steering {
-                " STEER · Enter queues "
+                " FOLLOW-UP · Enter queues "
             } else {
                 " MESSAGE · Enter sends "
             },
@@ -2817,7 +2817,7 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = if state.composer.is_empty() {
         let hint = if steering {
-            "Add guidance while the agent works…"
+            "Queue a follow-up while the agent works…"
         } else {
             "Ask Codypendent to build, fix, explain, or explore…"
         };
@@ -3962,19 +3962,27 @@ fn run_state_chips(run_state: Option<RunState>) -> Vec<Chip> {
             | RunState::WaitingForApproval
             | RunState::WaitingForUserInput
             | RunState::Recovering),
-        ) => vec![
-            Chip::new("s", "steer", Action::Steer),
-            Chip::new(
-                "p",
-                if matches!(run_state, RunState::Paused) {
-                    "resume"
-                } else {
-                    "pause"
-                },
-                Action::Pause,
-            ),
-            Chip::new("c", "interrupt", Action::Cancel),
-        ],
+        ) => {
+            let mut chips = vec![Chip::new("F9", "interrupt", Action::Cancel)];
+            // Match the states accepted by `pause_or_resume`: waiting and
+            // recovering runs must not advertise a control that does nothing.
+            if matches!(
+                run_state,
+                RunState::Queued | RunState::Preparing | RunState::Running | RunState::Paused
+            ) {
+                chips.push(Chip::new(
+                    "F8",
+                    if matches!(run_state, RunState::Paused) {
+                        "resume"
+                    } else {
+                        "pause"
+                    },
+                    Action::Pause,
+                ));
+            }
+            chips.push(Chip::new("F7", "steer", Action::Steer));
+            chips
+        }
         _ => vec![
             Chip::new("n", "new", Action::NewRun),
             Chip::new("/", "commands", Action::OpenPalette),
@@ -4167,7 +4175,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::styled("● ", Style::default().fg(theme.focus.active)),
                 Span::styled(
                     if steering {
-                        "Steering draft ready"
+                        "Follow-up draft ready"
                     } else {
                         "Message ready"
                     },
@@ -4176,9 +4184,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             if steering {
                 vec![
-                    Chip::new("Enter", "queue steer", Action::InputSubmit),
+                    Chip::new("F9", "interrupt", Action::Cancel),
+                    Chip::new("Enter", "queue message", Action::InputSubmit),
                     Chip::new("Alt+Enter", "newline", Action::InputNewline),
-                    Chip::new("c", "interrupt", Action::Cancel),
                 ]
             } else {
                 vec![
@@ -4354,7 +4362,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             "Post open question to Blackboard (evidence, decisions, artifacts)",
             buffer,
         ),
-        Overlay::ConfirmCancel => render_confirm(frame, area, state, theme),
+        Overlay::ConfirmCancel { run_id } => render_confirm(frame, area, state, theme, *run_id),
         Overlay::ConfirmWorkflowCancel { workflow_run_id } => render_confirm_box(
             frame,
             area,
@@ -10349,37 +10357,36 @@ fn render_backtrack(
     frame.render_widget(list, list_area);
 }
 
-fn render_confirm(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect_min(60, 20, 48, 7, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
-    let lines = vec![
-        Line::styled(
-            "Cancel this run?",
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
+fn render_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    run_id: codypendent_protocol::RunId,
+) {
+    let (title, detail) = match state.runs.iter().find(|run| run.run_id == run_id) {
+        Some(run) => (
+            format!("Cancel run: {}?", run.objective),
+            format!(
+                "Run {run_id}\n{} · {}\n{}",
+                mode_label(run.mode),
+                run_state_label(run.state),
+                if matches!(
+                    run.state,
+                    RunState::Completed | RunState::Failed | RunState::Cancelled
+                ) {
+                    "This run has already finished; no cancellation will be sent."
+                } else {
+                    "Cancelling stops this run; its chronicle and artifacts are kept."
+                }
+            ),
         ),
-        Line::styled(
-            "Cancelling stops the run; a chronicle and any artifacts are kept.",
-            Style::default().fg(theme.text.secondary),
+        None => (
+            "Cancel run?".to_owned(),
+            format!("Run {run_id}\nThis run is no longer available; no cancellation will be sent."),
         ),
-        Line::from(vec![
-            Span::styled("[y] yes, cancel   ", theme.status_fg(Tone::Danger)),
-            Span::styled("[n] no", theme.status_fg(Tone::Success)),
-        ]),
-    ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Confirm ")
-        .border_style(theme.status_fg(Tone::Danger))
-        .style(theme.overlay_style());
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        rect,
-    );
+    };
+    render_confirm_box(frame, area, state, theme, &title, &detail);
 }
 
 fn section(title: &str, theme: &Theme) -> Line<'static> {
@@ -14688,7 +14695,12 @@ mod tests {
         let text = render_to_string(&state, 110, 34);
         assert!(text.contains("Help"));
         assert!(text.contains("command palette"));
-        assert!(text.contains("detach"));
+        state.help_query = "detach".to_owned();
+        let filtered = render_to_string(&state, 110, 34);
+        assert!(
+            filtered.contains("Ctrl-C") && filtered.contains("detach"),
+            "{filtered}"
+        );
     }
 
     #[test]
@@ -14873,7 +14885,7 @@ mod tests {
     #[test]
     fn conversation_shell_shows_transcript_composer_and_footer() {
         // A live run: the transcript is the main surface, the composer offers to
-        // steer it, and the status footer spans the bottom.
+        // queue a follow-up, and the status footer spans the bottom.
         let state = running_build_state();
         let text = render_to_string(&state, 100, 30);
 
@@ -14884,11 +14896,11 @@ mod tests {
             text.contains("diagnose the failing test"),
             "run objective:\n{text}"
         );
-        // The persistent composer + its steering placeholder (the run is live).
+        // The persistent composer + its follow-up placeholder (the run is live).
         assert!(text.contains("❯"), "composer prompt:\n{text}");
         assert!(
-            text.contains("Add guidance while the agent works"),
-            "steer placeholder:\n{text}"
+            text.contains("Queue a follow-up while the agent works"),
+            "follow-up placeholder:\n{text}"
         );
         assert!(text.contains("Running"), "context footer:\n{text}");
     }
@@ -15025,7 +15037,7 @@ mod tests {
         }
         let drafting = render_to_string(&state, 120, 30);
         assert!(
-            drafting.contains("Steering draft ready") && drafting.contains("queue steer"),
+            drafting.contains("Follow-up draft ready") && drafting.contains("queue message"),
             "draft actions in the footer:\n{drafting}"
         );
     }
@@ -15209,7 +15221,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_has_three_text_rows_and_explicit_send_and_steer_semantics() {
+    fn composer_has_three_text_rows_and_explicit_send_and_queue_semantics() {
         let idle = AppState::new();
         for width in [40, 60, 80, 120] {
             assert_eq!(composer_box_height("", width), 4);
@@ -15224,9 +15236,12 @@ mod tests {
             let height = composer_box_height(&live.composer, width);
             assert!((4..=COMPOSER_MAX_HEIGHT).contains(&height));
             let text = render_to_string(&live, width, 24);
-            assert!(text.contains("STEER · Enter queues"), "{width}:\n{text}");
+            assert!(
+                text.contains("FOLLOW-UP · Enter queues"),
+                "{width}:\n{text}"
+            );
             if width >= 80 {
-                assert!(text.contains("queue steer"), "{width}:\n{text}");
+                assert!(text.contains("queue message"), "{width}:\n{text}");
                 assert!(text.contains("interrupt"), "{width}:\n{text}");
             }
         }
@@ -16406,6 +16421,70 @@ mod tests {
         assert!(
             !text.contains("sk-live-test-key"),
             "no key material in the confirm:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cancel_confirmation_names_the_pinned_run_and_keeps_compact_decisions_visible() {
+        let mut state = running_build_state();
+        let original = state.runs[0].run_id;
+        reduce(&mut state, Action::Cancel);
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id: RunId::new(),
+                objective: "different selected run".to_owned(),
+                mode: AgentMode::Plan,
+            }),
+        );
+        let text = render_to_string(&state, 100, 24);
+        assert!(
+            text.contains("Cancel run: diagnose the failing test?"),
+            "{text}"
+        );
+        assert!(text.contains(&original.to_string()), "{text}");
+        assert!(text.contains("Build · Running"), "{text}");
+        assert!(
+            !text.contains("Cancel run: different selected run"),
+            "{text}"
+        );
+
+        state.runs[0].objective =
+            "A long reviewed objective with 日本語 and enough words to wrap across many lines. "
+                .repeat(8);
+        for (width, height) in [(80, 24), (48, 12), (32, 10), (20, 10)] {
+            let text = render_to_string(&state, width, height);
+            assert!(
+                text.contains("[y] yes"),
+                "confirm missing at {width}x{height}:\n{text}"
+            );
+            assert!(
+                text.contains("[n] no"),
+                "decline missing at {width}x{height}:\n{text}"
+            );
+        }
+        for (width, height) in [(0, 0), (1, 1), (18, 4)] {
+            let _ = render_to_string(&state, width, height);
+        }
+    }
+
+    #[test]
+    fn cancel_confirmation_explains_when_its_target_has_finished_or_disappeared() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::Cancel);
+        state.runs[0].state = RunState::Completed;
+        let finished = render_to_string(&state, 120, 24);
+        assert!(finished.contains("already finished"), "{finished}");
+        assert!(
+            finished.contains("no cancellation will be sent"),
+            "{finished}"
+        );
+        state.runs.clear();
+        let missing = render_to_string(&state, 120, 24);
+        assert!(missing.contains("no longer available"), "{missing}");
+        assert!(
+            missing.contains("no cancellation will be sent"),
+            "{missing}"
         );
     }
 
@@ -18979,6 +19058,73 @@ mod tests {
                 "clicking {label:?} at column {x} must fire {action:?}: {footer:?}"
             );
         }
+    }
+
+    #[test]
+    fn live_run_footer_controls_match_keyboard_actions_and_run_capabilities() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        for run_state in [
+            RunState::Queued,
+            RunState::Preparing,
+            RunState::Running,
+            RunState::Paused,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+            RunState::Recovering,
+        ] {
+            let mut state = running_build_state();
+            state.runs[0].state = run_state;
+            let text = render_to_string(&state, 160, 24);
+            let y = 22;
+            let footer = text.lines().nth(y).expect("footer row");
+            let mut controls = vec![
+                ("F9 interrupt", KeyCode::F(9), Action::Cancel),
+                ("F7 steer", KeyCode::F(7), Action::Steer),
+            ];
+            if matches!(
+                run_state,
+                RunState::Queued | RunState::Preparing | RunState::Running | RunState::Paused
+            ) {
+                controls.push((
+                    if run_state == RunState::Paused {
+                        "F8 resume"
+                    } else {
+                        "F8 pause"
+                    },
+                    KeyCode::F(8),
+                    Action::Pause,
+                ));
+            } else {
+                assert!(
+                    !footer.contains("F8"),
+                    "unsupported pause at {run_state:?}: {footer}"
+                );
+            }
+            for (label, key, expected) in controls {
+                let byte = footer
+                    .find(label)
+                    .unwrap_or_else(|| panic!("{label} at {run_state:?}: {footer}"));
+                let x = UnicodeWidthStr::width(&footer[..byte]) as u16;
+                assert_eq!(click_at(&state, x, y as u16), Some(expected.clone()));
+                assert_eq!(
+                    crate::input::map_event(
+                        &Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                        state.input_mode(),
+                        160,
+                        &[]
+                    ),
+                    expected
+                );
+            }
+        }
+
+        let mut state = running_build_state();
+        state.composer = "steer the work".to_owned();
+        let draft = render_to_string(&state, 160, 24);
+        let footer = draft.lines().nth(22).unwrap();
+        assert!(footer.contains("F9 interrupt"), "{footer}");
+        assert!(!footer.contains("c interrupt"), "{footer}");
     }
 
     /// The Skills footer's `M memory` chip: its old hit region was declared at

@@ -63,6 +63,7 @@ jobs:
       - name: Check Apple release tooling
         run: |
           python3 apps/desktop/scripts/test_apple_release.py
+          python3 apps/desktop/scripts/test_linux_release.py
           python3 apps/desktop/scripts/test_prepare_embedding_runtime.py
           python3 .github/scripts/tests/test_release_install.py
           bash -n install.sh apps/desktop/scripts/apple-signing-env.sh apps/desktop/scripts/sign-apple-release.sh apps/desktop/scripts/sign-apple-runtime.sh apps/desktop/scripts/package-apple-release.sh
@@ -211,6 +212,8 @@ jobs:
         run: |
           python3 apps/desktop/scripts/prepare-monty-runtime.py
           python3 apps/desktop/scripts/prepare-embedding-runtime.py
+      - name: Check native fixture isolation and cleanup
+        run: npm --prefix apps/desktop run test:native-support
       - name: Check the complete Tauri bridge and application
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --features app --all-targets --locked
       - name: Build native clients for desktop handoff
@@ -561,12 +564,23 @@ jobs:
           (cd sdk/protocol && npm ci && npm run build)
           (cd sdk/ui && npm ci && npm run build)
 
-      - name: Download the matching Apple runtime
-        if: runner.os == 'macOS'
+      - name: Download the matching runtime
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: codypendent-${{ matrix.target }}
-          path: apple-runtime
+          path: desktop-runtime
+
+      - name: Extract the matching runtime
+        shell: bash
+        run: tar -xzf "desktop-runtime/codypendent-${{ matrix.target }}.tar.gz" -C desktop-runtime
+
+      - name: Stage the self-contained Linux runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 apps/desktop/scripts/linux-release.py stage \
+            "desktop-runtime/codypendent-${{ matrix.target }}" \
+            --config "$PWD/apps/desktop/src-tauri/target/linux-runtime-bundle.json"
 
       - name: Build the desktop bundle
         working-directory: apps/desktop
@@ -574,17 +588,28 @@ jobs:
           set -euo pipefail
           npm ci
           # Stage the complete runtime before applying any distribution signature.
-          npm run tauri:build -- --bundles ${{ matrix.bundles }} --no-sign
+          runtime_config=()
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            runtime_config=(--config "$PWD/src-tauri/target/linux-runtime-bundle.json")
+          fi
+          npm run tauri:build -- --bundles ${{ matrix.bundles }} --no-sign "${runtime_config[@]}"
+
+      - name: Verify the complete Linux AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          image="$(find apps/desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
+          test -n "$image"
+          python3 apps/desktop/scripts/linux-release.py verify-image "$image"
 
       - name: Stage the self-contained Apple runtime
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          tar -xzf "apple-runtime/codypendent-${{ matrix.target }}.tar.gz" -C apple-runtime
           python3 apps/desktop/scripts/apple-release.py stage \
             apps/desktop/src-tauri/target/release/bundle/macos/Codypendent.app \
-            "apple-runtime/codypendent-${{ matrix.target }}"
+            "desktop-runtime/codypendent-${{ matrix.target }}"
           python3 apps/desktop/scripts/apple-release.py verify \
             apps/desktop/src-tauri/target/release/bundle/macos/Codypendent.app
 

@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { App } from "../src/App.js";
 import { KnowledgeSessionFixture } from "./fixtures/knowledgeSession.js";
 import type { SkillCard } from "../src/components/knowledgeTransport.js";
@@ -59,19 +59,32 @@ it("discards a previous session's skill reply after the new session has loaded",
 
 it("keeps a completed correction's notice in its originating session", async () => {
   const fixture = new KnowledgeSessionFixture();
+  const correctMemory = vi.spyOn(fixture.knowledge, "correctMemory");
   render(<App initialView="memory" makeTransport={() => fixture.transport} knowledge={fixture.knowledge} />);
   await screen.findByText("Memory workspace");
-  fireEvent.click(await screen.findByLabelText("Session A"));
+  // Finish attaching before opening an editor: attachment clears the previous
+  // knowledge scope, including any card briefly loaded during the transition.
+  await act(async () => {
+    fireEvent.click(await screen.findByLabelText("Session A"));
+  });
   open("Memory");
   await screen.findByText("Memory A");
   let resolve!: (notice: string) => void;
   fixture.correctionPending = new Promise((done) => { resolve = done; });
   fireEvent.click(screen.getByRole("button", { name: /^Correct$/ }));
+  const statement = await screen.findByRole("textbox", { name: "Corrected statement" });
+  expect((statement as HTMLTextAreaElement).value).toBe("Memory A");
+  fireEvent.change(statement, { target: { value: "Memory A corrected" } });
   fireEvent.click(screen.getByRole("button", { name: /^Send correction$/ }));
-  fireEvent.click(screen.getByLabelText("Session B"));
+  expect(correctMemory).toHaveBeenCalledExactlyOnceWith("A", "Memory A corrected");
+  await act(async () => {
+    fireEvent.click(screen.getByLabelText("Session B"));
+  });
   open("Memory");
   await screen.findByText("Memory B");
   await act(async () => { resolve("Corrected memory A"); });
   expect(screen.queryByText("Corrected memory A")).toBeNull();
+  expect(screen.queryByText("Memory A")).toBeNull();
   expect(screen.getByText("Memory B")).toBeTruthy();
+  expect(correctMemory).toHaveBeenCalledTimes(1);
 });

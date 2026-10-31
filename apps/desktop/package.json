@@ -12,10 +12,12 @@
     "tauri:dev": "node scripts/dev-desktop.mjs",
     "desktop:dev": "node scripts/dev-desktop.mjs",
     "tauri:build": "tauri build -f app",
+    "build:native-window-smoke": "tauri build -f app --debug --no-bundle --config src-tauri/tauri.native-window-smoke.conf.json",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "perf": "vitest run --config vitest.perf.config.ts",
-    "test:native": "node test/native-smoke.mjs"
+    "test:native": "node test/native-smoke.mjs",
+    "test:native-support": "node --test test/native-smoke-support.test.mjs"
   },
   "dependencies": {
     "@ag-ui/client": "1.0.1",

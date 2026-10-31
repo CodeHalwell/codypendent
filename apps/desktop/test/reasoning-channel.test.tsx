@@ -4,10 +4,10 @@
  * ACP separates `AgentThoughtChunk` from `AgentMessageChunk`; the daemon merged
  * them until v0.12.2, so a model that deliberates out loud printed its whole
  * deliberation as the reply and buried the answer under it. These tests hold
- * the client end: marked chunks land in their own folded entry, unmarked ones
+ * the client end: marked chunks land in their own progress entry, unmarked ones
  * behave exactly as they always did.
  */
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { initialState, reduce, type DaemonState } from "../src/daemonState.js";
@@ -56,13 +56,13 @@ describe("the reasoning channel", () => {
     expect(state.transcript.map((item) => item.type)).toEqual(["assistant", "thought"]);
   });
 
-  it("renders reasoning folded, with the reply as page content", () => {
+  it("renders reasoning as progress, with the reply as separate page content", () => {
     let state = reduce(attached(), delta("deliberating", 1, true));
     state = reduce(state, delta("the answer", 2, false));
     render(<Transcript items={state.transcript} connectionStatus="connected" />);
     expect(screen.getByText("the answer")).toBeTruthy();
-    const details = document.querySelector("details");
-    expect(details?.hasAttribute("open")).toBe(false);
-    expect(details?.textContent).toContain("deliberating");
+    const progress = screen.getByLabelText("Agent progress");
+    expect(within(progress).getByText("deliberating")).toBeTruthy();
+    expect(within(progress).queryByText("the answer")).toBeNull();
   });
 });

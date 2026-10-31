@@ -11,6 +11,11 @@ const canonicalOutputRoot = join(packageRoot, "src", "generated");
 
 const targets = [
   {
+    schema: "workflow-catalog.schema.json",
+    output: "workflow-catalog.ts",
+    exports: ["WorkflowCatalog", "WorkflowCatalogEntry", "WorkflowCatalogInput", "WorkflowCatalogSource", "WorkflowCatalogDiagnostic"],
+  },
+  {
     schema: "command.schema.json",
     output: "commands.ts",
     // `CanaryMetrics` is deliberately absent: it stopped being a wire type when

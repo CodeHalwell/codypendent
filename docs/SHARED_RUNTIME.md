@@ -6,6 +6,59 @@ The Node transport, discovery, session controller and bounded activity projectio
 
 Anton vendors a versioned SDK archive and a hash-verified archive of Rust build inputs. The companion repository records both the base commit and whether local changes were included. Ordinary builds require no sibling checkout. Unix installers bundle the CLI/daemon and the confined UI-worker launcher. Windows currently retains the editor's native compatibility runtime.
 
+## Independent runtime profiles
+
+`RuntimePaths::resolve()` and Node SDK discovery select `codypendent` by default.
+An embedding host can choose `AGENT_RUNTIME_PRODUCT=son-of-anton`, or use an
+explicit product argument in `RuntimePaths::resolve_for` / `resolveRuntimePaths`.
+Explicit arguments take precedence over inherited selectors.
+
+The `son-of-anton` profile uses its own platform data/configuration directories
+and only `SON_OF_ANTON_DATA_DIR`, `SON_OF_ANTON_CONFIG_DIR`, and
+`SON_OF_ANTON_SOCKET` overrides. Codypendent continues to use `CODYPENDENT_*`.
+Each profile owns its database, auth file, logs, artifacts, trusted publishers,
+and socket. Child editor handoff pins the resolved profile and removes foreign
+path overrides. Repository-owned `.codypendent/` configuration remains an
+existing versioned repository contract; this change does not rename that format.
+
+The standalone Codypendent desktop and branded editor extension explicitly
+select Codypendent defaults even when launched from an Anton process. Desktop
+daemon children receive the same pinned product and paths. Explicit editor
+handoff or socket configuration continues to take precedence. The generic CLI
+and SDK retain the host selector for embedded use, including Anton's Agent Terminal.
+
+Anton defaults to its private runtime. Attaching to Codypendent is explicit and
+uses the existing authenticated/version-negotiated protocol. The selected owner
+continues executing a live run; clients never copy an active ledger or start it
+again. Session projections preserve recorded run modes through incremental
+updates and history recovery so Plan/Act presentation can use actual provenance.
+
+Run completion retains the configured routing profile for recovery and retry.
+Individual response chunks retain their provider-reported model, or an explicit
+unknown identity when no model was reported. Native and ACP completion therefore
+cannot replace a retry route with an unregistered provider snapshot or empty ID.
+
+Independent engines do not coordinate through database-local workspace leases.
+Use disjoint worktrees and reviewed patch/commit exchange for separate writing
+runs. Shared same-checkout writes require a jointly respected cross-process
+ownership contract. Do not share private SQLite files between products.
+
+## Browsing and run controls
+
+Anton offers graph filters, overview reset and a bounded Back trail that restores
+the query, focus and scroll position. Codypendent Desktop offers Back/Forward
+through selected symbols, retaining metadata and retry controls when an older
+detail page leaves the cache. Both trails stay within their repository and runtime;
+recorded structural evidence still does not establish complete impact or coverage.
+
+Desktop's **Implement This Plan** action requires an attributable, successfully
+completed Plan in a settled session. It stages Build and prepares an editable
+draft while retaining feedback and the chosen model. It does not submit or queue
+work. In the TUI, `F7` opens immediate steering, `F8` pauses/resumes, and `F9`
+confirms interruption of the named run. Ordinary composer Enter queues a live
+run's follow-up. Cancellation remains pinned if another run becomes selected
+while the confirmation is open; a finished or missing target is a safe no-op.
+
 Sessions, runs, questions, approvals, workflows, repository task cards and execution policy remain daemon-owned. Disconnecting or switching a frontend stops observation. Only explicit cancellation stops a run. Correlated mutations time out and are never automatically replayed; clients reconcile a receipt or ask for an explicit retry using stable idempotency keys.
 
 The SDK displays bounded retained history, preserves interleaved model/tool order and shows tool failures and checkpoint rollbacks. A completed run does not establish test success. Graph pages retain evidence and confidence rather than implying complete impact or test coverage. Missing usage remains unknown.

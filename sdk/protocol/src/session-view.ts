@@ -2,7 +2,7 @@
  * Copyright (c) Microsoft Corporation. All rights reserved.
  * Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import type { EventBody, SessionStoreSnapshot } from './index.js';
+import type { AgentMode, EventBody, SessionStoreSnapshot } from './index.js';
 
 export interface TranscriptRow { id: string; kind: 'user' | 'assistant' | 'status' | 'patch'; text: string; timestamp?: string; runId?: string; modelId?: string }
 export interface ApprovalCard { id: string; action: string; risk: string }
@@ -11,6 +11,8 @@ export interface SessionRunView {
 	id: string;
 	state: string;
 	objective?: string;
+	/** Recorded run mode; absent until its RunStarted history has been read. */
+	mode?: AgentMode['type'];
 	disposition?: Extract<EventBody, { type: 'RunCompleted' }>['disposition'];
 	usage?: { inputTokens?: number; outputTokens?: number; costMicros?: number };
 }
@@ -49,7 +51,7 @@ export function projectSession(snapshot: SessionStoreSnapshot, previous?: Sessio
 		const id = String(event.sequence);
 		switch (body.type) {
 			case 'SessionCreated': title = body.title; break;
-			case 'RunStarted': activeRuns.add(body.run_id); runs.set(body.run_id, { id: body.run_id, state: 'Running', objective: body.objective }); append(id, 'user', body.objective); break;
+			case 'RunStarted': activeRuns.add(body.run_id); runs.set(body.run_id, { id: body.run_id, state: 'Running', objective: body.objective, mode: body.mode.type }); append(id, 'user', body.objective); break;
 			case 'ModelStreamDelta':
 				if (!body.thought) {
 					const modelId = event.actor.type === 'Agent' && event.actor.run_id === body.run_id && event.actor.model.trim()

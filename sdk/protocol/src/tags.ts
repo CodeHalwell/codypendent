@@ -23,6 +23,7 @@ import type { EventBody, EventBodyTag } from "./events.js";
 type AssertNever<T extends never> = T;
 
 export const PAYLOAD_TAGS = [
+  "WorkflowCatalog",
   "KnowledgePage",
   "Ping",
   "Pong",
@@ -141,6 +142,7 @@ export const EVENT_BODY_TAGS = [
 ] as const satisfies readonly EventBodyTag[];
 
 export const COMMAND_BODY_TAGS = [
+  "ListWorkflows",
   "ReadKnowledge",
   "InstallUiPlugin",
   "SmokeTestUiPlugin",

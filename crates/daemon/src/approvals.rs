@@ -642,7 +642,7 @@ impl ApprovalBroker {
 
             if scope == ApprovalScope::Repository {
                 let provenance = crate::commands::run_launch_provenance_in(
-                    &mut **tx,
+                    tx,
                     parse_run_id(&run_id)?,
                     session_id,
                 )

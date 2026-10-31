@@ -1,0 +1,181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "WorkflowCatalogDiagnostic": {
+      "description": "Static diagnostics intentionally exclude parser context and manifest scalar values.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "workflow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogEntry": {
+      "properties": {
+        "definition_digest": {
+          "description": "SHA-256 of the canonical parsed definition, including its inputs and budget.",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/definitions/WorkflowCatalogInput"
+          },
+          "type": "object"
+        },
+        "node_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/definitions/WorkflowCatalogSource"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "definition_digest",
+        "id",
+        "inputs",
+        "node_count",
+        "source",
+        "version"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogInput": {
+      "description": "Input types are domain names, not JSON Schema or an invented control/default.",
+      "properties": {
+        "input_type": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "input_type",
+        "required"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogSource": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "BuiltIn"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "User"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "description": "Bounded workflow discovery metadata. No manifest, prompt, or environment is exposed.",
+  "properties": {
+    "diagnostics": {
+      "items": {
+        "$ref": "#/definitions/WorkflowCatalogDiagnostic"
+      },
+      "type": "array"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/definitions/WorkflowCatalogEntry"
+      },
+      "type": "array"
+    },
+    "repository": {
+      "description": "Canonical repository used for resolution; reuse it when starting the selected workflow.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "truncated": {
+      "description": "Some sources could not be inspected completely. No potentially shadowed entries are offered.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "diagnostics",
+    "items",
+    "truncated"
+  ],
+  "title": "WorkflowCatalog",
+  "type": "object"
+}

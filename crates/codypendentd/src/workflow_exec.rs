@@ -5477,6 +5477,7 @@ steps:
 
         let run_id = host
             .start(StartWorkflowRequest {
+                expected_definition_digest: None,
                 manifest: PUBLISH_ONLY_MANIFEST.to_owned(),
                 workflow_id: None,
                 inputs: json!({ "pull_request": 7 }),
@@ -5803,6 +5804,7 @@ steps:
             // The `/fix-ci` shape: no inline manifest — the daemon resolves the
             // built-in `repair-github-check` by id — plus the PR-number input and
             // the run's repository (Phase 5 T5).
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: Some(REPAIR_GITHUB_CHECK_ID.to_string()),
             inputs: json!({ "pull_request": 7 }),

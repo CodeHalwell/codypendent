@@ -36,3 +36,4 @@ __pycache__/
 node_modules/
 /apps/desktop/src-tauri/binaries/
 /apps/desktop/src-tauri/resources/embedding-runtime/
+/apps/desktop/src-tauri/resources/runtime/

@@ -1,6 +1,8 @@
 /** Mirrors `crates/protocol/src/workflow.rs`. */
 
 import type { JsonValue } from "./ids.js";
+export type { WorkflowCatalog, WorkflowCatalogEntry, WorkflowCatalogInput, WorkflowCatalogSource,
+  WorkflowCatalogDiagnostic } from "./generated/workflow-catalog.js";
 
 /** `#[serde(tag = "type")]` + `#[serde(other)] Unknown`. */
 export type WorkflowNodeState =
@@ -29,7 +31,7 @@ export interface WorkflowNodeView {
   state: WorkflowNodeState;
   attempt: number;
   cost?: JsonValue;
-  error?: string;
+  error?: string | null;
   /** `skip_serializing_if = "Vec::is_empty"`. */
   warnings?: string[];
   /** `skip_serializing_if = "Vec::is_empty"`. */

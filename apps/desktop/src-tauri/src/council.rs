@@ -35,7 +35,7 @@ use codypendent_protocol::SessionId;
 use serde::{Deserialize, Serialize};
 
 fn paths() -> anyhow::Result<RuntimePaths> {
-    RuntimePaths::resolve().context("resolving codypendent runtime paths")
+    crate::runtime_paths::resolve().context("resolving codypendent runtime paths")
 }
 
 /// One member row, as `councils.toml` stores it.

@@ -395,6 +395,11 @@ export type Payload =
       type: "SessionEventsPage";
     }
   | {
+      catalog: WorkflowCatalog;
+      command_id: string;
+      type: "WorkflowCatalog";
+    }
+  | {
       command_id: string;
       snapshot: WorkflowRunSnapshot;
       type: "WorkflowRunSnapshot";
@@ -834,6 +839,14 @@ type CommandBody =
       type: "PublishDocument";
     }
   | {
+      repository?: string | null;
+      type: "ListWorkflows";
+    }
+  | {
+      /**
+       * Optional precondition binding a new launcher to the selected parsed definition. A mismatch rejects before creating a run; legacy callers may omit it.
+       */
+      expected_definition_digest?: string | null;
       inputs?: JsonValue;
       /**
        * The workflow manifest YAML (the content of a `workflow.yaml`). Empty when [`workflow_id`](CommandBody::StartWorkflow::workflow_id) names a workflow the daemon resolves from its own sources instead.
@@ -3031,6 +3044,19 @@ type MemoryEvidence =
   | {
       type: "Unknown";
     };
+type WorkflowCatalogSource =
+  | {
+      type: "BuiltIn";
+    }
+  | {
+      type: "User";
+    }
+  | {
+      type: "Repository";
+    }
+  | {
+      type: "Unknown";
+    };
 /**
  * The lifecycle state of one workflow node, projected for a client. Mirrors `codypendent_workflow`'s `NodeState` across the wire; a value from a newer peer deserializes to [`Unknown`](WorkflowNodeState::Unknown) rather than failing the frame.
  */
@@ -4446,6 +4472,50 @@ interface BlackboardItemView {
    * The workflow run whose board holds it.
    */
   workflow_run_id: string;
+}
+/**
+ * Bounded workflow discovery metadata. No manifest, prompt, or environment is exposed.
+ */
+interface WorkflowCatalog {
+  diagnostics: WorkflowCatalogDiagnostic[];
+  items: WorkflowCatalogEntry[];
+  /**
+   * Canonical repository used for resolution; reuse it when starting the selected workflow.
+   */
+  repository?: string | null;
+  /**
+   * Some sources could not be inspected completely. No potentially shadowed entries are offered.
+   */
+  truncated: boolean;
+}
+/**
+ * Static diagnostics intentionally exclude parser context and manifest scalar values.
+ */
+interface WorkflowCatalogDiagnostic {
+  code: string;
+  message: string;
+  workflow_id?: string | null;
+}
+interface WorkflowCatalogEntry {
+  /**
+   * SHA-256 of the canonical parsed definition, including its inputs and budget.
+   */
+  definition_digest: string;
+  description?: string | null;
+  id: string;
+  inputs: {
+    [k: string]: WorkflowCatalogInput | undefined;
+  };
+  node_count: number;
+  source: WorkflowCatalogSource;
+  version: number;
+}
+/**
+ * Input types are domain names, not JSON Schema or an invented control/default.
+ */
+interface WorkflowCatalogInput {
+  input_type: string;
+  required: boolean;
 }
 /**
  * A workflow run's full observable state — the catch-up baseline a mid-run subscriber reads (via [`ReadWorkflowRun`](crate::command::CommandBody::ReadWorkflowRun)) before folding the live [`WorkflowEvent`] stream on top. Reconstructed from the durable store, so a late subscriber after a daemon restart still gets a truthful baseline.

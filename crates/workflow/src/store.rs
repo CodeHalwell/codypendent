@@ -185,6 +185,16 @@ pub struct WorkflowRunRecord {
     pub state: WorkflowRunState,
 }
 
+/// An accepted request used to reconcile a lost workflow-start acknowledgement.
+/// Internal only: the stored manifest never travels in discovery or a receipt.
+pub struct AcceptedWorkflowRequest {
+    pub id: String,
+    pub workflow_id: String,
+    pub inputs: Value,
+    pub repository: Option<String>,
+    pub manifest: Option<String>,
+}
+
 /// A durable workflow node row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkflowNodeRecord {
@@ -373,6 +383,32 @@ impl WorkflowStore {
         .await
     }
 
+    /// Look up a principal-bound accepted request before consulting mutable source files.
+    pub async fn accepted_request_owned(
+        &self,
+        pool: &SqlitePool,
+        idempotency_key: &str,
+        owner_uid: u32,
+    ) -> Result<Option<AcceptedWorkflowRequest>, WorkflowStoreError> {
+        let id = deterministic_run_id(&format!("owner:{owner_uid}:{idempotency_key}"));
+        let row = sqlx::query(
+            "SELECT workflow_id, inputs_json, repository, manifest_yaml, owner_uid FROM workflow_runs WHERE id = ?",
+        ).bind(&id).fetch_optional(pool).await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.get::<Option<i64>, _>("owner_uid") != Some(i64::from(owner_uid)) {
+            return Err(WorkflowStoreError::IdempotencyOwnerMismatch {
+                key: idempotency_key.to_owned(),
+            });
+        }
+        Ok(Some(AcceptedWorkflowRequest {
+            id,
+            workflow_id: row.get("workflow_id"),
+            inputs: serde_json::from_str(&row.get::<String, _>("inputs_json"))?,
+            repository: row.get("repository"),
+            manifest: row.get("manifest_yaml"),
+        }))
+    }
+
     async fn create_run_idempotent_inner(
         &self,
         pool: &SqlitePool,
@@ -396,7 +432,13 @@ impl WorkflowStore {
         let now = Utc::now().to_rfc3339();
         let signature = compiled.signature();
         let inputs_json = serde_json::to_string(inputs)?;
-        let incoming_request_signature = workflow_request_signature(&signature, &inputs_json);
+        let definition_digest = workflow_manifest_identity(manifest, &signature)?;
+        let incoming_request_signature = workflow_request_signature(
+            &signature,
+            &inputs_json,
+            repository,
+            definition_digest.as_deref(),
+        );
 
         let mut tx = pool.begin().await?;
         let inserted = sqlx::query(
@@ -423,12 +465,14 @@ impl WorkflowStore {
         // first application. Compare its stored signature against the incoming
         // compiled workflow's before treating this as a success (P5-D2).
         if inserted == 0 {
-            let (existing_signature, existing_inputs, existing_owner): (
+            let (existing_signature, existing_inputs, existing_owner, existing_repository, existing_manifest): (
                 String,
                 String,
                 Option<i64>,
+                Option<String>,
+                Option<String>,
             ) = sqlx::query_as(
-                "SELECT graph_signature, inputs_json, owner_uid FROM workflow_runs WHERE id = ?",
+                "SELECT graph_signature, inputs_json, owner_uid, repository, manifest_yaml FROM workflow_runs WHERE id = ?",
             )
             .bind(&id)
             .fetch_one(&mut *tx)
@@ -441,16 +485,26 @@ impl WorkflowStore {
                     });
                 }
             }
-            tx.commit().await?;
-            let existing_request_signature =
-                workflow_request_signature(&existing_signature, &existing_inputs);
+            // Compare the full request while SQLite still serializes the write.
+            // The assembly's accepted-request lookup is only a fast path: two
+            // concurrent starts can both pass it before either inserts a row.
+            let existing_definition_digest =
+                workflow_manifest_identity(existing_manifest.as_deref(), &existing_signature)?;
+            let existing_request_signature = workflow_request_signature(
+                &existing_signature,
+                &existing_inputs,
+                existing_repository.as_deref(),
+                existing_definition_digest.as_deref(),
+            );
             if existing_request_signature != incoming_request_signature {
+                tx.commit().await?;
                 return Err(WorkflowStoreError::IdempotencyKeyReused {
                     key: idempotency_key.to_owned(),
                     expected: existing_request_signature,
                     found: incoming_request_signature,
                 });
             }
+            tx.commit().await?;
             return Ok(id);
         }
 
@@ -1154,11 +1208,51 @@ fn deterministic_run_id(idempotency_key: &str) -> String {
     format!("wfrun-{}", hex::encode(&hasher.finalize()[..16]))
 }
 
-fn workflow_request_signature(graph_signature: &str, inputs_json: &str) -> String {
+/// A provided manifest is execution provenance, never an opaque fallback string.
+/// `None` remains the legacy store-mechanics path without restart provenance.
+fn workflow_manifest_identity(
+    manifest: Option<&str>,
+    graph_signature: &str,
+) -> Result<Option<String>, WorkflowStoreError> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    let definition = crate::parse_definition(manifest).map_err(|_| {
+        WorkflowStoreError::Corrupt("workflow request manifest cannot be parsed".to_owned())
+    })?;
+    let compiled = crate::compile::compile(&definition).map_err(|_| {
+        WorkflowStoreError::Corrupt("workflow request manifest cannot be compiled".to_owned())
+    })?;
+    if compiled.signature() != graph_signature {
+        return Err(WorkflowStoreError::Corrupt(
+            "workflow request manifest does not match its compiled graph".to_owned(),
+        ));
+    }
+    Ok(Some(crate::workflow_definition_digest(&definition)?))
+}
+
+fn workflow_request_signature(
+    graph_signature: &str,
+    inputs_json: &str,
+    repository: Option<&str>,
+    definition_digest: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(graph_signature.as_bytes());
     hasher.update([0]);
     hasher.update(inputs_json.as_bytes());
+    // Frame optional identities explicitly: None and an empty value must never
+    // collide, nor may a repository suffix become a definition prefix.
+    for value in [repository, definition_digest] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
     hex::encode(hasher.finalize())
 }
 

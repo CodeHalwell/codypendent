@@ -72,7 +72,7 @@ use crate::transcription::Transcriber;
 use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
     CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
-    StartWorkflowRequest, WorkflowLifecycle, WorkflowStarter,
+    StartWorkflowRequest, WorkflowCatalogRequest, WorkflowLifecycle, WorkflowStarter,
 };
 
 /// Heartbeat cadence advertised in `ServerHello` and used to probe idle clients.
@@ -2276,12 +2276,55 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                CommandBody::ListWorkflows { repository } => {
+                    // Match StartWorkflow admission before inspecting any local source.
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not discover workflows",
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let result = match state.starter.as_ref() {
+                        Some(starter) => {
+                            starter
+                                .catalog(WorkflowCatalogRequest {
+                                    repository: repository.clone(),
+                                    owner_uid: conn.principal.uid(),
+                                    client_id: conn.client_id_or(request.client_id),
+                                })
+                                .await
+                        }
+                        None => Err(codypendent_protocol::CodypendentError::new(
+                            "workflow.catalog-unavailable",
+                            "workflow discovery is not enabled on this daemon",
+                            false,
+                        )),
+                    };
+                    let reply = Envelope::reply_to(
+                        &request,
+                        match result {
+                            Ok(catalog) => Payload::WorkflowCatalog {
+                                command_id: command.command_id,
+                                catalog,
+                            },
+                            Err(error) => Payload::CommandRejected(error),
+                        },
+                    );
+                    send(writer, &reply).await?;
+                }
                 // A `StartWorkflow` creates a durable run in the workflow store,
                 // which lives outside the session ledger — so, like `MutateDocument`,
                 // it is intercepted here and applied through the assembly's
                 // `WorkflowStarter` seam rather than the event write path (Phase 5
                 // STEP 5.2). Driving the created run is a later step.
                 CommandBody::StartWorkflow {
+                    expected_definition_digest,
                     manifest,
                     workflow_id,
                     inputs,
@@ -2337,6 +2380,7 @@ async fn handle_request(
                         return Ok(false);
                     }
                     let start = StartWorkflowRequest {
+                        expected_definition_digest: expected_definition_digest.clone(),
                         manifest: manifest.clone(),
                         workflow_id: workflow_id.clone(),
                         inputs: inputs.clone(),
@@ -6671,6 +6715,13 @@ fn daemon_store_unavailable(
         ),
         codypendent_protocol::DaemonStore::CodeGraph => code_graph_unavailable(),
         codypendent_protocol::DaemonStore::Models => crate::models::probe_unavailable(),
+        codypendent_protocol::DaemonStore::Workflows => {
+            codypendent_protocol::CodypendentError::new(
+                "workflow.catalog-unavailable",
+                "workflow discovery is not enabled on this daemon",
+                false,
+            )
+        }
         codypendent_protocol::DaemonStore::Marketplace => {
             codypendent_protocol::CodypendentError::new(
                 "marketplace.transport-unavailable",

@@ -199,7 +199,7 @@ fn safe_text(text: &str) -> String {
     }
     clean
         .lines()
-        .filter_map(|line| {
+        .filter(|line| {
             let lower = line.to_ascii_lowercase();
             let sensitive = markers.prefixes.iter().any(|prefix| lower.contains(prefix))
                 || markers.keys.iter().any(|key| {
@@ -211,7 +211,7 @@ fn safe_text(text: &str) -> String {
                                 && lower[index + key.len()..].starts_with(char::is_whitespace))
                     })
                 });
-            (!sensitive && !line.trim().is_empty()).then_some(line)
+            !sensitive && !line.trim().is_empty()
         })
         .collect::<Vec<_>>()
         .join(" ")

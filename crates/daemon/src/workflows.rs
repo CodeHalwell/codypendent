@@ -13,7 +13,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use codypendent_protocol::{ClientId, CodypendentError};
+use codypendent_protocol::{ClientId, CodypendentError, WorkflowCatalog};
 use serde_json::Value;
 
 /// A ceiling imposed on a workflow run from **outside** its manifest, carried
@@ -54,6 +54,8 @@ impl WorkflowRunCeiling {
 /// A client's request to start a durable workflow run from a manifest.
 #[derive(Debug, Clone)]
 pub struct StartWorkflowRequest {
+    /// Optional selected-definition precondition, checked against the resolved bytes before creation.
+    pub expected_definition_digest: Option<String>,
     /// The workflow manifest YAML (its content, never a path — the daemon does not
     /// read an arbitrary client-named file). Empty when [`workflow_id`](Self::workflow_id)
     /// names a workflow the assembly resolves from its own sources instead.
@@ -102,6 +104,17 @@ pub struct StartWorkflowRequest {
 pub type WorkflowStartFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, CodypendentError>> + Send + 'a>>;
 
+/// Discovery uses the same daemon-owned source directories and authenticated caller as execution.
+#[derive(Debug, Clone)]
+pub struct WorkflowCatalogRequest {
+    pub repository: Option<String>,
+    pub owner_uid: u32,
+    pub client_id: ClientId,
+}
+
+pub type WorkflowCatalogFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<WorkflowCatalog, CodypendentError>> + Send + 'a>>;
+
 /// The daemon's seam for *creating* a durable run from an accepted `StartWorkflow`.
 ///
 /// Implemented by the assembly over `codypendent-workflow` — compile the manifest,
@@ -110,6 +123,17 @@ pub type WorkflowStartFuture<'a> =
 /// the created run (fire-and-forget) so it advances to a terminal state; this seam
 /// returns as soon as the run is durably created.
 pub trait WorkflowStarter: Send + Sync {
+    /// Optional discovery seam. Embeddings that only implement start remain explicitly unavailable.
+    fn catalog(&self, _request: WorkflowCatalogRequest) -> WorkflowCatalogFuture<'_> {
+        Box::pin(async {
+            Err(CodypendentError::new(
+                "workflow.catalog-unavailable",
+                "workflow discovery is not enabled on this daemon",
+                false,
+            ))
+        })
+    }
+
     /// Compile `request`'s manifest and create a durable run, returning its id. A
     /// manifest that does not compile (or a store failure) is surfaced verbatim to
     /// the client as a `CommandRejected`; nothing is created.
@@ -188,4 +212,29 @@ pub trait WorkflowLifecycle: Send + Sync {
     /// already-cancelled run; an error (`workflow.illegal-transition`) on a
     /// completed/failed run.
     fn cancel(&self, request: CancelWorkflowRequest) -> WorkflowLifecycleFuture<'_>;
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    struct StartOnly;
+    impl WorkflowStarter for StartOnly {
+        fn start(&self, _request: StartWorkflowRequest) -> WorkflowStartFuture<'_> {
+            Box::pin(async { Ok("unused".to_owned()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_defaults_to_explicit_unavailable_without_execution() {
+        let error = StartOnly
+            .catalog(WorkflowCatalogRequest {
+                repository: None,
+                owner_uid: 42,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "workflow.catalog-unavailable");
+    }
 }

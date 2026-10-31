@@ -36,7 +36,7 @@ import {
   readPatchSource,
   reviewablePatchFiles,
 } from "./patch-review.js";
-import { resolveRuntimePaths } from "./protocol/discovery.js";
+import { resolveClientSocketPath } from "./protocol/discovery.js";
 import {
   isMediatedRuntimeWire,
   isUiRuntimeMessage,
@@ -443,8 +443,7 @@ export function activate(context: vscode.ExtensionContext): void {
       .get<string>("socketPath")
       ?.trim();
     try {
-      socketPath = handoff?.socket ?? attachedSocketPath
-        ?? (configured && configured.length > 0 ? configured : resolveRuntimePaths().socketPath);
+      socketPath = resolveClientSocketPath({ handoff: handoff?.socket, attached: attachedSocketPath, configured });
     } catch (err) {
       void vscode.window.showErrorMessage(
         `Codypendent: cannot resolve daemon socket: ${err instanceof Error ? err.message : String(err)}`,

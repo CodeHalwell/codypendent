@@ -1423,12 +1423,17 @@ impl RuntimeExecutor {
         reconstructed_prior: Vec<TurnItem>,
         token: CancellationToken,
     ) -> Result<(), String> {
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: launch.run_id,
+            model: model_id.clone(),
+        };
         let store = AcpRegistryStore::new(&self.paths.data_dir);
         let mut launch_spec = tokio::select! {
             result = store.prepare_launch(registry_agent_id) => result
                 .map_err(|error| format!("ACP agent `{registry_agent_id}` is unavailable: {error}"))?,
             _ = token.cancelled() => {
-                self.finish_acp_run(launch, model_id, None, AcpRunCompletion {
+                self.finish_acp_run(launch, model_id, &run_actor, None, AcpRunCompletion {
                     state: RunState::Cancelled,
                     disposition: RunDisposition::Cancelled { reason: Some("run cancelled while preparing the agent".into()) },
                     summary: None, changed_files: Vec::new(),
@@ -1475,6 +1480,7 @@ impl RuntimeExecutor {
             self.finish_acp_run(
                 launch,
                 model_id,
+                &run_actor,
                 Some(&launch_spec),
                 AcpRunCompletion {
                     state: RunState::Cancelled,
@@ -1492,11 +1498,6 @@ impl RuntimeExecutor {
         self.transition_acp(launch.session_id, launch.run_id, RunState::Preparing)
             .await?;
 
-        let run_actor = Actor::Agent {
-            agent_id: AgentId::new(),
-            run_id: launch.run_id,
-            model: model_id.clone(),
-        };
         let desktop = codypendent_runtime::desktop_tools::DesktopTools::resolve()?;
         let mut mcp_servers = forwardable_mcp_servers(&self.paths.global_mcp_path());
         let desktop_mcp = {
@@ -1600,6 +1601,7 @@ impl RuntimeExecutor {
                 self.finish_acp_run(
                     launch,
                     model_id,
+                    &run_actor,
                     Some(&launch_spec),
                     AcpRunCompletion {
                         state: RunState::Cancelled,
@@ -1660,7 +1662,7 @@ impl RuntimeExecutor {
             approvals: self.approvals.clone(),
             session_id: launch.session_id,
             run_id: launch.run_id,
-            actor: run_actor,
+            actor: run_actor.clone(),
             registry_agent_id: registry_agent_id.to_string(),
             cancellation: token.clone(),
             assistant_text: String::new(),
@@ -1763,6 +1765,7 @@ impl RuntimeExecutor {
         self.finish_acp_run(
             launch,
             model_id,
+            &run_actor,
             Some(&launch_spec),
             AcpRunCompletion {
                 state,
@@ -1800,6 +1803,7 @@ impl RuntimeExecutor {
         &self,
         launch: &RunLaunch,
         model_id: &ModelId,
+        run_actor: &Actor,
         agent: Option<&codypendent_integrations::acp_registry::AcpLaunchSpec>,
         completion: AcpRunCompletion,
     ) -> Result<(), String> {
@@ -1835,7 +1839,7 @@ impl RuntimeExecutor {
         let event = ledger::append_next_event(
             &self.pool,
             launch.session_id,
-            &Actor::System,
+            run_actor,
             &EventBody::RunCompleted {
                 run_id: launch.run_id,
                 disposition: completion.disposition,
@@ -4206,22 +4210,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn acp_stream_actors_use_reported_models_with_the_effective_agent() {
+    async fn acp_stream_actors_keep_reported_models_while_completion_keeps_configured_route() {
         let temporary = tempfile::tempdir().unwrap();
         let (pool, _artifacts) = test_pool(temporary.path()).await;
         let (session_id, run_id) = seed_run_in_state(&pool, "Running").await;
         let agent_id = AgentId::new();
+        let configured_model = ModelId("acp/gemini#requested".into());
+        let run_actor = Actor::Agent {
+            agent_id,
+            run_id,
+            model: configured_model.clone(),
+        };
         let mut sink = AcpRunSink {
             pool: pool.clone(),
             subscriptions: SubscriptionHub::new(),
             approvals: ApprovalBroker::new(),
             session_id,
             run_id,
-            actor: Actor::Agent {
-                agent_id,
-                run_id,
-                model: ModelId("acp/gemini#requested".into()),
-            },
+            actor: run_actor.clone(),
             registry_agent_id: "antigravity-acp#requested".into(),
             cancellation: CancellationToken::never(),
             assistant_text: String::new(),
@@ -4239,9 +4245,44 @@ mod tests {
         }
 
         assert!(sink.failure.is_none());
+        let paths = RuntimePaths::from_data_dir(temporary.path().to_path_buf());
+        let executor = RuntimeExecutor::new(
+            pool.clone(),
+            paths,
+            scan::repository_id_for(temporary.path()),
+            temporary.path().to_path_buf(),
+        );
+        let launch = RunLaunch {
+            session_id,
+            run_id,
+            objective: "keep the configured retry route".into(),
+            mode: AgentMode::Ask,
+            repository: temporary.path().to_path_buf(),
+            model: Some(configured_model.clone()),
+            prior: Vec::new(),
+        };
+        executor
+            .finish_acp_run(
+                &launch,
+                &configured_model,
+                &run_actor,
+                None,
+                AcpRunCompletion {
+                    state: RunState::Failed,
+                    disposition: RunDisposition::Failed {
+                        reason: "fixture failure after response".into(),
+                        error: None,
+                    },
+                    summary: None,
+                    changed_files: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
         let events = ledger::load_events(&pool, session_id).await.unwrap();
         let models = events
             .iter()
+            .filter(|event| matches!(event.body, EventBody::ModelStreamDelta { .. }))
             .filter_map(|event| match &event.actor {
                 Actor::Agent {
                     agent_id: actual_agent,
@@ -4263,6 +4304,11 @@ mod tests {
                 "acp/antigravity-acp",
             ]
         );
+        let completed = events
+            .iter()
+            .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
+            .expect("ACP completion is persisted");
+        assert_eq!(completed.actor, run_actor);
     }
 
     #[tokio::test]

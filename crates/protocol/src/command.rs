@@ -439,6 +439,12 @@ pub enum CommandBody {
         document_id: DocumentId,
         target: PublishTarget,
     },
+    /// Discover bounded named workflow metadata from the same sources used by StartWorkflow.
+    /// Requires protocol 1.12 and the same role as starting a workflow.
+    ListWorkflows {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
+    },
     /// Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).
     ///
     /// Carries the workflow **manifest YAML** (its content, not a path — the daemon
@@ -453,6 +459,10 @@ pub enum CommandBody {
     /// (Driving the created run is a later step; this command only makes runs
     /// durably creatable.)
     StartWorkflow {
+        /// Optional precondition binding a new launcher to the selected parsed definition.
+        /// A mismatch rejects before creating a run; legacy callers may omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_definition_digest: Option<String>,
         /// The workflow manifest YAML (the content of a `workflow.yaml`). Empty
         /// when [`workflow_id`](CommandBody::StartWorkflow::workflow_id) names a
         /// workflow the daemon resolves from its own sources instead.
@@ -1156,6 +1166,8 @@ pub enum DaemonStore {
     /// able to make the daemon do that, nor to learn which models an operator
     /// has configured.
     Models,
+    /// Metadata from the daemon's private workflow configuration directories.
+    Workflows,
 }
 
 impl CommandBody {
@@ -1182,6 +1194,7 @@ impl CommandBody {
     #[must_use]
     pub fn named_resources(&self) -> Vec<NamedResource<'_>> {
         match self {
+            Self::ListWorkflows { .. } => vec![NamedResource::DaemonStore(DaemonStore::Workflows)],
             // The Remote UI plugin store is daemon-wide; `EnableUiPlugin` may
             // additionally scope a plugin to a session, which is a second,
             // per-row-owned id.
@@ -1845,6 +1858,7 @@ mod tests {
             },
         });
         round_trip(CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             workflow_id: None,
             inputs: serde_json::json!({ "pull_request": 42 }),
@@ -1853,6 +1867,7 @@ mod tests {
         // A named-workflow start (the `/fix-ci` shape): no inline manifest, a
         // resolved workflow id instead.
         round_trip(CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: Some("repair-github-check".to_string()),
             inputs: serde_json::json!({ "pull_request": 42 }),
@@ -2047,6 +2062,7 @@ mod tests {
         // (also what an older client emits) reparses with `inputs` defaulted to
         // null.
         let body = CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             workflow_id: None,
             inputs: serde_json::Value::Null,
@@ -2072,6 +2088,7 @@ mod tests {
         // and round-trips back to the same value — the durable store persists it
         // so recovery drives the run's agent nodes in the right checkout.
         let body = CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
             workflow_id: None,
             inputs: serde_json::Value::Null,
@@ -2299,6 +2316,22 @@ mod tests {
             },
         };
         assert!(list.named_resources().is_empty());
+    }
+
+    #[test]
+    fn workflow_catalog_names_the_private_daemon_store() {
+        let command = CommandBody::ListWorkflows {
+            repository: Some("/repo".to_owned()),
+        };
+        assert_eq!(
+            command.named_resources(),
+            vec![NamedResource::DaemonStore(DaemonStore::Workflows)]
+        );
+        let encoded = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&encoded).unwrap(),
+            command
+        );
     }
 
     #[test]

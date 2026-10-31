@@ -18,6 +18,20 @@ describe("editor session handoff", () => {
       session, repository: "/tmp/project with spaces", socket: "/tmp/cody.sock", file: "src/café test.ts", line: 42,
     });
   });
+  it("rejects every C0 control and DEL in each path field without rejecting adjacent characters", () => {
+    const codes = [...Array.from({ length: 32 }, (_, index) => index), 0x7f];
+    for (const code of codes) {
+      for (const field of ["repository", "checkout", "socket", "file"]) {
+        const prefix = field === "file" ? "src/" : "/tmp/";
+        expect(() => parseHandoff(query({ [field]: `${prefix}before${String.fromCharCode(code)}after` })))
+          .toThrow();
+      }
+    }
+    for (const code of [0x20, 0x7e, 0x80]) {
+      const file = `src/before${String.fromCharCode(code)}after.ts`;
+      expect(parseHandoff(query({ file })).file).toBe(file);
+    }
+  });
   it.each(["../secret", "src/../../secret", "/etc/passwd", "src\\outside", "src/./file", "src//file", "bad\nfile"])(
     "rejects an unsafe source path %j", (file) => expect(() => parseHandoff(query({ file }))).toThrow(),
   );
