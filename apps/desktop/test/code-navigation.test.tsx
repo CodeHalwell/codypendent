@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { KnowledgeGraph } from "../src/components/codeGraph/KnowledgeGraph.js";
 import { edge, node, page } from "./code-graph-fixtures.js";
@@ -17,7 +17,8 @@ describe("code navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Inspect app::work" }));
     await screen.findByRole("button", { name: "caller" });
     expect(read).toHaveBeenCalledWith("work");
-    expect(screen.getAllByTestId("graph-edge")).toHaveLength(2);
+    // The caller list updates before physics supplies the new node's position.
+    await waitFor(() => expect(screen.getAllByTestId("graph-edge")).toHaveLength(2));
     fireEvent.click(screen.getByRole("button", { name: "Open definition at src/work.rs:12" }));
     fireEvent.click(screen.getByRole("button", { name: "Open call at src/caller.rs:20" }));
     await act(async () => {});
