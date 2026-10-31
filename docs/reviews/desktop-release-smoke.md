@@ -48,7 +48,9 @@ be copied to another platform's row.
 
 The Linux bundle consumes the matching CLI artifact from the same release build.
 `linux-release.py` stages its CLI, worker launcher, Monty, sealed Node tree and
-pinned local embeddings as `runtime/` resources. It shares the Apple tooling's
+pinned local embeddings under `usr/share/Codypendent/runtime/`. This keeps the
+sealed executable bytes outside linuxdeploy's recursive ELF processing under
+`usr/lib/`. It shares the Apple tooling's
 Node and embedding verification, checks executable architecture and version, and
 seals the complete staged payload. Linux directory mappings preserve Node's
 internal symbolic links and their seal. The desktop checks these package resources

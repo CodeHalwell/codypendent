@@ -2,10 +2,10 @@
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("linux_release", Path(__file__).with_name("linux-release.py"))
@@ -56,7 +56,7 @@ class LinuxReleaseTests(unittest.TestCase):
         source = self.payload(root / "source")
         appdir = root / "Codypendent.AppDir"
         self.executable(appdir / "usr/bin/codypendent-desktop")
-        destination = appdir / "usr/lib/Codypendent/runtime"
+        destination = appdir / "usr/share/Codypendent/runtime"
         overlay = root / "linux-runtime.json"
         release.stage(source, destination, overlay, self.config)
         return source, appdir, destination, overlay
@@ -68,12 +68,50 @@ class LinuxReleaseTests(unittest.TestCase):
             for name in ["codypendent", "codypendent-ui-worker-launcher", "monty", "node-runtime/bin/node", "node-runtime/include/node/v8.h", "embedding-runtime/model.gguf"]:
                 self.assertEqual((destination / name).read_bytes(), (source / name).read_bytes())
             config = json.loads(overlay.read_text())
-            files = {"usr/lib/Codypendent/runtime": str(destination)}
+            files = {"usr/share/Codypendent/runtime": str(destination)}
             self.assertEqual(config, {"bundle": {"linux": {"appimage": {"files": files}, "deb": {"files": files}}}})
             self.assertTrue((destination / "node-runtime/bin/npm").is_symlink())
             self.assertEqual(os.readlink(destination / "node-runtime/bin/npm"), "../lib/node_modules/npm/bin/npm-cli.js")
             self.assertNotIn("resources", config["bundle"], "directory copies must preserve the sealed Node links")
             self.assertNotIn("active", config["bundle"], "release staging cannot disable bundling")
+
+    def test_tauri_overlay_keeps_sealed_payload_outside_linuxdeploy_elf_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.payload(root / "source")
+            staged, overlay = root / "staged", root / "overlay.json"
+            release.stage(source, staged, overlay, self.config)
+            appdir = root / "Codypendent.AppDir"
+            self.executable(appdir / "usr/bin/codypendent-desktop")
+            library = appdir / "usr/lib/libfixture.so"
+            self.executable(library)
+            files = json.loads(overlay.read_text())["bundle"]["linux"]["appimage"]["files"]
+            for destination, source_path in files.items():
+                shutil.copytree(source_path, appdir / destination, symlinks=True)
+            runtime = appdir / next(iter(files))
+            before = release.entries(runtime)
+            scanned = [*(appdir / "usr/bin").iterdir(), *(appdir / "usr/lib").rglob("*")]
+            rewritten = []
+            for path in scanned:
+                if path.is_file() and not path.is_symlink() and path.read_bytes().startswith(b"\x7fELF"):
+                    with path.open("ab") as handle:
+                        handle.write(b"linuxdeploy-rpath-rewrite")
+                    rewritten.append(path)
+            self.assertIn(library, rewritten)
+            self.assertFalse(any(path.is_relative_to(runtime) for path in rewritten))
+            self.assertEqual(release.entries(runtime), before)
+            self.assertEqual(before, release.entries(staged))
+            self.assertTrue((runtime / "node-runtime/bin/npm").is_symlink())
+            release.verify_appdir(appdir, self.config)
+
+    def test_legacy_lib_tree_cannot_replace_the_required_share_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, appdir, runtime, _ = self.stage_appdir(Path(temporary))
+            legacy = appdir / "usr/lib/Codypendent/runtime"
+            legacy.parent.mkdir(parents=True)
+            runtime.rename(legacy)
+            with self.assertRaises(FileNotFoundError):
+                release.verify_appdir(appdir, self.config)
 
     def test_missing_worker_and_mismatched_version_never_create_staging(self):
         with tempfile.TemporaryDirectory() as temporary:

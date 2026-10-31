@@ -245,10 +245,7 @@ impl Environment {
     }
 }
 
-/// Match the pinned Tauri Linux `resource_dir` convention. Tauri codegen uses
-/// `productName` for PackageInfo.name (not the binary's file name), and the
-/// installed/AppImage resource tree is `usr/lib/<name>` beside `usr/bin`.
-/// Debug window-only builds have no such tree and retain ordinary discovery.
+/// Keep sealed ELFs under `usr/share` outside linuxdeploy's `usr/lib` rewriting.
 fn packaged_runtime_directory(beside_app: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -268,7 +265,7 @@ fn packaged_runtime_directory(beside_app: &Path) -> Option<PathBuf> {
         Some(
             beside_app
                 .parent()?
-                .join("lib")
+                .join("share")
                 .join(product)
                 .join("runtime"),
         )
@@ -644,14 +641,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_packaged_runtime_uses_the_tauri_product_resource_name() {
+    fn linux_packaged_runtime_uses_the_sealed_product_share_tree() {
         let directory = tempfile::tempdir().unwrap();
         let binaries = directory.path().join("usr/bin");
         std::fs::create_dir_all(&binaries).unwrap();
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let product = config["productName"].as_str().unwrap();
-        let resources = directory.path().join("usr/lib").join(product);
+        let resources = directory.path().join("usr/share").join(product);
         assert_eq!(
             packaged_runtime_directory(&binaries),
             Some(resources.join("runtime"))
@@ -679,16 +676,16 @@ mod tests {
     #[test]
     fn packaged_resource_runtime_needs_no_path_and_preserves_explicit_override() {
         let mut env = environment(None, &[], &[], Some("/app/usr/bin"));
-        env.packaged_runtime = Some(PathBuf::from("/app/usr/lib/Codypendent/runtime"));
+        env.packaged_runtime = Some(PathBuf::from("/app/usr/share/Codypendent/runtime"));
         let (invocation, source) = resolve_in(
             &env,
-            &present(&["/app/usr/lib/Codypendent/runtime/codypendent"]),
+            &present(&["/app/usr/share/Codypendent/runtime/codypendent"]),
         )
         .unwrap();
         assert_eq!(source, InvocationSource::BesideThisApp);
         assert_eq!(
             invocation.program,
-            "/app/usr/lib/Codypendent/runtime/codypendent"
+            "/app/usr/share/Codypendent/runtime/codypendent"
         );
         assert_eq!(invocation.args, vec!["__daemon".to_owned()]);
         env.override_program = Some(PathBuf::from("/explicit/codypendent"));
@@ -700,7 +697,7 @@ mod tests {
     #[test]
     fn missing_packaged_runtime_cannot_fall_back_to_an_installed_cli() {
         let mut env = environment(None, &["/usr/bin"], &[], Some("/app/usr/bin"));
-        env.packaged_runtime = Some(PathBuf::from("/app/usr/lib/Codypendent/runtime"));
+        env.packaged_runtime = Some(PathBuf::from("/app/usr/share/Codypendent/runtime"));
         env.development_build = Some(PathBuf::from("/workspace/target/debug"));
         let searched = resolve_in(
             &env,
@@ -708,12 +705,13 @@ mod tests {
                 "/usr/bin/codypendent",
                 "/workspace/target/debug/codypendent",
                 "/app/usr/bin/codypendent",
+                "/app/usr/lib/Codypendent/runtime/codypendent",
             ]),
         )
         .unwrap_err();
         assert_eq!(
             searched,
-            vec!["/app/usr/lib/Codypendent/runtime/codypendent".to_owned()]
+            vec!["/app/usr/share/Codypendent/runtime/codypendent".to_owned()]
         );
     }
 

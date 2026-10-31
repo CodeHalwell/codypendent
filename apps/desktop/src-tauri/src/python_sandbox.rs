@@ -10,7 +10,6 @@ use std::{
 };
 
 use codypendent_protocol::SessionId;
-use codypendent_runtime::desktop_tools::DesktopTools;
 use monty_pool::{on_print_sync, Pool, PoolConfig, ReplConfig, ResumeValue, TurnEvent};
 use monty_types::{MontyObject, NameLookupResult, ResourceLimits};
 use serde::Serialize;
@@ -242,7 +241,7 @@ pub async fn desktop_tools_python_execute(
     call_id: String,
     on_host: Channel<HostRequest>,
 ) -> Result<Value, String> {
-    let desktop = DesktopTools::resolve()?;
+    let desktop = crate::runtime_paths::desktop_tools()?;
     let call = desktop.pending_generated_call(session_id, &call_id)?;
     if call.definition.language.as_deref() != Some("python") {
         return Err("This helper is not a Python helper.".into());
