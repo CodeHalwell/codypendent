@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { KnowledgeGraph } from "../src/components/codeGraph/KnowledgeGraph.js";
 import { edge, node, page } from "./code-graph-fixtures.js";
@@ -59,21 +59,20 @@ describe("code graph symbol history", () => {
       return page([node(id), node(nextId)], [edge(id, nextId)]);
     });
     render(<KnowledgeGraph page={page([node("s0")], [])} readNeighbors={read} />);
-    fireEvent.click(screen.getByRole("button", { name: "Calls" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Calls" })));
     fireEvent.click(screen.getByRole("button", { name: "List" }));
     for (let index = 1; index <= 15; index++) {
-      await waitFor(() => expect(within(screen.getByRole("list", { name: "Loaded code symbols" })).getByRole("button", { name: new RegExp(`app::s${index} `) })).toBeTruthy());
-      inspect(`s${index}`);
+      await act(async () => inspect(`s${index}`));
     }
-    await waitFor(() => expect(read).toHaveBeenLastCalledWith("s15"));
+    expect(read).toHaveBeenLastCalledWith("s15");
     fireEvent.click(screen.getByRole("button", { name: "Structure" }));
     failRestore = true;
-    for (let index = 14; index >= 2; index--) fireEvent.click(previous());
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Recorded connections unavailable"));
+    await act(async () => { for (let index = 14; index >= 2; index--) fireEvent.click(previous()); });
+    expect(screen.getByRole("alert").textContent).toContain("Recorded connections unavailable");
     expect(selected()).toBe("s2");
     failRestore = false;
-    fireEvent.click(screen.getByRole("button", { name: "Retry connections" }));
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry connections" })));
+    expect(screen.queryByRole("alert")).toBeNull();
     expect(selected()).toBe("s2");
   });
 });

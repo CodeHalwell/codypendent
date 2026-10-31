@@ -2841,7 +2841,7 @@ mod tests {
         assert!(skill.launch_directory.is_none());
         assert!(matches!(skill.command, Some(TopCommand::Skill {
             command: SkillCommand::Add { directory }
-        }) if directory == PathBuf::from("package")));
+        }) if directory == std::path::Path::new("package")));
         let skill = Cli::try_parse_from([
             "codypendent",
             "-C",
@@ -2862,7 +2862,7 @@ mod tests {
         assert_eq!(skill.launch_directory, Some(PathBuf::from("/tmp/project")));
         assert!(matches!(skill.command, Some(TopCommand::Skill {
             command: SkillCommand::New { directory: Some(directory), .. }
-        }) if directory == PathBuf::from("output")));
+        }) if directory == std::path::Path::new("output")));
     }
     use clap::CommandFactory;
 

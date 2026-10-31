@@ -52,7 +52,7 @@ coordinator and its editor/worktree surfaces have different availability.
 | --- | --- |
 | Anton Code OSS dependency setup | Missing locked dependencies restored; Node 22.23.4 checksum verified |
 | Anton built-in extensions and core | Full extension compilation and core TypeScript check passed |
-| Anton private engine source | Vendored archive refreshed; all 758 selected inputs match the frozen runtime checkout; integrity and build-input verification passed |
+| Anton private engine source | Vendored inputs include cross-root Rust contracts; integrity and build-input verification are required after each runtime refresh |
 | Anton primary extension | Build and 716 unit tests passed |
 | Anton workflow UI | 29 workflow tests passed; Chromium checked 280, 420 and 1000px layouts |
 | Anton daemon extension | 106 passed; one opt-in real-daemon integration skipped in this package run |
