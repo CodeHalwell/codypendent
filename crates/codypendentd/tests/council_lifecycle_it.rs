@@ -7,8 +7,8 @@ use std::time::Duration;
 use codypendent_council::{CouncilDefinition, CouncilMember, CouncilService, FileCouncilService};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, Catchup, ClientRole, CommandBody, EventBody, Payload, RunDisposition, SessionId,
-    Subscription,
+    Actor, Catchup, ClientRole, CommandBody, EventBody, Payload, RunDisposition, RunId,
+    SessionEvent, SessionId, Subscription,
 };
 use sqlx::SqlitePool;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -31,6 +31,27 @@ impl<T> Drop for AbortOnDrop<T> {
         if let Some(task) = &self.0 {
             task.abort();
         }
+    }
+}
+
+fn assert_closed_child_evidence(events: &[SessionEvent], run_ids: &[RunId]) {
+    let closed = events
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::SessionClosed))
+        .collect::<Vec<_>>();
+    assert_eq!(closed.len(), 1);
+    if run_ids.is_empty() {
+        assert!(events.iter().all(|event| !matches!(
+            event.body,
+            EventBody::RunStarted { .. } | EventBody::RunCompleted { .. }
+        )));
+    }
+    for run_id in run_ids {
+        let completed = events
+            .iter()
+            .find(|event| matches!(event.body, EventBody::RunCompleted { run_id: actual, .. } if actual == *run_id))
+            .expect("terminal evidence for each persisted child run");
+        assert!(completed.sequence < closed[0].sequence);
     }
 }
 
@@ -587,14 +608,23 @@ api_key_env = ""
             .fetch_one(&pool)
             .await
             .expect("active child count");
-            if active.0 > 0 {
+            let children: Vec<(String,)> =
+                sqlx::query_as("SELECT id FROM sessions WHERE title LIKE 'Council · %'")
+                    .fetch_all(&pool)
+                    .await
+                    .expect("reserved child sessions");
+            let reserved = children
+                .iter()
+                .filter(|(id,)| !prior_ids.contains(id))
+                .count();
+            if active.0 > 0 && reserved == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("hanging child became active");
+    .expect("both child sessions were reserved and the hanging child became active");
     aborted.abort();
     let _ = aborted.await;
     let aborted_children = tokio::time::timeout(Duration::from_secs(20), async {
@@ -662,16 +692,15 @@ api_key_env = ""
         )
         .await
         .expect("aborted child history");
-        let completed = events
-            .iter()
-            .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
-            .expect("terminal evidence");
-        let closed = events
-            .iter()
-            .filter(|event| matches!(event.body, EventBody::SessionClosed))
+        let run_ids = sqlx::query_as::<_, (String,)>("SELECT id FROM runs WHERE session_id = ?")
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .expect("aborted child runs")
+            .into_iter()
+            .map(|(id,)| RunId::from_str(&id).expect("run id"))
             .collect::<Vec<_>>();
-        assert_eq!(closed.len(), 1);
-        assert!(completed.sequence < closed[0].sequence);
+        assert_closed_child_evidence(&events, &run_ids);
     }
     let hanging_events = codypendent_daemon::ledger::load_events(
         &pool,
@@ -703,4 +732,62 @@ api_key_env = ""
         .expect("daemon shutdown")
         .expect("daemon task")
         .expect("daemon result");
+}
+
+#[cfg(test)]
+mod child_evidence_tests {
+    use super::*;
+    use codypendent_protocol::{ArtifactId, ArtifactRef, DataClassification};
+
+    fn event(sequence: u64, body: EventBody) -> SessionEvent {
+        SessionEvent {
+            sequence,
+            occurred_at: "2026-10-31T00:00:00Z".parse().unwrap(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body,
+        }
+    }
+
+    fn completed(run_id: RunId) -> SessionEvent {
+        event(
+            1,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Cancelled { reason: None },
+                chronicle: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "application/json".into(),
+                    byte_length: 0,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn unused_closed_child_has_no_run_completion() {
+        assert_closed_child_evidence(&[event(1, EventBody::SessionClosed)], &[]);
+    }
+
+    #[test]
+    fn launched_child_has_terminal_evidence_before_closure() {
+        let run = RunId::new();
+        assert_closed_child_evidence(
+            &[completed(run), event(2, EventBody::SessionClosed)],
+            &[run],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "terminal evidence for each persisted child run")]
+    fn another_runs_completion_cannot_cover_a_persisted_child_run() {
+        let first = RunId::new();
+        assert_closed_child_evidence(
+            &[completed(first), event(2, EventBody::SessionClosed)],
+            &[first, RunId::new()],
+        );
+    }
 }

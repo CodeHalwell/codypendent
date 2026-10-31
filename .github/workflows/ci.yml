@@ -151,19 +151,7 @@ jobs:
       #    up as a failure — it would show up as the first doctest anyone writes
       #    never being executed.
       #
-      # 2. There is a real order race in the suite that a global one-process-
-      #    per-test scheduler is more likely to expose than `cargo test`'s
-      #    binary-at-a-time run. `codypendentd::council_lifecycle_it::
-      #    successful_council_closes_real_member_and_chair_sessions_after_
-      #    terminal_evidence` polls the sessions table until two child sessions
-      #    read `closed`, then asserts each already has a `RunCompleted` event in
-      #    the ledger and that `completed.sequence < closed[0].sequence`
-      #    (crates/codypendentd/tests/council_lifecycle_it.rs:631). Those are two
-      #    separate writes and the poll loop waits for the state flip, not for
-      #    the terminal event, so the assert can land in the gap. That is a bug
-      #    in the test regardless of runner; raising concurrency just raises the
-      #    odds. Fix it — wait for the terminal event, not the state flip —
-      #    before changing how the suite is scheduled.
+      # 2. Runner changes need measured comparisons and stable lifecycle tests.
       #
       # NO SPEED COMPARISON IS RECORDED HERE, and the one that used to be is
       # gone. It asserted 2.6x-3.5x for nextest over `cargo test` with per-run
