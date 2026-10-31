@@ -46,12 +46,13 @@ use codypendent_daemon::workflow_stream::{
 };
 use codypendent_daemon::workflows::{
     CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
-    StartWorkflowRequest, WorkflowLifecycle, WorkflowLifecycleFuture, WorkflowRunCeiling,
-    WorkflowStartFuture, WorkflowStarter,
+    StartWorkflowRequest, WorkflowCatalogFuture, WorkflowCatalogRequest, WorkflowLifecycle,
+    WorkflowLifecycleFuture, WorkflowRunCeiling, WorkflowStartFuture, WorkflowStarter,
 };
 use codypendent_protocol::{
-    CodypendentError, WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
-    WorkflowRunSnapshot as ProtocolWorkflowRunSnapshot,
+    CodypendentError, WorkflowCatalog, WorkflowCatalogDiagnostic, WorkflowCatalogEntry,
+    WorkflowCatalogInput, WorkflowCatalogSource, WorkflowEvent, WorkflowNodeState,
+    WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot as ProtocolWorkflowRunSnapshot,
 };
 use codypendent_runtime::blackboard::{
     BlackboardChannelError, WorkflowQueryChannel, WorkflowRunSummary,
@@ -461,10 +462,115 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
 }
 
 impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
+    fn catalog(&self, request: WorkflowCatalogRequest) -> WorkflowCatalogFuture<'_> {
+        let user_dir = self.user_workflow_dir.clone();
+        Box::pin(async move {
+            // Filesystem resolution stays on the daemon and off the async reactor.
+            tokio::task::spawn_blocking(move || {
+                let repository = request
+                    .repository
+                    .map(|repository| {
+                        let path = Path::new(&repository);
+                        if repository.len() > 4096 || !path.is_absolute() {
+                            return Err(CodypendentError::new(
+                                "workflow.invalid-repository",
+                                "select an absolute repository path",
+                                false,
+                            ));
+                        }
+                        let canonical = path.canonicalize().map_err(|_| {
+                            CodypendentError::new(
+                                "workflow.invalid-repository",
+                                "the selected repository is unavailable",
+                                false,
+                            )
+                        })?;
+                        if !canonical.is_dir() {
+                            return Err(CodypendentError::new(
+                                "workflow.invalid-repository",
+                                "select a repository directory",
+                                false,
+                            ));
+                        }
+                        canonical.to_str().map(str::to_owned).ok_or_else(|| {
+                            CodypendentError::new(
+                                "workflow.invalid-repository",
+                                "the repository path is not valid UTF-8",
+                                false,
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let repo_dir = repository
+                    .as_ref()
+                    .map(|root| Path::new(root).join(".codypendent").join("workflows"));
+                let catalog =
+                    WorkflowSourceRegistry::catalog(user_dir.as_deref(), repo_dir.as_deref());
+                Ok(WorkflowCatalog {
+                    repository,
+                    items: catalog
+                        .entries
+                        .into_iter()
+                        .map(|entry| WorkflowCatalogEntry {
+                            definition_digest: entry.definition_digest,
+                            id: entry.id,
+                            version: entry.version,
+                            description: entry.description,
+                            inputs: entry
+                                .inputs
+                                .into_iter()
+                                .map(|(name, input)| {
+                                    (
+                                        name,
+                                        WorkflowCatalogInput {
+                                            input_type: input.input_type,
+                                            required: input.required,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            node_count: entry.node_count as u32,
+                            source: match entry.source {
+                                codypendent_workflow::WorkflowScope::BuiltIn => {
+                                    WorkflowCatalogSource::BuiltIn
+                                }
+                                codypendent_workflow::WorkflowScope::User => {
+                                    WorkflowCatalogSource::User
+                                }
+                                codypendent_workflow::WorkflowScope::Repository => {
+                                    WorkflowCatalogSource::Repository
+                                }
+                            },
+                        })
+                        .collect(),
+                    diagnostics: catalog
+                        .diagnostics
+                        .into_iter()
+                        .map(|code| WorkflowCatalogDiagnostic {
+                            message: catalog_diagnostic_message(&code).to_owned(),
+                            code,
+                            workflow_id: None,
+                        })
+                        .collect(),
+                    truncated: catalog.truncated,
+                })
+            })
+            .await
+            .map_err(|_| {
+                CodypendentError::new(
+                    "workflow.catalog-unavailable",
+                    "workflow discovery could not be completed",
+                    true,
+                )
+            })?
+        })
+    }
+
     fn start(&self, request: StartWorkflowRequest) -> WorkflowStartFuture<'_> {
         let host = self.clone();
         Box::pin(async move {
             let StartWorkflowRequest {
+                expected_definition_digest,
                 manifest,
                 workflow_id,
                 inputs,
@@ -475,6 +581,60 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 ..
             } = request;
 
+            // A retry of an accepted, definition-bound request recovers the original
+            // receipt before mutable workflow sources are read again. Reusing a key
+            // with changed inputs, repository, owner, or definition never starts work.
+            if let Some(expected) = expected_definition_digest.as_deref() {
+                if expected.len() != 64
+                    || !expected
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(CodypendentError::new(
+                        "workflow.invalid-definition-digest",
+                        "select a workflow from the current catalog",
+                        false,
+                    ));
+                }
+                if let Some(accepted) = WorkflowStore::new()
+                    .accepted_request_owned(&host.pool, &idempotency_key, owner_uid)
+                    .await
+                    .map_err(|_| {
+                        CodypendentError::new(
+                            "workflow.store-error",
+                            "could not reconcile the workflow request",
+                            true,
+                        )
+                    })?
+                {
+                    let same_definition = accepted
+                        .manifest
+                        .as_deref()
+                        .and_then(|manifest| parse_definition(manifest).ok())
+                        .and_then(|definition| {
+                            codypendent_workflow::workflow_definition_digest(&definition).ok()
+                        })
+                        .is_some_and(|digest| digest == expected);
+                    if !same_definition
+                        || accepted.inputs != inputs
+                        || accepted.repository != repository
+                        || workflow_id
+                            .as_ref()
+                            .is_some_and(|id| id != &accepted.workflow_id)
+                    {
+                        return Err(CodypendentError::new(
+                            "workflow.idempotency-mismatch",
+                            "this request key belongs to a different workflow request",
+                            false,
+                        ));
+                    }
+                    if host.is_fresh(&accepted.id).await {
+                        host.spawn_drive(accepted.id.clone());
+                    }
+                    return Ok(accepted.id);
+                }
+            }
+
             // A named workflow (`/fix-ci`'s `repair-github-check`) is resolved from
             // the assembly's sources (built-in / user / repository), enforcing the
             // registry's version + shadowing rules; an inline manifest is taken
@@ -484,6 +644,17 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 Some(id) => host.resolve_named_workflow(id, repository.as_deref())?,
                 None => manifest,
             };
+
+            // Compare against these exact resolved bytes, which are subsequently
+            // compiled and persisted. There is no second source read after the guard.
+            if let Some(expected) = expected_definition_digest.as_deref() {
+                let actual = parse_definition(&manifest).ok().and_then(|definition| {
+                    codypendent_workflow::workflow_definition_digest(&definition).ok()
+                });
+                if actual.as_deref() != Some(expected) {
+                    return Err(CodypendentError::new("workflow.definition-changed", "the workflow definition changed; refresh the catalog and review it before starting", false));
+                }
+            }
 
             // Apply any externally imposed ceiling to the manifest TEXT before
             // compiling, so the tightened envelope is what gets compiled AND what
@@ -601,6 +772,17 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
     }
 }
 
+fn catalog_diagnostic_message(code: &str) -> &'static str {
+    match code {
+        "workflow.version-collision" => "A workflow version has conflicting definitions; bump the changed definition's version.",
+        "workflow.catalog-invalid-manifest" => "An invalid workflow definition was skipped.",
+        "workflow.catalog-limit" => "Workflow discovery exceeded a metadata or source limit; no incomplete selection is offered.",
+        "workflow.catalog-unsafe-source" => "A workflow source contains unsupported links or files; no incomplete selection is offered.",
+        "workflow.catalog-source-unavailable" => "A workflow source could not be inspected; no incomplete selection is offered.",
+        _ => "A workflow could not be offered by bounded discovery.",
+    }
+}
+
 #[async_trait::async_trait]
 impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost<E> {
     async fn create(
@@ -657,6 +839,7 @@ impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost
         let workflow_run_id = WorkflowStarter::start(
             self,
             StartWorkflowRequest {
+                expected_definition_digest: None,
                 manifest,
                 workflow_id: named_id,
                 inputs,
@@ -1431,8 +1614,152 @@ steps:
         WorkflowConductorHost::new(pool, Arc::new(executor))
     }
 
+    #[tokio::test]
+    async fn catalog_echoes_canonical_repository_and_matches_named_resolution() {
+        let (temporary, pool) = temp_pool().await;
+        let sources = temporary.path().join(".codypendent/workflows");
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::write(
+            sources.join("override.yaml"),
+            MANIFEST.replace("\nversion: 1", "\nversion: 2"),
+        )
+        .unwrap();
+        let host = host_with(pool, FakeExecutor::default());
+        let catalog = host
+            .catalog(WorkflowCatalogRequest {
+                repository: Some(temporary.path().to_str().unwrap().to_owned()),
+                owner_uid: 42,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        assert_eq!(catalog.repository.as_deref(), root.to_str());
+        let entry = catalog
+            .items
+            .iter()
+            .find(|entry| entry.id == "repair-github-check")
+            .unwrap();
+        let manifest = host
+            .resolve_named_workflow(&entry.id, catalog.repository.as_deref())
+            .unwrap();
+        let actual = compile_yaml(&manifest).unwrap();
+        assert_eq!(
+            (entry.version, entry.node_count, entry.source),
+            (
+                actual.version,
+                actual.nodes.len() as u32,
+                WorkflowCatalogSource::Repository
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_refuses_relative_repository_without_disclosing_filesystem_errors() {
+        let (_temporary, pool) = temp_pool().await;
+        let host = host_with(pool, FakeExecutor::default());
+        let error = host
+            .catalog(WorkflowCatalogRequest {
+                repository: Some("../../private".to_owned()),
+                owner_uid: 42,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "workflow.invalid-repository");
+        assert!(!error.message.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn catalog_digest_rejects_a_changed_definition_before_first_launch() {
+        let (temporary, pool) = temp_pool().await;
+        let sources = temporary.path().join(".codypendent/workflows");
+        std::fs::create_dir_all(&sources).unwrap();
+        let source = sources.join("selected.yaml");
+        std::fs::write(&source, MANIFEST.replace("\nversion: 1", "\nversion: 2")).unwrap();
+        let host = host_with(pool.clone(), FakeExecutor::default());
+        let catalog = host
+            .catalog(WorkflowCatalogRequest {
+                repository: Some(temporary.path().to_str().unwrap().to_owned()),
+                owner_uid: 1000,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap();
+        let selected = catalog
+            .items
+            .into_iter()
+            .find(|entry| entry.id == "repair-github-check")
+            .unwrap();
+        // Same sole repository version, different inputs/budget: cross-source
+        // collision checks alone cannot protect this catalog-to-launch interval.
+        std::fs::write(
+            &source,
+            MANIFEST.replace("\nversion: 1", "\nversion: 2")
+                + "\ninputs:\n  changed:\n    type: string\n    required: true\n",
+        )
+        .unwrap();
+        let mut request = start_request("selected-definition");
+        request.workflow_id = Some(selected.id);
+        request.repository = catalog.repository;
+        request.expected_definition_digest = Some(selected.definition_digest);
+        let error = host.start(request).await.unwrap_err();
+        assert_eq!(error.code, "workflow.definition-changed");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_digest_recovers_an_accepted_receipt_after_definition_changes() {
+        let (temporary, pool) = temp_pool().await;
+        let sources = temporary.path().join(".codypendent/workflows");
+        std::fs::create_dir_all(&sources).unwrap();
+        let source = sources.join("selected.yaml");
+        std::fs::write(&source, MANIFEST.replace("\nversion: 1", "\nversion: 2")).unwrap();
+        let host = host_with(pool.clone(), FakeExecutor::default());
+        let catalog = host
+            .catalog(WorkflowCatalogRequest {
+                repository: Some(temporary.path().to_str().unwrap().to_owned()),
+                owner_uid: 1000,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap();
+        let selected = catalog
+            .items
+            .into_iter()
+            .find(|entry| entry.id == "repair-github-check")
+            .unwrap();
+        let mut request = start_request("lost-acknowledgement");
+        request.workflow_id = Some(selected.id);
+        request.repository = catalog.repository;
+        request.expected_definition_digest = Some(selected.definition_digest);
+        let run_id = host.start(request.clone()).await.unwrap();
+        // Even an unavailable current source must not hide the accepted request.
+        std::fs::write(&source, "no longer valid YAML: [").unwrap();
+        assert_eq!(host.start(request.clone()).await.unwrap(), run_id);
+        request.inputs = json!({ "pull_request": 8 });
+        assert_eq!(
+            host.start(request).await.unwrap_err().code,
+            "workflow.idempotency-mismatch"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     fn start_request(key: &str) -> StartWorkflowRequest {
         StartWorkflowRequest {
+            expected_definition_digest: None,
             manifest: MANIFEST.to_owned(),
             workflow_id: None,
             inputs: json!({ "pull_request": 7 }),
@@ -1586,6 +1913,7 @@ steps:
         let host = host_with(pool, FakeExecutor::default());
         let error = host
             .start(StartWorkflowRequest {
+                expected_definition_digest: None,
                 manifest: "schema_version: 1\nid: empty\nversion: 1\nsteps: []\n".to_owned(),
                 workflow_id: None,
                 inputs: json!(null),
@@ -1974,6 +2302,7 @@ steps:
         );
         let error = host
             .start(StartWorkflowRequest {
+                expected_definition_digest: None,
                 manifest: different_manifest,
                 workflow_id: None,
                 inputs: json!({ "pull_request": 7 }),

@@ -56,6 +56,7 @@ pub enum InvocationSource {
     Override,
     Path,
     KnownDirectory,
+    /// Inside the same application bundle, including Linux runtime resources.
     BesideThisApp,
     DevelopmentBuild,
 }
@@ -219,11 +220,15 @@ struct Environment {
     path_entries: Vec<PathBuf>,
     known_directories: Vec<PathBuf>,
     beside_app: Option<PathBuf>,
+    packaged_runtime: Option<PathBuf>,
     development_build: Option<PathBuf>,
 }
 
 impl Environment {
     fn from_process() -> Self {
+        let beside_app = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
         Self {
             override_program: std::env::var_os(PROGRAM_OVERRIDE_ENV)
                 .filter(|value| !value.is_empty())
@@ -232,12 +237,46 @@ impl Environment {
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
             known_directories: known_directories(),
-            beside_app: std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+            packaged_runtime: beside_app.as_deref().and_then(packaged_runtime_directory),
+            beside_app,
             development_build: cfg!(debug_assertions)
                 .then(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug")),
         }
+    }
+}
+
+/// Match the pinned Tauri Linux `resource_dir` convention. Tauri codegen uses
+/// `productName` for PackageInfo.name (not the binary's file name), and the
+/// installed/AppImage resource tree is `usr/lib/<name>` beside `usr/bin`.
+/// Debug window-only builds have no such tree and retain ordinary discovery.
+fn packaged_runtime_directory(beside_app: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // The package layout identifies ownership even when every resource was
+        // deleted. Checking directory existence would let a damaged AppImage
+        // silently switch to an installed CLI. Cargo's target/debug layout is
+        // deliberately outside this condition.
+        if !beside_app.ends_with(Path::new("usr/bin")) {
+            return None;
+        }
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).ok()?;
+        let product = config
+            .get("productName")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(env!("CARGO_PKG_NAME"));
+        Some(
+            beside_app
+                .parent()?
+                .join("lib")
+                .join(product)
+                .join("runtime"),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = beside_app;
+        None
     }
 }
 
@@ -253,6 +292,16 @@ fn resolve_in(
             return Ok((invocation_for(program), InvocationSource::Override));
         }
         searched.push(format!("{PROGRAM_OVERRIDE_ENV}={}", program.display()));
+    }
+    if let Some(runtime) = &environment.packaged_runtime {
+        let program = runtime.join("codypendent");
+        if executable(&program) {
+            return Ok((invocation_for(&program), InvocationSource::BesideThisApp));
+        }
+        // A damaged package must report its missing runtime instead of silently
+        // starting an unrelated, possibly older installation from PATH.
+        searched.push(program.display().to_string());
+        return Err(searched);
     }
     // A packaged app must start the daemon it shipped with, even when an
     // older CLI is also on PATH. The explicit development override still wins.
@@ -368,6 +417,7 @@ pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> 
         .with_context(|| format!("opening {}", log.display()))?;
 
     let mut command = std::process::Command::new(&invocation.program);
+    crate::runtime_paths::configure_command(&mut command, paths);
     if let Some(path) = daemon_path() {
         command.env("PATH", path);
     }
@@ -563,6 +613,7 @@ mod tests {
             path_entries: path_entries.iter().map(PathBuf::from).collect(),
             known_directories: known.iter().map(PathBuf::from).collect(),
             beside_app: beside.map(PathBuf::from),
+            packaged_runtime: None,
             development_build: None,
         }
     }
@@ -589,6 +640,99 @@ mod tests {
             resolve_in(&env, &present(&["/usr/local/bin/codypendentd"])).expect("found");
         assert_eq!(invocation.program, "/usr/local/bin/codypendentd");
         assert!(invocation.args.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_packaged_runtime_uses_the_tauri_product_resource_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = directory.path().join("usr/bin");
+        std::fs::create_dir_all(&binaries).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let product = config["productName"].as_str().unwrap();
+        let resources = directory.path().join("usr/lib").join(product);
+        assert_eq!(
+            packaged_runtime_directory(&binaries),
+            Some(resources.join("runtime"))
+        );
+        assert!(packaged_runtime_directory(&directory.path().join("target/debug")).is_none());
+        std::fs::create_dir_all(&resources).unwrap();
+        assert_eq!(
+            packaged_runtime_directory(&binaries)
+                .unwrap()
+                .canonicalize()
+                .ok(),
+            None,
+            "an absent runtime remains a package-owned missing target"
+        );
+        std::fs::create_dir_all(resources.join("runtime")).unwrap();
+        assert_eq!(
+            packaged_runtime_directory(&binaries)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            resources.join("runtime").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn packaged_resource_runtime_needs_no_path_and_preserves_explicit_override() {
+        let mut env = environment(None, &[], &[], Some("/app/usr/bin"));
+        env.packaged_runtime = Some(PathBuf::from("/app/usr/lib/Codypendent/runtime"));
+        let (invocation, source) = resolve_in(
+            &env,
+            &present(&["/app/usr/lib/Codypendent/runtime/codypendent"]),
+        )
+        .unwrap();
+        assert_eq!(source, InvocationSource::BesideThisApp);
+        assert_eq!(
+            invocation.program,
+            "/app/usr/lib/Codypendent/runtime/codypendent"
+        );
+        assert_eq!(invocation.args, vec!["__daemon".to_owned()]);
+        env.override_program = Some(PathBuf::from("/explicit/codypendent"));
+        let (invocation, source) = resolve_in(&env, &present(&["/explicit/codypendent"])).unwrap();
+        assert_eq!(source, InvocationSource::Override);
+        assert_eq!(invocation.program, "/explicit/codypendent");
+    }
+
+    #[test]
+    fn missing_packaged_runtime_cannot_fall_back_to_an_installed_cli() {
+        let mut env = environment(None, &["/usr/bin"], &[], Some("/app/usr/bin"));
+        env.packaged_runtime = Some(PathBuf::from("/app/usr/lib/Codypendent/runtime"));
+        env.development_build = Some(PathBuf::from("/workspace/target/debug"));
+        let searched = resolve_in(
+            &env,
+            &present(&[
+                "/usr/bin/codypendent",
+                "/workspace/target/debug/codypendent",
+                "/app/usr/bin/codypendent",
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            searched,
+            vec!["/app/usr/lib/Codypendent/runtime/codypendent".to_owned()]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_whole_product_resource_tree_cannot_fall_back_to_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = directory.path().join("usr/bin");
+        std::fs::create_dir_all(&binaries).unwrap();
+        let mut env = environment(None, &["/usr/bin"], &[], None);
+        env.beside_app = Some(binaries.clone());
+        env.packaged_runtime = packaged_runtime_directory(&binaries);
+        let expected = env.packaged_runtime.as_ref().unwrap().join("codypendent");
+        assert!(
+            !expected.exists(),
+            "the entire product resource tree is absent"
+        );
+        let searched = resolve_in(&env, &present(&["/usr/bin/codypendent"])).unwrap_err();
+        assert_eq!(searched, vec![expected.display().to_string()]);
     }
 
     #[test]

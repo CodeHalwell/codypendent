@@ -34,6 +34,64 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Bounded workflow discovery metadata. No manifest, prompt, or environment is exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct WorkflowCatalog {
+    /// Canonical repository used for resolution; reuse it when starting the selected workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub items: Vec<WorkflowCatalogEntry>,
+    pub diagnostics: Vec<WorkflowCatalogDiagnostic>,
+    /// Some sources could not be inspected completely. No potentially shadowed entries are offered.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct WorkflowCatalogEntry {
+    /// SHA-256 of the canonical parsed definition, including its inputs and budget.
+    pub definition_digest: String,
+    pub id: String,
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub inputs: BTreeMap<String, WorkflowCatalogInput>,
+    pub node_count: u32,
+    pub source: WorkflowCatalogSource,
+}
+
+/// Input types are domain names, not JSON Schema or an invented control/default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct WorkflowCatalogInput {
+    pub input_type: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type")]
+#[non_exhaustive]
+pub enum WorkflowCatalogSource {
+    BuiltIn,
+    User,
+    Repository,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Static diagnostics intentionally exclude parser context and manifest scalar values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct WorkflowCatalogDiagnostic {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+}
 
 /// The lifecycle state of one workflow node, projected for a client. Mirrors
 /// `codypendent_workflow`'s `NodeState` across the wire; a value from a newer peer

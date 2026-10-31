@@ -19,7 +19,8 @@ use codypendent_protocol::{
     RegistryItemId, RepositoryId, RunId, ServerHello, SessionEvent, SessionExportOptions,
     SessionHistoryPage, SessionId, SessionLifecycleAction, SessionProjection, SessionSearchPage,
     SessionSearchQuery, SessionSearchResult, SessionSummary, SkillId, SourceProvenance, TaskId,
-    TextEdit, ToolId, TriggerSource, UserId, WorkflowId, WorkspaceEdit, WorkspaceId,
+    TextEdit, ToolId, TriggerSource, UserId, WorkflowCatalog, WorkflowId, WorkspaceEdit,
+    WorkspaceId,
 };
 use schemars::gen::SchemaSettings;
 use schemars::JsonSchema;
@@ -197,6 +198,7 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     write_schema::<SourceProvenance>(output, "source-provenance.schema.json")?;
     write_schema::<TextEdit>(output, "text-edit.schema.json")?;
     write_schema::<WorkspaceEdit>(output, "workspace-edit.schema.json")?;
+    write_schema::<WorkflowCatalog>(output, "workflow-catalog.schema.json")?;
 
     Ok(())
 }

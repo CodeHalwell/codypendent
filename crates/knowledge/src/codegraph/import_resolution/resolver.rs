@@ -162,7 +162,7 @@ pub(in crate::codegraph) async fn resolve(
                 if let Some(owner) = declaration_name(node, source, language) {
                     for field in ["parameters", "return_type"] {
                         if let Some(annotation) = node.child_by_field_name(field) {
-                            named_types(annotation, source, &mut types, 0);
+                            named_types(annotation, &mut types, 0);
                         }
                     }
                     for annotation in types.drain(..) {

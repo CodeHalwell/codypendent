@@ -10,6 +10,9 @@
 .knowledge-graph button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; line-height: 1.35; }
 .knowledge-graph button:hover:not(:disabled) { background: var(--cody-panel-hover); border-color: var(--cody-border-strong); color: var(--cody-text); }
 .knowledge-graph button:disabled { opacity: .5; cursor: default; }
+.code-map-history { display: flex; align-items: center; gap: 7px; padding: 8px 14px; border-top: 1px solid var(--code-map-line); background: var(--code-map-surface); }
+.code-map-history > span { min-width: 0; margin-left: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cody-text-muted); font-size: 11px; }
+.code-map-history > button { flex-shrink: 0; }
 .knowledge-graph :is(button, select, input):focus-visible, .code-map-node:focus-visible, .code-map-stage > svg:focus-visible { outline: 2px solid var(--cody-accent); outline-offset: 3px; }
 .code-map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; min-height: 66px; padding: 12px 16px; border-bottom: 1px solid var(--code-map-line); background: var(--code-map-surface); }
 .code-map-title { display: flex; align-items: center; gap: 9px; min-width: 120px; margin-right: 8px; color: var(--cody-text-secondary); }

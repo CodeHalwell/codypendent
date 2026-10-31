@@ -210,8 +210,7 @@ fn daemon_socket() -> Result<String, String> {
 /// including the exact command to run by hand when it cannot.
 #[tauri::command]
 async fn daemon_launch_status() -> Result<crate::launcher::LaunchStatus, String> {
-    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
-        .map_err(|error| format!("{error:#}"))?;
+    let paths = crate::runtime_paths::resolve().map_err(|error| format!("{error:#}"))?;
     Ok(crate::launcher::launch_status(&paths).await)
 }
 
@@ -220,8 +219,7 @@ async fn daemon_launch_status() -> Result<crate::launcher::LaunchStatus, String>
 /// tried and the manual command.
 #[tauri::command]
 async fn daemon_start() -> Result<crate::launcher::StartOutcome, String> {
-    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
-        .map_err(|error| format!("{error:#}"))?;
+    let paths = crate::runtime_paths::resolve().map_err(|error| format!("{error:#}"))?;
     crate::launcher::start_daemon(&paths)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -239,8 +237,7 @@ async fn daemon_connect(
     let epoch = bridge.attempt.lock().await.begin(generation);
     let _connecting = bridge.connect_lock.lock().await;
     bridge.attempt.lock().await.validate(epoch)?;
-    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
-        .map_err(|error| format!("{error:#}"))?;
+    let paths = crate::runtime_paths::resolve().map_err(|error| format!("{error:#}"))?;
     // The repository the OPERATOR chose, or `None`.
     //
     // This used to be `std::env::current_dir()`. For a bundled `.app` that is
@@ -661,6 +658,18 @@ async fn mutate_session(
 
 // --------------------------------------------------------------- Workflow.
 
+#[tauri::command]
+async fn list_workflows(
+    bridge: State<'_, Bridge>,
+    expected_repository: Option<String>,
+) -> Result<codypendent_protocol::WorkflowCatalog, String> {
+    client_of(&bridge)
+        .await?
+        .list_workflows(expected_repository)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Start a durable workflow run by the id the daemon resolves from its own
 /// sources. `inputs` must be a JSON object; anything else is refused before it
 /// reaches the wire.
@@ -669,10 +678,19 @@ async fn start_workflow(
     bridge: State<'_, Bridge>,
     workflow_id: String,
     inputs: serde_json::Value,
+    expected_repository: Option<String>,
+    idempotency_key: Option<String>,
+    expected_definition_digest: Option<String>,
 ) -> Result<String, String> {
     let client = client_of(&bridge).await?;
     client
-        .start_workflow(workflow_id, inputs)
+        .start_workflow_with_options(
+            workflow_id,
+            inputs,
+            expected_repository,
+            idempotency_key,
+            expected_definition_digest,
+        )
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -2056,6 +2074,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             save_artifact,
             search_sessions,
             mutate_session,
+            list_workflows,
             start_workflow,
             read_workflow_run,
             watch_workflow,

@@ -426,6 +426,7 @@ fn command_vectors() -> Vec<Vector> {
         vec_of(
             "CommandBody_StartWorkflow_inline_manifest",
             CommandBody::StartWorkflow {
+                expected_definition_digest: None,
                 manifest: "schema_version: 1\nid: wf\nversion: 1\nsteps: []\n".to_string(),
                 workflow_id: None,
                 inputs: json!({ "pull_request": 42 }),
@@ -433,8 +434,15 @@ fn command_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "CommandBody_ListWorkflows",
+            CommandBody::ListWorkflows {
+                repository: Some("/home/user/project".to_string()),
+            },
+        ),
+        vec_of(
             "CommandBody_StartWorkflow_named_workflow",
             CommandBody::StartWorkflow {
+                expected_definition_digest: Some("a".repeat(64)),
                 manifest: String::new(),
                 workflow_id: Some("repair-github-check".to_string()),
                 inputs: json!({ "pull_request": 42 }),
@@ -732,6 +740,32 @@ fn envelope_vectors() -> Vec<Vector> {
                     workflow_run_id: "wfrun-abc123".to_string(),
                     phase: WorkflowRunPhase::Running,
                     nodes: vec![workflow_node_view()],
+                },
+            },
+        ),
+        vec_of(
+            "Payload_WorkflowCatalog",
+            Payload::WorkflowCatalog {
+                command_id: command_id(),
+                catalog: codypendent_protocol::WorkflowCatalog {
+                    repository: Some("/home/user/project".to_string()),
+                    items: vec![codypendent_protocol::WorkflowCatalogEntry {
+                        definition_digest: "a".repeat(64),
+                        id: "pr-review".to_string(),
+                        version: 1,
+                        description: Some("Review a pull request".to_string()),
+                        inputs: std::collections::BTreeMap::from([(
+                            "pull_request".to_string(),
+                            codypendent_protocol::WorkflowCatalogInput {
+                                input_type: "github_pull_request".to_string(),
+                                required: true,
+                            },
+                        )]),
+                        node_count: 4,
+                        source: codypendent_protocol::WorkflowCatalogSource::BuiltIn,
+                    }],
+                    diagnostics: vec![],
+                    truncated: false,
                 },
             },
         ),

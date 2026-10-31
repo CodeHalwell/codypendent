@@ -645,7 +645,29 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             ));
             lines.push("Press n to create a task; left or right moves the selected card between columns.".to_owned());
         }
-        Overlay::ConfirmCancel => lines.push("Confirmation: cancel this run?".to_owned()),
+        Overlay::ConfirmCancel { run_id } => {
+            match state.runs.iter().find(|run| run.run_id == *run_id) {
+                Some(run) => {
+                    lines.push(format!(
+                        "Confirmation: cancel run {run_id}: {}? Mode: {:?}. State: {:?}. Its chronicle and artifacts are kept.",
+                        clean(&run.objective),
+                        run.mode,
+                        run.state,
+                    ));
+                    if matches!(
+                        run.state,
+                        codypendent_protocol::RunState::Completed
+                            | codypendent_protocol::RunState::Failed
+                            | codypendent_protocol::RunState::Cancelled
+                    ) {
+                        lines.push("This run has already finished; no cancellation will be sent.".to_owned());
+                    }
+                }
+                None => lines.push(format!(
+                    "Confirmation: run {run_id} is no longer available; no cancellation will be sent."
+                )),
+            }
+        }
         Overlay::ConfirmWorkflowCancel { workflow_run_id } => lines.push(format!(
             "Confirmation: cancel workflow run {}?",
             clean(workflow_run_id)
@@ -987,7 +1009,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         | Overlay::None
         | Overlay::NewRun(_)
         | Overlay::Steering(_)
-        | Overlay::ConfirmCancel
+        | Overlay::ConfirmCancel { .. }
         | Overlay::ConfirmWorkflowCancel { .. }
         | Overlay::Palette { .. }
         | Overlay::ModelPicker { .. }
@@ -1401,6 +1423,7 @@ fn ascii_chrome(text: &str) -> String {
         .replace('→', "->")
         .replace('←', "<-")
         .replace('⌥', "Alt-")
+        .replace('⌫', "Backspace")
 }
 
 /// Remove terminal control sequences and Unicode bidi controls from text that
@@ -1528,6 +1551,55 @@ mod tests {
             map_accessible_input("shift-f6", InputMode::RemoteUi),
             vec![Action::RemoteUiNextDocument]
         );
+    }
+
+    #[test]
+    fn cancel_confirmation_announces_the_pinned_target_and_stale_state() {
+        let mut state = AppState::new();
+        let original = RunId::new();
+        state
+            .ensure_run(
+                original,
+                "original reviewed objective".to_owned(),
+                codypendent_protocol::AgentMode::Build,
+            )
+            .state = codypendent_protocol::RunState::Running;
+        state.overlay = Overlay::ConfirmCancel { run_id: original };
+        state.ensure_run(
+            RunId::new(),
+            "another selected objective".to_owned(),
+            codypendent_protocol::AgentMode::Plan,
+        );
+        let snapshot = accessible_snapshot(&state);
+        let confirmation = snapshot
+            .lines()
+            .find(|line| line.starts_with("Confirmation:"))
+            .unwrap();
+        assert!(
+            confirmation.contains(&original.to_string()),
+            "{confirmation}"
+        );
+        assert!(
+            confirmation.contains("original reviewed objective"),
+            "{confirmation}"
+        );
+        assert!(
+            confirmation.contains("Mode: Build. State: Running."),
+            "{confirmation}"
+        );
+        assert!(
+            !confirmation.contains("another selected objective"),
+            "{confirmation}"
+        );
+
+        state.runs[0].state = codypendent_protocol::RunState::Completed;
+        let finished = accessible_snapshot(&state);
+        assert!(finished.contains("already finished; no cancellation will be sent"));
+        state.runs.remove(0);
+        let missing = accessible_snapshot(&state);
+        assert!(missing.contains(&format!(
+            "run {original} is no longer available; no cancellation will be sent"
+        )));
     }
 
     #[test]

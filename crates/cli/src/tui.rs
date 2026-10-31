@@ -5226,6 +5226,7 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             workflow_id,
             inputs,
         } => CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: Some(workflow_id),
             inputs,

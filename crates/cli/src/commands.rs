@@ -16,7 +16,7 @@ use codypendent_knowledge::{
     Publication, PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig,
     RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
-use codypendent_protocol::discovery::RuntimePaths;
+use codypendent_protocol::discovery::{RuntimePaths, RuntimeProduct};
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, CommandId, DaemonStatus,
     DocumentId, ModelId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent,
@@ -928,12 +928,13 @@ pub async fn open(
         // the checkout and confirms the session without asking for a UUID.
         crate::editor_handoff::session_command(paths, session_id, ide_binary, &repo)?
     } else {
-        let mut command = std::process::Command::new(ide_binary);
-        command
-            .arg(&repo)
-            .env("CODYPENDENT_SESSION", session_id.to_string())
-            .env("CODYPENDENT_SOCKET", &paths.socket_path);
-        command
+        non_uri_editor_command(
+            paths,
+            session_id,
+            ide_binary,
+            &repo,
+            RuntimeProduct::from_env()?,
+        )
     };
     let launched = command.spawn();
     match launched {
@@ -953,6 +954,35 @@ pub async fn open(
         }
     }
     Ok(())
+}
+
+/// Launch an editor against the selected host's resolved paths, retaining the
+/// legacy session correlation variable without inheriting another host's state.
+fn non_uri_editor_command(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    ide_binary: &str,
+    repo: &Path,
+    product: RuntimeProduct,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(ide_binary);
+    command
+        .arg(repo)
+        .env("AGENT_RUNTIME_PRODUCT", product.namespace())
+        .env("CODYPENDENT_SESSION", session_id.to_string());
+    let prefix = product.environment_prefix();
+    command
+        .env(format!("{prefix}_DATA_DIR"), &paths.data_dir)
+        .env(format!("{prefix}_CONFIG_DIR"), &paths.config_dir)
+        .env(format!("{prefix}_SOCKET"), &paths.socket_path);
+    let other = match product {
+        RuntimeProduct::Codypendent => RuntimeProduct::SonOfAnton,
+        RuntimeProduct::SonOfAnton => RuntimeProduct::Codypendent,
+    };
+    for suffix in ["DATA_DIR", "CONFIG_DIR", "SOCKET"] {
+        command.env_remove(format!("{}_{suffix}", other.environment_prefix()));
+    }
+    command
 }
 
 /// `codypendent docs new <TITLE> [--from FILE] [--scope S]` — the CLI half of
@@ -1570,6 +1600,7 @@ pub async fn workflow_run_over_connection(
             workflow_id: None,
             inputs,
             repository,
+            expected_definition_digest: None,
         })
         .await?;
     match reply.payload {
@@ -1624,6 +1655,7 @@ pub async fn fix_ci_over_connection(
     bind_control_role(conn).await?;
     let reply = conn
         .send_command(CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: Some(codypendent_workflow::REPAIR_GITHUB_CHECK_ID.to_string()),
             inputs: serde_json::json!({ "pull_request": pr }),
@@ -2468,24 +2500,21 @@ fn plugin_diff_report(id: &str, diff: &codypendent_sandbox::PermissionDiff) -> S
     out
 }
 
-/// Resolve the trusted-publisher key store path
-/// (`<config_dir>/codypendent/trusted_publishers.toml`, the `models.toml`
-/// precedent). `CODYPENDENT_CONFIG_DIR` overrides the config root (test isolation),
-/// mirroring how `CODYPENDENT_DATA_DIR` overrides the data root.
-fn trusted_publishers_path() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CODYPENDENT_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join("trusted_publishers.toml"));
-    }
-    let dirs = directories::ProjectDirs::from("", "", "codypendent")
-        .context("cannot determine a config directory for the current user")?;
-    Ok(dirs.config_dir().join("trusted_publishers.toml"))
+/// Resolve the trusted-publisher store within the selected host's canonical
+/// config directory, using the same resolved paths as the daemon.
+fn trusted_publishers_path(paths: &RuntimePaths) -> PathBuf {
+    paths.config_dir.join("trusted_publishers.toml")
 }
 
 /// `codypendent plugin trust add <ID> <PUBLIC_KEY_B64>` (Phase 6 STEP 6.2): record
 /// a trusted publisher's ed25519 public key so signed plugins from that publisher
 /// verify against a real key. The key is validated before it is stored.
-pub fn plugin_trust_add(id: &str, public_key_b64: &str) -> anyhow::Result<()> {
-    let path = trusted_publishers_path()?;
+pub fn plugin_trust_add(
+    paths: &RuntimePaths,
+    id: &str,
+    public_key_b64: &str,
+) -> anyhow::Result<()> {
+    let path = trusted_publishers_path(paths);
     let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
         .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
     store
@@ -2500,8 +2529,8 @@ pub fn plugin_trust_add(id: &str, public_key_b64: &str) -> anyhow::Result<()> {
 
 /// `codypendent plugin trust list` (Phase 6 STEP 6.2): print the trusted
 /// publishers and their public keys.
-pub fn plugin_trust_list() -> anyhow::Result<()> {
-    let path = trusted_publishers_path()?;
+pub fn plugin_trust_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = trusted_publishers_path(paths);
     let store = codypendent_sandbox::TrustedPublishers::load(&path)
         .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
     if store.is_empty() {
@@ -2545,6 +2574,7 @@ pub async fn plugin_trust_remove(paths: &RuntimePaths, id: &str) -> anyhow::Resu
 /// `plugin install` builds on (persisting the installed record is daemon-wired
 /// follow-up work).
 pub fn plugin_verify(
+    paths: &RuntimePaths,
     manifest_file: &std::path::Path,
     artifact_file: &std::path::Path,
     allow_unsigned: bool,
@@ -2553,7 +2583,7 @@ pub fn plugin_verify(
     let artifact = std::fs::read(artifact_file)
         .with_context(|| format!("reading plugin artifact {}", artifact_file.display()))?;
 
-    let path = trusted_publishers_path()?;
+    let path = trusted_publishers_path(paths);
     let store = codypendent_sandbox::TrustedPublishers::load(&path)
         .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
 
@@ -4752,6 +4782,73 @@ mod open_tests {
     use super::*;
 
     #[test]
+    fn non_uri_editor_launch_pins_the_selected_product_and_removes_foreign_paths() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let session = SessionId::new();
+        for (product, other_prefix) in [
+            (RuntimeProduct::Codypendent, "SON_OF_ANTON"),
+            (RuntimeProduct::SonOfAnton, "CODYPENDENT"),
+        ] {
+            let mut paths = RuntimePaths::from_data_dir_for(
+                PathBuf::from("/private/data").join(product.namespace()),
+                product,
+            );
+            paths.config_dir = PathBuf::from("/private/config").join(product.namespace());
+            let command =
+                non_uri_editor_command(&paths, session, "zed", Path::new("/checkout"), product);
+            let environments: BTreeMap<_, _> = command
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(OsString::from),
+                    )
+                })
+                .collect();
+            let prefix = product.environment_prefix();
+            let expected = BTreeMap::from([
+                (
+                    "AGENT_RUNTIME_PRODUCT".to_owned(),
+                    Some(OsString::from(product.namespace())),
+                ),
+                (
+                    "CODYPENDENT_SESSION".to_owned(),
+                    Some(OsString::from(session.to_string())),
+                ),
+                (
+                    format!("{prefix}_DATA_DIR"),
+                    Some(paths.data_dir.clone().into_os_string()),
+                ),
+                (
+                    format!("{prefix}_CONFIG_DIR"),
+                    Some(paths.config_dir.clone().into_os_string()),
+                ),
+                (
+                    format!("{prefix}_SOCKET"),
+                    Some(paths.socket_path.clone().into_os_string()),
+                ),
+                (format!("{other_prefix}_DATA_DIR"), None),
+                (format!("{other_prefix}_CONFIG_DIR"), None),
+                (format!("{other_prefix}_SOCKET"), None),
+            ]);
+            assert_eq!(
+                (
+                    command.get_program(),
+                    command.get_args().collect::<Vec<_>>(),
+                    environments,
+                ),
+                (
+                    std::ffi::OsStr::new("zed"),
+                    vec![std::ffi::OsStr::new("/checkout")],
+                    expected,
+                )
+            );
+        }
+    }
+
+    #[test]
     fn handoff_message_names_the_session_and_socket() {
         let paths = RuntimePaths::from_data_dir(std::path::PathBuf::from("/tmp/cp-test"));
         let session = SessionId::new();
@@ -5163,7 +5260,8 @@ pub fn models_add(
         // Rebuilding the entry from scratch wiped both and then printed
         // `updated model`, which is the same success-over-silent-destruction
         // shape as the defect it replaced (MEGAPLAN R-COR-3).
-        let existing = configs.iter().find(|c| c.id.0 == display_id).cloned();
+        let existing_index = configs.iter().position(|c| c.id.0 == display_id);
+        let existing = existing_index.map(|index| configs[index].clone());
         // Only a profile still naming the SAME endpoint may lend those fields.
         // Repointing a reusable id at another provider inherits neither: an
         // `OPENAI_API_KEY` carried onto a keyless Ollama profile makes it
@@ -5188,9 +5286,14 @@ pub fn models_add(
             provider_id: Some(provider_id.to_string()),
             context_tokens: catalog_context.or_else(|| inheritable.and_then(|c| c.context_tokens)),
         };
-        let replaced = existing.is_some();
+        let replaced = existing_index.is_some();
         configs.retain(|c| c.id.0 != display_id);
-        configs.push(config);
+        // File order is the automatic provider fallback order. An update must
+        // keep the existing profile's priority, including after key rotation.
+        match existing_index {
+            Some(index) => configs.insert(index, config),
+            None => configs.push(config),
+        }
         Ok(replaced)
     })?;
     println!(
@@ -6128,6 +6231,69 @@ mod routing_command_tests {
     }
 
     #[test]
+    fn updating_the_first_model_preserves_priority_and_other_settings() {
+        let (_dir, paths) = temp_paths();
+        let models = paths.data_dir.join("models.toml");
+        let settings =
+            "# User retrieval settings\n[retrieval]\nbuiltin_top_k = 0\nmcp_top_k = 3\n\n";
+        std::fs::write(
+            &models,
+            format!(
+                r#"{settings}[[model]]
+id = "preferred"
+provider = "openai-compatible"
+provider_id = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "synthetic-primary"
+api_key_env = "PRIMARY_KEY_NAME"
+context_tokens = 8192
+
+[[model]]
+id = "fallback"
+provider = "openai-compatible"
+provider_id = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "synthetic-fallback"
+api_key_env = ""
+context_tokens = 4096
+"#,
+            ),
+        )
+        .unwrap();
+        let mut expected = codypendent_runtime::models::load_models(&models).unwrap();
+
+        models_add(
+            &paths,
+            "ollama",
+            "synthetic-primary",
+            None,
+            Some("preferred"),
+        )
+        .expect("update without changing the key source");
+        assert_eq!(
+            codypendent_runtime::models::load_models(&models).unwrap(),
+            expected
+        );
+
+        models_add(
+            &paths,
+            "ollama",
+            "synthetic-primary",
+            Some("ROTATED_PRIMARY_KEY_NAME"),
+            Some("preferred"),
+        )
+        .expect("rotate the first model's key source");
+        expected[0].api_key_env = "ROTATED_PRIMARY_KEY_NAME".to_owned();
+        assert_eq!(
+            codypendent_runtime::models::load_models(&models).unwrap(),
+            expected
+        );
+        assert!(std::fs::read_to_string(&models)
+            .unwrap()
+            .starts_with(settings));
+    }
+
+    #[test]
     fn classification_variant_name_is_case_insensitive_and_matches_the_wire_spelling() {
         // Must match `DataClassification`'s un-renamed Serde encoding exactly
         // (`crates/protocol/src/artifact.rs`) — the Rust variant name, PascalCase.
@@ -6284,6 +6450,37 @@ failure = 0.5
 #[cfg(test)]
 mod plugin_tests {
     use super::*;
+
+    #[test]
+    fn trusted_publishers_stay_in_the_supplied_products_config_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let key = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let mut paths = Vec::new();
+        for (product, publisher) in [
+            (RuntimeProduct::Codypendent, "cody-publisher"),
+            (RuntimeProduct::SonOfAnton, "anton-publisher"),
+        ] {
+            let mut supplied = RuntimePaths::from_data_dir_for(
+                temporary.path().join("data").join(product.namespace()),
+                product,
+            );
+            supplied.config_dir = temporary.path().join("config").join(product.namespace());
+            plugin_trust_add(&supplied, publisher, key).unwrap();
+            paths.push(supplied);
+        }
+        let publishers: Vec<Vec<_>> = paths
+            .iter()
+            .map(|supplied| {
+                let path = supplied.config_dir.join("trusted_publishers.toml");
+                let store = codypendent_sandbox::TrustedPublishers::load(&path).unwrap();
+                store.list().map(|(id, _)| id.to_owned()).collect()
+            })
+            .collect();
+        assert_eq!(
+            publishers,
+            vec![vec!["cody-publisher"], vec!["anton-publisher"]]
+        );
+    }
 
     const GITHUB_MANIFEST: &str = r#"
 schema_version = 1

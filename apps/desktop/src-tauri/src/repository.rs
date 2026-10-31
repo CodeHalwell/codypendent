@@ -118,7 +118,7 @@ pub struct StoredRunDefaults {
 
 /// The staged run defaults from the last launch, if any were saved.
 pub fn stored_run_defaults() -> anyhow::Result<StoredRunDefaults> {
-    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let paths = crate::runtime_paths::resolve().context("resolving the codypendent data dir")?;
     Ok(load_preferences(&paths)?.run_defaults)
 }
 
@@ -197,7 +197,7 @@ enum Save {
 /// A poisoned lock is recovered rather than propagated: a panic in some other
 /// mutation must not leave the shell unable to remember anything again.
 fn with_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> (Save, T)) -> anyhow::Result<T> {
-    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let paths = crate::runtime_paths::resolve().context("resolving the codypendent data dir")?;
     let _guard = PREFERENCES_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -368,7 +368,7 @@ fn is_home_directory(path: &Path) -> bool {
 /// one. `None` is a real answer the UI renders as such — it is never a cue to
 /// substitute the process working directory.
 pub fn selected_repository() -> anyhow::Result<Option<RepositorySelection>> {
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
+    let paths = crate::runtime_paths::resolve().context("resolving codypendent runtime paths")?;
     let Some(stored) = load_preferences(&paths)?.repository else {
         return Ok(None);
     };
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn a_selection_round_trips_through_the_preferences_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let paths = RuntimePaths::resolve().expect("runtime paths");
+        let paths = crate::runtime_paths::resolve().expect("runtime paths");
         let paths = RuntimePaths {
             config_dir: dir.path().to_path_buf(),
             ..paths
@@ -683,7 +683,7 @@ mod tests {
     fn a_corrupt_preferences_file_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(PREFERENCES_FILE), b"{ not json").expect("write");
-        let paths = RuntimePaths::resolve().expect("runtime paths");
+        let paths = crate::runtime_paths::resolve().expect("runtime paths");
         let paths = RuntimePaths {
             config_dir: dir.path().to_path_buf(),
             ..paths

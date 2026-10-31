@@ -455,7 +455,8 @@ describe("daemon transport and session lifecycle integration", () => {
       }),
     });
 
-    expect(screen.getByText("ExecuteCommand: git push origin main")).toBeTruthy();
+    expect(screen.getByText("Run a command")).toBeTruthy();
+    expect(screen.getByText("git push origin main", { selector: "code" })).toBeTruthy();
     const approveBtn = screen.getByRole("button", { name: "Approve" });
     await act(async () => {
       fireEvent.click(approveBtn);
@@ -475,7 +476,7 @@ describe("daemon transport and session lifecycle integration", () => {
       }),
     });
 
-    expect(screen.queryByText("ExecuteCommand: git push origin main")).toBeNull();
+    expect(screen.queryByText("git push origin main", { selector: "code" })).toBeNull();
 
     // 9. Question: daemon prompts a question and receives answer
     await transport.push({

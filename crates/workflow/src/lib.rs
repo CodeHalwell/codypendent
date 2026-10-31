@@ -78,8 +78,8 @@ pub use model::{
 pub use registry::{SetRegistry, WorkflowRegistry};
 pub use resolve::{AgentProfileSet, AgentProfileSetError, UnresolvedRole};
 pub use source::{
-    WorkflowScope, WorkflowSourceError, WorkflowSourceRegistry, REPAIR_GITHUB_CHECK_ID,
-    REPAIR_GITHUB_CHECK_MANIFEST,
+    definition_digest as workflow_definition_digest, WorkflowScope, WorkflowSourceError,
+    WorkflowSourceRegistry, REPAIR_GITHUB_CHECK_ID, REPAIR_GITHUB_CHECK_MANIFEST,
 };
 pub use store::{
     blocked_node_ids, ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord,

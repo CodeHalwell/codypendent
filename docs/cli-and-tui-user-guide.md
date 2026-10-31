@@ -271,10 +271,11 @@ equivalent and the key is the only way in.
 | | `Tab` / `Shift-Tab` | Move through controls across all mounted documents | Click a control |
 | | `Enter` / `Space` | Activate the focused extension control | Click the control |
 | | `Esc` | Return to the conversation composer | - |
-| **Run Control** | `n` | Start a new run | Palette row "New run" |
-| | `p` | Pause current run | Palette row "Pause / resume run" |
-| | `c` | Cancel active run | Palette row "Cancel run" |
-| | `s` | Steer / add prompt to running agent | Palette row "Steer run" |
+| **Run Control** | `F7` | Open a steering prompt for the selected run; Enter sends immediate steering | Click the `F7 steer` footer chip or palette row "Steer run" |
+| | `F8` | Pause / resume the selected run when its state allows it | Click the `F8 pause` / `F8 resume` footer chip |
+| | `F9` | Confirm interruption of the named run; later selection changes do not retarget it | Click the `F9 interrupt` footer chip |
+| | `Enter` with a live run and a composer draft | Queue the message as a follow-up | Click the composer send chip |
+| | `n` / `p` / `c` / `s` in Normal mode | New run / pause or resume / confirmed interruption / steering; printable keys remain text in the composer | Corresponding palette row |
 | | `q` | Close a Normal-mode view or browser (never quits); in text filters, including Help, it types `q` | Click outside it, or its `Esc close` chip |
 | | `Ctrl-C` | Detach the TUI (the run continues in the daemon) | Palette row "Detach" |
 | **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |

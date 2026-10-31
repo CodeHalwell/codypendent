@@ -30,7 +30,6 @@ use codypendent_knowledge::{
     RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
     Verification,
 };
-use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{LearningId, UserId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -153,7 +152,7 @@ pub struct DocCard {
 // ---------------------------------------------------------------------------
 
 fn database_path() -> anyhow::Result<PathBuf> {
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
+    let paths = crate::runtime_paths::resolve().context("resolving codypendent runtime paths")?;
     Ok(paths.data_dir.join(DATABASE_FILE))
 }
 

@@ -2227,6 +2227,7 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
             observer,
             Payload::Command(command(
                 CommandBody::StartWorkflow {
+                    expected_definition_digest: None,
                     manifest: manifest.to_string(),
                     workflow_id: None,
                     inputs: serde_json::Value::Null,
@@ -2259,6 +2260,7 @@ async fn start_workflow_is_role_denied_then_transport_unavailable() {
             contributor,
             Payload::Command(command(
                 CommandBody::StartWorkflow {
+                    expected_definition_digest: None,
                     manifest: manifest.to_string(),
                     workflow_id: None,
                     inputs: serde_json::Value::Null,

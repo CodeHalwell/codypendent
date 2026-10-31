@@ -3,7 +3,7 @@
  * Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import { NodeDaemonClient } from './node-client.js';
-import type { AgentMode, CommandBody, ConnectionFactory, IdeContextUpdate, Payload, QuestionOutcome, RequestOptions, SessionSummary, SessionStoreSnapshot, SessionEvent } from './index.js';
+import type { AgentMode, CommandBody, ConnectionFactory, IdeContextUpdate, Payload, QuestionOutcome, RequestOptions, SessionSummary, SessionStoreSnapshot, SessionEvent, WorkflowCatalog, WorkflowRunSnapshot, JsonValue } from './index.js';
 import { projectSession, type SessionProjection } from './session-view.js';
 
 export interface SharedSessionState {
@@ -25,6 +25,16 @@ export interface SharedSessionOptions {
 	clientVersion?: string;
 	onEvent?: (event: SessionEvent) => void;
 }
+
+/** Only a correlated CommandRejected proves a workflow mutation did not execute. */
+export class WorkflowCommandError extends Error {
+	constructor(message: string, readonly code: string, readonly retryable: boolean, readonly definitiveRejection: boolean) {
+		super(message);
+		this.name = 'WorkflowCommandError';
+	}
+}
+
+type WorkflowCommand = Extract<CommandBody, { type: 'ListWorkflows' | 'StartWorkflow' | 'ReadWorkflowRun' | 'PauseWorkflow' | 'ResumeWorkflow' | 'CancelWorkflow' | 'RetryWorkflowNode' }>;
 
 /** Owns a connection, never an agent loop, credentials, tools, or run lifetime. */
 export class SharedSession {
@@ -163,6 +173,63 @@ export class SharedSession {
 		return reply.payload.models;
 	}
 
+	/** Discover workflows on the selected connection without creating a chat session. */
+	async listWorkflows(repository?: string, options?: RequestOptions): Promise<WorkflowCatalog> {
+		if (repository !== undefined) { this.workflowIdentifier(repository, 4096); }
+		const reply = await this.workflowRequest({ type: 'ListWorkflows', repository }, options);
+		if (reply.type !== 'WorkflowCatalog') { throw this.workflowUnexpectedReply(); }
+		return reply.catalog;
+	}
+
+	/** Start exactly the named workflow in the caller's explicit repository. Never queues or retries. */
+	async startWorkflow(workflowId: string, inputs: Record<string, unknown>, repository: string, options?: RequestOptions & { expectedDefinitionDigest?: string }): Promise<string> {
+		this.requireWorkflowWrite();
+		this.workflowIdentifier(workflowId);
+		this.workflowIdentifier(repository, 4096);
+		const expectedDefinitionDigest = options?.expectedDefinitionDigest;
+		if (expectedDefinitionDigest !== undefined && (typeof expectedDefinitionDigest !== 'string' || !/^[a-f0-9]{64}$/.test(expectedDefinitionDigest))) { throw this.workflowInvalidRequest(); }
+		if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) { throw this.workflowInvalidRequest(); }
+		let encodedInputs: JsonValue;
+		try {
+			const serialized = JSON.stringify(inputs, (_key, value: unknown) => {
+				if (value === undefined || typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint'
+					|| typeof value === 'number' && !Number.isFinite(value)) { throw this.workflowInvalidRequest(); }
+				return value;
+			});
+			if (!serialized || serialized.length > 65_536) { throw this.workflowInvalidRequest(); }
+			encodedInputs = JSON.parse(serialized) as JsonValue;
+			if (!encodedInputs || typeof encodedInputs !== 'object' || Array.isArray(encodedInputs)) { throw this.workflowInvalidRequest(); }
+		} catch { throw this.workflowInvalidRequest(); }
+		const reply = await this.workflowRequest({ type: 'StartWorkflow', workflow_id: workflowId, manifest: '', inputs: encodedInputs, repository,
+			...(expectedDefinitionDigest !== undefined ? { expected_definition_digest: expectedDefinitionDigest } : {}) }, options);
+		if (reply.type !== 'WorkflowRunStarted' || !reply.workflow_run_id) { throw this.workflowUnexpectedReply(); }
+		return reply.workflow_run_id;
+	}
+
+	async readWorkflowRun(runId: string, options?: RequestOptions): Promise<WorkflowRunSnapshot> {
+		this.workflowIdentifier(runId);
+		const reply = await this.workflowRequest({ type: 'ReadWorkflowRun', workflow_run_id: runId }, options);
+		if (reply.type !== 'WorkflowRunSnapshot' || reply.snapshot.workflow_run_id !== runId) { throw this.workflowUnexpectedReply(); }
+		return reply.snapshot;
+	}
+
+	async pauseWorkflow(runId: string, options?: RequestOptions): Promise<void> {
+		await this.workflowMutation({ type: 'PauseWorkflow', workflow_run_id: runId }, options);
+	}
+
+	async resumeWorkflow(runId: string, options?: RequestOptions): Promise<void> {
+		await this.workflowMutation({ type: 'ResumeWorkflow', workflow_run_id: runId }, options);
+	}
+
+	async cancelWorkflow(runId: string, options?: RequestOptions): Promise<void> {
+		await this.workflowMutation({ type: 'CancelWorkflow', workflow_run_id: runId }, options);
+	}
+
+	async retryWorkflowNode(runId: string, nodeId: string, options?: RequestOptions): Promise<void> {
+		this.workflowIdentifier(nodeId);
+		await this.workflowMutation({ type: 'RetryWorkflowNode', workflow_run_id: runId, node_id: nodeId }, options);
+	}
+
 	async readService(body: Extract<CommandBody, { type: 'ReadCodeGraph' | 'ReadCodeGraphStatus' | 'ReadBlackboard' | 'ReadKnowledge' }>, options?: RequestOptions): Promise<Payload> {
 		const reply = await this.requireClient().requestGlobal(body, options);
 		this.checkReply(reply.payload); return reply.payload;
@@ -268,6 +335,40 @@ export class SharedSession {
 		const result = await this.requireClient().request(body, options);
 		this.checkReply(result);
 		return result;
+	}
+	private async workflowRequest(body: WorkflowCommand, options?: RequestOptions): Promise<Payload> {
+		const client = this.requireClient();
+		const epoch = this.epoch;
+		const changed = (): boolean => this.client !== client || this.epoch !== epoch;
+		let reply: Payload;
+		try { reply = (await client.requestGlobal(body, options)).payload; }
+		catch (error) {
+			if (changed()) { throw new WorkflowCommandError('The workflow connection changed. Reconcile its outcome before retrying.', 'workflow.connection-changed', false, false); }
+			throw error;
+		}
+		if (changed()) { throw new WorkflowCommandError('The workflow connection changed. Reconcile its outcome before retrying.', 'workflow.connection-changed', false, false); }
+		if (reply.type === 'CommandRejected') { throw new WorkflowCommandError(reply.message, reply.code, reply.retryable, true); }
+		if (reply.type === 'Error') { throw new WorkflowCommandError(reply.message, reply.code, reply.retryable, false); }
+		if (reply.type === 'Unknown') { throw this.workflowUnexpectedReply(); }
+		return reply;
+	}
+	private async workflowMutation(body: Extract<WorkflowCommand, { workflow_run_id: string }>, options?: RequestOptions): Promise<void> {
+		this.requireWorkflowWrite();
+		this.workflowIdentifier(body.workflow_run_id);
+		const reply = await this.workflowRequest(body, options);
+		if (reply.type !== 'CommandAccepted') { throw this.workflowUnexpectedReply(); }
+	}
+	private requireWorkflowWrite(): void {
+		if (!this.options.canWrite()) { throw new WorkflowCommandError('Trust this workspace before controlling a workflow.', 'workflow.workspace-untrusted', false, false); }
+	}
+	private workflowIdentifier(value: string, maximum = 128): void {
+		if (typeof value !== 'string' || !value.trim() || value.length > maximum || /[\x00-\x1f\x7f]/.test(value)) { throw this.workflowInvalidRequest(); }
+	}
+	private workflowInvalidRequest(): WorkflowCommandError {
+		return new WorkflowCommandError('Enter a bounded workflow ID, repository, and JSON input object.', 'workflow.invalid-request', false, false);
+	}
+	private workflowUnexpectedReply(): WorkflowCommandError {
+		return new WorkflowCommandError('The workflow response was not recognized. Reconcile its outcome before retrying.', 'workflow.unexpected-response', false, false);
 	}
 	private checkReply(reply: Payload): void {
 		if (reply.type === 'CommandRejected' || reply.type === 'Error') { throw new Error(reply.message); }

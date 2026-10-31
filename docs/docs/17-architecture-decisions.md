@@ -185,3 +185,83 @@ reproducible via `benches/crdt-bench`.
 CRDT snapshot is authoritative for drafts (ADR-004) and Git stores reviewed
 Markdown snapshots. The benchmark harness stays a standalone workspace so
 Automerge/Yrs never enter the product's dependency graph.
+
+---
+
+## ADR-017 — Independent products own their runtime state
+
+**Status:** Accepted
+
+**Decision:** Codypendent and Son of Anton ship independently, each with a
+pinned engine and SDK. An explicit product profile selects private data,
+configuration, credentials, logs and socket paths. Codypendent remains the
+default; embedding hosts can select `son-of-anton`. Explicit profile arguments
+override inherited selectors. Only the selected product's path overrides are
+read; the other product's environment variables do not redirect discovery.
+Branded clients pin their product when launching daemon children.
+
+Sharing requires explicit attachment through the authenticated, version-negotiated
+protocol. The selected daemon retains authority over its sessions, approvals,
+execution and durable store; attaching a client does not copy a live ledger or
+restart work. Disconnecting a client does not cancel a run. Private SQLite files
+are never the integration boundary.
+
+**Reason:** Either application must install and operate without the other.
+Sharing implementation must not silently share credentials, mutable stores or
+execution authority. Product profiles provide that boundary without requiring an
+upfront engine extraction or a separately installed runtime service.
+
+**Consequence:** Each product carries and updates its own pinned engine, with
+additional packaging size and compatibility verification. Independent daemons'
+database-local leases do not coordinate same-checkout writes: use separate
+writing worktrees and reviewed patch or commit exchange. Automatic cross-product
+write coordination requires a future jointly enforced ownership contract.
+Existing Codypendent defaults and repository-owned `.codypendent/` formats remain
+compatible; this decision requires no database migration. See
+[shared runtime integration](../SHARED_RUNTIME.md).
+
+---
+
+## ADR-018 — Workflow discovery binds explicit starts to reviewed definitions
+
+**Status:** Accepted
+
+**Decision:** Protocol 1.12 adds repository-scoped `ListWorkflows` and a bounded
+catalogue of definition metadata, inputs, source, diagnostics and definition
+digests. Discovery uses named execution's registry precedence and collision
+rules, authorizes access to private daemon sources, and echoes the canonical
+repository. Diagnostics expose static messages rather than raw YAML or parser
+context. Listing or selecting a definition does not execute it or establish
+model and tool readiness.
+
+A guarded `StartWorkflow` carries the selected definition's SHA-256 digest of
+the complete parsed definition, including inputs, budgets and steps. The daemon
+checks the same resolved manifest it will execute before creating a new run.
+Accepted-request recovery returns the original receipt; the store also compares
+owner, repository, inputs and full definition identity atomically when duplicate
+requests race. A conflicting request is rejected rather than creating another
+run. Clients retain uncertain request identities and require explicit
+reconciliation or retry; connection recovery never automatically replays starts.
+
+**Reason:** A workflow may change between browsing and submission, and a lost
+reply does not prove that a launch failed. Definition binding prevents silent
+execution of a changed workflow; atomic identity checks prevent concurrent
+retries from bypassing that guarantee. Parsed-definition digests allow formatting
+changes while detecting semantic changes beyond graph shape.
+
+**Consequence:** Clients must negotiate minor 12 before discovery or guarded
+starts. The optional digest preserves legacy unguarded starts; clients connected
+to older runtimes reject guarded requests before sending them. There is no
+database migration. Launching a changed definition requires a fresh selection
+and request identity; catalogue metadata is not an execution approval or a
+readiness certificate. Desktop's retained form state is scoped to the owning
+transport and app lifetime, not durable recovery of unsent inputs after exit.
+
+Distribution acceptance remains separate: final self-contained installers must
+include genuine pinned resources and pass packaging checks, followed by installed
+workflow execution, approvals, cancellation and budget-limit checks. An explicitly
+unbundled debug window test cannot satisfy those gates or weaken resource and
+execution-policy checks. Native signing/notarization and Windows shared-engine
+transport require platform evidence. See the
+[readiness record](../reviews/2026-10-31-product-readiness.md) and
+[native release smoke scope](../reviews/desktop-release-smoke.md).

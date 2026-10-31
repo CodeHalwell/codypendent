@@ -72,7 +72,7 @@
     "supported_protocols": [
       {
         "major": 1,
-        "minor": 11
+        "minor": 12
       }
     ],
     "type": "ClientHello"
@@ -125,7 +125,7 @@
     "pid": 4242,
     "protocol_version": {
       "major": 1,
-      "minor": 11
+      "minor": 12
     },
     "session_count": 2,
     "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
@@ -265,7 +265,7 @@
     "resume_token": "opaque",
     "selected_protocol": {
       "major": 1,
-      "minor": 11
+      "minor": 12
     },
     "type": "ServerHello"
   },
@@ -295,6 +295,33 @@
   "Payload_ShutdownRefused": {
     "active_run_count": 2,
     "type": "ShutdownRefused"
+  },
+  "Payload_WorkflowCatalog": {
+    "catalog": {
+      "diagnostics": [],
+      "items": [
+        {
+          "definition_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "description": "Review a pull request",
+          "id": "pr-review",
+          "inputs": {
+            "pull_request": {
+              "input_type": "github_pull_request",
+              "required": true
+            }
+          },
+          "node_count": 4,
+          "source": {
+            "type": "BuiltIn"
+          },
+          "version": 1
+        }
+      ],
+      "repository": "/home/user/project",
+      "truncated": false
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "WorkflowCatalog"
   },
   "Payload_WorkflowEvent": {
     "event": {

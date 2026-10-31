@@ -63,7 +63,7 @@ Consolidated documentation:
 
 The backend owns intelligence and session state; all frontends are clients.
 
-Son of Anton uses this runtime for its primary Unix editor chat, participants, inline assistance, repository board and graph. Its versioned SDK and runtime build inputs are vendored with provenance, so normal IDE builds need no sibling checkout. Both native clients and the IDE can observe the same durable sessions without cancelling work when a client closes. See [shared runtime integration](docs/SHARED_RUNTIME.md) for the ownership boundary, compatibility and verification.
+Son of Anton independently bundles a pinned copy of the engine for its Unix editor chat, participants, inline assistance, repository board and graph. The `son-of-anton` runtime profile has separate data, configuration, credentials and socket defaults; normal IDE builds need no sibling checkout or Codypendent installation. Explicit attachment lets the IDE observe a Codypendent-owned session without cancelling work when a client closes. See [shared runtime integration](docs/SHARED_RUNTIME.md) for profiles, ownership and compatibility.
 
 ## Skills Studio
 

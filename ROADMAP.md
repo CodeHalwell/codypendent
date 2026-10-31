@@ -134,8 +134,8 @@ passes its tests, and has no production caller.
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
 > `-D warnings`, `cargo test --workspace`). The current checkout declares
-> **4249 test attributes as of 2026-10-26**
-<!-- doc-count:test sources="crates" expect=4249 label="workspace total" -->
+> **4292 test attributes as of 2026-10-31**
+<!-- doc-count:test sources="crates" expect=4292 label="workspace total" -->
 > (a static `#[test]`/`#[tokio::test]` count over `crates/**/*.rs`, not a new full-suite result —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -237,8 +237,8 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger. **Updated 2026-08-18 (v0.11.0):** policy-*on* now does trigger one. `crates/codypendentd/src/automation.rs`'s `AutomationWebhookSink` is the `WebhookEventSink` this task built and never attached, and a verified, deduplicated delivery is fanned out to every enabled binding on that endpoint. It is a **second, separate** opt-in: `webhooks.toml` must set `automation_dispatch = true` on top of `enabled = true`, and both default to false. The per-endpoint signing key, body ceiling and replay window in `automation_endpoints` also finally govern something — `codypendent webhook endpoint add` is the writer that table never had, so `resolve_endpoint` no longer returns `None` for every request that reaches the listener
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery over the generated `@codypendent/protocol` package (as of v0.11.0 the 811-line hand-written `src/protocol/types.ts` mirror that shipped alongside it is **deleted**; the one remaining locally-declared wire view, `src/remote-ui/wire.ts`, is guarded field-by-field against the generated type at compile time), a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 323 vitest tests
-<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=323 label="VS Code vitest suite" -->
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery over the generated `@codypendent/protocol` package (as of v0.11.0 the 811-line hand-written `src/protocol/types.ts` mirror that shipped alongside it is **deleted**; the one remaining locally-declared wire view, `src/remote-ui/wire.ts`, is guarded field-by-field against the generated type at compile time), a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 327 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=327 label="VS Code vitest suite" -->
       across 15 files
 <!-- doc-count:vitest project="extensions/vscode" metric="files" expect=15 label="VS Code vitest files" -->
       (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
@@ -637,14 +637,17 @@ alongside this work.)
 
 - [x] **Conversation-centred shell + layout toggle** — the base view is a
       full-width transcript + a persistent bottom composer + a one-row status
-      footer. Type to send (a message starts a run, or steers the live one); `/`
+      footer. Type to send (a message starts a run, or queues a live run's follow-up); `/`
       on an empty composer opens the palette; PgUp/PgDn scroll; Ctrl-↑/↓ switch
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 751 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=751 label="TUI shell tests" -->
-      test attributes in the current source (counted 2026-10-04; this static count is not a full-suite pass).
+      model, so the panes are context, not a separate mode. `F7` opens explicit
+      steering, `F8` pauses/resumes, and `F9` confirms interruption of the pinned
+      run. Confirmation names its target and safely handles a run that finishes
+      while the prompt is open. Pure-reducer; 761 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=761 label="TUI shell tests" -->
+      test attributes in the current source (this static count is not a full-suite pass).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key
       actions.

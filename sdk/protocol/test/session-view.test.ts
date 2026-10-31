@@ -7,6 +7,40 @@ function events(...bodies: EventBody[]): SessionEvent[] {
 }
 
 describe("shared activity timeline", () => {
+  it("preserves the recorded run mode through incremental completion and history replay", () => {
+    const recorded = events(
+      { type: "RunStarted", run_id: "plan", objective: "Plan the change", mode: { type: "Plan" } },
+      { type: "RunStateChanged", run_id: "plan", state: { type: "Running" } },
+      { type: "RunCompleted", run_id: "plan", disposition: { type: "Completed", summary: "The plan" },
+        chronicle: { id: "chronicle", media_type: "text/plain", byte_length: 0, sha256: "0".repeat(64), sensitivity: { type: "Internal" } } },
+      { type: "RunUsage", run_id: "plan", prompt_tokens: 12, completion_tokens: 4 },
+    );
+    const started = projectSession({ ready: true, cursor: 1, droppedEvents: 0, events: recorded.slice(0, 1) });
+    const completed = projectSession({ ready: true, cursor: 3, droppedEvents: 0, events: recorded.slice(1, 3) }, started);
+    const live = projectSession({ ready: true, cursor: 4, droppedEvents: 0, events: recorded.slice(3) }, completed);
+    const history = projectSession({ ready: true, cursor: 4, droppedEvents: 0, events: recorded });
+    expect(live.runs).toEqual(history.runs);
+    expect(history.runs).toEqual([{ id: "plan", objective: "Plan the change", mode: "Plan", state: "Completed",
+      disposition: { type: "Completed", summary: "The plan" }, usage: { inputTokens: 12, outputTokens: 4, costMicros: undefined } }]);
+  });
+
+  it("leaves snapshot-only run modes unknown until their history supplies RunStarted", () => {
+    const snapshot = { ready: true, cursor: 3, droppedEvents: 0, events: [], projection: {
+      session_id: "session", title: "Restored", last_sequence: 3, active_runs: ["plan"], closed: false,
+    } };
+    const baseline = projectSession(snapshot);
+    expect(baseline.runs).toEqual([{ id: "plan", state: "Running" }]);
+    const restored = projectSession({ ...snapshot, events: events(
+      { type: "RunStarted", run_id: "plan", objective: "Plan the change", mode: { type: "Plan" } },
+      { type: "RunStateChanged", run_id: "plan", state: { type: "Running" } },
+      { type: "RunStateChanged", run_id: "plan", state: { type: "Paused" } },
+    ) }, baseline);
+    const next = projectSession({ ...snapshot, cursor: 4, projection: undefined, events: events(
+      { type: "RunStateChanged", run_id: "plan", state: { type: "Completed" } },
+    ).map(event => ({ ...event, sequence: 4 })) }, restored);
+    expect(next.runs).toEqual([{ id: "plan", state: "Completed", objective: "Plan the change", mode: "Plan" }]);
+  });
+
   it("retains daemon-recorded models across live updates, model changes and history replay", () => {
     const recorded = events(
       { type: "ModelStreamDelta", run_id: "a", text: "First " },

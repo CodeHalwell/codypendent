@@ -65,6 +65,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "session-projection.schema.json",
     "source-provenance.schema.json",
     "text-edit.schema.json",
+    "workflow-catalog.schema.json",
     "workspace-edit.schema.json",
 ];
 

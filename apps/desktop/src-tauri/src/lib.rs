@@ -40,6 +40,7 @@ pub mod repo_anchor;
 // under the data dir. Not protocol — there is no wire command for any of them,
 // so the shell reads and writes the files the CLI and TUI read and write.
 pub mod models;
+mod runtime_paths;
 
 pub use daemon::{ConnectionInfo, DaemonClient, DaemonFrame, FrameSink, RunHandle, SessionRow};
 pub use repository::RepositorySelection;

@@ -2209,12 +2209,12 @@ async fn run() -> anyhow::Result<()> {
                 manifest,
                 artifact,
                 allow_unsigned,
-            } => commands::plugin_verify(&manifest, &artifact, allow_unsigned),
+            } => commands::plugin_verify(&paths, &manifest, &artifact, allow_unsigned),
             PluginCommand::Trust { command } => match command {
                 TrustCommand::Add { id, public_key } => {
-                    commands::plugin_trust_add(&id, &public_key)
+                    commands::plugin_trust_add(&paths, &id, &public_key)
                 }
-                TrustCommand::List => commands::plugin_trust_list(),
+                TrustCommand::List => commands::plugin_trust_list(&paths),
                 TrustCommand::Remove { id } => commands::plugin_trust_remove(&paths, &id).await,
             },
         },

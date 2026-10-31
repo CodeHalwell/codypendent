@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import { Transcript } from "../src/components/Transcript.js";
 import type { TranscriptItem } from "../src/types.js";
@@ -16,8 +16,10 @@ it("prints formatted progress directly and updates it during streaming", () => {
 });
 
 it("combines short progress headings into one quiet line", () => {
-  const view = render(<Transcript items={[progress("**Checking repository contents**\n\n**Checking repository state**")]} connectionStatus="connected" />);
-  expect(view.container.querySelector(".transcript-thought")?.textContent).toBe("Checking repository contents · Checking repository state");
+  render(<Transcript items={[progress("**Checking repository contents**\n\n**Checking repository state**")]} connectionStatus="connected" />);
+  const entry = screen.getByLabelText("Agent progress");
+  expect(within(entry).getByText("Checking repository contents · Checking repository state")).toBeTruthy();
+  expect(within(entry).queryByRole("heading")).toBeNull();
 });
 
 it("keeps progress separate from the final answer and omits empty blocks", () => {
