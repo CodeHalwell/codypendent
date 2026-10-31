@@ -12416,10 +12416,15 @@ context_tokens = 1000000
                 repo.path(),
                 repo.path(),
             );
-            runtime
+            let run_outcome = runtime
                 .execute_run(&driver, ctx, CancellationToken::never())
                 .await
                 .expect("run completes");
+            assert!(
+                matches!(run_outcome.disposition, RunDisposition::Completed { .. }),
+                "a missing artifact must not fail the run in {mode:?}, got {:?}",
+                run_outcome.disposition
+            );
 
             let mut outcomes = Vec::new();
             while let Ok(event) = events.try_recv() {
@@ -12436,7 +12441,8 @@ context_tokens = 1000000
                 outcomes[0]
             );
             assert!(
-                matches!(&outcomes[1], ToolOutcome::Failed { message } if message == "artifact.not-found"),
+                matches!(&outcomes[1], ToolOutcome::Failed { message }
+                    if message.contains("no artifact") && message.contains(&missing.to_string())),
                 "a missing id is a legible failure in {mode:?}, got {:?}",
                 outcomes[1]
             );

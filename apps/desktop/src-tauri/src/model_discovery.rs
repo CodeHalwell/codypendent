@@ -170,479 +170,6 @@ async fn discover_models_in(
     Ok(report)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metadata_deadlines_allow_known_slow_agents_without_delaying_other_families() {
-        for agent in [
-            "claude-acp",
-            "claude-code",
-            "claude",
-            "gemini",
-            "gemini-cli",
-        ] {
-            assert_eq!(agent_discovery_timeout(agent), Duration::from_secs(45));
-        }
-        for agent in ["codex-acp", "copilot", "opencode", "custom-claude-server"] {
-            assert_eq!(agent_discovery_timeout(agent), Duration::from_secs(8));
-        }
-    }
-
-    fn config(id: &str, model: &str) -> ModelConfig {
-        ModelConfig {
-            id: ModelId(id.into()),
-            provider: "openai-compatible".into(),
-            base_url: "http://localhost:11434/v1".into(),
-            model: model.into(),
-            api_key_env: "EXISTING_KEY".into(),
-            context_tokens: Some(32000),
-            provider_id: Some("ollama".into()),
-        }
-    }
-
-    #[test]
-    fn discovered_models_preserve_existing_names_credentials_and_other_settings() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("models.toml");
-        std::fs::write(&path, "# keep this\n[speech]\nvoice = 'my-voice'\n").unwrap();
-        let existing = config("my-model", "coder:latest");
-        codypendent_runtime::models_file::write_model_entries(&path, &[existing.clone()]).unwrap();
-        let candidates = vec![
-            config("ollama/coder", "coder:latest"),
-            config("new-model", "chat:latest"),
-            config("my-model", "different"),
-        ];
-        let (added, default, _) = persist_candidates(&path, candidates.clone(), &[]).unwrap();
-        assert_eq!(added, vec!["new-model"]);
-        assert_eq!(default.as_deref(), Some("my-model"));
-        let saved = load_models(&path).unwrap();
-        assert_eq!(saved[0], existing);
-        assert_eq!(saved.len(), 2);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# keep this"));
-        assert!(text.contains("voice = 'my-voice'"));
-        assert!(persist_candidates(&path, candidates, &[])
-            .unwrap()
-            .0
-            .is_empty());
-    }
-
-    #[test]
-    fn local_discovery_validates_loopback_and_omits_non_chat_models() {
-        for url in [
-            "http://localhost:1234/v1",
-            "http://127.0.0.1:8000/v1",
-            "http://[::1]:11434/v1",
-        ] {
-            assert!(loopback_endpoint(url), "{url}");
-        }
-        for url in [
-            "https://api.example.com/v1",
-            "http://localhost.example.com/v1",
-            "http://user:secret@localhost/v1",
-            "http://localhost/v1?key=secret",
-            "file:///tmp/models",
-        ] {
-            assert!(!loopback_endpoint(url), "{url}");
-        }
-        assert!(chat_model("qwen-coder:latest"));
-        for model in [
-            "nomic-embed-text",
-            "text-embedding-3-large",
-            "whisper-large-v3",
-            "gemini-tts-preview",
-            "invalid\nmodel",
-        ] {
-            assert!(!chat_model(model));
-        }
-    }
-
-    #[tokio::test]
-    async fn a_real_local_catalog_is_persisted_as_usable_profiles() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let count = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /v1/models "));
-            let body = r#"{"data":[{"id":"local-coder"},{"id":"nomic-embed-text"}]}"#;
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        });
-        let provider: Provider = toml::from_str(&format!("id = 'local-test'\nname = 'Local test'\nprotocol = 'openai-chat'\nbase_url = 'http://{address}/v1'\nlocal = true\nauth = []")).unwrap();
-        let batch = discover_endpoint(provider, reqwest::Client::new()).await;
-        assert_eq!(batch.provider.state, "listed");
-        assert_eq!(batch.models.len(), 1);
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("models.toml");
-        let (added, default, _) = persist_candidates(&path, batch.models, &[]).unwrap();
-        assert_eq!(added, vec!["local-test/local-coder"]);
-        assert_eq!(default.as_deref(), Some("local-test/local-coder"));
-        assert_eq!(load_models(&path).unwrap()[0].model, "local-coder");
-        server.join().unwrap();
-    }
-
-    fn agent_config(id: &str, coordinate: &str) -> ModelConfig {
-        ModelConfig {
-            id: ModelId(id.into()),
-            provider: "acp".into(),
-            base_url: String::new(),
-            model: coordinate.into(),
-            api_key_env: String::new(),
-            provider_id: None,
-            context_tokens: Some(12345),
-        }
-    }
-
-    #[test]
-    fn installed_agent_defaults_refresh_old_versions_and_repair_only_disproved_selectors() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("models.toml");
-        let manual = agent_config("my-pinned-copilot", "copilot@1.0.98.#auto");
-        let current = vec![
-            agent_config("acp/copilot", "copilot@1.0.98."),
-            agent_config("acp/copilot#auto", "copilot@1.0.98.#auto"),
-            agent_config("acp/copilot#retired", "copilot@1.0.98.#retired"),
-            manual.clone(),
-        ];
-        codypendent_runtime::models_file::write_model_entries(&path, &current).unwrap();
-        let families = vec![DiscoveredFamily::Agent {
-            id: "copilot".into(),
-            selectors: Some(vec!["auto".into()]),
-        }];
-        let mut candidates = vec![
-            agent_config("acp/copilot#auto", "copilot#auto"),
-            agent_config("acp/copilot", "copilot"),
-        ];
-        candidates.sort_by_key(model_preference);
-        let (_, default_model, available_default_profiles) =
-            persist_candidates(&path, candidates, &families).unwrap();
-        let configured = load_models(&path).unwrap();
-        assert_eq!(default_model.as_deref(), Some("acp/copilot"));
-        assert_eq!(available_default_profiles, ["acp/copilot"]);
-        assert_eq!(
-            configured
-                .iter()
-                .find(|row| row.id.0 == "acp/copilot")
-                .unwrap()
-                .model,
-            "copilot"
-        );
-        assert_eq!(
-            configured
-                .iter()
-                .find(|row| row.id.0 == "acp/copilot")
-                .unwrap()
-                .context_tokens,
-            Some(12345)
-        );
-        assert!(!configured
-            .iter()
-            .any(|row| row.id.0 == "acp/copilot#retired"));
-        assert!(configured.contains(&manual));
-        let report = ModelDiscovery {
-            default_model,
-            available_default_profiles,
-            families,
-            ..Default::default()
-        };
-        assert_eq!(
-            reconcile_default(
-                &report,
-                Some(&ModelId("acp/copilot#retired".into())),
-                &configured
-            )
-            .as_deref(),
-            Some("acp/copilot")
-        );
-        assert_eq!(
-            reconcile_default(
-                &report,
-                Some(&ModelId("acp/copilot#auto".into())),
-                &configured
-            )
-            .as_deref(),
-            Some("acp/copilot#auto")
-        );
-        assert_eq!(
-            reconcile_default(&report, Some(&manual.id), &configured).as_deref(),
-            Some("my-pinned-copilot")
-        );
-    }
-
-    #[test]
-    fn a_slow_agent_keeps_the_selected_model_and_does_not_become_a_new_default() {
-        let current = agent_config("acp/claude-acp#opus", "claude-acp@0.66.0#opus");
-        let report = ModelDiscovery {
-            families: vec![DiscoveredFamily::Agent {
-                id: "claude-acp".into(),
-                selectors: None,
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            reconcile_default(&report, Some(&current.id), &[current.clone()]).as_deref(),
-            Some("acp/claude-acp#opus")
-        );
-        assert_eq!(reconcile_default(&report, None, &[current]), None);
-    }
-
-    #[test]
-    fn an_installed_agent_timeout_adds_only_its_unverified_default_profile() {
-        let batch = agent_discovery_batch(
-            AcpLaunchSpec {
-                registry_id: "gemini".into(),
-                name: "Gemini CLI".into(),
-                version: "0.46.0".into(),
-                command: PathBuf::from("/installed/gemini"),
-                args: vec!["--acp".into()],
-                env: Default::default(),
-            },
-            Err(
-                codypendent_integrations::acp_client::AcpClientError::Handshake(
-                    "Automatic discovery timed out".into(),
-                ),
-            ),
-        );
-        assert_eq!(batch.provider.state, "unavailable");
-        assert!(batch.provider.detail.contains("timed out"));
-        assert_eq!(batch.models.len(), 1);
-        assert_eq!(batch.models[0].id.0, "acp/gemini");
-        assert_eq!(batch.models[0].model, "gemini");
-        assert_eq!(batch.models[0].context_tokens, None);
-        let families = vec![batch.family.unwrap()];
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("models.toml");
-        let (added, default_model, available) =
-            persist_candidates(&path, batch.models.clone(), &families).unwrap();
-        assert_eq!(added, ["acp/gemini"]);
-        assert_eq!(default_model, None);
-        assert!(available.is_empty());
-
-        let selected = agent_config("acp/gemini#existing-choice", "gemini#existing-choice");
-        codypendent_runtime::models_file::write_model_entries(&path, &[selected.clone()]).unwrap();
-        persist_candidates(&path, batch.models, &families).unwrap();
-        let configured = load_models(&path).unwrap();
-        assert!(configured.contains(&selected));
-        let report = ModelDiscovery {
-            families,
-            ..Default::default()
-        };
-        assert_eq!(
-            reconcile_default(&report, Some(&selected.id), &configured).as_deref(),
-            Some("acp/gemini#existing-choice")
-        );
-    }
-
-    #[test]
-    fn startup_chooses_a_connected_default_but_manual_scans_keep_the_selected_agent() {
-        let selected = agent_config("acp/claude-acp#opus", "claude-acp#opus");
-        let connected = agent_config("acp/codex-acp", "codex-acp");
-        let configured = [selected.clone(), connected.clone()];
-        let report = ModelDiscovery {
-            default_model: Some(connected.id.0.clone()),
-            available_default_profiles: vec![connected.id.0.clone()],
-            detected: vec![DetectedProvider {
-                id: "claude-acp".into(),
-                name: "Claude Code".into(),
-                kind: "agent".into(),
-                state: "unavailable".into(),
-                detail: "Timed out".into(),
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            select_default(&report, Some(&selected.id), &configured, true).as_deref(),
-            Some("acp/codex-acp")
-        );
-        assert_eq!(
-            select_default(&report, Some(&selected.id), &configured, false).as_deref(),
-            Some("acp/claude-acp#opus")
-        );
-        assert_eq!(
-            select_default(
-                &ModelDiscovery::default(),
-                Some(&selected.id),
-                &configured,
-                true
-            )
-            .as_deref(),
-            Some("acp/claude-acp#opus")
-        );
-    }
-
-    #[test]
-    fn a_live_provider_list_repairs_a_retired_catalog_default() {
-        let old = config("hosted/retired", "retired");
-        let current = config("hosted/current", "current");
-        let report = ModelDiscovery {
-            default_model: Some(current.id.0.clone()),
-            available_default_profiles: vec![current.id.0.clone()],
-            families: vec![DiscoveredFamily::Endpoint {
-                provider_id: "ollama".into(),
-                endpoint: old.base_url.clone(),
-                models: vec!["current".into()],
-                complete: true,
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            reconcile_default(&report, Some(&old.id), &[old.clone(), current]).as_deref(),
-            Some("hosted/current")
-        );
-        let no_metadata = ModelDiscovery::default();
-        assert_eq!(
-            reconcile_default(&no_metadata, Some(&old.id), &[old.clone()]).as_deref(),
-            Some("hosted/retired")
-        );
-    }
-
-    #[test]
-    fn only_a_complete_live_list_removes_retired_automatic_profiles() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("models.toml");
-        let retired = config("ollama/retired", "retired");
-        let manual = config("my-retired-model", "retired");
-        let current = config("ollama/current", "current");
-        codypendent_runtime::models_file::write_model_entries(
-            &path,
-            &[retired.clone(), manual.clone()],
-        )
-        .unwrap();
-        let family = |complete| DiscoveredFamily::Endpoint {
-            provider_id: "ollama".into(),
-            endpoint: current.base_url.clone(),
-            models: vec!["current".into()],
-            complete,
-        };
-        persist_candidates(&path, vec![current.clone()], &[family(false)]).unwrap();
-        assert!(load_models(&path).unwrap().contains(&retired));
-        let families = vec![family(true)];
-        let (_, default_model, available_default_profiles) =
-            persist_candidates(&path, vec![current], &families).unwrap();
-        let configured = load_models(&path).unwrap();
-        assert!(!configured.contains(&retired));
-        assert!(configured.contains(&manual));
-        let report = ModelDiscovery {
-            default_model,
-            available_default_profiles,
-            families,
-            ..Default::default()
-        };
-        assert_eq!(
-            reconcile_default(&report, Some(&retired.id), &configured).as_deref(),
-            Some("ollama/current")
-        );
-    }
-
-    #[tokio::test]
-    async fn hosted_discovery_uses_existing_auth_and_only_the_account_model_list() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let count = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]).to_lowercase();
-            assert!(request.starts_with("get /v1/models "));
-            assert!(request.contains("authorization: bearer fixture-only-key"));
-            let body = r#"{"data":[{"id":"account-coder"},{"id":"text-embedding-3-large"}]}"#;
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        });
-        let provider: Provider = toml::from_str(&format!("id = 'hosted-test'\nname = 'Hosted test'\nprotocol = 'openai-chat'\nbase_url = 'http://{address}/v1'\nlocal = false\nauth = [{{ kind = 'api_key', env = ['UNSET_DISCOVERY_TEST_KEY'] }}]")).unwrap();
-        let batch =
-            discover_hosted(provider, reqwest::Client::new(), "fixture-only-key".into()).await;
-        assert_eq!(batch.provider.state, "listed");
-        assert_eq!(batch.models.len(), 1);
-        assert_eq!(batch.models[0].model, "account-coder");
-        assert!(!serde_json::to_string(&batch.provider)
-            .unwrap()
-            .contains("fixture-only-key"));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn ollama_metadata_omits_decision_and_gone_models_without_generating() {
-        use std::io::{BufRead, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = std::io::BufReader::new(&mut stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                assert!(line.starts_with("POST /api/show "));
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let (status, body) = match request["model"].as_str().unwrap() {
-                    "decision" => ("200 OK", r#"{"capabilities":["decision"]}"#),
-                    "gone" => ("410 Gone", "{}"),
-                    "chat" => ("200 OK", r#"{"capabilities":["completion","tools"]}"#),
-                    _ => ("200 OK", "{}"),
-                };
-                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-        });
-        let names = ["decision", "gone", "chat", "unknown"]
-            .map(str::to_string)
-            .to_vec();
-        let filtered = filter_ollama_chat_models(
-            &reqwest::Client::new(),
-            &format!("http://{address}/v1"),
-            names,
-        )
-        .await;
-        assert_eq!(filtered, ["chat", "unknown"]);
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "checks installed agents without submitting any prompts"]
-    async fn installed_agents_are_discovered_without_changing_user_configuration() {
-        let directory = tempfile::tempdir().unwrap();
-        let report = discover_models_in(directory.path(), None).await.unwrap();
-        for provider in &report.detected {
-            eprintln!(
-                "{}: {} ({})",
-                provider.name, provider.state, provider.detail
-            );
-        }
-        eprintln!(
-            "{} profiles; default {:?}",
-            report.added.len(),
-            report.default_model
-        );
-        assert!(
-            !report.added.is_empty(),
-            "this machine has installed ACP agents"
-        );
-        assert!(report.default_model.is_some());
-        assert!(
-            load_models(&directory.path().join("models.toml"))
-                .unwrap()
-                .len()
-                > 0
-        );
-    }
-}
-
 fn loopback_endpoint(endpoint: &str) -> bool {
     reqwest::Url::parse(endpoint).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https")
@@ -1250,5 +777,484 @@ fn agent_discovery_batch(
         },
         models,
         family,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_deadlines_allow_known_slow_agents_without_delaying_other_families() {
+        for agent in [
+            "claude-acp",
+            "claude-code",
+            "claude",
+            "gemini",
+            "gemini-cli",
+        ] {
+            assert_eq!(agent_discovery_timeout(agent), Duration::from_secs(45));
+        }
+        for agent in ["codex-acp", "copilot", "opencode", "custom-claude-server"] {
+            assert_eq!(agent_discovery_timeout(agent), Duration::from_secs(8));
+        }
+    }
+
+    fn config(id: &str, model: &str) -> ModelConfig {
+        ModelConfig {
+            id: ModelId(id.into()),
+            provider: "openai-compatible".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: model.into(),
+            api_key_env: "EXISTING_KEY".into(),
+            context_tokens: Some(32000),
+            provider_id: Some("ollama".into()),
+        }
+    }
+
+    #[test]
+    fn discovered_models_preserve_existing_names_credentials_and_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models.toml");
+        std::fs::write(&path, "# keep this\n[speech]\nvoice = 'my-voice'\n").unwrap();
+        let existing = config("my-model", "coder:latest");
+        codypendent_runtime::models_file::write_model_entries(
+            &path,
+            std::slice::from_ref(&existing),
+        )
+        .unwrap();
+        let candidates = vec![
+            config("ollama/coder", "coder:latest"),
+            config("new-model", "chat:latest"),
+            config("my-model", "different"),
+        ];
+        let (added, default, _) = persist_candidates(&path, candidates.clone(), &[]).unwrap();
+        assert_eq!(added, vec!["new-model"]);
+        assert_eq!(default.as_deref(), Some("my-model"));
+        let saved = load_models(&path).unwrap();
+        assert_eq!(saved[0], existing);
+        assert_eq!(saved.len(), 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this"));
+        assert!(text.contains("voice = 'my-voice'"));
+        assert!(persist_candidates(&path, candidates, &[])
+            .unwrap()
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn local_discovery_validates_loopback_and_omits_non_chat_models() {
+        for url in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:8000/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert!(loopback_endpoint(url), "{url}");
+        }
+        for url in [
+            "https://api.example.com/v1",
+            "http://localhost.example.com/v1",
+            "http://user:secret@localhost/v1",
+            "http://localhost/v1?key=secret",
+            "file:///tmp/models",
+        ] {
+            assert!(!loopback_endpoint(url), "{url}");
+        }
+        assert!(chat_model("qwen-coder:latest"));
+        for model in [
+            "nomic-embed-text",
+            "text-embedding-3-large",
+            "whisper-large-v3",
+            "gemini-tts-preview",
+            "invalid\nmodel",
+        ] {
+            assert!(!chat_model(model));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_local_catalog_is_persisted_as_usable_profiles() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let count = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /v1/models "));
+            let body = r#"{"data":[{"id":"local-coder"},{"id":"nomic-embed-text"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let provider: Provider = toml::from_str(&format!("id = 'local-test'\nname = 'Local test'\nprotocol = 'openai-chat'\nbase_url = 'http://{address}/v1'\nlocal = true\nauth = []")).unwrap();
+        let batch = discover_endpoint(provider, reqwest::Client::new()).await;
+        assert_eq!(batch.provider.state, "listed");
+        assert_eq!(batch.models.len(), 1);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models.toml");
+        let (added, default, _) = persist_candidates(&path, batch.models, &[]).unwrap();
+        assert_eq!(added, vec!["local-test/local-coder"]);
+        assert_eq!(default.as_deref(), Some("local-test/local-coder"));
+        assert_eq!(load_models(&path).unwrap()[0].model, "local-coder");
+        server.join().unwrap();
+    }
+
+    fn agent_config(id: &str, coordinate: &str) -> ModelConfig {
+        ModelConfig {
+            id: ModelId(id.into()),
+            provider: "acp".into(),
+            base_url: String::new(),
+            model: coordinate.into(),
+            api_key_env: String::new(),
+            provider_id: None,
+            context_tokens: Some(12345),
+        }
+    }
+
+    #[test]
+    fn installed_agent_defaults_refresh_old_versions_and_repair_only_disproved_selectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models.toml");
+        let manual = agent_config("my-pinned-copilot", "copilot@1.0.98.#auto");
+        let current = vec![
+            agent_config("acp/copilot", "copilot@1.0.98."),
+            agent_config("acp/copilot#auto", "copilot@1.0.98.#auto"),
+            agent_config("acp/copilot#retired", "copilot@1.0.98.#retired"),
+            manual.clone(),
+        ];
+        codypendent_runtime::models_file::write_model_entries(&path, &current).unwrap();
+        let families = vec![DiscoveredFamily::Agent {
+            id: "copilot".into(),
+            selectors: Some(vec!["auto".into()]),
+        }];
+        let mut candidates = vec![
+            agent_config("acp/copilot#auto", "copilot#auto"),
+            agent_config("acp/copilot", "copilot"),
+        ];
+        candidates.sort_by_key(model_preference);
+        let (_, default_model, available_default_profiles) =
+            persist_candidates(&path, candidates, &families).unwrap();
+        let configured = load_models(&path).unwrap();
+        assert_eq!(default_model.as_deref(), Some("acp/copilot"));
+        assert_eq!(available_default_profiles, ["acp/copilot"]);
+        assert_eq!(
+            configured
+                .iter()
+                .find(|row| row.id.0 == "acp/copilot")
+                .unwrap()
+                .model,
+            "copilot"
+        );
+        assert_eq!(
+            configured
+                .iter()
+                .find(|row| row.id.0 == "acp/copilot")
+                .unwrap()
+                .context_tokens,
+            Some(12345)
+        );
+        assert!(!configured
+            .iter()
+            .any(|row| row.id.0 == "acp/copilot#retired"));
+        assert!(configured.contains(&manual));
+        let report = ModelDiscovery {
+            default_model,
+            available_default_profiles,
+            families,
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_default(
+                &report,
+                Some(&ModelId("acp/copilot#retired".into())),
+                &configured
+            )
+            .as_deref(),
+            Some("acp/copilot")
+        );
+        assert_eq!(
+            reconcile_default(
+                &report,
+                Some(&ModelId("acp/copilot#auto".into())),
+                &configured
+            )
+            .as_deref(),
+            Some("acp/copilot#auto")
+        );
+        assert_eq!(
+            reconcile_default(&report, Some(&manual.id), &configured).as_deref(),
+            Some("my-pinned-copilot")
+        );
+    }
+
+    #[test]
+    fn a_slow_agent_keeps_the_selected_model_and_does_not_become_a_new_default() {
+        let current = agent_config("acp/claude-acp#opus", "claude-acp@0.66.0#opus");
+        let report = ModelDiscovery {
+            families: vec![DiscoveredFamily::Agent {
+                id: "claude-acp".into(),
+                selectors: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_default(&report, Some(&current.id), std::slice::from_ref(&current))
+                .as_deref(),
+            Some("acp/claude-acp#opus")
+        );
+        assert_eq!(reconcile_default(&report, None, &[current]), None);
+    }
+
+    #[test]
+    fn an_installed_agent_timeout_adds_only_its_unverified_default_profile() {
+        let batch = agent_discovery_batch(
+            AcpLaunchSpec {
+                registry_id: "gemini".into(),
+                name: "Gemini CLI".into(),
+                version: "0.46.0".into(),
+                command: PathBuf::from("/installed/gemini"),
+                args: vec!["--acp".into()],
+                env: Default::default(),
+            },
+            Err(
+                codypendent_integrations::acp_client::AcpClientError::Handshake(
+                    "Automatic discovery timed out".into(),
+                ),
+            ),
+        );
+        assert_eq!(batch.provider.state, "unavailable");
+        assert!(batch.provider.detail.contains("timed out"));
+        assert_eq!(batch.models.len(), 1);
+        assert_eq!(batch.models[0].id.0, "acp/gemini");
+        assert_eq!(batch.models[0].model, "gemini");
+        assert_eq!(batch.models[0].context_tokens, None);
+        let families = vec![batch.family.unwrap()];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models.toml");
+        let (added, default_model, available) =
+            persist_candidates(&path, batch.models.clone(), &families).unwrap();
+        assert_eq!(added, ["acp/gemini"]);
+        assert_eq!(default_model, None);
+        assert!(available.is_empty());
+
+        let selected = agent_config("acp/gemini#existing-choice", "gemini#existing-choice");
+        codypendent_runtime::models_file::write_model_entries(
+            &path,
+            std::slice::from_ref(&selected),
+        )
+        .unwrap();
+        persist_candidates(&path, batch.models, &families).unwrap();
+        let configured = load_models(&path).unwrap();
+        assert!(configured.contains(&selected));
+        let report = ModelDiscovery {
+            families,
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_default(&report, Some(&selected.id), &configured).as_deref(),
+            Some("acp/gemini#existing-choice")
+        );
+    }
+
+    #[test]
+    fn startup_chooses_a_connected_default_but_manual_scans_keep_the_selected_agent() {
+        let selected = agent_config("acp/claude-acp#opus", "claude-acp#opus");
+        let connected = agent_config("acp/codex-acp", "codex-acp");
+        let configured = [selected.clone(), connected.clone()];
+        let report = ModelDiscovery {
+            default_model: Some(connected.id.0.clone()),
+            available_default_profiles: vec![connected.id.0.clone()],
+            detected: vec![DetectedProvider {
+                id: "claude-acp".into(),
+                name: "Claude Code".into(),
+                kind: "agent".into(),
+                state: "unavailable".into(),
+                detail: "Timed out".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            select_default(&report, Some(&selected.id), &configured, true).as_deref(),
+            Some("acp/codex-acp")
+        );
+        assert_eq!(
+            select_default(&report, Some(&selected.id), &configured, false).as_deref(),
+            Some("acp/claude-acp#opus")
+        );
+        assert_eq!(
+            select_default(
+                &ModelDiscovery::default(),
+                Some(&selected.id),
+                &configured,
+                true
+            )
+            .as_deref(),
+            Some("acp/claude-acp#opus")
+        );
+    }
+
+    #[test]
+    fn a_live_provider_list_repairs_a_retired_catalog_default() {
+        let old = config("hosted/retired", "retired");
+        let current = config("hosted/current", "current");
+        let report = ModelDiscovery {
+            default_model: Some(current.id.0.clone()),
+            available_default_profiles: vec![current.id.0.clone()],
+            families: vec![DiscoveredFamily::Endpoint {
+                provider_id: "ollama".into(),
+                endpoint: old.base_url.clone(),
+                models: vec!["current".into()],
+                complete: true,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_default(&report, Some(&old.id), &[old.clone(), current]).as_deref(),
+            Some("hosted/current")
+        );
+        let no_metadata = ModelDiscovery::default();
+        assert_eq!(
+            reconcile_default(&no_metadata, Some(&old.id), std::slice::from_ref(&old)).as_deref(),
+            Some("hosted/retired")
+        );
+    }
+
+    #[test]
+    fn only_a_complete_live_list_removes_retired_automatic_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models.toml");
+        let retired = config("ollama/retired", "retired");
+        let manual = config("my-retired-model", "retired");
+        let current = config("ollama/current", "current");
+        codypendent_runtime::models_file::write_model_entries(
+            &path,
+            &[retired.clone(), manual.clone()],
+        )
+        .unwrap();
+        let family = |complete| DiscoveredFamily::Endpoint {
+            provider_id: "ollama".into(),
+            endpoint: current.base_url.clone(),
+            models: vec!["current".into()],
+            complete,
+        };
+        persist_candidates(&path, vec![current.clone()], &[family(false)]).unwrap();
+        assert!(load_models(&path).unwrap().contains(&retired));
+        let families = vec![family(true)];
+        let (_, default_model, available_default_profiles) =
+            persist_candidates(&path, vec![current], &families).unwrap();
+        let configured = load_models(&path).unwrap();
+        assert!(!configured.contains(&retired));
+        assert!(configured.contains(&manual));
+        let report = ModelDiscovery {
+            default_model,
+            available_default_profiles,
+            families,
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_default(&report, Some(&retired.id), &configured).as_deref(),
+            Some("ollama/current")
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_discovery_uses_existing_auth_and_only_the_account_model_list() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_lowercase();
+            assert!(request.starts_with("get /v1/models "));
+            assert!(request.contains("authorization: bearer fixture-only-key"));
+            let body = r#"{"data":[{"id":"account-coder"},{"id":"text-embedding-3-large"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let provider: Provider = toml::from_str(&format!("id = 'hosted-test'\nname = 'Hosted test'\nprotocol = 'openai-chat'\nbase_url = 'http://{address}/v1'\nlocal = false\nauth = [{{ kind = 'api_key', env = ['UNSET_DISCOVERY_TEST_KEY'] }}]")).unwrap();
+        let batch =
+            discover_hosted(provider, reqwest::Client::new(), "fixture-only-key".into()).await;
+        assert_eq!(batch.provider.state, "listed");
+        assert_eq!(batch.models.len(), 1);
+        assert_eq!(batch.models[0].model, "account-coder");
+        assert!(!serde_json::to_string(&batch.provider)
+            .unwrap()
+            .contains("fixture-only-key"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_metadata_omits_decision_and_gone_models_without_generating() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /api/show "));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let (status, body) = match request["model"].as_str().unwrap() {
+                    "decision" => ("200 OK", r#"{"capabilities":["decision"]}"#),
+                    "gone" => ("410 Gone", "{}"),
+                    "chat" => ("200 OK", r#"{"capabilities":["completion","tools"]}"#),
+                    _ => ("200 OK", "{}"),
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let names = ["decision", "gone", "chat", "unknown"]
+            .map(str::to_string)
+            .to_vec();
+        let filtered = filter_ollama_chat_models(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1"),
+            names,
+        )
+        .await;
+        assert_eq!(filtered, ["chat", "unknown"]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "checks installed agents without submitting any prompts"]
+    async fn installed_agents_are_discovered_without_changing_user_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = discover_models_in(directory.path(), None).await.unwrap();
+        for provider in &report.detected {
+            eprintln!(
+                "{}: {} ({})",
+                provider.name, provider.state, provider.detail
+            );
+        }
+        eprintln!(
+            "{} profiles; default {:?}",
+            report.added.len(),
+            report.default_model
+        );
+        assert!(
+            !report.added.is_empty(),
+            "this machine has installed ACP agents"
+        );
+        assert!(report.default_model.is_some());
+        assert!(!load_models(&directory.path().join("models.toml"))
+            .unwrap()
+            .is_empty());
     }
 }
