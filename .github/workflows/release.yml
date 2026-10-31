@@ -300,7 +300,7 @@ jobs:
         working-directory: extensions/vscode
         run: npm run package
       - name: Upload the extension bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: codypendent-vsix
           path: extensions/vscode/*.vsix
@@ -467,7 +467,7 @@ jobs:
           echo "artifact=$dist.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload the build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: codypendent-${{ matrix.target }}
           path: ${{ steps.package.outputs.artifact }}
@@ -666,7 +666,7 @@ jobs:
           esac
 
       - name: Upload the desktop artefact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: codypendent-desktop-${{ matrix.target }}
           path: codypendent-desktop-${{ matrix.target }}.*
@@ -732,7 +732,7 @@ jobs:
         run: python3 .github/scripts/generate_release_manifest.py dist
 
       - name: Upload verified distribution set
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-artifacts
           path: dist/*
