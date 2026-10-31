@@ -76,7 +76,7 @@ agent-framework-openai = "0.2.0"
 agent-framework-anthropic = "0.2.0"
 
 # TUI
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
