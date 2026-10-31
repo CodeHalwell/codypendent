@@ -93,7 +93,7 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Enter",
-        description: "send: start a run, or steer the active one",
+        description: "send: start a run, or queue a follow-up for the active one",
         mouse: None,
     },
     KeyBinding {
@@ -115,6 +115,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         keys: "Ctrl-↑ / Ctrl-↓",
         description: "switch to the previous / next run",
         mouse: None,
+    },
+    KeyBinding {
+        keys: "F7 / F8 / F9",
+        description: "steer the selected run · pause / resume · interrupt with confirmation",
+        mouse: Some("click a run-control chip"),
     },
     KeyBinding {
         keys: "F2",
@@ -370,6 +375,17 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
     // double-fire every command).
     if key.kind == KeyEventKind::Release {
         return Action::NoOp;
+    }
+    // Live run controls remain reachable while the composer owns printable
+    // keys. Prompt and decision modes retain their own keys; navigable browser
+    // modes keep the reducer's existing context-specific run-control actions.
+    if matches!(mode, InputMode::Composer | InputMode::Normal) {
+        match key.code {
+            KeyCode::F(7) => return Action::Steer,
+            KeyCode::F(8) => return Action::Pause,
+            KeyCode::F(9) => return Action::Cancel,
+            _ => {}
+        }
     }
     if matches!(mode, InputMode::Composer | InputMode::Normal) && alt(key) {
         if key.code == KeyCode::Char('o') {
@@ -1220,6 +1236,73 @@ mod tests {
             map_event(&key(KeyCode::F(2)), InputMode::Composer, W, &[]),
             Action::ToggleLayout
         );
+    }
+
+    #[test]
+    fn run_control_shortcuts_work_without_consuming_composer_text() {
+        for mode in [InputMode::Composer, InputMode::Normal] {
+            assert_eq!(map_event(&key(KeyCode::F(7)), mode, W, &[]), Action::Steer);
+            assert_eq!(map_event(&key(KeyCode::F(8)), mode, W, &[]), Action::Pause);
+            assert_eq!(map_event(&key(KeyCode::F(9)), mode, W, &[]), Action::Cancel);
+            assert_eq!(
+                map_event(&ctrl(KeyCode::Char('c')), mode, W, &[]),
+                Action::Detach
+            );
+        }
+        for letter in ['p', 'c', 's'] {
+            assert_eq!(
+                map_event(&ch(letter), InputMode::Composer, W, &[]),
+                Action::InputChar(letter)
+            );
+        }
+        assert_eq!(
+            map_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)),
+                InputMode::Composer,
+                W,
+                &[],
+            ),
+            Action::NavigatePatch {
+                forward: false,
+                files: false,
+            },
+            "Alt-P remains previous patch navigation"
+        );
+    }
+
+    #[test]
+    fn run_control_shortcuts_do_not_bypass_modal_input() {
+        for mode in [
+            InputMode::Editing,
+            InputMode::Confirm,
+            InputMode::Palette,
+            InputMode::Help,
+            InputMode::Approval,
+            InputMode::Question,
+            InputMode::CouncilResults,
+            InputMode::RemoteUi,
+        ] {
+            for function in [7, 8, 9] {
+                assert_eq!(
+                    map_event(&key(KeyCode::F(function)), mode, W, &[]),
+                    Action::NoOp,
+                    "F{function} must not bypass {mode:?} input"
+                );
+            }
+        }
+        for mode in [InputMode::Composer, InputMode::Normal] {
+            for function in [7, 8, 9] {
+                let release = Event::Key(KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..KeyEvent::new(KeyCode::F(function), KeyModifiers::NONE)
+                });
+                assert_eq!(
+                    map_event(&release, mode, W, &[]),
+                    Action::NoOp,
+                    "key release must not fire F{function} in {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

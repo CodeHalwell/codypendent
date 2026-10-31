@@ -70,6 +70,10 @@
     "type": "ListSessions",
     "workspace": "10000000-0000-0000-0000-000000000001"
   },
+  "CommandBody_ListWorkflows": {
+    "repository": "/home/user/project",
+    "type": "ListWorkflows"
+  },
   "CommandBody_MutateDocument": {
     "document_id": "70000000-0000-0000-0000-000000000001",
     "mutation": {
@@ -175,6 +179,7 @@
     "type": "StartWorkflow"
   },
   "CommandBody_StartWorkflow_named_workflow": {
+    "expected_definition_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "inputs": {
       "pull_request": 42
     },

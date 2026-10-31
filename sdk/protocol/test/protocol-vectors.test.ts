@@ -120,6 +120,8 @@ import type {
   TranscriptionMode,
   UserAction,
   WorkflowEvent,
+  WorkflowCatalog,
+  WorkflowCatalogSource,
   WorkflowNodeState,
   WorkflowNodeView,
   WorkflowRunPhase,
@@ -1048,6 +1050,31 @@ function reconstructWorkflowRunSnapshot(r: Record<string, unknown>): WorkflowRun
   };
 }
 
+function reconstructWorkflowCatalogSource(r: Record<string, unknown>): WorkflowCatalogSource {
+  const type = str(r, "type");
+  switch (type) {
+    case "BuiltIn": case "User": case "Repository": case "Unknown": return { type };
+    default: return unknownTag("WorkflowCatalogSource", type);
+  }
+}
+
+function reconstructWorkflowCatalog(r: Record<string, unknown>): WorkflowCatalog {
+  return {
+    repository: optStr(r, "repository"),
+    truncated: bool(r, "truncated"),
+    diagnostics: recArr(r, "diagnostics").map(item => ({ code: str(item, "code"), message: str(item, "message"), workflow_id: optStr(item, "workflow_id") })),
+    items: recArr(r, "items").map(item => ({
+      id: str(item, "id"), version: num(item, "version"), definition_digest: str(item, "definition_digest"),
+      description: optStr(item, "description"), node_count: num(item, "node_count"),
+      source: reconstructWorkflowCatalogSource(rec(item, "source")),
+      inputs: Object.fromEntries(Object.entries(rec(item, "inputs")).map(([name, value]) => {
+        const input = asRecord(value, "workflow input");
+        return [name, { input_type: str(input, "input_type"), required: bool(input, "required") }];
+      })),
+    })),
+  };
+}
+
 function reconstructWorkflowEvent(r: Record<string, unknown>): WorkflowEvent {
   const tag = str(r, "type");
   switch (tag) {
@@ -1915,9 +1942,12 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         document_id: str(r, "document_id"),
         target: reconstructPublishTarget(rec(r, "target")),
       };
+    case "ListWorkflows":
+      return { type: "ListWorkflows", repository: optStr(r, "repository") };
     case "StartWorkflow":
       return {
         type: "StartWorkflow",
+        expected_definition_digest: optStr(r, "expected_definition_digest"),
         manifest: str(r, "manifest"),
         workflow_id: optStr(r, "workflow_id"),
         inputs: optJson(r, "inputs"),
@@ -2348,6 +2378,8 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         command_id: str(r, "command_id"),
         page: reconstructCodeGraphPage(rec(r, "page")),
       };
+    case "WorkflowCatalog":
+      return { type: "WorkflowCatalog", command_id: str(r, "command_id"), catalog: reconstructWorkflowCatalog(rec(r, "catalog")) };
     case "RemoteUi":
       return {
         type: "RemoteUi",

@@ -100,9 +100,13 @@ pub use run::{
 };
 pub use secrets::*;
 pub use session::*;
-pub use version::{ProtocolVersion, PROBE_MODEL_MIN_MINOR, PROTOCOL_V1};
+pub use version::{
+    ProtocolVersion, PROBE_MODEL_MIN_MINOR, PROTOCOL_V1, WORKFLOW_CATALOG_MIN_MINOR,
+};
 pub use workflow::{
-    WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
+    WorkflowCatalog, WorkflowCatalogDiagnostic, WorkflowCatalogEntry, WorkflowCatalogInput,
+    WorkflowCatalogSource, WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
+    WorkflowRunSnapshot,
 };
 
 /// A per-build identifier, computed by `build.rs` and identical across the

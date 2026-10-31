@@ -9,6 +9,9 @@ import type { ArtifactRef } from "@codypendent/protocol";
 import type { ApprovalGrant } from "./approval.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
+import { PlanHandoff } from "./components/PlanHandoff.js";
+import { completedPlanHandoff } from "./planHandoff.js";
+import { createWorkflowLaunchMemory } from "./components/workflowInputs.js";
 import { Steering } from "./components/Steering.js";
 import { PromptQueue } from "./components/PromptQueue.js";
 import { usePromptQueueActions } from "./usePromptQueueActions.js";
@@ -32,7 +35,7 @@ import { RepoPicker } from "./components/RepoPicker.js";
 import { CouncilBrowser } from "./components/CouncilBrowser.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { ProviderPicker } from "./components/ProviderPicker.js";
-import type { ProviderRow } from "./components/localConfig.js";
+import type { ProviderRow, RunDefaults } from "./components/localConfig.js";
 import { ApiKeys } from "./components/ApiKeys.js";
 import { ModePicker } from "./components/ModePicker.js";
 import {
@@ -402,37 +405,46 @@ export const App: React.FC<AppProps> = ({
   const [modelDiscoveryReady, setModelDiscoveryReady] = useState(!shellAvailable());
   const discoveryPromise = useRef<Promise<unknown> | null>(null);
   const selectedModel = useRef<string | null>(null);
+  const defaultsReadGeneration = useRef(0);
   /** The composer draft, lifted so a view round-trip cannot lose it. */
   const [composerDraft, setComposerDraft] = useState("");
   const draftRevision = useRef(0);
   const modelRevision = useRef(0);
   const liveDraft = useRef(composerDraft);
+  const [objectivePending, setObjectivePending] = useState(false);
+  const pendingObjectives = useRef(0);
+  const preparingPlan = useRef(false);
+  const [planPreparing, setPlanPreparing] = useState(false);
+  const [preparedPlan, setPreparedPlan] = useState<string | null>(null);
+  const [workflowLaunchMemory] = useState(createWorkflowLaunchMemory);
+  const [planPreparationError, setPlanPreparationError] = useState<string | null>(null);
   liveDraft.current = composerDraft;
   const changeComposerDraft = useCallback((text: string) => { draftRevision.current++; liveDraft.current = text; setComposerDraft(text); }, []);
   const acceptComposerDraft = useCallback((submittedDraft: string) => {
     if (liveDraft.current === submittedDraft) { liveDraft.current = ""; setComposerDraft(""); }
+  }, []);
+  const refreshRunDefaults = useCallback(async (stillWanted: () => boolean, onRead?: (defaults: RunDefaults) => void) => {
+    const generation = ++defaultsReadGeneration.current;
+    const defaults = await localConfigClient.runDefaults();
+    if (generation !== defaultsReadGeneration.current || !stillWanted()) return;
+    const mode = defaults.mode.type === "Unknown" ? "Build" : defaults.mode.type;
+    selectedModel.current = defaults.model;
+    setRunDefaultsLabel(`${mode} mode · ${defaults.model ?? "model: daemon chooses"}`);
+    onRead?.(defaults);
   }, []);
   useEffect(() => {
     if (currentView !== "sessions" || !shellAvailable()) {
       return;
     }
     let cancelled = false;
-    void localConfigClient
-      .runDefaults()
-      .then((defaults) => {
-        if (!cancelled) {
-          const mode = defaults.mode.type === "Unknown" ? "Build" : defaults.mode.type;
-          selectedModel.current = defaults.model;
-          setRunDefaultsLabel(`${mode} mode · ${defaults.model ?? "model: daemon chooses"}`);
-        }
-      })
+    void refreshRunDefaults(() => !cancelled)
       .catch(() => {
         // The fallback constant stays; a failed read must not invent a label.
       });
     return () => {
       cancelled = true;
     };
-  }, [currentView, modelDiscoveryReady]);
+  }, [currentView, modelDiscoveryReady, refreshRunDefaults]);
   useEffect(() => {
     if (currentView !== "council" || !buildingCouncil || !shellAvailable()) {
       return;
@@ -593,11 +605,19 @@ export const App: React.FC<AppProps> = ({
   const attachedSession = useRef(state.activeSessionId);
   attachedSession.current = state.activeSessionId;
   const [agent] = useState(() => new NativeAgent({ submit: async (text) => {
+    if (preparingPlan.current) return false;
     const session = attachedSession.current;
     const send = nativeSubmit.current;
-    if (shellAvailable() && !selectedModel.current) await discoveryPromise.current;
-    if (attachedSession.current !== session || nativeSubmit.current !== send) return false;
-    return send(text);
+    pendingObjectives.current++;
+    setObjectivePending(true);
+    try {
+      if (shellAvailable() && !selectedModel.current) await discoveryPromise.current;
+      if (attachedSession.current !== session || nativeSubmit.current !== send) return false;
+      return await send(text);
+    } finally {
+      pendingObjectives.current--;
+      if (!pendingObjectives.current) setObjectivePending(false);
+    }
   }, sessionId: () => attachedSession.current }));
   useEffect(() => { agent.observeNative(); return () => agent.close(); }, [agent]);
   useEffect(() => { if (!connected) agent.close(); }, [connected, agent]);
@@ -611,12 +631,20 @@ export const App: React.FC<AppProps> = ({
     previousAgentSession.current = state.activeSessionId;
   }, [agent, state.activeSessionId]);
   const sendWithAgent = useCallback(async (objective: string): Promise<boolean> => {
-    const accepted = await agent.submitObjective(objective);
-    if (accepted) {
-      setFocusDecision(null);
-      setFollowLatestRequest((request) => request + 1);
+    if (preparingPlan.current) return false;
+    pendingObjectives.current++;
+    setObjectivePending(true);
+    try {
+      const accepted = await agent.submitObjective(objective);
+      if (accepted) {
+        setFocusDecision(null);
+        setFollowLatestRequest((request) => request + 1);
+      }
+      return accepted;
+    } finally {
+      pendingObjectives.current--;
+      if (!pendingObjectives.current) setObjectivePending(false);
     }
-    return accepted;
   }, [agent]);
   const modelRecovery = useModelRecovery({
     snapshot: () => ({ connected, epoch: state.connectionEpoch, sessionId: state.activeSessionId,
@@ -636,6 +664,55 @@ export const App: React.FC<AppProps> = ({
     },
   });
   const sendObjective = modelRecovery.submit;
+  const completedPlan = useMemo(() => completedPlanHandoff(state), [state]);
+  useEffect(() => { setPlanPreparationError(null); }, [completedPlan?.runId, state.activeSessionId]);
+  const planBoundary = useMemo(() => ({}), [state.connectionEpoch, state.status, state.activeSessionId,
+    state.attachingSessionId, state.sessionAttachmentConfirmed, repository?.path, viewIdentity.current]);
+  const livePlanContext = useRef({ boundary: planBoundary, candidate: completedPlan, draftRevision: draftRevision.current,
+    modelRevision: modelRevision.current, model: selectedModel.current, pending: objectivePending });
+  livePlanContext.current = { boundary: planBoundary, candidate: completedPlan, draftRevision: draftRevision.current,
+    modelRevision: modelRevision.current, model: selectedModel.current, pending: objectivePending };
+  const preparePlan = async () => {
+    const captured = livePlanContext.current;
+    if (!captured.candidate || captured.pending || pendingObjectives.current || preparingPlan.current || !shellAvailable()) return;
+    const identity = `${captured.candidate.sessionId}:${captured.candidate.runId}`;
+    if (preparedPlan === identity) return;
+    const current = () => {
+      const latest = livePlanContext.current;
+      return latest.boundary === captured.boundary && latest.candidate?.runId === captured.candidate?.runId &&
+        latest.draftRevision === captured.draftRevision && latest.modelRevision === captured.modelRevision &&
+        latest.model === captured.model && !latest.pending && !pendingObjectives.current;
+    };
+    preparingPlan.current = true;
+    // A pre-stage read may still be waiting for the shell; it cannot describe the new defaults.
+    defaultsReadGeneration.current++;
+    setPlanPreparing(true);
+    setPlanPreparationError(null);
+    modelRecovery.cancel();
+    let modeSaved = false;
+    try {
+      // Existing desktop semantics: stage Build for the next run, without starting one.
+      await localConfigClient.setRunMode({ type: "Build" });
+      modeSaved = true;
+      if (!current()) return;
+      await refreshRunDefaults(current, (defaults) => {
+        if (defaults.mode.type !== "Build") {
+          setPlanPreparationError("Build mode changed before preparation finished. Your draft was kept; try again.");
+          return;
+        }
+        changeComposerDraft(liveDraft.current.length ? `Implement this plan.\n\n${liveDraft.current}` : "Implement this plan.");
+        setPreparedPlan(identity);
+        setComposerFocusRequested(true);
+      });
+    } catch {
+      if (current()) setPlanPreparationError(modeSaved
+        ? "Build mode was saved, but its settings could not be refreshed. Your draft was kept; try again."
+        : "Could not prepare Build mode. Your draft was kept; try again.");
+    } finally {
+      preparingPlan.current = false;
+      setPlanPreparing(false);
+    }
+  };
   const cancel = useCallback(() => { modelRecovery.cancel(); return cancelNative(); }, [cancelNative, modelRecovery.cancel]);
   const pauseRun = useCallback(() => { modelRecovery.cancel(); return pauseNativeRun(); }, [pauseNativeRun, modelRecovery.cancel]);
   const desktopContext: DesktopContext = {
@@ -1174,6 +1251,8 @@ export const App: React.FC<AppProps> = ({
 
   useEffect(() => {
     if (!composerFocusRequested) return;
+    // Preparation can commit its draft before the mode-read promise unwinds.
+    if (planPreparing) return;
     if (currentView !== "sessions" || paletteOpen || shortcutsOpen || blockingModalOpen()) {
       setComposerFocusRequested(false);
       return;
@@ -1183,7 +1262,7 @@ export const App: React.FC<AppProps> = ({
     // frame, which WebKit can defer while the window is being activated.
     document.querySelector<HTMLTextAreaElement>(".workspace-composer textarea:not(:disabled)")?.focus();
     setComposerFocusRequested(false);
-  }, [composerFocusRequested, currentView, paletteOpen, shortcutsOpen]);
+  }, [composerFocusRequested, currentView, paletteOpen, shortcutsOpen, planPreparing]);
 
   useNativeDesktopActions((action) => {
     if (blockingModalOpen()) return;
@@ -1370,6 +1449,9 @@ export const App: React.FC<AppProps> = ({
                 }}
               />
             )}
+            {completedPlan && !objectivePending && shellAvailable() && preparedPlan !== `${completedPlan.sessionId}:${completedPlan.runId}` && (
+              <PlanHandoff preparing={planPreparing} error={planPreparationError} onPrepare={() => void preparePlan()} />
+            )}
             <Composer
               statusLabel={runDefaultsLabel}
               onOpenModels={() => selectView("models")}
@@ -1394,7 +1476,7 @@ export const App: React.FC<AppProps> = ({
               }
               onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
-              disabled={!connected || state.attachingSessionId !== null}
+              disabled={!connected || state.attachingSessionId !== null || planPreparing}
               canCancel={canControlRun}
               canSteer={canControlRun}
               steeringOpen={steeringOpen}
@@ -1454,9 +1536,13 @@ export const App: React.FC<AppProps> = ({
 
         {currentView === "workflow" && (
           <WorkflowView
+            key={repository?.path ?? "no-repository"}
             transport={transport}
+            repository={repository?.path ?? null}
+            onOpenRepository={() => selectView("repository")}
+            launchMemory={workflowLaunchMemory}
             connectionEpoch={state.connectionEpoch}
-            unavailable={transport ? null : state.detail}
+            unavailable={connected ? null : state.detail}
             onOpenBlackboard={(workflowRunId) => {
               setBlackboardRunId(workflowRunId);
               setCurrentView("blackboard");

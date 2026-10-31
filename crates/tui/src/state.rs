@@ -292,8 +292,8 @@ pub enum Overlay {
     },
     /// The steering-text prompt (buffer inline).
     Steering(String),
-    /// A "cancel this run?" confirmation.
-    ConfirmCancel,
+    /// A cancellation confirmation pinned to the run the operator reviewed.
+    ConfirmCancel { run_id: RunId },
     /// The Skill Studio browser (STEP 2.6): the [`AppState::skills`] list plus a
     /// detail panel that shows the selected skill's description, risk, and its
     /// requested permissions **verbatim** ("skill permissions are visible").
@@ -757,7 +757,7 @@ impl PatchSummary {
             .take(selected.saturating_add(1))
             .filter(|(_, line)| line.starts_with("diff --git "))
             .map(|(index, _)| index)
-            .last()
+            .next_back()
             .unwrap_or(0);
         let end = lines
             .iter()
@@ -3170,7 +3170,7 @@ impl AppState {
             | Overlay::AddModelProviderKey { .. }
             | Overlay::ApiKeySet { .. }
             | Overlay::CouncilRunObjective { .. } => InputMode::Editing,
-            Overlay::ConfirmCancel
+            Overlay::ConfirmCancel { .. }
             | Overlay::ConfirmWorkflowCancel { .. }
             | Overlay::ApiKeyRemoveConfirm { .. }
             | Overlay::ConfirmUiPluginApprove { .. }
@@ -3287,7 +3287,7 @@ impl AppState {
     }
 
     /// Whether the selected run is still live — i.e. a composer message should
-    /// *steer* it rather than start a fresh run. `false` when no run is selected
+    /// queue a follow-up rather than start a fresh run. `false` when no run is selected
     /// or the selected run has reached a terminal state.
     #[must_use]
     pub fn selected_run_is_active(&self) -> bool {

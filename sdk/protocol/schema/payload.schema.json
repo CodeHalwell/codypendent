@@ -5334,8 +5334,36 @@
           "type": "object"
         },
         {
+          "description": "Discover bounded named workflow metadata from the same sources used by StartWorkflow. Requires protocol 1.12 and the same role as starting a workflow.",
+          "properties": {
+            "repository": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "ListWorkflows"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).\n\nCarries the workflow **manifest YAML** (its content, not a path — the daemon never reads an arbitrary client-named file) and the typed `inputs` the manifest declares. Handled at the connection level like `MutateDocument` (a workflow run lives in its own durable store outside the session ledger): the daemon compiles the manifest, creates the run through its `WorkflowStarter` seam, and replies [`WorkflowRunStarted`](crate::envelope::Payload::WorkflowRunStarted) with the new run id — or `CommandRejected` when the manifest does not compile. A daemon assembled without a starter rejects it `workflow.transport-unavailable`. (Driving the created run is a later step; this command only makes runs durably creatable.)",
           "properties": {
+            "expected_definition_digest": {
+              "description": "Optional precondition binding a new launcher to the selected parsed definition. A mismatch rejects before creating a run; legacy callers may omit it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "inputs": {
               "description": "The typed inputs the manifest declares, as JSON. Defaults to null when omitted (a workflow with no required inputs)."
             },
@@ -17083,6 +17111,183 @@
       ],
       "type": "string"
     },
+    "WorkflowCatalog": {
+      "description": "Bounded workflow discovery metadata. No manifest, prompt, or environment is exposed.",
+      "properties": {
+        "diagnostics": {
+          "items": {
+            "$ref": "#/definitions/WorkflowCatalogDiagnostic"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/WorkflowCatalogEntry"
+          },
+          "type": "array"
+        },
+        "repository": {
+          "description": "Canonical repository used for resolution; reuse it when starting the selected workflow.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "description": "Some sources could not be inspected completely. No potentially shadowed entries are offered.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "diagnostics",
+        "items",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogDiagnostic": {
+      "description": "Static diagnostics intentionally exclude parser context and manifest scalar values.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "workflow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogEntry": {
+      "properties": {
+        "definition_digest": {
+          "description": "SHA-256 of the canonical parsed definition, including its inputs and budget.",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/definitions/WorkflowCatalogInput"
+          },
+          "type": "object"
+        },
+        "node_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/definitions/WorkflowCatalogSource"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "definition_digest",
+        "id",
+        "inputs",
+        "node_count",
+        "source",
+        "version"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogInput": {
+      "description": "Input types are domain names, not JSON Schema or an invented control/default.",
+      "properties": {
+        "input_type": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "input_type",
+        "required"
+      ],
+      "type": "object"
+    },
+    "WorkflowCatalogSource": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "BuiltIn"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "User"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "WorkflowEvent": {
       "description": "One live event on a workflow run's observability stream ([`Subscription::Workflow`](crate::handshake::Subscription::Workflow)), delivered as [`Payload::WorkflowEvent`](crate::envelope::Payload::WorkflowEvent).\n\nA newer peer's variant deserializes to [`Unknown`](WorkflowEvent::Unknown) so an additive event never breaks an older client.",
       "oneOf": [
@@ -19024,6 +19229,30 @@
         "has_more",
         "session_id",
         "through",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Repository-scoped, bounded metadata for named workflow selection (protocol 1.12).",
+      "properties": {
+        "catalog": {
+          "$ref": "#/definitions/WorkflowCatalog"
+        },
+        "command_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "WorkflowCatalog"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "command_id",
         "type"
       ],
       "type": "object"

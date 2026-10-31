@@ -41,6 +41,7 @@ import type {
   SessionSearchPage,
   SessionSummary,
   WorkflowEvent,
+  WorkflowCatalog,
   WorkflowRunSnapshot,
 } from "@codypendent/protocol";
 import type { QuestionOutcomeView, WorkspaceTarget, WorkspaceOpenRequest } from "./types.js";
@@ -328,7 +329,9 @@ export type DesktopTransport = {
   mutateSession?(sessionId: string, action: SessionLifecycleAction): Promise<SessionLifecycleOutcome>;
 
   /** Start a durable workflow run by id; `inputs` must be a JSON object. */
-  startWorkflow?(workflowId: string, inputs: Record<string, unknown>): Promise<string>;
+  startWorkflow?(workflowId: string, inputs: Record<string, unknown>, options?: { expectedRepository?: string; idempotencyKey?: string; expectedDefinitionDigest?: string }): Promise<string>;
+  /** Read the owning runtime's effective definitions for the captured repository. */
+  listWorkflows?(expectedRepository?: string): Promise<WorkflowCatalog>;
   /** A run's snapshot on its own, for a refresh that does not re-subscribe. */
   readWorkflowRun?(workflowRunId: string): Promise<WorkflowRunSnapshot>;
   /** Subscribe to a run's live streams and read both baselines. */
@@ -496,7 +499,8 @@ export function createTransport(): DesktopTransport | null {
     mutateSession: (sessionId, action) =>
       invoke<SessionLifecycleOutcome>("mutate_session", { sessionId, action }),
 
-    startWorkflow: (workflowId, inputs) => invoke<string>("start_workflow", { workflowId, inputs }),
+    listWorkflows: (expectedRepository) => invoke<WorkflowCatalog>("list_workflows", { expectedRepository }),
+    startWorkflow: (workflowId, inputs, options) => invoke<string>("start_workflow", { workflowId, inputs, ...options }),
     readWorkflowRun: (workflowRunId) =>
       invoke<WorkflowRunSnapshot>("read_workflow_run", { workflowRunId }),
     watchWorkflow: (workflowRunId) => invoke<WorkflowWatch>("watch_workflow", { workflowRunId }),

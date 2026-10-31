@@ -5,10 +5,39 @@ import {
   DiscoveryError,
   MAX_SOCKET_PATH_BYTES,
   platformDataDir,
+  resolveClientSocketPath,
   resolveRuntimePaths,
   validateSocketPath,
   type Env,
 } from "../src/protocol/discovery.js";
+
+describe("Codypendent editor connection selection", () => {
+  const inheritedSonEnvironment: Env = {
+    HOME: "/home/dana", XDG_RUNTIME_DIR: "/run/user/1000", AGENT_RUNTIME_PRODUCT: "son-of-anton",
+    SON_OF_ANTON_SOCKET: "/anton/daemon.sock", SON_OF_ANTON_DATA_DIR: "/anton/data",
+    SON_OF_ANTON_CONFIG_DIR: "/anton/config",
+  };
+
+  it("defaults to Codypendent when the editor inherits a Son of Anton environment", () => {
+    expect(resolveClientSocketPath({}, inheritedSonEnvironment, "linux"))
+      .toBe(path.join("/run/user/1000", "codypendent", "daemon.sock"));
+    expect(resolveClientSocketPath({}, { ...inheritedSonEnvironment, CODYPENDENT_SOCKET: "/cody/custom.sock" }, "linux"))
+      .toBe("/cody/custom.sock");
+  });
+
+  it("preserves handoff, attached and configured socket precedence over discovery", () => {
+    const cases = [
+      { selection: { configured: " /configured.sock " }, expected: "/configured.sock" },
+      { selection: { configured: "/configured.sock", attached: "/attached.sock" }, expected: "/attached.sock" },
+      { selection: { configured: "/configured.sock", attached: "/attached.sock", handoff: "/handoff.sock" }, expected: "/handoff.sock" },
+    ];
+    for (const { selection, expected } of cases) {
+      expect(resolveClientSocketPath(selection, inheritedSonEnvironment, "linux")).toBe(expected);
+    }
+    expect(resolveClientSocketPath({ configured: " \t" }, inheritedSonEnvironment, "linux"))
+      .toBe(path.join("/run/user/1000", "codypendent", "daemon.sock"));
+  });
+});
 
 // Resolution order mirrors crates/protocol/src/discovery.rs exactly.
 

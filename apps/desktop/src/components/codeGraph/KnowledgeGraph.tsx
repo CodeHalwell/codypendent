@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CircleDot, Expand, List, Map as MapIcon, Minus, Network, Pause, Play, Plus, RotateCcw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { ArrowLeft, ArrowRight, CircleDot, Expand, List, Map as MapIcon, Minus, Network, Pause, Play, Plus, RotateCcw } from "lucide-react";
 import type { CodeGraphPage } from "@codypendent/protocol";
 import { boundGraph, collectGraph, filterGraph, layoutGraph, MAP_HEIGHT, MAP_WIDTH, relationLabel } from "./layout.js";
 import { GraphCanvas } from "./GraphCanvas.js";
 import { GraphGuide, GraphInspector } from "./GraphInspector.js";
-import { fitCamera, nodeColor, symbolKind, type Camera, type Viewport } from "./presentation.js";
+import { fitCamera, nodeColor, symbolKind, symbolTitle, type Camera, type Viewport } from "./presentation.js";
 import { useGraphPhysics } from "./useGraphPhysics.js";
 import { useSymbolDetails } from "./useSymbolDetails.js";
 import { entryFunction, functionNeighborhood, layoutCalls } from "./callGraph.js";
+import { initialGraphSelection, navigateGraphSelection } from "./selectionHistory.js";
 import "./codeGraph.css";
 
 const INITIAL: Camera = { x: 0, y: 0, zoom: 1 };
@@ -18,7 +19,16 @@ export function KnowledgeGraph({ page, readNeighbors, defaultMode = "structure",
 }) {
   const [pages, setPages] = useState<CodeGraphPage[]>([]);
   const [expanded, setExpanded] = useState<string[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const initialSelection = useMemo(() => defaultMode === "calls" ? collectGraph([page]).nodes.find((node) => node.id === entryFunction(page)) ?? null : null, [page, defaultMode]);
+  const [savedHistory, navigate] = useReducer(navigateGraphSelection, { scope: page, node: initialSelection }, initialGraphSelection);
+  // Ignore old query state immediately, including the render before reset effects.
+  const history = savedHistory.scope === page ? savedHistory : initialGraphSelection({ scope: page, node: initialSelection });
+  const selectedEntry = history.entries[history.index];
+  const selected = selectedEntry?.id ?? null;
+  const setSelected = (id: string | null) => {
+    const node = id === null ? null : all.nodes.find((entry) => entry.id === id);
+    if (node !== undefined) navigate({ type: "select", scope: page, node });
+  };
   const [focused, setFocused] = useState<string | null>(null);
   const [relation, setRelation] = useState("");
   const [view, setView] = useState<"map" | "list">("map");
@@ -33,10 +43,10 @@ export function KnowledgeGraph({ page, readNeighbors, defaultMode = "structure",
 
   useEffect(() => {
     epoch.current++;
-    setPages([]); setExpanded([]); setSelected(defaultMode === "calls" ? entryFunction(page) : null); setFocused(null); setRelation(""); setMode(defaultMode);
+    setPages([]); setExpanded([]); navigate({ type: "reset", scope: page, node: initialSelection }); setFocused(null); setRelation(""); setMode(defaultMode);
     setLoading(null); setFailure(null); setCamera(INITIAL); setIncludeOther(false);
     return () => { epoch.current++; };
-  }, [page, defaultMode]);
+  }, [page, defaultMode, initialSelection]);
   useEffect(() => {
     const element = stage.current;
     if (!element || typeof ResizeObserver === "undefined") return;
@@ -51,8 +61,14 @@ export function KnowledgeGraph({ page, readNeighbors, defaultMode = "structure",
     return () => observer.disconnect();
   }, []);
 
-  const details = useSymbolDetails(page, defaultMode === "calls" || mode === "calls" ? selected : null, readNeighbors);
-  const all = useMemo(() => collectGraph([page, ...pages, ...details.pages]), [page, pages, details.pages]);
+  const details = useSymbolDetails(page, defaultMode === "calls" || mode === "calls" || history.restoring ? selected : null, readNeighbors);
+  const all = useMemo(() => {
+    const data = collectGraph([page, ...(savedHistory.scope === page ? pages : []), ...details.pages]);
+    // Detail pages have a smaller cache than the browsing trail. Keep a restored
+    // symbol visible while reloading, including the inspector's error/retry UI.
+    if (selectedEntry && !data.nodes.some((node) => node.id === selectedEntry.id)) data.nodes.push(selectedEntry);
+    return data;
+  }, [page, pages, details.pages, selectedEntry, savedHistory.scope]);
   const relations = useMemo(() => [...new Set(all.edges.map((edge) => edge.relation))].sort(), [all]);
   const filtered = useMemo(() => {
     const data = mode === "calls" ? functionNeighborhood(all, selected) : filterGraph(all, "", relation);
@@ -88,6 +104,10 @@ export function KnowledgeGraph({ page, readNeighbors, defaultMode = "structure",
     return { zoom: next, x: point.x - (point.x - old.x) * next / old.zoom, y: point.y - (point.y - old.y) * next / old.zoom };
   }), [viewport, mapWidth]);
   const selectNode = (id: string) => { if (!linked.has(id)) setIncludeOther(true); setSelected(id); };
+  const visitHistory = (type: "back" | "forward") => {
+    setFocused(null); setRelation(""); setIncludeOther(true);
+    navigate({ type });
+  };
   const expand = async () => {
     if (!selected || !readNeighbors || loading || expanded.includes(selected) || pages.length >= 6) return;
     const id = selected, current = epoch.current;
@@ -131,6 +151,11 @@ export function KnowledgeGraph({ page, readNeighbors, defaultMode = "structure",
           <button type="button" onClick={() => setCamera(fitCamera(physics.nodes, { ...viewport, width: mapWidth }))}><Expand size={14} /> Fit</button>
         </div>
       </>}
+    </div>
+    <div className="code-map-history" role="group" aria-label="Symbol navigation">
+      <button type="button" aria-label="Previous symbol" disabled={history.index === 0} onClick={() => visitHistory("back")}><ArrowLeft size={14} aria-hidden="true" /> Back</button>
+      <button type="button" aria-label="Next symbol" disabled={history.index === history.entries.length - 1} onClick={() => visitHistory("forward")}><ArrowRight size={14} aria-hidden="true" /> Forward</button>
+      <span aria-live="polite" title={active?.name}>{active ? symbolTitle(active.name) : selected ? details.loading ? "Loading symbol…" : "Symbol details unavailable" : "Map overview"}</span>
     </div>
     <div className={"code-map-workspace" + (active ? " has-selection" : "")}>
       <div className="code-map-stage" ref={stage}>

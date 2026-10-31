@@ -151,6 +151,7 @@ async fn legacy_and_forked_sessions_recover_only_applied_repository_provenance()
         &pool,
         legacy,
         CommandBody::StartWorkflow {
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: None,
             inputs: serde_json::json!({ "type": "StartRun" }),

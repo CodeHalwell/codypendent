@@ -20,7 +20,7 @@ use crate::ids::{
 };
 use crate::remote_ui::UiWireMessage;
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
-use crate::workflow::{WorkflowEvent, WorkflowRunSnapshot};
+use crate::workflow::{WorkflowCatalog, WorkflowEvent, WorkflowRunSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -382,6 +382,11 @@ pub enum Payload {
         events: Vec<SessionEvent>,
         through: u64,
         has_more: bool,
+    },
+    /// Repository-scoped, bounded metadata for named workflow selection (protocol 1.12).
+    WorkflowCatalog {
+        command_id: CommandId,
+        catalog: WorkflowCatalog,
     },
     /// A `ReadWorkflowRun` command's reply (Phase 5 STEP 5.2 / T9): the run's
     /// observability snapshot — its current phase plus every node's full current

@@ -7,7 +7,7 @@
  * inside it, Escape closes only the dialog, focus returns to the trigger, and
  * every non-session view carries a Back control.
  */
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { App } from "../src/App.js";
@@ -115,12 +115,12 @@ describe("the way back", () => {
     expect(screen.getByTestId("view-bar").textContent).toContain("API Keys");
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "‹ Back" }));
+      fireEvent.click(within(screen.getByTestId("view-bar")).getByRole("button", { name: "Back" }));
     });
     expect(screen.getByTestId("view-bar").textContent).toContain("Models");
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "‹ Back" }));
+      fireEvent.click(within(screen.getByTestId("view-bar")).getByRole("button", { name: "Back" }));
     });
     expect(screen.queryByTestId("view-bar")).toBeNull();
   });

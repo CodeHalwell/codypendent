@@ -21,7 +21,6 @@ use anyhow::{anyhow, bail, Context};
 #[cfg(test)]
 use base64::Engine as _;
 use codypendent_council::connection::Connection;
-use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, AgentMode, AnalyticsExportRequest, AnalyticsExportResult,
     AnalyticsPage, AnalyticsQuery, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactRef,
@@ -35,7 +34,7 @@ use codypendent_protocol::{
 use codypendent_protocol::{
     board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope, PageCursor,
     SessionLifecycleAction, SessionSearchFilters, SessionSearchPage, SessionSearchQuery,
-    SessionSummary, WorkflowRunSnapshot,
+    SessionSummary, WorkflowCatalog, WorkflowRunSnapshot,
 };
 // Run lifecycle (`PauseRun`/`ResumeRun`) and the pending-prompt queue
 // (`QueuePrompt` and friends). A fourth additive `use` block, for the same
@@ -304,7 +303,7 @@ pub struct SessionRow {
 /// The socket the daemon is expected on, resolved exactly the way every other
 /// client resolves it (`CODYPENDENT_SOCKET`, then the platform data dir).
 pub fn socket_path() -> anyhow::Result<PathBuf> {
-    Ok(RuntimePaths::resolve()
+    Ok(crate::runtime_paths::resolve()
         .context("resolving the codypendentd socket path")?
         .socket_path)
 }
@@ -1075,6 +1074,39 @@ impl DaemonClient {
 
     // --------------------------------------------------------------- Workflow
 
+    /// Discover exactly the workflows resolved by this connection's repository.
+    pub async fn list_workflows(
+        &self,
+        expected_repository: Option<String>,
+    ) -> anyhow::Result<WorkflowCatalog> {
+        if self.selected_protocol.minor < 12 {
+            bail!("Workflow discovery requires agent runtime protocol 1.12 or newer. Update the runtime, or use a known workflow id.");
+        }
+        self.check_workflow_repository(expected_repository.as_deref())?;
+        let repository = self
+            .repository
+            .clone()
+            .ok_or_else(|| anyhow!("Choose a repository before browsing workflows."))?;
+        let reply = self
+            .send_command(CommandBody::ListWorkflows {
+                repository: Some(repository.clone()),
+            })
+            .await?;
+        match reply.payload {
+            Payload::WorkflowCatalog { catalog, .. } if catalog.repository.as_deref() == Some(repository.as_str()) => Ok(catalog),
+            Payload::WorkflowCatalog { .. } => bail!("The workflow catalogue belongs to another repository. Reconnect before starting work."),
+            Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+            other => bail!("unexpected reply to ListWorkflows: {other:?}"),
+        }
+    }
+
+    fn check_workflow_repository(&self, expected: Option<&str>) -> anyhow::Result<()> {
+        if expected.is_some_and(|path| self.repository.as_deref() != Some(path)) {
+            bail!("The selected repository changed. Reload workflows before starting work.");
+        }
+        Ok(())
+    }
+
     /// Start a durable workflow run from a workflow the daemon resolves by id.
     ///
     /// `manifest` stays empty: the desktop does not ship YAML over the wire,
@@ -1091,16 +1123,51 @@ impl DaemonClient {
         workflow_id: String,
         inputs: serde_json::Value,
     ) -> anyhow::Result<String> {
+        self.start_workflow_with_options(workflow_id, inputs, None, None, None)
+            .await
+    }
+
+    /// Pin the UI's repository and retain its launch identity across an explicit retry.
+    pub async fn start_workflow_with_options(
+        &self,
+        workflow_id: String,
+        inputs: serde_json::Value,
+        expected_repository: Option<String>,
+        idempotency_key: Option<String>,
+        expected_definition_digest: Option<String>,
+    ) -> anyhow::Result<String> {
+        self.check_workflow_repository(expected_repository.as_deref())?;
+        if expected_definition_digest.is_some() && self.selected_protocol.minor < 12 {
+            bail!("Starting the selected definition requires agent runtime protocol 1.12 or newer. Update the runtime first.");
+        }
+        if expected_definition_digest.as_ref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            bail!("Invalid workflow definition fingerprint.");
+        }
         if !inputs.is_object() {
             bail!("workflow inputs must be a JSON object");
         }
+        if serde_json::to_vec(&inputs)?.len() > 65_536 {
+            bail!("Workflow inputs must fit within 64 KiB.");
+        }
+        if idempotency_key.as_ref().is_some_and(|key| {
+            key.trim().is_empty() || key.len() > 256 || key.chars().any(char::is_control)
+        }) {
+            bail!("Invalid workflow launch identity.");
+        }
         let reply = self
-            .send_command(CommandBody::StartWorkflow {
-                manifest: String::new(),
-                workflow_id: Some(workflow_id),
-                inputs,
-                repository: self.repository.clone(),
-            })
+            .send_command_with_options(
+                CommandBody::StartWorkflow {
+                    manifest: String::new(),
+                    workflow_id: Some(workflow_id),
+                    inputs,
+                    repository: self.repository.clone(),
+                    expected_definition_digest,
+                },
+                COMMAND_TIMEOUT,
+                idempotency_key,
+            )
             .await?;
         match reply.payload {
             Payload::WorkflowRunStarted {
@@ -1964,10 +2031,19 @@ impl DaemonClient {
         body: CommandBody,
         timeout: Duration,
     ) -> anyhow::Result<Envelope> {
+        self.send_command_with_options(body, timeout, None).await
+    }
+
+    async fn send_command_with_options(
+        &self,
+        body: CommandBody,
+        timeout: Duration,
+        idempotency_key: Option<String>,
+    ) -> anyhow::Result<Envelope> {
         let command_id = codypendent_protocol::CommandId::new();
         let command = codypendent_protocol::Command {
             command_id,
-            idempotency_key: command_id.to_string(),
+            idempotency_key: idempotency_key.unwrap_or_else(|| command_id.to_string()),
             expected_revision: None,
             body,
         };
@@ -2568,6 +2644,233 @@ mod tests {
             actor: Actor::System,
             body,
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_catalog_pins_repository_and_guarded_retry_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let digest = "a".repeat(64);
+        let expected_digest = digest.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello = read_envelope(&mut stream).await.unwrap().unwrap();
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(&hello, Payload::ServerHello(server_hello())),
+            )
+            .await
+            .unwrap();
+            let mut launch_ids = Vec::new();
+            for index in 0..4 {
+                let request = read_envelope(&mut stream).await.unwrap().unwrap();
+                let Payload::Command(command) = &request.payload else {
+                    panic!("expected command");
+                };
+                let payload = match &command.body {
+                    CommandBody::ListWorkflows { repository } => {
+                        assert!(index < 2);
+                        assert_eq!(repository.as_deref(), Some("/work/repo"));
+                        Payload::WorkflowCatalog {
+                            command_id: command.command_id,
+                            catalog: WorkflowCatalog {
+                                repository: Some(
+                                    if index == 0 {
+                                        "/work/repo"
+                                    } else {
+                                        "/work/foreign"
+                                    }
+                                    .into(),
+                                ),
+                                items: vec![],
+                                diagnostics: vec![],
+                                truncated: false,
+                            },
+                        }
+                    }
+                    CommandBody::StartWorkflow {
+                        workflow_id,
+                        inputs,
+                        repository,
+                        expected_definition_digest,
+                        ..
+                    } => {
+                        assert_eq!(workflow_id.as_deref(), Some("review"));
+                        assert_eq!(inputs, &serde_json::json!({"objective":"review the patch"}));
+                        assert_eq!(repository.as_deref(), Some("/work/repo"));
+                        assert_eq!(
+                            expected_definition_digest.as_deref(),
+                            Some(expected_digest.as_str())
+                        );
+                        assert_eq!(command.idempotency_key, "review-intent");
+                        launch_ids.push(command.command_id);
+                        Payload::WorkflowRunStarted {
+                            command_id: command.command_id,
+                            workflow_run_id: "owned-receipt".into(),
+                        }
+                    }
+                    other => panic!("unexpected workflow command: {other:?}"),
+                };
+                write_envelope(&mut stream, &Envelope::reply_to(&request, payload))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(launch_ids.len(), 2);
+            assert_ne!(
+                launch_ids[0], launch_ids[1],
+                "correlation ids change while launch identity stays fixed"
+            );
+        });
+        let (client, _) = DaemonClient::connect(
+            &socket,
+            Some("/work/repo".into()),
+            Arc::new(Collector::default()),
+        )
+        .await
+        .unwrap();
+        assert!(client
+            .list_workflows(Some("/work/foreign".into()))
+            .await
+            .is_err());
+        assert!(client
+            .start_workflow_with_options(
+                "review".into(),
+                serde_json::json!({}),
+                Some("/work/foreign".into()),
+                None,
+                None
+            )
+            .await
+            .is_err());
+        assert!(client
+            .start_workflow_with_options(
+                "review".into(),
+                serde_json::json!({"text":"é".repeat(40_000)}),
+                Some("/work/repo".into()),
+                None,
+                None
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("64 KiB"));
+        assert!(client
+            .start_workflow_with_options(
+                "review".into(),
+                serde_json::json!({}),
+                Some("/work/repo".into()),
+                Some(" ".into()),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            client
+                .list_workflows(Some("/work/repo".into()))
+                .await
+                .unwrap()
+                .repository
+                .as_deref(),
+            Some("/work/repo")
+        );
+        assert!(client
+            .list_workflows(Some("/work/repo".into()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("another repository"));
+        for _ in 0..2 {
+            let receipt = client
+                .start_workflow_with_options(
+                    "review".into(),
+                    serde_json::json!({"objective":"review the patch"}),
+                    Some("/work/repo".into()),
+                    Some("review-intent".into()),
+                    Some(digest.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt, "owned-receipt");
+        }
+        client.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_catalog_and_digest_guard_do_not_reach_an_older_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(&dir);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello = read_envelope(&mut stream).await.unwrap().unwrap();
+            let mut selected = server_hello();
+            selected.selected_protocol.minor = 11;
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(&hello, Payload::ServerHello(selected)),
+            )
+            .await
+            .unwrap();
+            let request = read_envelope(&mut stream).await.unwrap().unwrap();
+            let Payload::Command(command) = &request.payload else {
+                panic!("expected legacy start");
+            };
+            assert!(matches!(
+                &command.body,
+                CommandBody::StartWorkflow {
+                    expected_definition_digest: None,
+                    ..
+                }
+            ));
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(
+                    &request,
+                    Payload::WorkflowRunStarted {
+                        command_id: command.command_id,
+                        workflow_run_id: "legacy-receipt".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let (client, _) = DaemonClient::connect(
+            &socket,
+            Some("/work/repo".into()),
+            Arc::new(Collector::default()),
+        )
+        .await
+        .unwrap();
+        assert!(client
+            .list_workflows(Some("/work/repo".into()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("1.12"));
+        assert!(client
+            .start_workflow_with_options(
+                "review".into(),
+                serde_json::json!({}),
+                Some("/work/repo".into()),
+                Some("review-intent".into()),
+                Some("a".repeat(64))
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("1.12"));
+        assert_eq!(
+            client
+                .start_workflow("review".into(), serde_json::json!({}))
+                .await
+                .unwrap(),
+            "legacy-receipt"
+        );
+        client.shutdown().await;
+        server.await.unwrap();
     }
 
     /// A minimal daemon: handshake, accept every command, and emit one model

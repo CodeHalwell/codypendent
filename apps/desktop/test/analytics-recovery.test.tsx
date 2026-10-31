@@ -56,14 +56,16 @@ describe("analytics request recovery", () => {
     render(<AnalyticsDashboard onQueryAnalytics={query} />);
     await act(async () => undefined);
     const first = query.mock.calls[0][0];
+    expect(screen.getByRole("cell", { name: "First" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Load more measurements" }));
     expect(query.mock.calls[1][0]).toEqual({ ...first, cursor: "cursor-1" });
     await act(async () => more.reject(new Error("temporary socket failure")));
-    expect(screen.getByText("first")).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "First" })).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain("retry below");
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more measurements" })));
     expect(query.mock.calls[2][0]).toEqual({ ...first, cursor: "cursor-1" });
-    expect(screen.getByText("second")).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "First" })).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "Second" })).toBeTruthy();
     expect(screen.getByTestId("metric-input-tokens").textContent).toContain("24");
     expect(screen.queryByRole("button", { name: "Load more measurements" })).toBeNull();
   });
@@ -77,7 +79,7 @@ describe("analytics request recovery", () => {
     await act(async () => undefined);
     fireEvent.click(screen.getByRole("button", { name: "Load more measurements" }));
     await change("provider");
-    expect(screen.queryByText("first")).toBeNull();
+    expect(screen.queryByRole("cell", { name: "First" })).toBeNull();
     expect(screen.queryByTestId("analytics-empty")).toBeNull();
     expect(screen.getByTestId("analytics-loading")).toBeTruthy();
     await act(async () => fresh.resolve(page("fresh")));

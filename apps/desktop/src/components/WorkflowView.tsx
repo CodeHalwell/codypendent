@@ -3,13 +3,9 @@ import { EmptyState, PageSection, PageShell } from "./PageShell.js";
  * A durable workflow run: its graph, its live node transitions, and the four
  * lifecycle controls the protocol exposes.
  *
- * The split this view sits on is real and worth naming. The **list** of
- * available workflows has no wire command at all — the TUI reads
- * `<repo>/.codypendent/workflows/*.yaml` and overlays the last durable run from
- * SQLite (`crates/cli/src/tui.rs::load_workflows`). This shell has neither the
- * repository walker nor the database open, so it does not guess: there is no
- * workflow picker here, only a field for a workflow id the daemon resolves
- * itself, and the panel says so rather than showing a hardcoded menu.
+ * Available definitions come from the owning daemon's repository-scoped
+ * catalogue. The launcher submits a selected definition with declared inputs;
+ * the advanced ID entry remains available for older runtimes.
  *
  * **Control** is entirely protocol, and that half is complete: `StartWorkflow`,
  * `ReadWorkflowRun`, `PauseWorkflow`, `ResumeWorkflow`, `CancelWorkflow`,
@@ -29,6 +25,8 @@ import { useFocusTrap } from "../useFocusTrap.js";
 import type { WorkflowNodeView, WorkflowRunSnapshot } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
+import { WorkflowLauncher } from "./WorkflowLauncher.js";
+import { bindWorkflowLaunchMemory, createWorkflowLaunchMemory, workflowIntent, type WorkflowLaunchMemory } from "./workflowInputs.js";
 
 export interface WorkflowViewProps {
   transport: DesktopTransport | null;
@@ -44,6 +42,9 @@ export interface WorkflowViewProps {
    * gone and must be re-established. Zero means nothing has connected yet.
    */
   connectionEpoch?: number;
+  repository?: string | null;
+  onOpenRepository?: () => void;
+  launchMemory?: WorkflowLaunchMemory;
 }
 
 type Watch =
@@ -88,13 +89,37 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   initialRunId,
   onOpenBlackboard,
   connectionEpoch = 0,
+  repository,
+  onOpenRepository,
+  launchMemory,
 }) => {
-  const [runIdInput, setRunIdInput] = useState(initialRunId ?? "");
-  const [watch, setWatch] = useState<Watch>({ status: "idle" });
+  const [localMemory] = useState(createWorkflowLaunchMemory);
+  const memory = launchMemory ?? localMemory;
+  bindWorkflowLaunchMemory(memory, transport);
+  const memoryRepository = repository ?? "";
+  const boundary = useMemo(() => ({}), [transport, repository, memory]);
+  const restored = useRef({ boundary, runId: initialRunId ?? memory.runs.get(memoryRepository) });
+  if (restored.current.boundary !== boundary) restored.current = { boundary, runId: initialRunId ?? memory.runs.get(memoryRepository) };
+  const initialTarget = initialRunId ?? restored.current.runId;
+  const manualDraft = memory.manual.get(memoryRepository);
+  const liveBoundary = useRef(boundary); liveBoundary.current = boundary;
+  const liveEpoch = useRef(connectionEpoch); liveEpoch.current = connectionEpoch;
+  const liveAvailable = useRef(!unavailable); liveAvailable.current = !unavailable;
+  const watchScope = useRef(boundary);
+  const [runIdInput, setRunIdInput] = useState(initialTarget ?? "");
+  const [storedWatch, setWatch] = useState<Watch>({ status: "idle" });
+  const watch: Watch = watchScope.current === boundary ? storedWatch : { status: "idle" };
   const [notice, setNotice] = useState<string | null>(null);
-  const [startId, setStartId] = useState("");
-  const [startInputs, setStartInputs] = useState("");
+  const [startId, setStartId] = useState(manualDraft?.workflowId ?? "");
+  const [startInputs, setStartInputs] = useState(manualDraft?.inputs ?? "");
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [controlling, setControlling] = useState(false);
+  const pendingStart = useRef<symbol | null>(null);
+  const pendingControl = useRef<symbol | null>(null);
+  const openGeneration = useRef(0);
+  const observedEpoch = useRef(connectionEpoch);
+  const requestEpoch = useRef<number | null>(null);
   // The cancel confirmation takes focus and owns Escape (`useFocusTrap`).
   const cancelDialogRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(cancelDialogRef, {
@@ -105,24 +130,47 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   /** The run whose open may still be drawn. Two rapid opens race, and only the
    * most recent request's answer may paint — never the last to RESOLVE. */
   const liveOpen = useRef<string | null>(null);
+  const initialOpen = useRef<{ id: string; boundary: object } | null>(null);
+
+  useEffect(() => {
+    liveBoundary.current = boundary;
+    watchScope.current = boundary;
+    setWatch({ status: "idle" });
+    setNotice(null); setConfirmCancel(null); setStarting(false); setControlling(false);
+    pendingStart.current = null; pendingControl.current = null;
+    const draft = memory.manual.get(memoryRepository);
+    setStartId(draft?.workflowId ?? ""); setStartInputs(draft?.inputs ?? "");
+    setRunIdInput(initialTarget ?? "");
+    liveOpen.current = null; openGeneration.current++;
+    requestEpoch.current = null;
+    return () => { openGeneration.current++; if (liveBoundary.current === boundary) liveBoundary.current = {}; };
+  }, [boundary]);
 
   const open = useCallback(
     async (runId: string) => {
       const trimmed = runId.trim();
-      if (!transport?.watchWorkflow || trimmed.length === 0) {
+      if (!transport?.watchWorkflow || trimmed.length === 0 || unavailable) {
         return;
       }
+      if (liveOpen.current !== trimmed) { pendingControl.current = null; setControlling(false); }
       liveOpen.current = trimmed;
+      const generation = ++openGeneration.current;
+      const epoch = connectionEpoch;
+      requestEpoch.current = epoch;
+      watchScope.current = boundary;
+      setNotice(null);
       setWatch({ status: "loading" });
       try {
         const result = await transport.watchWorkflow(trimmed);
-        if (liveOpen.current !== trimmed) {
+        if (liveOpen.current !== trimmed || generation !== openGeneration.current || liveBoundary.current !== boundary || liveEpoch.current !== epoch) {
           // A newer open is in flight; its own answer sets the state.
           return;
         }
+        if (result.snapshot.workflow_run_id !== trimmed) throw new Error("The runtime returned a snapshot for another workflow run.");
         setWatch({ status: "watching", runId: trimmed, snapshot: result.snapshot });
+        memory.runs.set(memoryRepository, trimmed);
       } catch (error) {
-        if (liveOpen.current !== trimmed) {
+        if (liveOpen.current !== trimmed || generation !== openGeneration.current || liveBoundary.current !== boundary || liveEpoch.current !== epoch) {
           return;
         }
         // A refused read is an outcome. The graph area says the run could not
@@ -131,14 +179,16 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
         setWatch({ status: "failed", detail: describe(error) });
       }
     },
-    [transport],
+    [transport, boundary, connectionEpoch, unavailable, memory, memoryRepository],
   );
 
   useEffect(() => {
-    if (initialRunId) {
-      void open(initialRunId);
+    if (!initialTarget) initialOpen.current = null;
+    else if (!unavailable && transport?.watchWorkflow && (initialOpen.current?.id !== initialTarget || initialOpen.current.boundary !== boundary)) {
+      initialOpen.current = { id: initialTarget, boundary };
+      void open(initialTarget);
     }
-  }, [initialRunId, open]);
+  }, [initialTarget, open, boundary, unavailable, transport]);
 
   // A watch belongs to the connection that asked for it. A reconnect builds a
   // new client, so the daemon is no longer streaming this run to anyone and the
@@ -146,8 +196,13 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   // new connection, which re-subscribes and re-reads the baseline.
   const watchedRunId = watch.status === "watching" ? watch.runId : null;
   useEffect(() => {
-    if (connectionEpoch > 0 && watchedRunId) {
-      void open(watchedRunId);
+    if (observedEpoch.current === connectionEpoch) return;
+    observedEpoch.current = connectionEpoch;
+    pendingControl.current = null; pendingStart.current = null;
+    setControlling(false); setStarting(false); setConfirmCancel(null);
+    const target = liveOpen.current ?? watchedRunId;
+    if (connectionEpoch > 0 && target && requestEpoch.current !== connectionEpoch) {
+      void open(target);
     }
     // Deliberately keyed on the epoch alone: this is "the connection changed",
     // not "the run changed", which the effect above already handles.
@@ -192,13 +247,24 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
 
   const control = useCallback(
     async (action: () => Promise<void> | undefined, label: string, runId: string) => {
+      if (pendingControl.current || unavailable) return;
+      const token = Symbol(); pendingControl.current = token; setControlling(true);
+      const generation = openGeneration.current;
+      const current = () => liveBoundary.current === boundary && liveEpoch.current === connectionEpoch && liveOpen.current === runId && liveAvailable.current && openGeneration.current === generation;
+      let accepted = false;
       try {
-        await action();
+        const request = action();
+        if (!request) throw new Error("This runtime does not offer that workflow control.");
+        await request;
+        accepted = true;
+        if (!current()) return;
         setNotice(`${label} accepted`);
         // The daemon is the authority on what the command did, so the panel
         // re-reads its snapshot rather than predicting the new phase.
         if (transport?.readWorkflowRun) {
           const snapshot = await transport.readWorkflowRun(runId);
+          if (!current()) return;
+          if (snapshot.workflow_run_id !== runId) throw new Error("The runtime returned a snapshot for another workflow run.");
           setWatch((current) =>
             current.status === "watching" && current.runId === runId
               ? { ...current, snapshot }
@@ -206,14 +272,16 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
           );
         }
       } catch (error) {
-        setNotice(describe(error));
+        if (current()) setNotice(accepted ? `${label} accepted, but progress could not be refreshed: ${describe(error)}` : describe(error));
+      } finally {
+        if (pendingControl.current === token) { pendingControl.current = null; setControlling(false); }
       }
     },
-    [transport],
+    [transport, boundary, connectionEpoch, unavailable],
   );
 
   const startWorkflow = useCallback(async () => {
-    if (!transport?.startWorkflow) {
+    if (!transport?.startWorkflow || pendingStart.current || repository === null || unavailable) {
       return;
     }
     const id = startId.trim();
@@ -224,6 +292,10 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
     // Blank means "no inputs", which is the empty object — not null, and not a
     // guess at what the manifest wanted.
     const raw = startInputs.trim();
+    if (id.length > 512 || raw.length > 100_000) {
+      setNotice("Use at most 512 characters for the workflow id and 100,000 for its inputs.");
+      return;
+    }
     let inputs: Record<string, unknown> = {};
     if (raw.length > 0) {
       let parsed: unknown;
@@ -241,15 +313,36 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
       }
       inputs = parsed as Record<string, unknown>;
     }
+    let identity: string;
     try {
-      const runId = await transport.startWorkflow(id, inputs);
+      const intent = workflowIntent(id, "", inputs);
+      if (new TextEncoder().encode(JSON.stringify(inputs)).length > 65_536) {
+        setNotice("Workflow inputs must fit within 64 KiB.");
+        return;
+      }
+      identity = `manual\0${memoryRepository}\0${intent}`;
+    } catch {
+      setNotice("Workflow inputs must use finite numbers and JSON that can be serialized.");
+      return;
+    }
+    const key = memory.keys.get(identity) ?? crypto.randomUUID();
+    memory.keys.set(identity, key);
+    const token = Symbol(); pendingStart.current = token; setStarting(true);
+    try {
+      const runId = await transport.startWorkflow(id, inputs, { expectedRepository: repository ?? undefined, idempotencyKey: key });
+      if (!runId.trim()) throw new Error("The runtime did not return a workflow run identity.");
+      if (memory.transport === transport) memory.runs.set(memoryRepository, runId);
+      if (liveBoundary.current !== boundary || liveEpoch.current !== connectionEpoch || !liveAvailable.current) return;
+      memory.keys.delete(identity);
       setNotice(`workflow run ${runId} started`);
       setRunIdInput(runId);
       await open(runId);
     } catch (error) {
-      setNotice(describe(error));
+      if (liveBoundary.current === boundary && liveEpoch.current === connectionEpoch) setNotice(`Launch was not confirmed. ${describe(error)} An explicit retry of the same request keeps its launch identity.`);
+    } finally {
+      if (pendingStart.current === token) { pendingStart.current = null; setStarting(false); }
     }
-  }, [transport, startId, startInputs, open]);
+  }, [transport, startId, startInputs, open, repository, unavailable, boundary, connectionEpoch, memory, memoryRepository]);
 
   const nodes = watch.status === "watching" ? watch.snapshot.nodes : [];
   const phase = watch.status === "watching" ? watch.snapshot.phase : null;
@@ -296,6 +389,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
           <NodeRow
             key={node.node_id}
             node={node}
+            retryDisabled={controlling || !transport?.retryWorkflowNode || !!unavailable}
             onRetry={() =>
               void control(
                 () => transport?.retryWorkflowNode?.(node.workflow_run_id, node.node_id),
@@ -307,7 +401,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
         ))}
       </div>
     );
-  }, [unavailable, watch, nodes, control, transport]);
+  }, [unavailable, watch, nodes, control, transport, controlling]);
 
   return (
     <PageShell role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}>
@@ -316,24 +410,34 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
         <p style={{ margin: "4px 0 14px", fontSize: 13, color: "var(--cody-text-muted)" }}>
           Follow work across agents, review progress and keep each step moving.
         </p>
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+      </div>
+      <WorkflowLauncher transport={transport} repository={repository} connectionEpoch={connectionEpoch} unavailable={unavailable} launchMemory={memory}
+          onOpenRepository={onOpenRepository} onStarted={(runId) => { setRunIdInput(runId); void open(runId); }} />
+      <div style={{ padding: "0 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
+        <details style={{ marginTop: 16 }}><summary style={{ cursor: "pointer", fontSize: 12 }}>Start by Workflow ID</summary>
+        <p style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>Use a known ID when browsing is unavailable. The runtime resolves its current definition when launched.</p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
           <input aria-label="Workflow id to start" value={startId}
-            onChange={(event) => setStartId(event.target.value)}
+            maxLength={512}
+            disabled={starting}
+            onChange={(event) => { setStartId(event.target.value); memory.manual.set(memoryRepository, { workflowId: event.target.value, inputs: startInputs }); }}
             onKeyDown={(event) => event.key === "Enter" && startId.trim() && void startWorkflow()}
-            placeholder="Workflow name or ID" style={{ ...field, minWidth: 240, flex: 1 }} />
+            placeholder="Workflow name or ID" style={{ ...field, minWidth: 0, flex: "1 1 200px" }} />
           <button style={{ ...button, background: "var(--cody-accent-strong)", color: "var(--cody-on-accent)" }}
-            disabled={!transport?.startWorkflow || !startId.trim()} onClick={() => void startWorkflow()}>
-            Start workflow
+            disabled={!transport?.startWorkflow || !startId.trim() || starting || repository === null || !!unavailable} onClick={() => void startWorkflow()}>
+            {starting ? "Starting…" : "Start workflow"}
           </button>
         </div>
         <PageSection title="Workflow inputs" description="Optional values for this run">
           <label htmlFor="workflow-inputs" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>Input values as JSON</label>
           <input id="workflow-inputs" aria-label="Workflow inputs JSON" value={startInputs}
-            onChange={(event) => setStartInputs(event.target.value)}
+            maxLength={100_000}
+            disabled={starting}
+            onChange={(event) => { setStartInputs(event.target.value); memory.manual.set(memoryRepository, { workflowId: startId, inputs: event.target.value }); }}
             onKeyDown={(event) => event.key === "Enter" && void startWorkflow()}
             placeholder='e.g. {"branch":"main"}' style={{ ...field, width: "100%", marginTop: 6 }} />
         </PageSection>
+        </details>
         <PageSection title="Open an existing run" description="Continue from a workflow run ID" defaultOpen={Boolean(initialRunId)}>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <input aria-label="Workflow run id" value={runIdInput}
@@ -363,6 +467,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
           <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               style={button}
+              disabled={controlling || !transport?.pauseWorkflow || !!unavailable}
               onClick={() =>
                 void control(() => transport?.pauseWorkflow?.(watch.runId), "pause", watch.runId)
               }
@@ -371,6 +476,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
             </button>
             <button
               style={button}
+              disabled={controlling || !transport?.resumeWorkflow || !!unavailable}
               onClick={() =>
                 void control(() => transport?.resumeWorkflow?.(watch.runId), "resume", watch.runId)
               }
@@ -379,6 +485,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
             </button>
             <button
               style={{ ...button, color: "var(--cody-danger-soft)", borderColor: "var(--cody-danger-soft)" }}
+              disabled={controlling || !transport?.cancelWorkflow || !!unavailable}
               onClick={() => setConfirmCancel(watch.runId)}
             >
               Cancel run
@@ -424,6 +531,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
               </button>
               <button
                 style={{ ...button, background: "var(--cody-danger)", borderColor: "var(--cody-danger-soft)", color: "var(--cody-on-accent)" }}
+                disabled={controlling || !transport?.cancelWorkflow || !!unavailable}
                 onClick={() => {
                   const runId = confirmCancel;
                   setConfirmCancel(null);
@@ -440,11 +548,12 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   );
 };
 
-const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ node, onRetry }) => (
+const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void; retryDisabled: boolean }> = ({ node, onRetry, retryDisabled }) => (
   <div
     data-testid={`workflow-node-${node.node_id}`}
     style={{
       padding: 12,
+      overflowWrap: "anywhere",
       background: "var(--cody-panel-raised)",
       border: "1px solid var(--cody-border-strong)",
       borderRadius: 8,
@@ -462,6 +571,7 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
       <button
         style={{ ...button, marginLeft: "auto" }}
         title="Re-drive the run from this node; its dependents reset and re-run with it"
+        disabled={retryDisabled}
         onClick={onRetry}
       >
         Retry from here

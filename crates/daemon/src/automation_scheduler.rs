@@ -1172,6 +1172,7 @@ impl AutomationScheduler {
         // 7. Start. The idempotency key is the receipt's, so a crash between here
         // and the receipt update resolves to the SAME run on re-drive.
         let request = StartWorkflowRequest {
+            expected_definition_digest: None,
             manifest: String::new(),
             workflow_id: Some(workflow_name),
             inputs: automation_inputs(binding, reservation, event),

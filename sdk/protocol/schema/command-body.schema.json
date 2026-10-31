@@ -6565,8 +6565,36 @@
       "type": "object"
     },
     {
+      "description": "Discover bounded named workflow metadata from the same sources used by StartWorkflow. Requires protocol 1.12 and the same role as starting a workflow.",
+      "properties": {
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "ListWorkflows"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
       "description": "Start a durable workflow run from a compiled manifest (Phase 5 STEP 5.2).\n\nCarries the workflow **manifest YAML** (its content, not a path — the daemon never reads an arbitrary client-named file) and the typed `inputs` the manifest declares. Handled at the connection level like `MutateDocument` (a workflow run lives in its own durable store outside the session ledger): the daemon compiles the manifest, creates the run through its `WorkflowStarter` seam, and replies [`WorkflowRunStarted`](crate::envelope::Payload::WorkflowRunStarted) with the new run id — or `CommandRejected` when the manifest does not compile. A daemon assembled without a starter rejects it `workflow.transport-unavailable`. (Driving the created run is a later step; this command only makes runs durably creatable.)",
       "properties": {
+        "expected_definition_digest": {
+          "description": "Optional precondition binding a new launcher to the selected parsed definition. A mismatch rejects before creating a run; legacy callers may omit it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "inputs": {
           "description": "The typed inputs the manifest declares, as JSON. Defaults to null when omitted (a workflow with no required inputs)."
         },

@@ -13,6 +13,14 @@ export interface SessionHandoff {
   line?: number;
 }
 
+function hasPathControl(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
 export function parseHandoff(query: string): SessionHandoff {
   if (query.length > 16_384) throw new Error("Session link is too long");
   const params = new URLSearchParams(query);
@@ -30,13 +38,13 @@ export function parseHandoff(query: string): SessionHandoff {
     throw new Error("Session link has an invalid session ID");
   }
   for (const value of [repository, socket, ...(checkout === undefined ? [] : [checkout])]) {
-    if (!path.isAbsolute(value) || /[\x00-\x1f\x7f]/.test(value)) {
+    if (!path.isAbsolute(value) || hasPathControl(value)) {
       throw new Error("Session link must name absolute local paths");
     }
   }
   validateSocketPath(socket);
   const file = params.get("file") ?? undefined;
-  if (file !== undefined && (!file || /[\\\x00-\x1f\x7f]/.test(file) || path.isAbsolute(file)
+  if (file !== undefined && (!file || file.includes("\\") || hasPathControl(file) || path.isAbsolute(file)
       || file.split("/").some((part) => !part || part === "." || part === ".."))) {
     throw new Error("Source location must stay inside the repository");
   }

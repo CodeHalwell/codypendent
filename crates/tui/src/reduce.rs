@@ -4477,18 +4477,31 @@ fn request_cancel(state: &mut AppState) {
         return;
     };
     if !is_terminal(run.state) {
-        state.overlay = Overlay::ConfirmCancel;
+        state.overlay = Overlay::ConfirmCancel { run_id: run.run_id };
     }
 }
 
 fn confirm_cancel(state: &mut AppState) {
-    if !matches!(state.overlay, Overlay::ConfirmCancel) {
+    let Overlay::ConfirmCancel { run_id } = state.overlay else {
         return;
-    }
+    };
     state.overlay = Overlay::None;
-    if let Some(run) = state.selected_run() {
-        let run_id = run.run_id;
-        state.outbox.push(Intent::CancelRun { run_id });
+    match state.runs.iter().find(|run| run.run_id == run_id) {
+        Some(run) if !is_terminal(run.state) => {
+            state.outbox.push(Intent::CancelRun { run_id });
+        }
+        Some(_) => {
+            state.notice = Some((
+                "That run has already finished; no cancellation was sent.".to_owned(),
+                state.tick + 40,
+            ));
+        }
+        None => {
+            state.notice = Some((
+                "That run is no longer available; no cancellation was sent.".to_owned(),
+                state.tick + 40,
+            ));
+        }
     }
 }
 
@@ -4498,7 +4511,7 @@ fn confirm_cancel(state: &mut AppState) {
 /// open.
 fn confirm_top(state: &mut AppState) {
     match &state.overlay {
-        Overlay::ConfirmCancel => confirm_cancel(state),
+        Overlay::ConfirmCancel { .. } => confirm_cancel(state),
         Overlay::ConfirmWorkflowCancel { .. } => {
             if let Overlay::ConfirmWorkflowCancel { workflow_run_id } =
                 std::mem::take(&mut state.overlay)
@@ -11258,6 +11271,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn retry_failed_run_uses_configured_model_after_reported_or_unknown_response() {
+        for reported in ["provider/raw-snapshot", ""] {
+            let mut state = AppState::new();
+            let run_id = RunId::new();
+            let agent_id = codypendent_protocol::AgentId::new();
+            let configured = ModelId("configured-provider-alias".to_owned());
+            let actor = |model: &str| Actor::Agent {
+                agent_id,
+                run_id,
+                model: ModelId(model.to_owned()),
+            };
+            reduce(
+                &mut state,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: "retry this change".to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            reduce(
+                &mut state,
+                ev(
+                    actor(&configured.0),
+                    EventBody::RunStateChanged {
+                        run_id,
+                        state: RunState::Running,
+                    },
+                ),
+            );
+            reduce(
+                &mut state,
+                ev(
+                    actor(reported),
+                    EventBody::ModelStreamDelta {
+                        run_id,
+                        text: "partial response before failure".to_owned(),
+                        thought: false,
+                    },
+                ),
+            );
+            // The durable terminal event identifies the configured execution
+            // route; a provider response identifier is not a retry target.
+            reduce(
+                &mut state,
+                ev(
+                    actor(&configured.0),
+                    EventBody::RunCompleted {
+                        run_id,
+                        disposition: RunDisposition::Failed {
+                            reason: "provider stream failed".to_owned(),
+                            error: None,
+                        },
+                        chronicle: artifact(),
+                    },
+                ),
+            );
+            let _ = state.drain_outbox();
+
+            reduce(&mut state, Action::RetryFailedRun);
+
+            assert_eq!(
+                state.drain_outbox(),
+                vec![Intent::StartRun {
+                    objective: "retry this change".to_owned(),
+                    mode: AgentMode::Build,
+                    model: Some(configured),
+                }],
+                "response identity {reported:?} must not replace the retry route"
+            );
+        }
+    }
+
     /// Task 3: `RunActivity` is derived purely from folding run-state,
     /// streaming, and tool-lifecycle events — never fetched. Walks a run
     /// through every transition the reducer owns: `Running` ⇒ `Thinking`, a
@@ -11498,11 +11584,168 @@ mod tests {
             }),
         );
         reduce(&mut s, Action::Cancel);
-        assert!(matches!(s.overlay, Overlay::ConfirmCancel));
+        assert_eq!(s.overlay, Overlay::ConfirmCancel { run_id });
         assert!(s.outbox.is_empty(), "no cancel until confirmed");
         reduce(&mut s, Action::ConfirmCancel);
         assert!(matches!(s.overlay, Overlay::None));
         assert_eq!(s.drain_outbox(), vec![Intent::CancelRun { run_id }]);
+    }
+
+    #[test]
+    fn cancel_confirmation_keeps_its_target_when_another_run_starts() {
+        let mut s = AppState::new();
+        let original = RunId::new();
+        let incoming = RunId::new();
+        for (run_id, objective) in [(original, "original"), (incoming, "another client")] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: objective.to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            if run_id == original {
+                reduce(&mut s, Action::Cancel);
+            }
+        }
+        assert_eq!(s.selected_run().unwrap().run_id, incoming);
+        assert_eq!(s.overlay, Overlay::ConfirmCancel { run_id: original });
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::CancelRun { run_id: original }]
+        );
+        assert_eq!(s.selected_run().unwrap().run_id, incoming);
+        reduce(&mut s, Action::ConfirmCancel);
+        assert!(s.outbox.is_empty(), "a repeated confirmation does nothing");
+    }
+
+    #[test]
+    fn cancel_confirmation_does_not_cancel_finished_or_missing_runs() {
+        for terminal in [RunState::Completed, RunState::Failed, RunState::Cancelled] {
+            let mut s = AppState::new();
+            let run_id = RunId::new();
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: "finishes during review".to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            reduce(&mut s, Action::Cancel);
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStateChanged {
+                    run_id,
+                    state: terminal,
+                }),
+            );
+            reduce(&mut s, Action::ConfirmCancel);
+            assert!(s.outbox.is_empty(), "{terminal:?} is already terminal");
+            assert_eq!(s.overlay, Overlay::None);
+            assert!(s.notice.as_ref().unwrap().0.contains("already finished"));
+            reduce(&mut s, Action::Cancel);
+            assert_eq!(
+                s.overlay,
+                Overlay::None,
+                "finished runs cannot open cancellation"
+            );
+        }
+
+        let mut missing = AppState::new();
+        missing.overlay = Overlay::ConfirmCancel {
+            run_id: RunId::new(),
+        };
+        reduce(&mut missing, Action::ConfirmCancel);
+        assert!(missing.outbox.is_empty());
+        assert_eq!(missing.overlay, Overlay::None);
+        assert!(missing
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("no longer available"));
+    }
+
+    #[test]
+    fn run_control_keys_steer_pause_resume_and_confirm_without_losing_the_draft() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        fn press(state: &mut AppState, code: KeyCode) {
+            let action = crate::input::map_event(
+                &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                state.input_mode(),
+                100,
+                &[],
+            );
+            reduce(state, action);
+        }
+
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "work while I draft".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s.composer = "keep this follow-up draft".to_owned();
+        s.composer_cursor = 9;
+        press(&mut s, KeyCode::F(7));
+        assert_eq!(s.overlay, Overlay::Steering(String::new()));
+        assert!(s.outbox.is_empty());
+        for character in "change course".chars() {
+            press(&mut s, KeyCode::Char(character));
+        }
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueuePrompt {
+                text: "change course".to_owned(),
+                mode: AgentMode::Build,
+                delivery: codypendent_protocol::PromptDelivery::Steer,
+            }]
+        );
+        assert_eq!(s.composer, "keep this follow-up draft");
+        assert_eq!(s.composer_cursor, 9);
+        press(&mut s, KeyCode::F(8));
+        assert_eq!(s.drain_outbox(), vec![Intent::PauseRun { run_id }]);
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Paused,
+            }),
+        );
+        press(&mut s, KeyCode::F(8));
+        assert_eq!(s.drain_outbox(), vec![Intent::ResumeRun { run_id }]);
+        press(&mut s, KeyCode::F(9));
+        assert_eq!(s.overlay, Overlay::ConfirmCancel { run_id });
+        assert!(s.outbox.is_empty(), "F9 only asks for confirmation");
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.outbox.is_empty());
+        assert_eq!(s.composer, "keep this follow-up draft");
+        assert_eq!(s.composer_cursor, 9);
+        press(&mut s, KeyCode::F(9));
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(s.drain_outbox(), vec![Intent::CancelRun { run_id }]);
+        assert_eq!(s.composer, "keep this follow-up draft");
+        assert_eq!(s.composer_cursor, 9);
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueuePrompt {
+                text: "keep this follow-up draft".to_owned(),
+                mode: AgentMode::Build,
+                delivery: codypendent_protocol::PromptDelivery::Queue,
+            }],
+            "ordinary composer submission queues a follow-up instead of steering"
+        );
     }
 
     #[test]

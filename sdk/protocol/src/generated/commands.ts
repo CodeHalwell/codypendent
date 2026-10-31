@@ -270,6 +270,14 @@ export type CommandBody =
       type: "PublishDocument";
     }
   | {
+      repository?: string | null;
+      type: "ListWorkflows";
+    }
+  | {
+      /**
+       * Optional precondition binding a new launcher to the selected parsed definition. A mismatch rejects before creating a run; legacy callers may omit it.
+       */
+      expected_definition_digest?: string | null;
       inputs?: JsonValue;
       /**
        * The workflow manifest YAML (the content of a `workflow.yaml`). Empty when [`workflow_id`](CommandBody::StartWorkflow::workflow_id) names a workflow the daemon resolves from its own sources instead.

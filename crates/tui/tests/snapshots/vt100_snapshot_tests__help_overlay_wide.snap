@@ -10,12 +10,12 @@ expression: terminal.backend().to_string()
                ┌ Help ──────────────────────────────────────────────────────────────┐               
                │Keys — every mouse action has a keyboard equivalent                 │               
                │Type to filter shortcuts. Ctrl-U clears. Esc or ? closes help.      │               
-               │  Filter: all  ·  46 shortcuts                                      │               
+               │  Filter: all  ·  47 shortcuts                                      │               
                │                                                                    │               
                │  type…                          compose a message in the bottom    │               
                │                                 composer                           │               
-               │  Enter                          send: start a run, or steer the    │               
-       ✦  Conne│                                 active one                         │               
+               │  Enter                          send: start a run, or queue a      │               
+       ✦  Conne│                                 follow-up for the active one       │               
                │  Shift-Enter                    insert a line break (modern        │               
        No model│                                 terminals); Alt-Enter also works   │n.             
        Press En│  /                              command palette — every command,   │               
@@ -23,6 +23,10 @@ expression: terminal.backend().to_string()
                │  PgUp / PgDn                    page the focused pane (or scroll   │               
                │                                 the conversation) (mouse: wheel)   │               
                │  Ctrl-↑ / Ctrl-↓                switch to the previous / next run  │               
+               │  F7 / F8 / F9                   steer the selected run · pause /   │               
+               │                                 resume · interrupt with            │               
+               │                                 confirmation (mouse: click a       │               
+               │                                 run-control chip)                  │               
                │  F2                             toggle layout: chat ⇄ workspace    │               
                │                                 panes                              │               
                │  a / A / p / P                  approve once / for the run / this  │               
@@ -42,11 +46,7 @@ expression: terminal.backend().to_string()
                │                                 accept / reject suggestion         │               
                │  Ctrl-C                         detach (the run keeps going)       │               
                │  ↑↓ + Enter                     activate the selected row in a     │               
-               │                                 browser or the palette (mouse:     │               
-               │                                 click a row)                       │               
-               │  Tab                            focus the next workspace pane (same│               
-               │                                 as clicking it) (mouse: click a    │               
-   MESSAGE · En└ 76 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
+   MESSAGE · En└ 80 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
   ❯ Ask Codypendent to build, fix, explain, or explore…                                             
                                                                                                     
                                                                                                     

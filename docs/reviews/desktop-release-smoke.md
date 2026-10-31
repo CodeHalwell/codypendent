@@ -38,10 +38,65 @@ provider with Ctrl-C after closing the clients and stopping the isolated daemon.
 | Native workspace menu | Open Repository, Focus Composer, palette, sidebar and Settings act on the current window; standard Copy/Paste and Services work |
 | IDE / Finder / Terminal hand-off | Only installed targets appear; the selected checkout opens, including paths with spaces and shell punctuation |
 | Standalone Apple bundle | With a minimal PATH and no globally installed CLI, Start daemon launches the bundled CLI; Remote UI finds the bundled worker and sealed Node tree |
+| Standalone Linux AppImage | Without a globally installed CLI, Start daemon uses the matching resource payload; a missing packaged CLI is reported instead of falling back to PATH |
 
 Local evidence for the September review is recorded in
 [the review report](2026-09-08-app-review.md). Results from one platform must not
 be copied to another platform's row.
+
+## Linux runtime staging
+
+The Linux bundle consumes the matching CLI artifact from the same release build.
+`linux-release.py` stages its CLI, worker launcher, Monty, sealed Node tree and
+pinned local embeddings as `runtime/` resources. It shares the Apple tooling's
+Node and embedding verification, checks executable architecture and version, and
+seals the complete staged payload. Linux directory mappings preserve Node's
+internal symbolic links and their seal. The desktop checks these package resources
+before PATH; an explicit `CODYPENDENT_BINARY` remains a development override.
+
+For an extracted matching Linux CLI artifact, run from the repository root:
+
+```sh
+python3 apps/desktop/scripts/linux-release.py stage \
+  /path/to/codypendent-x86_64-unknown-linux-gnu \
+  --config "$PWD/apps/desktop/src-tauri/target/linux-runtime-bundle.json"
+npm --prefix apps/desktop run tauri:build -- --bundles appimage --no-sign \
+  --config "$PWD/apps/desktop/src-tauri/target/linux-runtime-bundle.json"
+python3 apps/desktop/scripts/linux-release.py verify-image \
+  /path/to/Codypendent.AppImage
+```
+
+The final verifier extracts the actual AppImage without FUSE, then verifies the
+desktop executable and complete runtime tree. The release workflow runs it before
+uploading the AppImage. Missing assets, mismatched versions, escaping links and
+modified payload members fail the check. Fixture tests exercise these refusals;
+they do not substitute for extracting and launching a real built AppImage.
+
+## Native window smoke versus packaged acceptance
+
+`npm --prefix apps/desktop run build:native-window-smoke` is an explicitly
+unbundled debug build using the standard Tauri configuration overlay
+`tauri.native-window-smoke.conf.json`. It embeds the real frontend and native
+bridge while excluding distribution-only sidecars and resource copies. It
+inherits application security settings and does not change daemon execution
+policy. Build the matching CLI and worker first, then run `test:native` under
+`xvfb-run -a` on headless Linux with explicit binary paths as described in
+[Shared runtime](../SHARED_RUNTIME.md#verification).
+
+The window test uses a loopback model, private HOME/config/data/socket paths and
+no inherited provider credentials. It waits for its own processes to exit before
+removing temporary state. Its report covers native IPC, disconnect/replay and
+knowledge browsing; distribution assets are explicitly unassessed. The report
+records any fixture WebKit renderer sandbox override and distinguishes the Ask
+request from automatic memory extraction. Catalogue browsing and input preview
+must add no model requests. Neither selecting a definition nor this preview
+executes a workflow.
+
+Packaged acceptance still requires the real checksum-pinned assets declared in
+`apps/desktop/scripts/embedding-runtime.json`, including the model hosted on
+Hugging Face. If network policy blocks a pinned asset, record that packaging gate
+as blocked. The window-only overlay cannot satisfy `linux-release.py` or the
+Apple distribution verifier, and must never stand in for package acceptance.
 
 ## Apple distribution preparation — 4 October 2026
 

@@ -339,7 +339,7 @@ pub async fn run_checkout(
     session: codypendent_protocol::SessionId,
     run: codypendent_protocol::RunId,
 ) -> anyhow::Result<PathBuf> {
-    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()?;
+    let paths = crate::runtime_paths::resolve()?;
     let pool =
         codypendent_knowledge::db::open_read_only(&paths.data_dir.join("codypendent.db")).await?;
     let result = run_checkout_in(&pool, repository, session, run).await;

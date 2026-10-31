@@ -89,6 +89,11 @@ import type {
   Subscription,
   ToolOutcome,
   UserAction,
+  WorkflowCatalog,
+  WorkflowCatalogDiagnostic,
+  WorkflowCatalogEntry,
+  WorkflowCatalogInput,
+  WorkflowCatalogSource,
 } from "@codypendent/protocol";
 
 // ---------------------------------------------------------------------------
@@ -763,6 +768,8 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         session_id: str(r, "session_id"),
         update: reconstructIdeContextUpdate(rec(r, "update")),
       };
+    case "ListWorkflows":
+      return { type: "ListWorkflows", repository: optStr(r, "repository") };
     default:
       throw new Error(`unmodeled or unknown CommandBody tag: ${str(r, "type")}`);
   }
@@ -888,11 +895,50 @@ function reconstructCodypendentError(r: Record<string, unknown>): CodypendentErr
   };
 }
 
+function reconstructWorkflowCatalogSource(r: Record<string, unknown>): WorkflowCatalogSource {
+  switch (str(r, "type")) {
+    case "BuiltIn": return { type: "BuiltIn" };
+    case "User": return { type: "User" };
+    case "Repository": return { type: "Repository" };
+    case "Unknown": return { type: "Unknown" };
+    default: throw new Error(`unknown WorkflowCatalogSource tag: ${str(r, "type")}`);
+  }
+}
+
+function reconstructWorkflowCatalogInput(r: Record<string, unknown>): WorkflowCatalogInput {
+  return { input_type: str(r, "input_type"), required: bool(r, "required") };
+}
+
+function reconstructWorkflowCatalogEntry(r: Record<string, unknown>): WorkflowCatalogEntry {
+  return {
+    id: str(r, "id"),
+    version: num(r, "version"),
+    definition_digest: str(r, "definition_digest"),
+    description: r.description === null ? null : optStr(r, "description"),
+    node_count: num(r, "node_count"),
+    source: reconstructWorkflowCatalogSource(rec(r, "source")),
+    inputs: Object.fromEntries(Object.entries(rec(r, "inputs")).map(([name, input]) => [name, reconstructWorkflowCatalogInput(asRecord(input, `inputs.${name}`))])),
+  };
+}
+
+function reconstructWorkflowCatalogDiagnostic(r: Record<string, unknown>): WorkflowCatalogDiagnostic {
+  return { code: str(r, "code"), message: str(r, "message"), workflow_id: r.workflow_id === null ? null : optStr(r, "workflow_id") };
+}
+
+function reconstructWorkflowCatalog(r: Record<string, unknown>): WorkflowCatalog {
+  return {
+    repository: r.repository === null ? null : optStr(r, "repository"),
+    items: arr(r, "items").map(entry => reconstructWorkflowCatalogEntry(asRecord(entry, "items[]"))),
+    diagnostics: arr(r, "diagnostics").map(diagnostic => reconstructWorkflowCatalogDiagnostic(asRecord(diagnostic, "diagnostics[]"))),
+    truncated: bool(r, "truncated"),
+  };
+}
+
 function reconstructProtocolError(r: Record<string, unknown>): ProtocolError {
   return { code: str(r, "code"), message: str(r, "message"), retryable: bool(r, "retryable") };
 }
 
-/** Only the 12 variants the extension's `Payload` union names explicitly. */
+/** Reconstruct the client payloads and workflow discovery metadata field by field. */
 function reconstructModeledPayload(r: Record<string, unknown>): Payload {
   switch (str(r, "type")) {
     case "ClientHello":
@@ -928,14 +974,16 @@ function reconstructModeledPayload(r: Record<string, unknown>): Payload {
       return { type: "ShutdownIfIdle" };
     case "ShutdownRefused":
       return { type: "ShutdownRefused", active_run_count: num(r, "active_run_count") };
+    case "WorkflowCatalog":
+      return { type: "WorkflowCatalog", command_id: str(r, "command_id"), catalog: reconstructWorkflowCatalog(rec(r, "catalog")) };
     default:
       throw new Error(`not a modeled Payload variant: ${str(r, "type")}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// command.json: CommandBody (9 of 26 modeled — the extension sends only
-// these), PromotionAction (not modeled — nested inside a command the
+// command.json: CommandBody (editor commands and workflow discovery),
+// PromotionAction (not modeled — nested inside a command the
 // extension never sends).
 // ---------------------------------------------------------------------------
 
@@ -946,6 +994,7 @@ describe("command.json against CommandBody (@codypendent/protocol)", () => {
   const modeled = [
     "CommandBody_AttachSession",
     "CommandBody_CancelRun",
+    "CommandBody_ListWorkflows",
     "CommandBody_PauseRun",
     "CommandBody_QueueSteering",
     "CommandBody_ResolveApproval",
@@ -995,8 +1044,8 @@ describe("command.json against CommandBody (@codypendent/protocol)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// envelope.json: Payload. 14 tags are reconstructed field-by-field (the ones
-// the extension sends or reads); the rest are payloads it never handles.
+// envelope.json: Payload. Editor payloads and workflow discovery metadata are
+// reconstructed field-by-field; the rest are payloads it never handles.
 //
 // The hand-written mirror gave those a permissive `{ type: string; … }`
 // catch-all member, so "not modeled" there meant "typed as an open bag". The
@@ -1026,6 +1075,7 @@ describe("envelope.json against Payload (@codypendent/protocol)", () => {
     "Payload_ShutdownAck",
     "Payload_ShutdownIfIdle",
     "Payload_ShutdownRefused",
+    "Payload_WorkflowCatalog",
   ];
   // Not reconstructed here: payloads the extension never sends or reads. The
   // generated union still names every one of them; the check below proves it

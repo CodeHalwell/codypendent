@@ -1,6 +1,7 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ pub struct BundledEmbedder {
     identity: String,
     ready: watch::Receiver<Option<Arc<HttpEmbedder>>>,
     supervisor: tokio::task::JoinHandle<()>,
+    verification_cancelled: Arc<AtomicBool>,
 }
 
 impl BundledEmbedder {
@@ -66,16 +68,32 @@ impl BundledEmbedder {
         let directory = directory.to_path_buf();
         let configuration = manifest.clone();
         let space = identity.clone();
-        let supervisor = tokio::runtime::Handle::try_current().map_err(error)?.spawn(async move {
+        let verification_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&verification_cancelled);
+        let runtime = tokio::runtime::Handle::try_current().map_err(error)?;
+        let supervisor = runtime.spawn(async move {
             let checked = directory.clone();
-        let expected = configuration.clone();
-                match tokio::task::spawn_blocking(move || {
-                    verify_file(&checked.join("model.gguf"), &expected.model_sha256)?;
-                    verify_file(&server_binary(&checked), &expected.server_sha256)
-                }).await {
+            let expected = configuration.clone();
+            let verification_cancelled = Arc::clone(&cancelled);
+            let verification = tokio::task::spawn_blocking(move || {
+                verify_file(
+                    &checked.join("model.gguf"),
+                    &expected.model_sha256,
+                    &verification_cancelled,
+                )?;
+                verify_file(
+                    &server_binary(&checked),
+                    &expected.server_sha256,
+                    &verification_cancelled,
+                )
+            })
+            .await;
+            match verification {
                 Ok(Ok(())) => {}
                 _ => {
-                    warn!("bundled embedding model checksum verification failed");
+                    if !cancelled.load(Ordering::Relaxed) {
+                        warn!("bundled embedding model checksum verification failed");
+                    }
                     return;
                 }
             }
@@ -92,6 +110,7 @@ impl BundledEmbedder {
             identity,
             ready: receiver,
             supervisor,
+            verification_cancelled,
         })
     }
 
@@ -105,6 +124,10 @@ impl BundledEmbedder {
 
 impl Drop for BundledEmbedder {
     fn drop(&mut self) {
+        // Aborting the async supervisor cannot stop an active spawn_blocking
+        // hash. Let that task stop between chunks so runtime shutdown does not
+        // wait for the entire model file after the daemon has stopped serving.
+        self.verification_cancelled.store(true, Ordering::Relaxed);
         self.supervisor.abort();
     }
 }
@@ -139,13 +162,28 @@ fn bundle_candidates(executable: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn verify_file(path: &Path, expected: &str) -> Result<(), EmbedError> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).map_err(error)?;
+fn verify_file(path: &Path, expected: &str, cancelled: &AtomicBool) -> Result<(), EmbedError> {
+    verify_reader(
+        std::fs::File::open(path).map_err(error)?,
+        expected,
+        cancelled,
+    )
+}
+
+fn verify_reader(
+    mut reader: impl std::io::Read,
+    expected: &str,
+    cancelled: &AtomicBool,
+) -> Result<(), EmbedError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer).map_err(error)?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(EmbedError(
+                "bundled embedding verification cancelled".to_string(),
+            ));
+        }
+        let count = reader.read(&mut buffer).map_err(error)?;
         if count == 0 {
             break;
         }
@@ -273,7 +311,42 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("model.gguf"), b"weights").unwrap();
         let expected = hex::encode(Sha256::digest(b"weights"));
-        assert!(verify_file(&directory.path().join("model.gguf"), &expected).is_ok());
-        assert!(verify_file(&directory.path().join("model.gguf"), &"0".repeat(64)).is_err());
+        let cancelled = AtomicBool::new(false);
+        assert!(verify_file(&directory.path().join("model.gguf"), &expected, &cancelled).is_ok());
+        assert!(verify_file(
+            &directory.path().join("model.gguf"),
+            &"0".repeat(64),
+            &cancelled
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn model_verification_stops_between_chunks_when_its_owner_is_dropped() {
+        struct CancelAfterFirstRead<'a> {
+            cancelled: &'a AtomicBool,
+            reads: usize,
+        }
+        impl std::io::Read for CancelAfterFirstRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(
+                    self.reads, 1,
+                    "cancelled verification must not read another chunk"
+                );
+                buffer[..7].copy_from_slice(b"weights");
+                self.cancelled.store(true, Ordering::Relaxed);
+                Ok(7)
+            }
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut reader = CancelAfterFirstRead {
+            cancelled: &cancelled,
+            reads: 0,
+        };
+        let expected = hex::encode(Sha256::digest(b"weights"));
+        let failure = verify_reader(&mut reader, &expected, &cancelled).unwrap_err();
+        assert!(failure.to_string().contains("cancelled"));
+        assert_eq!(reader.reads, 1);
     }
 }

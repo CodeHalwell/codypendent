@@ -12,14 +12,14 @@ expression: terminal.backend().to_string()
          │equivalent                              │         
          │Type to filter shortcuts. Ctrl-U clears.│         
          │Esc or ? closes help.                   │         
-         │  Filter: all  ·  46 shortcuts          │         
+         │  Filter: all  ·  47 shortcuts          │         
          │                                        │         
          │  type…                                 │         
  ✦  Conne│    compose a message in the bottom     │         
          │    composer                            │         
  No model│  Enter                                 │verified 
- model to│    send: start a run, or steer the     │         
- Press En│    active one                          │etup.    
+ model to│    send: start a run, or queue a       │         
+ Press En│    follow-up for the active one        │etup.    
          │  Shift-Enter                           │         
          │    insert a line break (modern         │         
          │    terminals); Alt-Enter also works    │         
@@ -31,6 +31,10 @@ expression: terminal.backend().to_string()
          │    conversation) (mouse: wheel)        │         
          │  Ctrl-↑ / Ctrl-↓                       │         
          │    switch to the previous / next run   │         
+         │  F7 / F8 / F9                          │         
+         │    steer the selected run · pause /    │         
+         │    resume · interrupt with confirmation│         
+         │    (mouse: click a run-control chip)   │         
          │  F2                                    │         
          │    toggle layout: chat ⇄ workspace     │         
          │    panes                               │         
@@ -42,11 +46,7 @@ expression: terminal.backend().to_string()
          │  1-9 · Space · Enter · r               │         
          │    question card: pick an option ·     │         
          │    toggle · confirm · reject           │         
-         │  Esc                                   │         
-         │    clear the draft (Ctrl-Z restores    │         
-         │    it), or close an overlay            │         
-         │  ? (empty) / F1                        │         
-  MESSAGE└ 124 more rows · PgUp / PgDn ───────────┘──────── 
+  MESSAGE└ 128 more rows · PgUp / PgDn ───────────┘──────── 
  ❯ Ask Codypendent to build, fix, explain, or explore…      
                                                             
                                                             

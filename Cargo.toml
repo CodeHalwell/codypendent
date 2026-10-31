@@ -171,7 +171,7 @@ loro = "1.13"
 # Rich TUI output formatting (client-only, Phase 6). pulldown-cmark: the
 # CommonMark + GFM-tables parser behind rustdoc/mdBook (MIT). default-features
 # off drops its getopts CLI path; the pull-parser (Parser/Event/Tag) is core.
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { version = "0.13.5", default-features = false }
 
 # synoptic: pure-Rust, asset-free, per-language syntax highlighter (MIT). Its
 # heavy deps (regex 1.x, unicode-width) are already in the tree; it emits token

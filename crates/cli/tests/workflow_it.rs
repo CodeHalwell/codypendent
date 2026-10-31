@@ -224,6 +224,7 @@ async fn mock_daemon_fix_ci(mut stream: UnixStream, workflow_run_id: &str) {
             workflow_id,
             inputs,
             repository,
+            expected_definition_digest: None,
         } => {
             assert!(
                 manifest.is_empty(),

@@ -702,7 +702,7 @@ fn recovery_gemini_model(models: &[AcpModel], requested: Option<&str>) -> Option
         .iter()
         .filter(gemini)
         .find(|model| model.current)
-        .or_else(|| models.iter().filter(gemini).next())
+        .or_else(|| models.iter().find(gemini))
         .map(|model| model.id.clone())
 }
 

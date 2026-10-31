@@ -2945,7 +2945,6 @@ impl FrameworkAgentRuntime {
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
         let mut model_requests: u64 = 0;
-        let mut message_actor = response_actor(&run_actor, None);
         // The run's AGGREGATED measured usage (Phase 7): starts `None` and stays
         // `None` unless a request actually reports usage. An unmeasured run keeps
         // it `None`, so the cost budget charges nothing — the honesty invariant.
@@ -3128,7 +3127,7 @@ impl FrameworkAgentRuntime {
             }
 
             coverage.requests = coverage.requests.saturating_add(1);
-            message_actor = response_actor(&run_actor, None);
+            let mut message_actor = response_actor(&run_actor, None);
             let started = Instant::now();
             // Live streaming with COALESCED journaling. The driver pushes each
             // text chunk through the `ChannelSink` AS the model produces it;
@@ -3599,7 +3598,10 @@ impl FrameworkAgentRuntime {
             .journal
             .complete(
                 run.session_id,
-                message_actor,
+                // Completion describes the configured run, including the route
+                // clients need for retries. Response chunks retain their own
+                // provider-reported (or unknown) model attribution.
+                run_actor,
                 run.run_id,
                 state,
                 EventBody::RunCompleted {
@@ -12414,10 +12416,15 @@ context_tokens = 1000000
                 repo.path(),
                 repo.path(),
             );
-            runtime
+            let run_outcome = runtime
                 .execute_run(&driver, ctx, CancellationToken::never())
                 .await
                 .expect("run completes");
+            assert!(
+                matches!(run_outcome.disposition, RunDisposition::Completed { .. }),
+                "a missing artifact must not fail the run in {mode:?}, got {:?}",
+                run_outcome.disposition
+            );
 
             let mut outcomes = Vec::new();
             while let Ok(event) = events.try_recv() {
@@ -12434,7 +12441,8 @@ context_tokens = 1000000
                 outcomes[0]
             );
             assert!(
-                matches!(&outcomes[1], ToolOutcome::Failed { message } if message == "artifact.not-found"),
+                matches!(&outcomes[1], ToolOutcome::Failed { message }
+                    if message.contains("no artifact") && message.contains(&missing.to_string())),
                 "a missing id is a legible failure in {mode:?}, got {:?}",
                 outcomes[1]
             );
@@ -14756,6 +14764,7 @@ context_tokens = 1000000
         served: Mutex<bool>,
         response_model: Option<String>,
         preface: Option<String>,
+        finish_text: Option<String>,
     }
 
     impl ParallelCallDriver {
@@ -14771,6 +14780,7 @@ context_tokens = 1000000
                 served: Mutex::new(false),
                 response_model: None,
                 preface: None,
+                finish_text: None,
             }
         }
     }
@@ -14789,6 +14799,9 @@ context_tokens = 1000000
         ) -> anyhow::Result<StepOutcome> {
             let mut served = self.served.lock().expect("parallel driver mutex");
             if *served {
+                if let Some(text) = &self.finish_text {
+                    sink.on_text(text);
+                }
                 return Ok(StepOutcome::new(
                     ModelStep::Finish {
                         summary: "done".to_string(),
@@ -14824,12 +14837,13 @@ context_tokens = 1000000
     }
 
     #[tokio::test]
-    async fn response_model_attributes_prefaces_without_leaking_into_an_unreported_finish() {
+    async fn response_model_attributes_prefaces_while_completion_retains_configured_route() {
         let repo = repo_with_files(&[("a.txt", "alpha")]);
         let mut driver =
             ParallelCallDriver::new(vec![("workspace.read_file", json!({"path":"a.txt"}))]);
         driver.response_model = Some("provider/actual-preface-model".into());
         driver.preface = Some("Reading the file.".into());
+        driver.finish_text = Some("done".into());
         let (runtime, mut events, session_id) = test_runtime();
         let run = RunContext::new(
             session_id,
@@ -14844,11 +14858,15 @@ context_tokens = 1000000
             .await
             .unwrap();
         let mut preface = None;
+        let mut finish = None;
         let mut completed = None;
         while let Ok(event) = events.try_recv() {
             match event.body {
                 EventBody::ModelStreamDelta { text, .. } if text == "Reading the file." => {
                     preface = Some(event.actor);
+                }
+                EventBody::ModelStreamDelta { text, .. } if text == "done" => {
+                    finish = Some(event.actor);
                 }
                 EventBody::RunCompleted { .. } => completed = Some(event.actor),
                 _ => {}
@@ -14857,7 +14875,8 @@ context_tokens = 1000000
         assert!(
             matches!(preface, Some(Actor::Agent { model, .. }) if model.0 == "provider/actual-preface-model")
         );
-        assert!(matches!(completed, Some(Actor::Agent { model, .. }) if model.0.is_empty()));
+        assert!(matches!(finish, Some(Actor::Agent { model, .. }) if model.0.is_empty()));
+        assert!(matches!(completed, Some(Actor::Agent { model, .. }) if model.0 == "parallel"));
         assert_eq!(driver.model_id().0, "parallel");
     }
 
@@ -15294,7 +15313,7 @@ context_tokens = 1000000
     }
 
     #[cfg(feature = "provider-openai")]
-    async fn native_response_models(client: FlakyChatClient) -> Vec<String> {
+    async fn native_response_models(client: FlakyChatClient) -> (Vec<String>, RunDisposition) {
         let driver =
             FrameworkModelDriver::new(Arc::new(client), ModelId("configured-alias".into()));
         let (runtime, mut events, session_id) = test_runtime();
@@ -15313,22 +15332,29 @@ context_tokens = 1000000
             .unwrap();
         assert_eq!(driver.model_id().0, "configured-alias");
         let mut models = Vec::new();
+        let mut completed = None;
         while let Ok(event) = events.try_recv() {
-            if matches!(
-                event.body,
-                EventBody::ModelStreamDelta { .. } | EventBody::RunCompleted { .. }
-            ) {
-                let Actor::Agent { model, .. } = event.actor else {
-                    panic!("response must retain its agent actor")
-                };
-                models.push(model.0);
+            match event.body {
+                EventBody::ModelStreamDelta { .. } => {
+                    let Actor::Agent { model, .. } = event.actor else {
+                        panic!("response must retain its agent actor")
+                    };
+                    models.push(model.0);
+                }
+                EventBody::RunCompleted { disposition, .. } => {
+                    let Actor::Agent { model, .. } = event.actor else {
+                        panic!("completion must retain its configured route")
+                    };
+                    assert_eq!(model.0, "configured-alias");
+                    assert!(completed.replace(disposition).is_none());
+                }
+                _ => {}
             }
         }
-        assert!(
-            models.len() >= 2,
-            "streamed response and final summary must be attributed"
-        );
-        models
+        (
+            models,
+            completed.expect("the run must reach durable completion"),
+        )
     }
 
     #[cfg(feature = "provider-openai")]
@@ -15337,20 +15363,22 @@ context_tokens = 1000000
         let (mut client, _) = FlakyChatClient::new(0, "");
         client.response_model = Some("provider/actual-snapshot".into());
         client.chunks = vec!["First".into(), " second".into()];
-        assert!(native_response_models(client)
-            .await
+        let (models, disposition) = native_response_models(client).await;
+        assert!(!models.is_empty());
+        assert!(models
             .iter()
             .all(|model| model == "provider/actual-snapshot"));
+        assert!(matches!(disposition, RunDisposition::Completed { .. }));
     }
 
     #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn native_response_model_is_unreported_when_the_provider_omits_it() {
         let (client, _) = FlakyChatClient::new(0, "");
-        assert!(native_response_models(client)
-            .await
-            .iter()
-            .all(String::is_empty));
+        let (models, disposition) = native_response_models(client).await;
+        assert!(!models.is_empty());
+        assert!(models.iter().all(String::is_empty));
+        assert!(matches!(disposition, RunDisposition::Completed { .. }));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -15358,11 +15386,41 @@ context_tokens = 1000000
     async fn native_response_model_does_not_leak_from_a_failed_metadata_only_retry() {
         let (mut client, requests) = FlakyChatClient::new(0, "503 Service Unavailable");
         client.metadata_failure = Some("failed-request-model".into());
-        assert!(native_response_models(client)
-            .await
-            .iter()
-            .all(String::is_empty));
+        let (models, disposition) = native_response_models(client).await;
+        assert!(!models.is_empty());
+        assert!(models.iter().all(String::is_empty));
+        assert!(matches!(disposition, RunDisposition::Completed { .. }));
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_response_model_failure_before_metadata_retains_configured_retry_route() {
+        let (client, requests) = FlakyChatClient::new(1, "HTTP 401 Unauthorized");
+        let (models, disposition) = native_response_models(client).await;
+        assert!(models.is_empty());
+        assert!(
+            matches!(disposition, RunDisposition::Failed { reason, .. } if reason.contains("401"))
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_response_model_failure_after_reported_snapshot_retains_configured_retry_route()
+    {
+        let (mut client, requests) =
+            FlakyChatClient::failing_mid_stream("HTTP 401 Unauthorized", &["partial response"]);
+        client.response_model = Some("provider/actual-snapshot".into());
+        let (models, disposition) = native_response_models(client).await;
+        assert!(!models.is_empty());
+        assert!(models
+            .iter()
+            .all(|model| model == "provider/actual-snapshot"));
+        assert!(
+            matches!(disposition, RunDisposition::Failed { reason, .. } if reason.contains("401"))
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     /// Collect every chunk a driver pushes through its sink.

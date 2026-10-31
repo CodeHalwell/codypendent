@@ -11,6 +11,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 
 import { renderMarkdown } from "../src/markdown.js";
+import { Transcript } from "../src/components/Transcript.js";
 
 function draw(text: string) {
   return render(<div data-testid="md">{renderMarkdown(text)}</div>);
@@ -77,8 +78,7 @@ describe("markdown rendering", () => {
 });
 
 describe("long system notes fold instead of walling the transcript", () => {
-  it("folds the daemon's worktree-retention note behind a summary", async () => {
-    const { Transcript } = await import("../src/components/Transcript.js");
+  it("folds the daemon's worktree-retention note behind a summary", () => {
     const note =
       "Kept the worktree /Users/x/codypendent-worktrees/s/run-abc and its branch `codypendent/run-abc`: " +
       "it held uncommitted changes, so nothing was deleted. Its diff is saved as artifact 01a0-e2a0.\n" +
@@ -96,8 +96,7 @@ describe("long system notes fold instead of walling the transcript", () => {
     expect(details?.textContent).toContain("git branch -D");
   });
 
-  it("leaves a short system line inline", async () => {
-    const { Transcript } = await import("../src/components/Transcript.js");
+  it("leaves a short system line inline", () => {
     render(
       <Transcript
         items={[{ id: "s2", type: "system", text: "Run cancelled", timestamp: "t" }]}

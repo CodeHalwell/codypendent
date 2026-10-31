@@ -18,7 +18,7 @@
  */
 
 import { encodeEnvelope, FrameDecoder, FrameError, MAX_FRAME_BYTES } from "./framing.js";
-import { PROTOCOL_V1, type ProtocolVersion } from "./version.js";
+import { PROTOCOL_V1, WORKFLOW_CATALOG_MIN_MINOR, type ProtocolVersion } from "./version.js";
 import { IDE_CAPABILITIES, type ClientCapabilities } from "./capabilities.js";
 import type { ClientHello, ServerHello, ClientRole, Subscription, ResumeToken } from "./handshake.js";
 import type { Envelope, Payload } from "./envelope.js";
@@ -922,7 +922,7 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
    * outcome and must be reconciled by the caller rather than silently repeated.
    */
   requestGlobal(
-    body: Extract<CommandBody, { type: "CreateSession" | "ListSessions" | "SearchSessions" | "ProbeModel" | "ReadCodeGraphStatus" | "ReadCodeGraph" | "BuildCodeGraph" | "ReadBlackboard" | "ReadKnowledge" | "PostBlackboardItem" | "UpdateBlackboardItem" }>,
+    body: Extract<CommandBody, { type: "CreateSession" | "ListSessions" | "SearchSessions" | "ProbeModel" | "ReadCodeGraphStatus" | "ReadCodeGraph" | "BuildCodeGraph" | "ReadBlackboard" | "ReadKnowledge" | "PostBlackboardItem" | "UpdateBlackboardItem" | "ListWorkflows" | "StartWorkflow" | "ReadWorkflowRun" | "PauseWorkflow" | "ResumeWorkflow" | "CancelWorkflow" | "RetryWorkflowNode" }>,
     options?: RequestOptions,
   ): Promise<Envelope> {
     return this.requestEnvelope(body, false, options);
@@ -935,6 +935,17 @@ export class DaemonClient extends TypedEventEmitter<DaemonClientEvents> {
     }
     if (body.type === "ProbeModel" && (this.negotiatedProtocol?.minor ?? 0) < 9) {
       return Promise.reject(new Error("Model readiness requires Codypendent protocol 1.9 or newer. Update and restart the daemon."));
+    }
+    if (body.type === "ListWorkflows" && (this.negotiatedProtocol?.minor ?? 0) < WORKFLOW_CATALOG_MIN_MINOR) {
+      return Promise.reject(Object.assign(new Error("Workflow discovery requires protocol 1.12 or newer. Update and restart this product's runtime."), {
+        code: "workflow.catalog-unavailable", retryable: false,
+      }));
+    }
+    if (body.type === "StartWorkflow" && body.expected_definition_digest !== undefined && body.expected_definition_digest !== null
+      && (this.negotiatedProtocol?.minor ?? 0) < WORKFLOW_CATALOG_MIN_MINOR) {
+      return Promise.reject(Object.assign(new Error("Starting the selected workflow definition requires protocol 1.12 or newer. Update and restart this product's runtime."), {
+        code: "workflow.definition-precondition-unavailable", retryable: false,
+      }));
     }
     if (body.type === "ReadKnowledge" && (this.negotiatedProtocol?.minor ?? 0) < 10) {
       return Promise.reject(new Error("Knowledge browsing requires Codypendent protocol 1.10 or newer. Update and restart the daemon."));

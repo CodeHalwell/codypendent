@@ -59,10 +59,14 @@ pub struct ProtocolVersion {
 /// Old records retain unknown coverage; older clients ignore this additive field.
 /// Tool display refinements add `ToolUpdated`. Older clients fold this event
 /// to `Unknown` while retaining the original start and completion events.
+/// Repository-scoped workflow discovery adds ListWorkflows and WorkflowCatalog.
+/// Clients gate the new command on negotiated minor 12; existing workflow controls remain compatible.
 pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 11,
+    minor: 12,
 };
+
+pub const WORKFLOW_CATALOG_MIN_MINOR: u16 = 12;
 
 /// The lowest negotiated minor that understands
 /// [`CommandBody::ProbeModel`](crate::CommandBody::ProbeModel). A client MUST

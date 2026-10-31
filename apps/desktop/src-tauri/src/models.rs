@@ -27,7 +27,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
 use codypendent_providers::{AuthMethod, Catalog, Protocol, Provider};
 use codypendent_runtime::auth::{AuthStore, Save};
@@ -44,7 +43,7 @@ pub use discovery::{
 /// The `<data_dir>` every file in this module hangs off, resolved exactly the
 /// way `socket_path()` resolves the socket.
 fn data_dir() -> anyhow::Result<PathBuf> {
-    Ok(RuntimePaths::resolve()
+    Ok(crate::runtime_paths::resolve()
         .context("resolving the codypendent data directory")?
         .data_dir)
 }

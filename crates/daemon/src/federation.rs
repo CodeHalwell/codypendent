@@ -2027,6 +2027,7 @@ async fn execute_campaign(
 
         let run_id = starter
             .start(StartWorkflowRequest {
+                expected_definition_digest: None,
                 manifest: String::new(),
                 workflow_id: Some(campaign.workflow_id.clone()),
                 inputs: serde_json::json!({
