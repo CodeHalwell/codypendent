@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { AlertTriangle, GitBranch, Play, RefreshCw, Search } from "lucide-react";
 import type { WorkflowCatalog } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
-import { MAX_WORKFLOW_INPUT_BYTES, bindWorkflowLaunchMemory, createWorkflowLaunchMemory, newWorkflowRequestKey, parseWorkflowInputs, workflowInputEntries, workflowIntent, type WorkflowCatalogEntry, type WorkflowLaunchMemory } from "./workflowInputs.js";
+import { MAX_WORKFLOW_INPUT_BYTES, bindWorkflowLaunchMemory, createWorkflowLaunchMemory, newWorkflowRequestKey, parseWorkflowInputs, preferWorkflowRun, rememberWorkflowRun, workflowInputEntries, workflowIntent, type WorkflowCatalogEntry, type WorkflowLaunchMemory } from "./workflowInputs.js";
 import "./WorkflowLauncher.css";
 
 export interface WorkflowLauncherProps {
@@ -131,6 +131,7 @@ export function WorkflowLauncher({ transport, repository = null, connectionEpoch
     const intent = `catalog\0${repository}\0${workflowIntent(selected.id, selected.definition_digest, parsed.inputs)}`;
     const key = unresolved.get(intent) ?? newWorkflowRequestKey();
     unresolved.set(intent, key);
+    const preference = preferWorkflowRun(memory, boundary.repository ?? "");
     const operation = { boundary, key };
     const generation = availability.current.generation;
     pending.current = operation;
@@ -140,16 +141,15 @@ export function WorkflowLauncher({ transport, repository = null, connectionEpoch
       if (!runId.trim()) throw new Error("The runtime did not return a workflow run identity.");
       // A receipt still belongs to its owner after view navigation. Remember it
       // for the next visit without navigating or focusing an abandoned view.
-      if (memory.transport === boundary.transport) {
-        memory.runs.set(boundary.repository ?? "", runId);
-      }
+      const preferred = memory.transport === boundary.transport &&
+        rememberWorkflowRun(memory, boundary.repository ?? "", preference, runId);
       if (!mounted.current || currentBoundary.current !== boundary || pending.current !== operation || generation !== availability.current.generation) return;
       // A background receipt must not turn another view's visible Retry into
       // a new paid launch. Retain its identity until the current view confirms it.
       unresolved.delete(intent);
       updateEditor(current => ({ ...current, pending: false, feedback: { type: "success", text: `Workflow started: ${runId}` } }));
       pending.current = null;
-      latestStarted.current(runId);
+      if (preferred) latestStarted.current(runId);
     } catch (error) {
       if (!mounted.current || currentBoundary.current !== boundary || pending.current !== operation || generation !== availability.current.generation) return;
       pending.current = null;

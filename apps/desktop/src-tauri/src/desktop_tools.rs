@@ -1,5 +1,5 @@
 use codypendent_protocol::SessionId;
-use codypendent_runtime::desktop_tools::{DesktopTool, DesktopToolCall, DesktopTools};
+use codypendent_runtime::desktop_tools::{DesktopTool, DesktopToolCall};
 use serde_json::Value;
 
 #[tauri::command]
@@ -8,12 +8,12 @@ pub fn desktop_tools_publish(
     context: Value,
     tools: Vec<DesktopTool>,
 ) -> Result<(), String> {
-    DesktopTools::resolve()?.publish(session_id, context, tools)
+    crate::runtime_paths::desktop_tools()?.publish(session_id, context, tools)
 }
 
 #[tauri::command]
 pub fn desktop_tools_pending(session_id: SessionId) -> Result<Option<DesktopToolCall>, String> {
-    DesktopTools::resolve()?.pending(session_id)
+    crate::runtime_paths::desktop_tools()?.pending(session_id)
 }
 
 #[tauri::command]
@@ -28,12 +28,12 @@ pub fn desktop_tools_resolve(
     } else {
         result
     };
-    DesktopTools::resolve()?.resolve_call(session_id, &call_id, result, error)
+    crate::runtime_paths::desktop_tools()?.resolve_call(session_id, &call_id, result, error)
 }
 
 #[tauri::command]
 pub fn desktop_tools_list(session_id: SessionId) -> Result<Vec<DesktopTool>, String> {
-    DesktopTools::resolve()?.list(session_id)
+    crate::runtime_paths::desktop_tools()?.list(session_id)
 }
 
 #[tauri::command]
@@ -42,5 +42,5 @@ pub fn desktop_tools_remove(
     name: String,
     expected_version: u64,
 ) -> Result<(), String> {
-    DesktopTools::resolve()?.remove(session_id, &name, expected_version)
+    crate::runtime_paths::desktop_tools()?.remove(session_id, &name, expected_version)
 }

@@ -6,11 +6,11 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TAURI_CONFIG = HERE.parent / "src-tauri/tauri.conf.json"
@@ -27,7 +27,7 @@ def configuration(path: Path) -> dict:
     if not isinstance(product, str) or not product or Path(product).name != product or product in (".", ".."):
         raise ValueError("The desktop product name must be one resource directory component")
     if not isinstance(config.get("version"), str):
-        raise ValueError("The desktop version is missing")
+        raise TypeError("The desktop version is missing")
     return config
 
 
@@ -86,9 +86,9 @@ def stage(source: Path, destination: Path, overlay: Path, config: dict) -> None:
     overlay.parent.mkdir(parents=True, exist_ok=True)
     # Generic Tauri resources copy one file at a time and dereference links.
     # Linux's directory mapping preserves the complete sealed Node tree,
-    # including npm/npx links, at Tauri's ordinary product resource path.
+    # outside linuxdeploy's recursive ELF rewriting under usr/lib.
     # Neither distribution bundling nor the pinned resources are disabled.
-    files = {f"usr/lib/{config['productName']}/runtime": str(destination)}
+    files = {f"usr/share/{config['productName']}/runtime": str(destination)}
     overlay.write_text(json.dumps({"bundle": {"linux": {
         "appimage": {"files": files}, "deb": {"files": files},
     }}}, indent=2) + "\n")
@@ -97,9 +97,7 @@ def stage(source: Path, destination: Path, overlay: Path, config: dict) -> None:
 
 def verify_appdir(appdir: Path, config: dict) -> None:
     elf_x64(appdir / "usr/bin/codypendent-desktop")
-    # Tauri's pinned Linux resource_dir uses PackageInfo.name, which is the
-    # configured productName, rather than the main executable's file name.
-    verify_payload(appdir / "usr/lib" / config["productName"] / "runtime", config, sealed=True)
+    verify_payload(appdir / "usr/share" / config["productName"] / "runtime", config, sealed=True)
     print("Self-contained Linux AppDir verified; distribution signing was not assessed")
 
 
@@ -107,7 +105,7 @@ def verify_image(image: Path, config: dict) -> None:
     elf_x64(image)
     # Extraction needs neither FUSE nor a display, and never starts the GUI.
     with tempfile.TemporaryDirectory(prefix="codypendent-appimage-check-") as temporary:
-        result = subprocess.run([str(image), "--appimage-extract"], cwd=temporary,
+        result = subprocess.run([str(image), "--appimage-extract"], check=False, cwd=temporary,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120)
         if result.returncode:
             raise ValueError(f"AppImage extraction failed: {result.stderr[-2000:]}")
@@ -135,7 +133,7 @@ def main() -> int:
             verify_appdir(args.appdir.resolve(), config)
         else:
             verify_image(args.image.resolve(), config)
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
         print(f"Linux desktop release check failed: {error}", file=sys.stderr)
         return 1
     return 0

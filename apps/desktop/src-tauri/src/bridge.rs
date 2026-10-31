@@ -393,7 +393,7 @@ async fn start_objective(
                     .as_object_mut()
                     .ok_or_else(|| anyhow::anyhow!("Desktop context must be an object"))?
                     .insert("sessionId".into(), serde_json::json!(session.to_string()));
-                codypendent_runtime::desktop_tools::DesktopTools::resolve()
+                crate::runtime_paths::desktop_tools()
                     .and_then(|tools| tools.publish(session, desktop.context, desktop.tools))
                     .map_err(anyhow::Error::msg)?;
             }

@@ -13,17 +13,30 @@ export interface WorkflowLaunchMemory {
   editors: Map<string, { query: string; selected: string | null; drafts: Map<string, Map<string, string>> }>;
   manual: Map<string, { workflowId: string; inputs: string }>;
   runs: Map<string, string>;
+  preferences: Map<string, symbol>;
 }
 
 export function createWorkflowLaunchMemory(): WorkflowLaunchMemory {
-  return { transport: null, keys: new Map(), editors: new Map(), manual: new Map(), runs: new Map() };
+  return { transport: null, keys: new Map(), editors: new Map(), manual: new Map(), runs: new Map(), preferences: new Map() };
 }
 
 /** A transport change cannot inherit another runtime owner's unresolved launches. */
 export function bindWorkflowLaunchMemory(memory: WorkflowLaunchMemory, transport: DesktopTransport | null): void {
   if (memory.transport === transport) return;
   memory.transport = transport;
-  memory.keys.clear(); memory.editors.clear(); memory.manual.clear(); memory.runs.clear();
+  memory.keys.clear(); memory.editors.clear(); memory.manual.clear(); memory.runs.clear(); memory.preferences.clear();
+}
+
+export function preferWorkflowRun(memory: WorkflowLaunchMemory, repository: string): symbol {
+  const preference = Symbol();
+  memory.preferences.set(repository, preference);
+  return preference;
+}
+
+export function rememberWorkflowRun(memory: WorkflowLaunchMemory, repository: string, preference: symbol, runId: string): boolean {
+  if (memory.preferences.get(repository) !== preference) return false;
+  memory.runs.set(repository, runId);
+  return true;
 }
 
 export function workflowInputEntries(entry: WorkflowCatalogEntry): Array<[string, InputSpecification]> {

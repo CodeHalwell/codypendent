@@ -26,7 +26,7 @@ import type { WorkflowNodeView, WorkflowRunSnapshot } from "@codypendent/protoco
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
 import { WorkflowLauncher } from "./WorkflowLauncher.js";
-import { bindWorkflowLaunchMemory, createWorkflowLaunchMemory, workflowIntent, type WorkflowLaunchMemory } from "./workflowInputs.js";
+import { bindWorkflowLaunchMemory, createWorkflowLaunchMemory, preferWorkflowRun, rememberWorkflowRun, workflowIntent, type WorkflowLaunchMemory } from "./workflowInputs.js";
 
 export interface WorkflowViewProps {
   transport: DesktopTransport | null;
@@ -130,7 +130,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   /** The run whose open may still be drawn. Two rapid opens race, and only the
    * most recent request's answer may paint — never the last to RESOLVE. */
   const liveOpen = useRef<string | null>(null);
-  const initialOpen = useRef<{ id: string; boundary: object } | null>(null);
+  const initialOpen = useRef<{ id: string; boundary: object; explicit: boolean } | null>(null);
 
   useEffect(() => {
     liveBoundary.current = boundary;
@@ -147,11 +147,12 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   }, [boundary]);
 
   const open = useCallback(
-    async (runId: string) => {
+    async (runId: string, prefer = true) => {
       const trimmed = runId.trim();
       if (!transport?.watchWorkflow || trimmed.length === 0 || unavailable) {
         return;
       }
+      if (prefer) rememberWorkflowRun(memory, memoryRepository, preferWorkflowRun(memory, memoryRepository), trimmed);
       if (liveOpen.current !== trimmed) { pendingControl.current = null; setControlling(false); }
       liveOpen.current = trimmed;
       const generation = ++openGeneration.current;
@@ -168,7 +169,6 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
         }
         if (result.snapshot.workflow_run_id !== trimmed) throw new Error("The runtime returned a snapshot for another workflow run.");
         setWatch({ status: "watching", runId: trimmed, snapshot: result.snapshot });
-        memory.runs.set(memoryRepository, trimmed);
       } catch (error) {
         if (liveOpen.current !== trimmed || generation !== openGeneration.current || liveBoundary.current !== boundary || liveEpoch.current !== epoch) {
           return;
@@ -183,12 +183,15 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   );
 
   useEffect(() => {
+    const explicit = initialRunId !== undefined;
     if (!initialTarget) initialOpen.current = null;
-    else if (!unavailable && transport?.watchWorkflow && (initialOpen.current?.id !== initialTarget || initialOpen.current.boundary !== boundary)) {
-      initialOpen.current = { id: initialTarget, boundary };
-      void open(initialTarget);
+    else if (!explicit && initialOpen.current?.explicit && initialOpen.current.boundary === boundary) {
+      initialOpen.current = { id: initialTarget, boundary, explicit };
+    } else if (!unavailable && transport?.watchWorkflow && (initialOpen.current?.id !== initialTarget || initialOpen.current.boundary !== boundary || explicit && !initialOpen.current.explicit)) {
+      initialOpen.current = { id: initialTarget, boundary, explicit };
+      void open(initialTarget, explicit);
     }
-  }, [initialTarget, open, boundary, unavailable, transport]);
+  }, [initialTarget, initialRunId, open, boundary, unavailable, transport]);
 
   // A watch belongs to the connection that asked for it. A reconnect builds a
   // new client, so the daemon is no longer streaming this run to anyone and the
@@ -202,7 +205,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
     setControlling(false); setStarting(false); setConfirmCancel(null);
     const target = liveOpen.current ?? watchedRunId;
     if (connectionEpoch > 0 && target && requestEpoch.current !== connectionEpoch) {
-      void open(target);
+      void open(target, false);
     }
     // Deliberately keyed on the epoch alone: this is "the connection changed",
     // not "the run changed", which the effect above already handles.
@@ -327,14 +330,16 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
     }
     const key = memory.keys.get(identity) ?? crypto.randomUUID();
     memory.keys.set(identity, key);
+    const preference = preferWorkflowRun(memory, memoryRepository);
     const token = Symbol(); pendingStart.current = token; setStarting(true);
     try {
       const runId = await transport.startWorkflow(id, inputs, { expectedRepository: repository ?? undefined, idempotencyKey: key });
       if (!runId.trim()) throw new Error("The runtime did not return a workflow run identity.");
-      if (memory.transport === transport) memory.runs.set(memoryRepository, runId);
+      const preferred = memory.transport === transport && rememberWorkflowRun(memory, memoryRepository, preference, runId);
       if (liveBoundary.current !== boundary || liveEpoch.current !== connectionEpoch || !liveAvailable.current) return;
       memory.keys.delete(identity);
       setNotice(`workflow run ${runId} started`);
+      if (!preferred) return;
       setRunIdInput(runId);
       await open(runId);
     } catch (error) {
