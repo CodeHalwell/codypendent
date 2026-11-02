@@ -203,9 +203,12 @@ pub fn render_splash(
 }
 
 fn one_line(text: &str, width: u16) -> String {
-    let bounded: String = text.chars().take(4096).collect();
+    let bounded = match text.char_indices().nth(4096) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    };
     truncate_display_width(
-        &sanitize_terminal_text(&bounded).replace('\n', " "),
+        &sanitize_terminal_text(bounded).replace('\n', " "),
         usize::from(width),
     )
 }
