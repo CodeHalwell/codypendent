@@ -59,15 +59,18 @@ impl AcpToolFailure {
     }
 
     fn capture_text(&mut self, text: &str) {
-        let bounded: String = text.chars().take(MAX_TEXT).collect();
-        if let Ok(value) = serde_json::from_str::<Value>(&bounded) {
+        let bounded = match text.char_indices().nth(MAX_TEXT) {
+            Some((idx, _)) => &text[..idx],
+            None => text,
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(bounded) {
             self.capture_raw(&value, 0);
             return;
         }
         if bounded.trim_start().starts_with('{') {
             return;
         }
-        let message = safe_text(&bounded);
+        let message = safe_text(bounded);
         if !message.is_empty() && !self.messages.contains(&message) {
             if self.messages.len() == MAX_MESSAGES {
                 self.messages.remove(0);
@@ -145,12 +148,16 @@ impl AcpToolFailure {
         if text.is_empty() {
             "The tool failed without reporting a reason.".to_owned()
         } else {
-            let mut bounded: String = text.chars().take(MAX_TEXT).collect();
-            if text.chars().count() > MAX_TEXT {
-                bounded.pop();
-                bounded.push('…');
+            match text.char_indices().nth(MAX_TEXT) {
+                Some(_) => {
+                    let (idx, _) = text.char_indices().nth(MAX_TEXT - 1).unwrap();
+                    let mut bounded = String::with_capacity(idx + 3);
+                    bounded.push_str(&text[..idx]);
+                    bounded.push('…');
+                    bounded
+                }
+                None => text,
             }
-            bounded
         }
     }
 }
