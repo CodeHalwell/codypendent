@@ -76,12 +76,11 @@ const DECISION_MARKERS: [&str; 4] = ["decided", "chose", "will use", "because"];
 /// Truncate `s` to at most `max` **characters** (never splitting a multibyte
 /// char), appending `…` only when truncation actually occurred.
 fn cap_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    if let Some((idx, _)) = s.char_indices().nth(max) {
+        format!("{}\u{2026}", &s[..idx])
+    } else {
+        s.to_string()
     }
-    let mut truncated: String = s.chars().take(max).collect();
-    truncated.push('…');
-    truncated
 }
 
 /// The canonical orderable revision for a ledger sequence. Delegates to
