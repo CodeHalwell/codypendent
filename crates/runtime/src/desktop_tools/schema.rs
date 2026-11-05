@@ -184,9 +184,9 @@ fn validate_schema(schema: &Value, depth: usize) -> Result<(), String> {
                 .as_str()
                 .ok_or("desktop.invalid_schema: required must be a string array")?;
             if !seen.insert(key)
-                || !schema
+                || schema
                     .get("properties")
-                    .is_some_and(|properties| properties.get(key).is_some())
+                    .is_none_or(|properties| properties.get(key).is_none())
             {
                 return Err(
                     "desktop.invalid_schema: required must contain unique declared property names"
