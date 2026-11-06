@@ -7445,14 +7445,14 @@ fn canonical_json(value: &Value) -> String {
 fn mcp_summary(server: &str, tool: &str, canonical_args: &str) -> String {
     /// Roughly one card line of arguments.
     const MAX_SUMMARY_ARGS_CHARS: usize = 120;
-    let args = if canonical_args.chars().count() > MAX_SUMMARY_ARGS_CHARS {
-        let truncated: String = canonical_args
-            .chars()
-            .take(MAX_SUMMARY_ARGS_CHARS)
-            .collect();
-        format!("{truncated}…")
-    } else {
-        canonical_args.to_string()
+    let args = match canonical_args.char_indices().nth(MAX_SUMMARY_ARGS_CHARS) {
+        Some((idx, _)) => {
+            let mut truncated = String::with_capacity(idx + 3);
+            truncated.push_str(&canonical_args[..idx]);
+            truncated.push('…');
+            truncated
+        }
+        None => canonical_args.to_string(),
     };
     format!("{server}.{tool}({args})")
 }
@@ -9053,11 +9053,14 @@ const MAX_ARGS_PREVIEW_CHARS: usize = 200;
 #[cfg(feature = "provider-openai")]
 fn compact_args(args: &Value) -> String {
     let rendered = args.to_string();
-    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
-        let truncated: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
-        format!("{truncated}… ({} bytes total)", rendered.len())
-    } else {
-        rendered
+    match rendered.char_indices().nth(MAX_ARGS_PREVIEW_CHARS) {
+        Some((idx, _)) => {
+            let mut truncated = String::with_capacity(idx + 32);
+            truncated.push_str(&rendered[..idx]);
+            truncated.push_str(&format!("… ({} bytes total)", rendered.len()));
+            truncated
+        }
+        None => rendered,
     }
 }
 

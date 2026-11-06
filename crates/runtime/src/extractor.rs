@@ -71,12 +71,10 @@ const SYSTEM_PROMPT: &str = "Extract at most 10 discrete, standalone facts worth
 /// recently written part.
 #[must_use]
 fn tail_cap(s: &str, max: usize) -> &str {
-    let total_chars = s.chars().count();
-    if total_chars <= max {
-        return s;
+    if max == 0 {
+        return "";
     }
-    let skip = total_chars - max;
-    match s.char_indices().nth(skip) {
+    match s.char_indices().rev().nth(max.saturating_sub(1)) {
         Some((idx, _)) => &s[idx..],
         None => s,
     }
@@ -88,11 +86,22 @@ fn tail_cap(s: &str, max: usize) -> &str {
 /// so a fact's `statement` is bounded independent of what the model sent.
 #[must_use]
 fn cap_statement(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    if s.is_empty() {
+        return String::new();
     }
-    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{truncated}\u{2026}")
+    if max == 0 {
+        return "\u{2026}".to_string();
+    }
+    match s.char_indices().nth(max) {
+        Some(_) => {
+            let idx = s.char_indices().nth(max - 1).map(|(i, _)| i).unwrap_or(0);
+            let mut truncated = String::with_capacity(idx + 3);
+            truncated.push_str(&s[..idx]);
+            truncated.push('\u{2026}');
+            truncated
+        }
+        None => s.to_string(),
+    }
 }
 
 /// Map a model-reported fact `kind` to a [`MemoryClass`] (D2 mapping table).
