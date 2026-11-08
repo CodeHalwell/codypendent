@@ -764,7 +764,7 @@ jobs:
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           body_path: docs/releases/v${{ steps.version.outputs.version }}.md
           files: |
@@ -778,7 +778,7 @@ jobs:
       # platform artifact has passed the same quality gates.
       - name: Publish rolling release (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: v${{ steps.version.outputs.version }}-build.${{ github.run_number }}
           name: codypendent v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
