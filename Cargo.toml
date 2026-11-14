@@ -116,7 +116,7 @@ agent-client-protocol = "2"
 # Async traits and config parsing
 async-trait = "0.1"
 toml = "0.8"
-toml_edit = "0.22"
+toml_edit = "0.25"
 # Declarative workflow manifests (Phase 5, STEP 5.1) are YAML — the shape of
 # `docs/specs/workflow.yaml`. Kept out of every other crate's graph: only
 # `codypendent-workflow` depends on it.
