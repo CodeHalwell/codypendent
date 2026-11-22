@@ -441,7 +441,7 @@ jobs:
       # the manifest and lockfile — it never builds — so an older cargo is fine
       # for it and for nothing else.
       - name: Check root Rust dependency policy
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         env:
           RUSTUP_TOOLCHAIN: "1.85.0"
         with:
@@ -449,7 +449,7 @@ jobs:
           manifest-path: ./Cargo.toml
           arguments: --all-features --locked --config deny.toml
       - name: Check desktop Tauri license, ban, and source policy
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         env:
           RUSTUP_TOOLCHAIN: "1.85.0"
         with:
@@ -459,7 +459,7 @@ jobs:
           # Reuse the root policy rather than maintaining a weaker desktop copy.
           command-arguments: licenses bans sources
       - name: Check desktop Tauri advisory policy
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         env:
           RUSTUP_TOOLCHAIN: "1.85.0"
         with:
