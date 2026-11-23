@@ -24,17 +24,6 @@ ignore = [
     { id = "RUSTSEC-2026-0371", reason = "Reviewed 2026-10-26: zbus_names unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
     { id = "RUSTSEC-2026-0370", reason = "Reviewed 2026-10-26: zvariant unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
     { id = "RUSTSEC-2026-0372", reason = "Reviewed 2026-10-26: zvariant_derive unmaintained — transitive via notify-rust and zbus 5; latest notify-rust 4.18.2 still requires zbus 5. No safe compatible upgrade is available." },
-    # gtk-rs GTK3 bindings, pulled by Tauri's Linux webkit2gtk backend.
-    { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0412", reason = "gdk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0413", reason = "atk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0414", reason = "gdkx11-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0415", reason = "gtk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0416", reason = "atk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0417", reason = "gdkx11 is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0418", reason = "gdk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0419", reason = "gtk3-macros is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
-    { id = "RUSTSEC-2024-0420", reason = "gtk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
     # Macro helper used by the same GTK3 bindings.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is transitive via gtk-rs macros; no safe upgrade is available" },
     # rust-unic crates pulled by urlpattern -> tauri-utils.
